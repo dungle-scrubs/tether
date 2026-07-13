@@ -1,0 +1,1 @@
+CREATE INDEX "tasks_claim_expiry_idx" ON "tasks" USING btree ("claim_expires_at");

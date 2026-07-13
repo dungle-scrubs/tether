@@ -1,0 +1,159 @@
+import { z } from "zod";
+
+import { sessionEventSchema } from "./event-builders.js";
+import { controlChannelSchema, participantRuntimeKindSchema } from "./records.js";
+
+/**
+ * Server-issued Control Epoch carried by control-protected REST requests. It is
+ * a positive safe integer; the server validates it against the current durable
+ * lease generation in the same transaction as the protected mutation.
+ */
+export const controlEpochSchema = z
+  .number()
+  .int()
+  .positive()
+  .refine((value) => Number.isSafeInteger(value), {
+    message: "controlEpoch must be a positive safe integer",
+  });
+
+/** Pagination metadata returned by bounded session event-list responses. */
+export const eventListPaginationSchema = z.object({
+  afterSeq: z.number().int().nonnegative(),
+  hasMore: z.boolean(),
+  limit: z.number().int().positive(),
+  nextAfterSeq: z.number().int().nonnegative(),
+  returned: z.number().int().nonnegative(),
+});
+
+/** HTTP response schema for bounded session event-list responses. */
+export const eventListResponseSchema = z.object({
+  events: z.array(z.lazy(() => sessionEventSchema)),
+  pagination: eventListPaginationSchema,
+});
+
+/** Pagination metadata returned by bounded session event-list responses. */
+export type EventListPagination = z.infer<typeof eventListPaginationSchema>;
+
+/** HTTP response body for bounded session event-list responses. */
+export type EventListResponse = z.infer<typeof eventListResponseSchema>;
+
+/** HTTP body schema for appending a generic session event. */
+export const appendEventSchema = z.object({
+  controlEpoch: controlEpochSchema.optional(),
+  eventId: z.string().min(1).optional(),
+  instanceId: z.string().min(1).optional(),
+  payload: z.record(z.string(), z.unknown()).default({}),
+  producerId: z.string().min(1),
+  type: z.string().min(1),
+});
+
+/** HTTP body schema for session creation. */
+export const createSessionSchema = z.object({
+  sessionId: z.string().min(1).optional(),
+});
+
+/** HTTP body schema for resolving external client conversations. */
+export const resolveClientSessionSchema = z.object({
+  externalId: z.string().min(1),
+  provider: z.string().min(1),
+  sessionId: z.string().min(1).optional(),
+});
+
+/** HTTP body schema for participant registration. */
+export const registerParticipantSchema = z.object({
+  capabilities: z.record(z.string(), z.unknown()).default({}),
+  controlChannel: controlChannelSchema.default("rest"),
+  displayName: z.string().min(1).optional(),
+  instanceId: z.string().min(1).optional(),
+  participantId: z.string().min(1).optional(),
+  runtimeKind: participantRuntimeKindSchema,
+});
+
+/** HTTP body schema for participant heartbeat refresh. */
+export const heartbeatParticipantSchema = z.object({
+  capabilities: z.record(z.string(), z.unknown()).optional(),
+  controlEpoch: controlEpochSchema.optional(),
+  instanceId: z.string().min(1).optional(),
+});
+
+/** HTTP body schema for task creation. */
+/**
+ * Deterministic schedule and Mailbox Scope identity a scheduled maintenance run
+ * carries at creation. Interval and algorithm version are part of task identity.
+ */
+export const scheduledTaskIdentitySchema = z.object({
+  mailboxAccountId: z.string().min(1),
+  mailboxProvider: z.string().min(1),
+  scheduleAlgorithmVersion: z.number().int().positive(),
+  scheduleIntervalMs: z.number().int().positive(),
+  scheduleWindowStart: z.number().int().nonnegative(),
+});
+
+export const createTaskSchema = z.object({
+  input: z.record(z.string(), z.unknown()).nullable().optional(),
+  kind: z.string().min(1),
+  objective: z.string().min(1),
+  requireContract: z.boolean().optional(),
+  schedule: scheduledTaskIdentitySchema.optional(),
+  taskId: z.string().min(1).optional(),
+});
+
+/** HTTP body schema for task claim. */
+export const claimTaskSchema = z.object({
+  controlEpoch: controlEpochSchema.optional(),
+  instanceId: z.string().min(1).optional(),
+  participantId: z.string().min(1),
+});
+
+/** HTTP body schema for task claim refresh. */
+export const refreshTaskClaimSchema = z.object({
+  controlEpoch: controlEpochSchema.optional(),
+  instanceId: z.string().min(1).optional(),
+  participantId: z.string().min(1),
+});
+
+/** HTTP body schema for task cancellation. */
+export const cancelTaskSchema = z.object({
+  controlEpoch: controlEpochSchema.optional(),
+  instanceId: z.string().min(1).optional(),
+  participantId: z.string().min(1),
+  reason: z.record(z.string(), z.unknown()).default({}),
+});
+
+/** HTTP body schema for task completion. */
+export const completeTaskSchema = z.object({
+  controlEpoch: controlEpochSchema.optional(),
+  instanceId: z.string().min(1).optional(),
+  participantId: z.string().min(1),
+  result: z.record(z.string(), z.unknown()).default({}),
+});
+
+/** HTTP body schema for task failure. */
+export const failTaskSchema = z.object({
+  controlEpoch: controlEpochSchema.optional(),
+  failure: z.record(z.string(), z.unknown()).default({}),
+  instanceId: z.string().min(1).optional(),
+  participantId: z.string().min(1),
+});
+
+/** HTTP body schema for task claim release. */
+export const releaseTaskSchema = z.object({
+  controlEpoch: controlEpochSchema.optional(),
+  instanceId: z.string().min(1).optional(),
+  participantId: z.string().min(1),
+});
+
+/** Schema for durable task approval decisions. */
+export const approvalDecisionSchema = z.union([z.literal("approved"), z.literal("rejected")]);
+
+/** Durable approval decision values recorded in session events. */
+export type ApprovalDecision = z.infer<typeof approvalDecisionSchema>;
+
+/** HTTP payload schema for recording approval intent for a task. */
+export const recordTaskApprovalSchema = z.object({
+  controlEpoch: controlEpochSchema.optional(),
+  decision: approvalDecisionSchema,
+  instanceId: z.string().min(1).optional(),
+  participantId: z.string().min(1),
+  reason: z.record(z.string(), z.unknown()).default({}),
+});

@@ -1,0 +1,54 @@
+{
+  "name": "@dungle-scrubs/tether-client",
+  "version": "0.1.1",
+  "description": "Participant runtime client for Tether REST and WebSocket integration.",
+  "license": "MIT",
+  "author": "Kevin Frilot",
+  "homepage": "https://github.com/dungle-scrubs/tether/tree/main/packages/client#readme",
+  "bugs": "https://github.com/dungle-scrubs/tether/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dungle-scrubs/tether.git",
+    "directory": "packages/client"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./observability": {
+      "import": "./dist/observability.js",
+      "types": "./dist/observability.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "format": "biome format --config-path=../../tooling/biome.json --write .",
+    "format:check": "biome format --config-path=../../tooling/biome.json .",
+    "lint": "biome lint --config-path=../../tooling/biome.json .",
+    "pack:tether": "pnpm --filter @dungle-scrubs/tether-protocol build && pnpm --filter @dungle-scrubs/tether-client build && node scripts/pack-tether-client.mjs",
+    "prepublishOnly": "pnpm run build",
+    "test": "vitest run --passWithNoTests",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json"
+  },
+  "dependencies": {
+    "@dungle-scrubs/tether-protocol": "workspace:*",
+    "@opentelemetry/api": "^1.9.1",
+    "effect": "^3.21.2",
+    "ws": "^8.20.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "@types/ws": "^8.18.1",
+    "esbuild": "0.25.12",
+    "vitest": "^4.1.7"
+  }
+}

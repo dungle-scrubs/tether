@@ -1,0 +1,60 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.4.15/schema.json",
+  "root": false,
+  "files": {
+    "includes": ["**", "!**/.turbo", "!**/dist", "!**/node_modules", "!**/package-lock.json"]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "double",
+      "semicolons": "always",
+      "trailingCommas": "all"
+    }
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true,
+      "suspicious": {
+        "noConsole": "off"
+      }
+    }
+  },
+  "overrides": [
+    {
+      "includes": [
+        "apps/tether/src/**/*.ts",
+        "!apps/tether/src/smoke/**",
+        "!apps/tether/src/examples/**",
+        "!apps/tether/src/observability.ts",
+        "!apps/tether/src/server.ts",
+        "!apps/tether/src/http.ts",
+        "!apps/tether/src/session-event-fanout.ts",
+        "!apps/tether/src/task-claim-sweeper.ts",
+        "!apps/tether/src/websocket-participant-gateway.ts",
+        "packages/*/src/**/*.ts",
+        "!packages/client/src/observability.ts",
+        "!packages/client/src/approval-observer.ts",
+        "!packages/client/src/participant-claimable-task-runner.ts"
+      ],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noConsole": "error"
+          }
+        }
+      }
+    }
+  ],
+  "vcs": {
+    "clientKind": "git",
+    "enabled": true,
+    "useIgnoreFile": true
+  }
+}

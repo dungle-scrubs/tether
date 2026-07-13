@@ -1,0 +1,43 @@
+{
+  "name": "@dungle-scrubs/tether-client-bridge",
+  "version": "0.1.1",
+  "description": "Helpers for binding external client conversations to Tether sessions and task APIs.",
+  "license": "MIT",
+  "author": "Kevin Frilot",
+  "homepage": "https://github.com/dungle-scrubs/tether/tree/main/packages/client-bridge#readme",
+  "bugs": "https://github.com/dungle-scrubs/tether/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dungle-scrubs/tether.git",
+    "directory": "packages/client-bridge"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "format": "biome format --config-path=../../tooling/biome.json --write .",
+    "format:check": "biome format --config-path=../../tooling/biome.json .",
+    "lint": "biome lint --config-path=../../tooling/biome.json .",
+    "prepublishOnly": "pnpm run build",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json"
+  },
+  "dependencies": {
+    "@dungle-scrubs/tether-protocol": "workspace:*",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.7"
+  }
+}

@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-tether}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_USER: ${POSTGRES_USER:-tether}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "${POSTGRES_HOST_BIND:-127.0.0.1}:${POSTGRES_HOST_PORT:-54329}:5432"
+    volumes:
+      - tether-postgres:/var/lib/postgresql/data
+
+  app:
+    build:
+      context: .
+      dockerfile: apps/tether/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AUTH_MODE: ${AUTH_MODE:-required}
+      AUTH_SIGNING_KID: ${AUTH_SIGNING_KID:-default}
+      AUTH_SIGNING_SECRET: ${AUTH_SIGNING_SECRET:-}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      PORT: "3025"
+      WS_BACKPRESSURE_BUFFERED_BYTES: ${WS_BACKPRESSURE_BUFFERED_BYTES:-67108864}
+    ports:
+      - "${APP_HOST_BIND:-127.0.0.1}:${APP_HOST_PORT:-3025}:3025"
+
+volumes:
+  tether-postgres:

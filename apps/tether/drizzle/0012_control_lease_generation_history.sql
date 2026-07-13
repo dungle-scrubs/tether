@@ -1,0 +1,2 @@
+ALTER TABLE "participant_control_leases" DROP CONSTRAINT "participant_control_leases_session_id_participant_id_instance_id_pk";--> statement-breakpoint
+ALTER TABLE "participant_control_leases" ADD CONSTRAINT "participant_control_leases_session_id_participant_id_instance_id_epoch_pk" PRIMARY KEY("session_id","participant_id","instance_id","epoch");

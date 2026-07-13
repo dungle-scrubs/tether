@@ -1,0 +1,43 @@
+{
+  "name": "@dungle-scrubs/tether-protocol",
+  "version": "0.1.0",
+  "description": "Shared Tether protocol records, validators, and event builders.",
+  "license": "MIT",
+  "author": "Kevin Frilot",
+  "homepage": "https://github.com/dungle-scrubs/tether/tree/main/packages/protocol#readme",
+  "bugs": "https://github.com/dungle-scrubs/tether/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dungle-scrubs/tether.git",
+    "directory": "packages/protocol"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "format": "biome format --config-path=../../tooling/biome.json --write .",
+    "format:check": "biome format --config-path=../../tooling/biome.json .",
+    "lint": "biome lint --config-path=../../tooling/biome.json .",
+    "prepublishOnly": "pnpm run build",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "vitest": "^4.1.7"
+  }
+}

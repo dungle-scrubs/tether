@@ -1,0 +1,16 @@
+pre-commit:
+  parallel: false
+  commands:
+    typecheck:
+      run: pnpm run typecheck
+    format:
+      run: pnpm run format:check
+    lint:
+      run: pnpm run lint
+    mark-verified:
+      run: node scripts/mark-verified.mjs
+
+prepare-commit-msg:
+  commands:
+    require-precommit:
+      run: node scripts/require-precommit.mjs

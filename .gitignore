@@ -1,0 +1,21 @@
+**/dist/
+**/node_modules/
+**/.turbo/
+**/.cache/
+**/.eval-runs/
+.env
+.env.*
+!**/.env.example
+.git/tether-precommit-ok
+packages/client/.pack/
+*.tgz
+
+.claude/
+.plans/
+
+# Agent tooling and instructions (kept out of the public tree)
+AGENTS.md
+CLAUDE.md
+.agents
+.codex
+.trevor

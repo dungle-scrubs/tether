@@ -1,0 +1,43 @@
+{
+  "name": "tether",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "db:generate": "drizzle-kit generate",
+    "db:push": "drizzle-kit push",
+    "dev": "tsx watch src/server.ts",
+    "format": "biome format --config-path=../../tooling/biome.json --write .",
+    "format:check": "biome format --config-path=../../tooling/biome.json .",
+    "lint": "biome lint --config-path=../../tooling/biome.json .",
+    "mint": "tsx src/auth/mint-cli.ts",
+    "start": "node dist/server.js",
+    "test": "vitest run",
+    "test:e2e": "tsx scripts/test-e2e.ts",
+    "test:e2e:clean": "tsx scripts/e2e-clean.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "ui": "PORT=17421 tsx watch src/server.ts"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.1",
+    "@dungle-scrubs/tether-client": "workspace:*",
+    "@dungle-scrubs/tether-client-bridge": "workspace:*",
+    "@dungle-scrubs/tether-protocol": "workspace:*",
+    "drizzle-orm": "^0.45.2",
+    "effect": "^3.21.2",
+    "pg": "^8.21.0",
+    "ws": "^8.20.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "@types/pg": "^8.20.0",
+    "@types/ws": "^8.18.1",
+    "drizzle-kit": "^0.31.10",
+    "tsx": "^4.22.3",
+    "vite": "^8.0.13",
+    "vitest": "^4.1.7",
+    "yaml": "^2.9.0"
+  }
+}

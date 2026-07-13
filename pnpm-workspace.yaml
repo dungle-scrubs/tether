@@ -1,0 +1,14 @@
+packages:
+  - "apps/*"
+  - "packages/client"
+  - "packages/client-bridge"
+  - "packages/protocol"
+
+allowBuilds:
+  esbuild: true
+  lefthook: true
+onlyBuiltDependencies:
+  - esbuild
+  - lefthook
+overrides:
+  esbuild: 0.25.12

@@ -1,0 +1,1 @@
+ALTER TABLE "participant_control_leases" ADD COLUMN "epoch" bigint DEFAULT 1 NOT NULL;

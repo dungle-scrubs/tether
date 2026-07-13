@@ -1,0 +1,264 @@
+import { z } from "zod";
+import { sessionEventSchema } from "./event-builders.js";
+import type { SessionEvent } from "./records.js";
+import { taskRecordSchema, webSocketOperation } from "./records.js";
+
+/** WebSocket task-claim command schema. */
+export const wsTaskClaimMessageSchema = z.object({
+  op: z.literal(webSocketOperation.taskClaim),
+  requestId: z.string().min(1).optional(),
+  taskId: z.string().min(1),
+});
+
+/** WebSocket task claim-refresh command schema. */
+export const wsTaskRefreshMessageSchema = z.object({
+  op: z.literal(webSocketOperation.taskRefresh),
+  requestId: z.string().min(1).optional(),
+  taskId: z.string().min(1),
+});
+
+/** WebSocket task-cancel command schema. */
+export const wsTaskCancelMessageSchema = z.object({
+  op: z.literal(webSocketOperation.taskCancel),
+  reason: z.record(z.string(), z.unknown()).default({}),
+  requestId: z.string().min(1).optional(),
+  taskId: z.string().min(1),
+});
+
+/** WebSocket task-complete command schema. */
+export const wsTaskCompleteMessageSchema = z.object({
+  op: z.literal(webSocketOperation.taskComplete),
+  requestId: z.string().min(1).optional(),
+  result: z.record(z.string(), z.unknown()).default({}),
+  taskId: z.string().min(1),
+});
+
+/** WebSocket task-fail command schema. */
+export const wsTaskFailMessageSchema = z.object({
+  failure: z.record(z.string(), z.unknown()).default({}),
+  op: z.literal(webSocketOperation.taskFail),
+  requestId: z.string().min(1).optional(),
+  taskId: z.string().min(1),
+});
+
+/** WebSocket task-release command schema. */
+export const wsTaskReleaseMessageSchema = z.object({
+  op: z.literal(webSocketOperation.taskRelease),
+  requestId: z.string().min(1).optional(),
+  taskId: z.string().min(1),
+});
+
+/** WebSocket publish command schema. */
+export const wsPublishMessageSchema = z.object({
+  eventId: z.string().min(1).optional(),
+  op: z.literal(webSocketOperation.publish),
+  payload: z.record(z.string(), z.unknown()).default({}),
+  producerId: z.string().min(1),
+  requestId: z.string().min(1).optional(),
+  type: z.string().min(1),
+});
+
+/** WebSocket server event envelope schema. */
+export const webSocketEventEnvelopeSchema = z.object({
+  event: sessionEventSchema,
+  op: z.literal(webSocketOperation.event),
+});
+
+/** WebSocket replay-complete envelope schema. */
+export const webSocketReplayCompleteEnvelopeSchema = z.object({
+  op: z.literal(webSocketOperation.replayComplete),
+});
+
+/** WebSocket command-result envelope schema. */
+export const webSocketCommandResultEnvelopeSchema = z
+  .object({
+    command: z.string().min(1),
+    op: z.literal(webSocketOperation.commandResult),
+    requestId: z.string().min(1).optional(),
+    task: taskRecordSchema.nullable().optional(),
+  })
+  .passthrough();
+
+/** WebSocket error envelope schema. */
+export const webSocketErrorEnvelopeSchema = z
+  .object({
+    error: z.string(),
+    op: z.literal(webSocketOperation.error),
+    requestId: z.string().min(1).optional(),
+  })
+  .passthrough();
+
+/** Runtime validator for server-to-client WebSocket envelopes. */
+export const webSocketServerEnvelopeSchema = z.union([
+  webSocketCommandResultEnvelopeSchema,
+  webSocketErrorEnvelopeSchema,
+  webSocketEventEnvelopeSchema,
+  webSocketReplayCompleteEnvelopeSchema,
+]);
+
+/** Parsed WebSocket command-result envelope. */
+export type CommandResultEnvelope = z.infer<typeof webSocketCommandResultEnvelopeSchema>;
+
+/** Parsed server-to-client WebSocket envelope. */
+export type WebSocketServerEnvelope = z.infer<typeof webSocketServerEnvelopeSchema>;
+
+/** Parsed WebSocket task command message. */
+export type WebSocketTaskCommandMessage =
+  | z.infer<typeof wsTaskCancelMessageSchema>
+  | z.infer<typeof wsTaskClaimMessageSchema>
+  | z.infer<typeof wsTaskCompleteMessageSchema>
+  | z.infer<typeof wsTaskFailMessageSchema>
+  | z.infer<typeof wsTaskRefreshMessageSchema>
+  | z.infer<typeof wsTaskReleaseMessageSchema>;
+
+/**
+ * WebSocket client command messages that can be correlated with a command
+ * result envelope.
+ */
+export type WebSocketCommandMessage =
+  | WebSocketTaskCommandMessage
+  | z.infer<typeof wsPublishMessageSchema>;
+
+interface SerializeCommandEnvelopeInput {
+  readonly command: string;
+  readonly payload: Record<string, unknown>;
+  readonly requestId?: string;
+}
+
+interface SerializeErrorEnvelopeInput {
+  readonly details?: Record<string, unknown>;
+  readonly error: string;
+  readonly requestId?: string;
+}
+
+/** Creates a WebSocket publish message for participant-originated events. */
+export function buildWsPublishMessage(input: {
+  readonly eventId?: string;
+  readonly payload: Record<string, unknown>;
+  readonly producerId: string;
+  readonly requestId?: string;
+  readonly type: string;
+}): z.infer<typeof wsPublishMessageSchema> {
+  return {
+    ...(input.eventId !== undefined ? { eventId: input.eventId } : {}),
+    op: webSocketOperation.publish,
+    payload: input.payload,
+    producerId: input.producerId,
+    ...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
+    type: input.type,
+  };
+}
+
+/** Creates a WebSocket task-claim command. */
+export function buildWsTaskClaimMessage(input: {
+  readonly requestId?: string;
+  readonly taskId: string;
+}): z.infer<typeof wsTaskClaimMessageSchema> {
+  return {
+    op: webSocketOperation.taskClaim,
+    ...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
+    taskId: input.taskId,
+  };
+}
+
+/** Creates a WebSocket task claim-refresh command. */
+export function buildWsTaskRefreshMessage(input: {
+  readonly requestId?: string;
+  readonly taskId: string;
+}): z.infer<typeof wsTaskRefreshMessageSchema> {
+  return {
+    op: webSocketOperation.taskRefresh,
+    ...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
+    taskId: input.taskId,
+  };
+}
+
+/** Creates a WebSocket task-cancel command. */
+export function buildWsTaskCancelMessage(input: {
+  readonly reason?: Record<string, unknown>;
+  readonly requestId?: string;
+  readonly taskId: string;
+}): z.infer<typeof wsTaskCancelMessageSchema> {
+  return {
+    op: webSocketOperation.taskCancel,
+    reason: input.reason ?? {},
+    ...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
+    taskId: input.taskId,
+  };
+}
+
+/** Creates a WebSocket task-complete command. */
+export function buildWsTaskCompleteMessage(input: {
+  readonly requestId?: string;
+  readonly result: Record<string, unknown>;
+  readonly taskId: string;
+}): z.infer<typeof wsTaskCompleteMessageSchema> {
+  return {
+    op: webSocketOperation.taskComplete,
+    ...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
+    result: input.result,
+    taskId: input.taskId,
+  };
+}
+
+/** Creates a WebSocket task-fail command. */
+export function buildWsTaskFailMessage(input: {
+  readonly failure: Record<string, unknown>;
+  readonly requestId?: string;
+  readonly taskId: string;
+}): z.infer<typeof wsTaskFailMessageSchema> {
+  return {
+    failure: input.failure,
+    op: webSocketOperation.taskFail,
+    ...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
+    taskId: input.taskId,
+  };
+}
+
+/** Creates a WebSocket task-release command. */
+export function buildWsTaskReleaseMessage(input: {
+  readonly requestId?: string;
+  readonly taskId: string;
+}): z.infer<typeof wsTaskReleaseMessageSchema> {
+  return {
+    op: webSocketOperation.taskRelease,
+    ...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
+    taskId: input.taskId,
+  };
+}
+
+/** Parses server-to-client WebSocket envelopes into the known protocol union. */
+export function parseWebSocketServerEnvelope(value: unknown): WebSocketServerEnvelope | null {
+  const parsed = webSocketServerEnvelopeSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
+/** Serializes a session event envelope for WebSocket subscribers. */
+export function serializeEventEnvelope(event: SessionEvent): string {
+  return JSON.stringify({ event, op: webSocketOperation.event });
+}
+
+/** Serializes the replay-complete marker sent after historical events. */
+export function serializeReplayCompleteEnvelope(): string {
+  return JSON.stringify({ op: webSocketOperation.replayComplete });
+}
+
+/** Serializes a command result envelope while preserving command-specific fields. */
+export function serializeCommandResultEnvelope(input: SerializeCommandEnvelopeInput): string {
+  return JSON.stringify({
+    ...input.payload,
+    command: input.command,
+    op: webSocketOperation.commandResult,
+    ...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
+  });
+}
+
+/** Serializes a command or connection error envelope. */
+export function serializeErrorEnvelope(input: SerializeErrorEnvelopeInput): string {
+  return JSON.stringify({
+    ...(input.details ?? {}),
+    error: input.error,
+    op: webSocketOperation.error,
+    ...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
+  });
+}
