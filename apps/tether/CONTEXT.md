@@ -13,6 +13,24 @@ client bindings are scoped to a session.
 An append-only record with a monotonic per-session sequence. Events are replayed
 over REST and WebSocket boundaries.
 
+**Handled Event Cursor**:
+The highest contiguous Session Event sequence whose consumer handlers have all
+completed successfully.
+_Avoid_: observed sequence, received cursor, delivery acknowledgement
+
+**Replay Window**:
+The bounded suffix of the Source Event Stream that a reconnecting consumer may
+request after its Handled Event Cursor.
+
+**Session Context View**:
+A budgeted read model containing durable task state and recent Session Events
+for one Session.
+
+**Session Summary**:
+A durable compacted representation of a contiguous Source Event Stream range,
+identified by its covered sequence range.
+_Avoid_: transcript, cache
+
 **Participant**:
 A runtime identity that can publish events, advertise capabilities, claim tasks,
 and hold a control lease.
@@ -45,9 +63,10 @@ what happened but does not claim that an external provider received it.
 _Avoid_: delivery queue, provider outbox
 
 **Host Presence**:
-A process-local, passive WebSocket projection for session inventory consumers.
+A replica-local, passive WebSocket projection for session inventory consumers.
 `runtimeKind=host` announces live host metadata. `runtimeKind=viewer` receives
 presence frames. Neither mode creates durable participant rows.
+_Avoid_: cluster-wide presence, durable participant
 
 **Runtime Process Contract**:
 The supervisor-neutral startup, readiness, shutdown, durable-state, and restart
@@ -106,6 +125,19 @@ than duplicated public source.
 A bridge may persist a provider-specific outbox keyed to the **Source Event
 Stream**. That outbox tracks external delivery independently from Tether event
 replay; successful session replay is not evidence of provider delivery.
+
+A consumer resumes after its **Handled Event Cursor**, not after the latest
+Session Event merely received from the transport. A handler failure leaves the
+cursor unchanged so reconnect replay includes the failed event.
+
+A **Replay Window** bounds transport catch-up; it does not bound the durable
+**Source Event Stream**. A cursor older than the available replay window is a
+typed recovery condition, not permission to skip events.
+
+A **Session Summary** covers one contiguous sequence range and a **Session
+Context View** may combine the latest summary with later raw Session Events.
+Compaction and retention may advance only when consumers have a defined recovery
+path from the retained summary and cursor metadata.
 
 A reconnect with the same Participant and runtime instance supersedes its prior
 **Control Lease** and advances the **Control Epoch**. Commands from an older
