@@ -1,12 +1,11 @@
 import { and, desc, eq, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
-import { readMigrationFiles } from "drizzle-orm/migrator";
-import { migrate as runDrizzleMigrations } from "drizzle-orm/node-postgres/migrator";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { Context, Effect, Layer } from "effect";
 import pg from "pg";
 
 import { approvalTargetKey } from "./approval-target-key.js";
 import { ControlEpochStaleError, nextControlEpoch, parseControlEpoch } from "./control-epoch.js";
+import { migrateDatabase } from "./database-migration.js";
 import * as schema from "./schema.js";
 import {
   clientSessionBindings,
@@ -59,7 +58,13 @@ import type {
 } from "./types.js";
 
 const { Pool } = pg;
-const migrationsFolder = "drizzle";
+
+export { DatabaseMigrationError } from "./database-migration.js";
+export type {
+  DatabaseMigrationFailureContext,
+  DatabaseMigrationFailureReason,
+  MigrationJournalHead,
+} from "./database-migration.js";
 
 export type ParticipantRegistration =
   | {
@@ -230,22 +235,7 @@ export function createPool(databaseUrl: string, options?: CreatePoolOptions): Da
  * files are the source of truth for runtime database bootstrapping.
  */
 export async function migrate(database: DatabasePool): Promise<void> {
-  await baselineLegacySchema(database);
-  await runDrizzleMigrations(database.db, { migrationsFolder });
-}
-
-interface MigrationCountRow {
-  readonly count: number;
-}
-
-interface SchemaObjectExistsRow {
-  readonly exists: boolean;
-}
-
-/** Structural primary-key identity returned by the PostgreSQL catalogs. */
-interface PrimaryKeySignatureRow {
-  readonly columnNames: readonly string[];
-  readonly constraintType: string;
+  await migrateDatabase(database);
 }
 
 interface SessionExistenceRow {
@@ -644,318 +634,6 @@ const taskApprovalReturningColumns = `
   target_key AS "targetKey",
   task_id AS "taskId"
 `;
-
-interface LegacyMigrationProbe {
-  readonly label: string;
-  readonly represented: (database: DatabasePool) => Promise<boolean>;
-}
-
-/** Error raised when a legacy schema cannot be represented as a migration prefix. */
-export class LegacySchemaBaselineError extends Error {
-  readonly missingOrGappedObjects: readonly string[];
-  readonly representedPrefix: number;
-
-  constructor(input: {
-    readonly missingOrGappedObjects: readonly string[];
-    readonly representedPrefix: number;
-  }) {
-    super(
-      `Unsupported legacy schema for Drizzle baseline: represented prefix ${input.representedPrefix}, missing or gapped objects: ${input.missingOrGappedObjects.join(", ")}`,
-    );
-    this.name = "LegacySchemaBaselineError";
-    this.missingOrGappedObjects = input.missingOrGappedObjects;
-    this.representedPrefix = input.representedPrefix;
-  }
-}
-
-/**
- * Baselines old pre-migrator databases by probing schema shape before any
- * application-table mutation. Supported shapes are contiguous generated
- * migration prefixes; Drizzle then applies the remaining generated migrations.
- */
-async function baselineLegacySchema(database: DatabasePool): Promise<void> {
-  await database.pool.query(`
-    CREATE SCHEMA IF NOT EXISTS drizzle;
-    CREATE TABLE IF NOT EXISTS drizzle.__drizzle_migrations (
-      id SERIAL PRIMARY KEY,
-      hash text NOT NULL,
-      created_at bigint
-    );
-  `);
-  const migrationCount = await database.pool.query<MigrationCountRow>(
-    `SELECT count(*)::int AS "count" FROM drizzle.__drizzle_migrations`,
-  );
-  if ((migrationCount.rows[0]?.count ?? 0) > 0) {
-    return;
-  }
-
-  const probes = legacyMigrationProbes();
-  const results: boolean[] = [];
-  for (const probe of probes) {
-    results.push(await probe.represented(database));
-  }
-  if (results.every((result) => !result)) {
-    return;
-  }
-  const firstGap = results.findIndex((result) => !result);
-  const representedPrefix =
-    firstGap === -1 ? results.length - 1 : results.slice(0, firstGap).length - 1;
-  const hasNonContiguousSuffix =
-    firstGap !== -1 && results.slice(firstGap + 1).some((result) => result);
-  if (hasNonContiguousSuffix) {
-    throw new LegacySchemaBaselineError({
-      missingOrGappedObjects: probes
-        .filter((_, index) => !results[index] && results.slice(index + 1).some((result) => result))
-        .map((probe) => probe.label),
-      representedPrefix,
-    });
-  }
-
-  const migrations = readMigrationFiles({ migrationsFolder }).slice(0, representedPrefix + 1);
-  await database.pool.query("BEGIN");
-  try {
-    for (const migration of migrations) {
-      await database.pool.query(
-        `INSERT INTO drizzle.__drizzle_migrations ("hash", "created_at") VALUES ($1, $2)`,
-        [migration.hash, migration.folderMillis],
-      );
-    }
-    await database.pool.query("COMMIT");
-  } catch (error) {
-    await database.pool.query("ROLLBACK");
-    throw error;
-  }
-}
-
-/** Ordered probes for generated migrations that can be represented by schema shape alone. */
-function legacyMigrationProbes(): readonly LegacyMigrationProbe[] {
-  return [
-    {
-      label: "0000 core session, participant, event, and task tables",
-      represented: async (database) =>
-        (await hasTables(database, [
-          "participants",
-          "session_event_sequences",
-          "session_events",
-          "sessions",
-          "tasks",
-        ])) &&
-        (await hasColumns(database, "sessions", ["created_at", "session_id"])) &&
-        (await hasColumns(database, "tasks", [
-          "claimed_at",
-          "claimed_by",
-          "completed_at",
-          "created_at",
-          "kind",
-          "objective",
-          "session_id",
-          "task_id",
-        ])),
-    },
-    {
-      label: "0001 terminal task columns",
-      represented: (database) =>
-        hasColumns(database, "tasks", [
-          "cancelled_at",
-          "failed_at",
-          "failure",
-          "released_at",
-          "result",
-        ]),
-    },
-    {
-      label: "0002 participant control leases",
-      represented: (database) => hasTable(database, "participant_control_leases"),
-    },
-    {
-      label: "0003 task claim expiry column",
-      represented: (database) => hasColumn(database, "tasks", "claim_expires_at"),
-    },
-    {
-      label: "0004 client session bindings",
-      represented: (database) => hasTable(database, "client_session_bindings"),
-    },
-    {
-      label: "0005 task input column",
-      represented: (database) => hasColumn(database, "tasks", "input"),
-    },
-    {
-      label: "0006 task claim expiry index",
-      represented: (database) => hasIndex(database, "tasks_claim_expiry_idx"),
-    },
-    {
-      label: "0007 task approval rows",
-      represented: (database) =>
-        hasTable(database, "task_approvals").then((hasApprovalTable) =>
-          hasApprovalTable ? hasIndex(database, "task_approvals_task_decided_idx") : false,
-        ),
-    },
-    {
-      label: "0008 participant current lease index",
-      represented: (database) =>
-        hasColumn(database, "participant_control_leases", "superseded_at").then(
-          async (hasSupersededAt) =>
-            hasSupersededAt &&
-            (await hasIndex(database, "participant_control_leases_current_unique")),
-        ),
-    },
-    {
-      label: "0009 task clear cause and removed session archival",
-      represented: async (database) =>
-        (await hasColumns(database, "tasks", [
-          "claim_expired_at",
-          "claim_expired_by",
-          "released_by",
-        ])) && !(await hasColumn(database, "sessions", "archived_at")),
-    },
-    {
-      label: "0010 participant control lease epoch",
-      represented: (database) => hasColumn(database, "participant_control_leases", "epoch"),
-    },
-    {
-      label: "0011 task schedule and mailbox scope identity with unique schedule index",
-      represented: (database) =>
-        hasColumns(database, "tasks", [
-          "mailbox_account_id",
-          "mailbox_provider",
-          "schedule_algorithm_version",
-          "schedule_interval_ms",
-          "schedule_window_start",
-        ]).then((hasScheduleColumns) =>
-          hasScheduleColumns ? hasUniqueIndex(database, "tasks_schedule_identity_idx") : false,
-        ),
-    },
-    {
-      label: "0012 control lease generation history primary key including epoch",
-      represented: hasParticipantControlLeaseGenerationPrimaryKey,
-    },
-  ];
-}
-
-/** Returns whether all named public tables exist. */
-async function hasTables(database: DatabasePool, tableNames: readonly string[]): Promise<boolean> {
-  for (const tableName of tableNames) {
-    if (!(await hasTable(database, tableName))) {
-      return false;
-    }
-  }
-  return true;
-}
-
-/** Returns whether one public table exists. */
-async function hasTable(database: DatabasePool, tableName: string): Promise<boolean> {
-  const result = await database.pool.query<SchemaObjectExistsRow>(
-    `SELECT to_regclass($1) IS NOT NULL AS "exists"`,
-    [`public.${tableName}`],
-  );
-  return result.rows[0]?.exists === true;
-}
-
-/** Returns whether all named columns exist on one public table. */
-async function hasColumns(
-  database: DatabasePool,
-  tableName: string,
-  columnNames: readonly string[],
-): Promise<boolean> {
-  for (const columnName of columnNames) {
-    if (!(await hasColumn(database, tableName, columnName))) {
-      return false;
-    }
-  }
-  return true;
-}
-
-/** Returns whether one column exists on one public table. */
-async function hasColumn(
-  database: DatabasePool,
-  tableName: string,
-  columnName: string,
-): Promise<boolean> {
-  const result = await database.pool.query<SchemaObjectExistsRow>(
-    `
-      SELECT EXISTS (
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = $1
-          AND column_name = $2
-      ) AS "exists"
-    `,
-    [tableName, columnName],
-  );
-  return result.rows[0]?.exists === true;
-}
-
-/** Returns whether one public index exists. */
-async function hasIndex(database: DatabasePool, indexName: string): Promise<boolean> {
-  const result = await database.pool.query<SchemaObjectExistsRow>(
-    `
-      SELECT EXISTS (
-        SELECT 1
-        FROM pg_indexes
-        WHERE schemaname = 'public'
-          AND indexname = $1
-      ) AS "exists"
-    `,
-    [indexName],
-  );
-  return result.rows[0]?.exists === true;
-}
-
-/**
- * Returns whether the public Control Lease table has the migration 0012
- * primary-key structure, independently of PostgreSQL's truncated identifier.
- */
-async function hasParticipantControlLeaseGenerationPrimaryKey(
-  database: DatabasePool,
-): Promise<boolean> {
-  const result = await database.pool.query<PrimaryKeySignatureRow>(
-    `
-      SELECT
-        ARRAY(
-          SELECT attribute.attname
-          FROM unnest(constraint_record.conkey) WITH ORDINALITY AS key_column(attnum, position)
-          JOIN pg_attribute attribute
-            ON attribute.attrelid = constraint_record.conrelid
-            AND attribute.attnum = key_column.attnum
-          ORDER BY key_column.position
-        ) AS "columnNames",
-        constraint_record.contype::text AS "constraintType"
-      FROM pg_constraint constraint_record
-      JOIN pg_class table_record ON table_record.oid = constraint_record.conrelid
-      JOIN pg_namespace namespace_record ON namespace_record.oid = table_record.relnamespace
-      WHERE namespace_record.nspname = 'public'
-        AND table_record.relname = 'participant_control_leases'
-        AND constraint_record.contype = 'p'
-    `,
-  );
-  const expectedColumnNames = ["session_id", "participant_id", "instance_id", "epoch"] as const;
-  return result.rows.some(
-    (row) =>
-      row.constraintType === "p" &&
-      row.columnNames.length === expectedColumnNames.length &&
-      row.columnNames.every((columnName, index) => columnName === expectedColumnNames[index]),
-  );
-}
-
-/** Returns whether one public index exists and enforces uniqueness. */
-async function hasUniqueIndex(database: DatabasePool, indexName: string): Promise<boolean> {
-  const result = await database.pool.query<SchemaObjectExistsRow>(
-    `
-      SELECT EXISTS (
-        SELECT 1
-        FROM pg_class idx
-        JOIN pg_index ix ON ix.indexrelid = idx.oid
-        JOIN pg_namespace ns ON ns.oid = idx.relnamespace
-        WHERE ns.nspname = 'public'
-          AND idx.relname = $1
-          AND ix.indisunique
-      ) AS "exists"
-    `,
-    [indexName],
-  );
-  return result.rows[0]?.exists === true;
-}
 
 /**
  * Finds an active client/session binding for one external conversation.

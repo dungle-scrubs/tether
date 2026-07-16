@@ -1,13 +1,20 @@
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:net";
+import { fileURLToPath } from "node:url";
 
+import { readMigrationFiles } from "drizzle-orm/migrator";
 import { Effect } from "effect";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 
 import { ParticipantRuntimeClient } from "../src/client.js";
+import {
+  DatabaseMigrationError,
+  projectDatabaseMigrationFailure,
+} from "../src/database-migration.js";
 import {
   mintTestAuthToken,
   testAuthSigningKid,
@@ -54,8 +61,37 @@ const e2eAuthOptions = {
   secrets: { [testAuthSigningKid]: testAuthSigningSecret },
 } as const;
 
+/** Generated migration filenames in their authoritative application order. */
+const generatedMigrationNames = [
+  "0000_lively_enchantress.sql",
+  "0001_far_mephisto.sql",
+  "0002_left_havok.sql",
+  "0003_productive_stone_men.sql",
+  "0004_clean_arclight.sql",
+  "0005_bored_roulette.sql",
+  "0006_wandering_iron_monger.sql",
+  "0007_unique_whirlwind.sql",
+  "0008_flowery_the_watchers.sql",
+  "0009_sticky_lucky_pierre.sql",
+  "0010_true_human_torch.sql",
+  "0011_special_blue_marvel.sql",
+  "0012_control_lease_generation_history.sql",
+] as const;
+
 interface JsonResponse {
   readonly [key: string]: unknown;
+}
+
+interface ServerProcessResult {
+  readonly exitCode: number | null;
+  readonly signal: NodeJS.Signals | null;
+  readonly stderr: string;
+  readonly stdout: string;
+}
+
+interface RunServerProcessOptions {
+  readonly env?: NodeJS.ProcessEnv;
+  readonly shutdownAfterStdout?: string;
 }
 
 /** Reads the admin database URL required for enabled e2e runs. */
@@ -499,6 +535,659 @@ e2e("tether e2e", () => {
     }
   });
 
+  it.each(
+    generatedMigrationNames.map((_, prefixIndex) => prefixIndex),
+  )("baselines journal-less migration prefix %i through current head", async (prefixIndex) => {
+    const legacyDatabaseName = `tether_e2e_prefix_${String(prefixIndex).padStart(4, "0")}_${randomUUID().replaceAll("-", "_")}`;
+    const database = createPool(buildDatabaseUrl(legacyDatabaseName));
+    try {
+      await createDatabase(legacyDatabaseName);
+      await applyLegacyMigrationPrefix(database, prefixIndex);
+
+      await migrate(database);
+
+      const expectedMigrations = readMigrationFiles({ migrationsFolder: "drizzle" });
+      const journal = await database.pool.query<{
+        readonly createdAt: string;
+        readonly hash: string;
+      }>(
+        `
+            SELECT created_at::text AS "createdAt", hash
+            FROM drizzle.__drizzle_migrations
+            ORDER BY id
+          `,
+      );
+      expect(journal.rows).toEqual(
+        expectedMigrations.map((migration) => ({
+          createdAt: String(migration.folderMillis),
+          hash: migration.hash,
+        })),
+      );
+    } finally {
+      await database.end();
+      await dropDatabase(legacyDatabaseName);
+    }
+  });
+
+  it("rejects a partial migration 0000 schema before journal or application mutation", async () => {
+    const legacyDatabaseName = `tether_e2e_partial_0000_${randomUUID().replaceAll("-", "_")}`;
+    const database = createPool(buildDatabaseUrl(legacyDatabaseName));
+    try {
+      await createDatabase(legacyDatabaseName);
+      await database.pool.query(`
+        CREATE TABLE sessions (
+          session_id text PRIMARY KEY NOT NULL
+        )
+      `);
+
+      await expect(migrate(database)).rejects.toMatchObject({
+        name: "DatabaseMigrationError",
+        reason: "unsupported_schema",
+        recognizedPrefix: null,
+      });
+
+      const journal = await database.pool.query<{ readonly count: number }>(
+        `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
+      );
+      const applicationMutation = await database.pool.query<{ readonly count: number }>(
+        `
+          SELECT count(*)::int AS count
+          FROM pg_class table_record
+          JOIN pg_namespace namespace_record ON namespace_record.oid = table_record.relnamespace
+          WHERE namespace_record.nspname = 'public'
+            AND table_record.relname IN (
+              'participants',
+              'session_event_sequences',
+              'session_events',
+              'tasks'
+            )
+        `,
+      );
+      expect(journal.rows[0]?.count).toBe(0);
+      expect(applicationMutation.rows[0]?.count).toBe(0);
+    } finally {
+      await database.end();
+      await dropDatabase(legacyDatabaseName);
+    }
+  });
+
+  it("reports an unsupported schema through one structured real-server failure", async () => {
+    const databaseName = `tether_e2e_server_unsupported_${randomUUID().replaceAll("-", "_")}`;
+    const databaseUrl = buildDatabaseUrl(databaseName);
+    const database = createPool(databaseUrl);
+    try {
+      await createDatabase(databaseName);
+      await database.pool.query(`CREATE TABLE sessions (session_id text PRIMARY KEY NOT NULL)`);
+
+      const result = await runServerProcess(databaseUrl);
+      const migrationEvents = parseStructuredLogEntries(result.stderr).filter(
+        (entry) => entry.event === "database.migration_failed",
+      );
+
+      expect(result.exitCode).not.toBe(0);
+      expect(result.signal).toBeNull();
+      expect(migrationEvents).toEqual([
+        {
+          details: {
+            expectedFacts: ["migration_0000_complete=true"],
+            journalHead: null,
+            observedFacts: ["migration_0000_complete=false", "known_tether_table_count=1"],
+            reason: "unsupported_schema",
+            recognizedPrefix: null,
+          },
+          event: "database.migration_failed",
+        },
+      ]);
+      expect(result.stderr).not.toContain(databaseUrl);
+      expect(result.stderr).not.toContain("e2e-local-postgres-password");
+    } finally {
+      await database.end();
+      await dropDatabase(databaseName);
+    }
+  });
+
+  it("reports an invalid journal through the same typed real-server projection", async () => {
+    const databaseName = `tether_e2e_server_invalid_journal_${randomUUID().replaceAll("-", "_")}`;
+    const databaseUrl = buildDatabaseUrl(databaseName);
+    const database = createPool(databaseUrl);
+    try {
+      await createDatabase(databaseName);
+      await applyLegacyMigrationsThrough0007(database);
+      await seedMigrationJournalPrefix(database, 8);
+      const firstMigration = readMigrationFiles({ migrationsFolder: "drizzle" })[0];
+      if (firstMigration === undefined) {
+        throw new Error("Expected at least one generated migration");
+      }
+      const rawHashMarker = "raw-invalid-journal-hash-marker";
+      await database.pool.query(
+        `INSERT INTO drizzle.__drizzle_migrations (hash, created_at) VALUES ($1, $2)`,
+        [rawHashMarker, firstMigration.folderMillis],
+      );
+
+      let expectedDetails: ReturnType<typeof projectDatabaseMigrationFailure> | null = null;
+      try {
+        await migrate(database);
+      } catch (error) {
+        if (!(error instanceof DatabaseMigrationError)) {
+          throw error;
+        }
+        expectedDetails = projectDatabaseMigrationFailure(error);
+      }
+      if (expectedDetails === null) {
+        throw new Error("Expected invalid journal migration to fail");
+      }
+
+      const result = await runServerProcess(databaseUrl);
+      const migrationEvents = parseStructuredLogEntries(result.stderr).filter(
+        (entry) => entry.event === "database.migration_failed",
+      );
+
+      expect(result.exitCode).not.toBe(0);
+      expect(result.signal).toBeNull();
+      expect(migrationEvents).toEqual([
+        {
+          details: expectedDetails,
+          event: "database.migration_failed",
+        },
+      ]);
+      expect(expectedDetails).toEqual({
+        expectedFacts: ["journal_position=8", "known_migration_exists=true"],
+        journalHead: {
+          hashMatchesKnownMigration: false,
+          position: 8,
+          timestamp: String(firstMigration.folderMillis),
+        },
+        observedFacts: ["journal_row_count=9", "timestamp_matches=false", "hash_matches=false"],
+        reason: "invalid_journal",
+        recognizedPrefix: 7,
+      });
+      expect(result.stderr).not.toContain(rawHashMarker);
+      expect(result.stderr).not.toContain("DatabaseMigrationError");
+      expect(result.stderr.match(/database\.migration_failed/gu)).toHaveLength(1);
+    } finally {
+      await database.end();
+      await dropDatabase(databaseName);
+    }
+  });
+
+  it("preserves generic startup failure and successful startup logging", async () => {
+    const databaseName = `tether_e2e_server_logging_${randomUUID().replaceAll("-", "_")}`;
+    const databaseUrl = buildDatabaseUrl(databaseName);
+    try {
+      await createDatabase(databaseName);
+
+      const genericFailure = await runServerProcess(databaseUrl, {
+        env: { AUTH_MODE: "required", AUTH_SIGNING_SECRET: "" },
+      });
+      expect(genericFailure.exitCode).not.toBe(0);
+      expect(genericFailure.stderr).toContain(
+        "AUTH_SIGNING_SECRET is required when AUTH_MODE=required",
+      );
+      expect(genericFailure.stderr).not.toContain("database.migration_failed");
+
+      const successfulStartup = await runServerProcess(databaseUrl, {
+        shutdownAfterStdout: "tether listening on :0",
+      });
+      expect(successfulStartup).toMatchObject({ exitCode: 0, signal: null });
+      expect(successfulStartup.stdout).toContain("tether listening on :0");
+      expect(successfulStartup.stderr).not.toContain("database.migration_failed");
+    } finally {
+      await dropDatabase(databaseName);
+    }
+  }, 20_000);
+
+  it("migrates a fresh database that contains an unrelated public table", async () => {
+    const databaseName = `tether_e2e_unrelated_table_${randomUUID().replaceAll("-", "_")}`;
+    const database = createPool(buildDatabaseUrl(databaseName));
+    try {
+      await createDatabase(databaseName);
+      await database.pool.query(`CREATE TABLE operator_scratchpad (note text NOT NULL)`);
+
+      await migrate(database);
+
+      const unrelatedTable = await database.pool.query<{ readonly exists: boolean }>(
+        `SELECT to_regclass('public.operator_scratchpad') IS NOT NULL AS exists`,
+      );
+      const journal = await database.pool.query<{ readonly count: number }>(
+        `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
+      );
+      expect(unrelatedTable.rows[0]?.exists).toBe(true);
+      expect(journal.rows[0]?.count).toBe(
+        readMigrationFiles({ migrationsFolder: "drizzle" }).length,
+      );
+    } finally {
+      await database.end();
+      await dropDatabase(databaseName);
+    }
+  });
+
+  it("accepts a current journal-less schema with an additive unrelated column", async () => {
+    const databaseName = `tether_e2e_additive_schema_${randomUUID().replaceAll("-", "_")}`;
+    const database = createPool(buildDatabaseUrl(databaseName));
+    try {
+      await createDatabase(databaseName);
+      await applyLegacyMigrationPrefix(database, generatedMigrationNames.length - 1);
+      await database.pool.query(`ALTER TABLE tasks ADD COLUMN operator_annotation text`);
+
+      await migrate(database);
+
+      const additiveColumn = await database.pool.query<{ readonly exists: boolean }>(
+        `
+          SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'tasks'
+              AND column_name = 'operator_annotation'
+          ) AS exists
+        `,
+      );
+      const journal = await database.pool.query<{ readonly count: number }>(
+        `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
+      );
+      expect(additiveColumn.rows[0]?.exists).toBe(true);
+      expect(journal.rows[0]?.count).toBe(
+        readMigrationFiles({ migrationsFolder: "drizzle" }).length,
+      );
+    } finally {
+      await database.end();
+      await dropDatabase(databaseName);
+    }
+  });
+
+  it("leaves the exact journal and application schema unchanged on second startup", async () => {
+    const databaseName = `tether_e2e_idempotent_migration_${randomUUID().replaceAll("-", "_")}`;
+    const database = createPool(buildDatabaseUrl(databaseName));
+    try {
+      await createDatabase(databaseName);
+      await migrate(database);
+      const journalBefore = await readMigrationJournal(database);
+      const schemaBefore = await readPublicSchemaFacts(database);
+
+      await migrate(database);
+
+      expect(await readMigrationJournal(database)).toEqual(journalBefore);
+      expect(await readPublicSchemaFacts(database)).toEqual(schemaBefore);
+    } finally {
+      await database.end();
+      await dropDatabase(databaseName);
+    }
+  });
+
+  it("rejects a same-named index with the wrong structural definition", async () => {
+    const legacyDatabaseName = `tether_e2e_wrong_index_${randomUUID().replaceAll("-", "_")}`;
+    const database = createPool(buildDatabaseUrl(legacyDatabaseName));
+    try {
+      await createDatabase(legacyDatabaseName);
+      await applyLegacyMigrationPrefix(database, 5);
+      await database.pool.query(`CREATE INDEX tasks_claim_expiry_idx ON tasks (created_at)`);
+
+      await expect(migrate(database)).rejects.toMatchObject({
+        name: "DatabaseMigrationError",
+        reason: "unsupported_schema",
+        recognizedPrefix: 5,
+      });
+
+      const journal = await database.pool.query<{ readonly count: number }>(
+        `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
+      );
+      const laterApplicationDdl = await database.pool.query<{ readonly exists: boolean }>(
+        `SELECT to_regclass('public.task_approvals') IS NOT NULL AS exists`,
+      );
+      expect(journal.rows[0]?.count).toBe(0);
+      expect(laterApplicationDdl.rows[0]?.exists).toBe(false);
+    } finally {
+      await database.end();
+      await dropDatabase(legacyDatabaseName);
+    }
+  });
+
+  it("serializes concurrent migration starts against one legacy database", async () => {
+    const legacyDatabaseName = `tether_e2e_concurrent_migration_${randomUUID().replaceAll("-", "_")}`;
+    const firstDatabase = createPool(buildDatabaseUrl(legacyDatabaseName));
+    const secondDatabase = createPool(buildDatabaseUrl(legacyDatabaseName));
+    try {
+      await createDatabase(legacyDatabaseName);
+      await applyLegacyMigrationsThrough0007(firstDatabase);
+
+      await withDiagnosticTimeout(
+        Promise.all([migrate(firstDatabase), migrate(secondDatabase)]),
+        5_000,
+        "Concurrent migrations did not complete within 5 seconds",
+      );
+
+      const expectedMigrations = readMigrationFiles({ migrationsFolder: "drizzle" });
+      const journal = await firstDatabase.pool.query<{
+        readonly createdAt: string;
+        readonly hash: string;
+      }>(
+        `
+          SELECT created_at::text AS "createdAt", hash
+          FROM drizzle.__drizzle_migrations
+          ORDER BY created_at, id
+        `,
+      );
+      const duplicates = await firstDatabase.pool.query<{ readonly count: number }>(
+        `
+          SELECT count(*)::int AS count
+          FROM (
+            SELECT hash, created_at
+            FROM drizzle.__drizzle_migrations
+            GROUP BY hash, created_at
+            HAVING count(*) > 1
+          ) duplicate_journal_rows
+        `,
+      );
+
+      expect(journal.rows).toEqual(
+        expectedMigrations.map((migration) => ({
+          createdAt: String(migration.folderMillis),
+          hash: migration.hash,
+        })),
+      );
+      expect(duplicates.rows[0]?.count).toBe(0);
+    } finally {
+      await Promise.allSettled([firstDatabase.end(), secondDatabase.end()]);
+      await dropDatabase(legacyDatabaseName);
+    }
+  }, 15_000);
+
+  it("serializes concurrent migration starts when each pool has one connection", async () => {
+    const legacyDatabaseName = `tether_e2e_single_connection_migration_${randomUUID().replaceAll("-", "_")}`;
+    const firstDatabase = createPool(buildDatabaseUrl(legacyDatabaseName), { max: 1 });
+    const secondDatabase = createPool(buildDatabaseUrl(legacyDatabaseName), { max: 1 });
+    try {
+      await createDatabase(legacyDatabaseName);
+      await applyLegacyMigrationsThrough0007(firstDatabase);
+
+      await withDiagnosticTimeout(
+        Promise.all([migrate(firstDatabase), migrate(secondDatabase)]),
+        5_000,
+        "Single-connection concurrent migrations did not complete within 5 seconds",
+      );
+
+      const expectedMigrations = readMigrationFiles({ migrationsFolder: "drizzle" });
+      const journal = await firstDatabase.pool.query<{
+        readonly createdAt: string;
+        readonly hash: string;
+      }>(
+        `
+          SELECT created_at::text AS "createdAt", hash
+          FROM drizzle.__drizzle_migrations
+          ORDER BY created_at, id
+        `,
+      );
+
+      expect(journal.rows).toEqual(
+        expectedMigrations.map((migration) => ({
+          createdAt: String(migration.folderMillis),
+          hash: migration.hash,
+        })),
+      );
+    } finally {
+      await Promise.allSettled([firstDatabase.end(), secondDatabase.end()]);
+      await dropDatabase(legacyDatabaseName);
+    }
+  }, 15_000);
+
+  it("releases failed migration ownership without replacing the original cause", async () => {
+    const legacyDatabaseName = `tether_e2e_failed_migration_cleanup_${randomUUID().replaceAll("-", "_")}`;
+    const database = createPool(buildDatabaseUrl(legacyDatabaseName), { max: 1 });
+    try {
+      await createDatabase(legacyDatabaseName);
+      await applyLegacyMigrationsThrough0007(database);
+      let migrationFailed = false;
+      const failingDatabase = wrapPoolQueries(database, async (query, values, next) => {
+        const text = typeof query === "string" ? query : query.text;
+        if (
+          !migrationFailed &&
+          /ALTER TABLE\s+"participant_control_leases"\s+ADD COLUMN\s+"superseded_at"/iu.test(text)
+        ) {
+          migrationFailed = true;
+          throw new Error("injected migration execution failure");
+        }
+        if (migrationFailed && /pg_advisory_unlock/iu.test(text)) {
+          throw new Error("injected advisory unlock failure");
+        }
+        return next(query, values);
+      });
+
+      await expect(migrate(failingDatabase)).rejects.toMatchObject({
+        cause: expect.objectContaining({ message: "injected migration execution failure" }),
+      });
+      await withDiagnosticTimeout(
+        migrate(database),
+        5_000,
+        "Migration retry did not complete after ownership cleanup",
+      );
+
+      const expectedMigrations = readMigrationFiles({ migrationsFolder: "drizzle" });
+      const journal = await database.pool.query<{ readonly count: number }>(
+        `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
+      );
+      expect(journal.rows[0]?.count).toBe(expectedMigrations.length);
+    } finally {
+      await database.end();
+      await dropDatabase(legacyDatabaseName);
+    }
+  }, 15_000);
+
+  it("applies only later migrations after a valid partial journal prefix", async () => {
+    const legacyDatabaseName = `tether_e2e_partial_journal_${randomUUID().replaceAll("-", "_")}`;
+    const database = createPool(buildDatabaseUrl(legacyDatabaseName));
+    try {
+      await createDatabase(legacyDatabaseName);
+      await applyLegacyMigrationsThrough0007(database);
+      await seedMigrationJournalPrefix(database, 8);
+
+      await migrate(database);
+
+      const expectedMigrations = readMigrationFiles({ migrationsFolder: "drizzle" });
+      const journal = await database.pool.query<{
+        readonly createdAt: string;
+        readonly hash: string;
+      }>(
+        `
+          SELECT created_at::text AS "createdAt", hash
+          FROM drizzle.__drizzle_migrations
+          ORDER BY created_at, id
+        `,
+      );
+      expect(journal.rows).toEqual(
+        expectedMigrations.map((migration) => ({
+          createdAt: String(migration.folderMillis),
+          hash: migration.hash,
+        })),
+      );
+    } finally {
+      await database.end();
+      await dropDatabase(legacyDatabaseName);
+    }
+  });
+
+  it("rejects duplicate journal rows before applying later migrations", async () => {
+    const legacyDatabaseName = `tether_e2e_duplicate_journal_${randomUUID().replaceAll("-", "_")}`;
+    const database = createPool(buildDatabaseUrl(legacyDatabaseName));
+    try {
+      await createDatabase(legacyDatabaseName);
+      await applyLegacyMigrationsThrough0007(database);
+      await seedMigrationJournalPrefix(database, 8);
+      const firstMigration = readMigrationFiles({ migrationsFolder: "drizzle" })[0];
+      if (firstMigration === undefined) {
+        throw new Error("Expected at least one generated migration");
+      }
+      await database.pool.query(
+        `INSERT INTO drizzle.__drizzle_migrations (hash, created_at) VALUES ($1, $2)`,
+        [firstMigration.hash, firstMigration.folderMillis],
+      );
+
+      await expectInvalidJournalBeforeApplicationDdl(database);
+    } finally {
+      await database.end();
+      await dropDatabase(legacyDatabaseName);
+    }
+  });
+
+  it("rejects gapped journal rows before applying later migrations", async () => {
+    const legacyDatabaseName = `tether_e2e_gapped_journal_${randomUUID().replaceAll("-", "_")}`;
+    const database = createPool(buildDatabaseUrl(legacyDatabaseName));
+    try {
+      await createDatabase(legacyDatabaseName);
+      await applyLegacyMigrationsThrough0007(database);
+      await seedMigrationJournalPrefix(database, 8);
+      const migrations = readMigrationFiles({ migrationsFolder: "drizzle" });
+      const omittedMigration = migrations[3];
+      if (omittedMigration === undefined) {
+        throw new Error("Expected generated migration 0003");
+      }
+      await database.pool.query(`DELETE FROM drizzle.__drizzle_migrations WHERE created_at = $1`, [
+        omittedMigration.folderMillis,
+      ]);
+
+      await expectInvalidJournalBeforeApplicationDdl(database);
+    } finally {
+      await database.end();
+      await dropDatabase(legacyDatabaseName);
+    }
+  });
+
+  it("rejects reordered journal rows before applying later migrations", async () => {
+    const legacyDatabaseName = `tether_e2e_reordered_journal_${randomUUID().replaceAll("-", "_")}`;
+    const database = createPool(buildDatabaseUrl(legacyDatabaseName));
+    try {
+      await createDatabase(legacyDatabaseName);
+      await applyLegacyMigrationsThrough0007(database);
+      await seedMigrationJournalPrefix(database, 8);
+      await database.pool.query(`
+        UPDATE drizzle.__drizzle_migrations
+        SET id = -id
+        WHERE id IN (3, 4);
+
+        UPDATE drizzle.__drizzle_migrations
+        SET id = CASE id WHEN -3 THEN 4 WHEN -4 THEN 3 END
+        WHERE id IN (-3, -4);
+      `);
+
+      await expectInvalidJournalBeforeApplicationDdl(database);
+    } finally {
+      await database.end();
+      await dropDatabase(legacyDatabaseName);
+    }
+  });
+
+  it("rejects a known journal timestamp with a mismatched hash", async () => {
+    const legacyDatabaseName = `tether_e2e_hash_mismatch_journal_${randomUUID().replaceAll("-", "_")}`;
+    const database = createPool(buildDatabaseUrl(legacyDatabaseName));
+    try {
+      await createDatabase(legacyDatabaseName);
+      await applyLegacyMigrationsThrough0007(database);
+      await seedMigrationJournalPrefix(database, 8);
+      const migration = readMigrationFiles({ migrationsFolder: "drizzle" })[4];
+      if (migration === undefined) {
+        throw new Error("Expected generated migration 0004");
+      }
+      await database.pool.query(
+        `UPDATE drizzle.__drizzle_migrations SET hash = $1 WHERE created_at = $2`,
+        ["mismatched-known-migration-hash", migration.folderMillis],
+      );
+
+      await expectInvalidJournalBeforeApplicationDdl(database);
+    } finally {
+      await database.end();
+      await dropDatabase(legacyDatabaseName);
+    }
+  });
+
+  it("rejects a future unknown journal row before applying later migrations", async () => {
+    const legacyDatabaseName = `tether_e2e_future_journal_${randomUUID().replaceAll("-", "_")}`;
+    const database = createPool(buildDatabaseUrl(legacyDatabaseName));
+    try {
+      await createDatabase(legacyDatabaseName);
+      await applyLegacyMigrationsThrough0007(database);
+      await seedMigrationJournalPrefix(database, 8);
+      const migrations = readMigrationFiles({ migrationsFolder: "drizzle" });
+      const futureTimestamp =
+        Math.max(...migrations.map((migration) => migration.folderMillis)) + 1;
+      await database.pool.query(
+        `INSERT INTO drizzle.__drizzle_migrations (hash, created_at) VALUES ($1, $2)`,
+        ["unknown-future-migration-hash", futureTimestamp],
+      );
+
+      await expectInvalidJournalBeforeApplicationDdl(database);
+    } finally {
+      await database.end();
+      await dropDatabase(legacyDatabaseName);
+    }
+  });
+
+  it("rolls back failed legacy journal seeding and permits a clean retry", async () => {
+    const legacyDatabaseName = `tether_e2e_seed_rollback_${randomUUID().replaceAll("-", "_")}`;
+    const database = createPool(buildDatabaseUrl(legacyDatabaseName), { max: 1 });
+    try {
+      await createDatabase(legacyDatabaseName);
+      await applyLegacyMigrationsThrough0007(database);
+      const queryTrace: string[] = [];
+      let seedInsertCount = 0;
+      const failingDatabase = wrapPoolQueries(database, async (query, values, next) => {
+        const text = typeof query === "string" ? query : query.text;
+        const normalized = text.trim().replaceAll(/\s+/gu, " ");
+        if (
+          normalized === "BEGIN" ||
+          normalized === "COMMIT" ||
+          normalized === "ROLLBACK" ||
+          /INSERT INTO drizzle\.__drizzle_migrations/iu.test(normalized)
+        ) {
+          queryTrace.push(normalized);
+        }
+        if (/INSERT INTO drizzle\.__drizzle_migrations/iu.test(normalized)) {
+          seedInsertCount += 1;
+          if (seedInsertCount === 3) {
+            throw new Error("injected legacy journal seed failure");
+          }
+        }
+        return next(query, values);
+      });
+
+      await expect(migrate(failingDatabase)).rejects.toThrow(
+        "injected legacy journal seed failure",
+      );
+      const rowsAfterFailure = await database.pool.query<{ readonly count: number }>(
+        `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
+      );
+      expect(rowsAfterFailure.rows[0]?.count).toBe(0);
+      expect(queryTrace[0]).toBe("BEGIN");
+      expect(queryTrace.at(-1)).toBe("ROLLBACK");
+      expect(queryTrace.filter((query) => /INSERT INTO/iu.test(query))).toHaveLength(3);
+      expect(queryTrace).not.toContain("COMMIT");
+
+      await withDiagnosticTimeout(
+        migrate(database),
+        5_000,
+        "Migration retry did not complete after seed rollback",
+      );
+      const expectedMigrations = readMigrationFiles({ migrationsFolder: "drizzle" });
+      const journal = await database.pool.query<{
+        readonly createdAt: string;
+        readonly hash: string;
+      }>(
+        `
+          SELECT created_at::text AS "createdAt", hash
+          FROM drizzle.__drizzle_migrations
+          ORDER BY id
+        `,
+      );
+      expect(journal.rows).toEqual(
+        expectedMigrations.map((migration) => ({
+          createdAt: String(migration.folderMillis),
+          hash: migration.hash,
+        })),
+      );
+    } finally {
+      await database.end();
+      await dropDatabase(legacyDatabaseName);
+    }
+  }, 15_000);
+
   it("rejects non-contiguous legacy schemas before mutating application tables", async () => {
     const legacyDatabaseName = `tether_e2e_non_contiguous_${randomUUID().replaceAll("-", "_")}`;
     const legacyDatabase = createPool(buildDatabaseUrl(legacyDatabaseName));
@@ -520,7 +1209,17 @@ e2e("tether e2e", () => {
         `CREATE INDEX tasks_claim_expiry_idx ON tasks (claim_expires_at)`,
       );
 
-      await expect(migrate(legacyDatabase)).rejects.toThrow("Unsupported legacy schema");
+      await expect(migrate(legacyDatabase)).rejects.toMatchObject({
+        expectedFacts: ["contiguous_migration_prefix=true"],
+        journalHead: null,
+        name: "DatabaseMigrationError",
+        observedFacts: expect.arrayContaining([
+          "migration_0005_represented=false",
+          "migration_0006_represented=true",
+        ]),
+        reason: "unsupported_schema",
+        recognizedPrefix: 4,
+      });
 
       const mutatedColumns = await legacyDatabase.pool.query<{ readonly count: number }>(
         `
@@ -5399,39 +6098,25 @@ e2e("tether e2e", () => {
 
   /** Applies the earliest task-claim-expiry migration prefix. */
   async function applyLegacyMigrationsThrough0003(database: DatabasePool): Promise<void> {
-    await applyLegacyMigrations(database, [
-      "0000_lively_enchantress.sql",
-      "0001_far_mephisto.sql",
-      "0002_left_havok.sql",
-      "0003_productive_stone_men.sql",
-    ]);
+    await applyLegacyMigrationPrefix(database, 3);
   }
 
   /** Applies the pre-approval-table migration set for backfill cutover tests. */
   async function applyLegacyMigrationsThrough0006(database: DatabasePool): Promise<void> {
-    await applyLegacyMigrations(database, [
-      "0000_lively_enchantress.sql",
-      "0001_far_mephisto.sql",
-      "0002_left_havok.sql",
-      "0003_productive_stone_men.sql",
-      "0004_clean_arclight.sql",
-      "0005_bored_roulette.sql",
-      "0006_wandering_iron_monger.sql",
-    ]);
+    await applyLegacyMigrationPrefix(database, 6);
   }
 
   /** Applies migrations through the last pre-control-lease-current-index schema. */
   async function applyLegacyMigrationsThrough0007(database: DatabasePool): Promise<void> {
-    await applyLegacyMigrations(database, [
-      "0000_lively_enchantress.sql",
-      "0001_far_mephisto.sql",
-      "0002_left_havok.sql",
-      "0003_productive_stone_men.sql",
-      "0004_clean_arclight.sql",
-      "0005_bored_roulette.sql",
-      "0006_wandering_iron_monger.sql",
-      "0007_unique_whirlwind.sql",
-    ]);
+    await applyLegacyMigrationPrefix(database, 7);
+  }
+
+  /** Applies one complete journal-less generated migration prefix. */
+  async function applyLegacyMigrationPrefix(
+    database: DatabasePool,
+    prefixIndex: number,
+  ): Promise<void> {
+    await applyLegacyMigrations(database, generatedMigrationNames.slice(0, prefixIndex + 1));
   }
 
   /** Applies a list of generated migration SQL files to a legacy test database. */
@@ -5446,6 +6131,150 @@ e2e("tether e2e", () => {
       );
       await database.pool.query(migrationSql);
     }
+  }
+
+  /** Seeds an exact ordered prefix of Drizzle's generated migration journal. */
+  async function seedMigrationJournalPrefix(
+    database: DatabasePool,
+    prefixLength: number,
+  ): Promise<void> {
+    await database.pool.query(`
+      CREATE SCHEMA IF NOT EXISTS drizzle;
+      CREATE TABLE drizzle.__drizzle_migrations (
+        id SERIAL PRIMARY KEY,
+        hash text NOT NULL,
+        created_at bigint
+      )
+    `);
+    const migrations = readMigrationFiles({ migrationsFolder: "drizzle" }).slice(0, prefixLength);
+    for (const migration of migrations) {
+      await database.pool.query(
+        `INSERT INTO drizzle.__drizzle_migrations (hash, created_at) VALUES ($1, $2)`,
+        [migration.hash, migration.folderMillis],
+      );
+    }
+  }
+
+  /** Reads the complete migration journal in insertion order. */
+  async function readMigrationJournal(
+    database: DatabasePool,
+  ): Promise<readonly { readonly createdAt: string; readonly hash: string }[]> {
+    const result = await database.pool.query<{
+      readonly createdAt: string;
+      readonly hash: string;
+    }>(
+      `
+        SELECT created_at::text AS "createdAt", hash
+        FROM drizzle.__drizzle_migrations
+        ORDER BY id
+      `,
+    );
+    return result.rows;
+  }
+
+  /** Reads deterministic public application-schema facts for idempotency comparison. */
+  async function readPublicSchemaFacts(
+    database: DatabasePool,
+  ): Promise<readonly Record<string, unknown>[]> {
+    const result = await database.pool.query<Record<string, unknown>>(
+      `
+        SELECT
+          column_default AS "columnDefault",
+          column_name AS "columnName",
+          data_type AS "dataType",
+          is_nullable AS "isNullable",
+          table_name AS "tableName"
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+        ORDER BY table_name, ordinal_position
+      `,
+    );
+    return result.rows;
+  }
+
+  /** Runs the real server entry point and captures its terminal startup result. */
+  async function runServerProcess(
+    databaseUrl: string,
+    options: RunServerProcessOptions = {},
+  ): Promise<ServerProcessResult> {
+    const child = spawn(process.execPath, ["--import", "tsx", "src/server.ts"], {
+      cwd: fileURLToPath(new URL("..", import.meta.url)),
+      env: {
+        ...process.env,
+        AUTH_MODE: "disabled",
+        DATABASE_URL: databaseUrl,
+        PORT: "0",
+        ...options.env,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stderr = "";
+    let stdout = "";
+    child.stderr.setEncoding("utf8");
+    child.stdout.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+      if (
+        options.shutdownAfterStdout !== undefined &&
+        stdout.includes(options.shutdownAfterStdout)
+      ) {
+        child.kill("SIGTERM");
+      }
+    });
+
+    const result = await new Promise<ServerProcessResult>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        child.kill("SIGKILL");
+        reject(new Error("Real server process did not terminate after startup failure"));
+      }, 10_000);
+      child.once("error", (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      child.once("close", (exitCode, signal) => {
+        clearTimeout(timeout);
+        resolve({ exitCode, signal, stderr, stdout });
+      });
+    });
+    return result;
+  }
+
+  /** Parses only complete JSON object lines from captured structured stderr. */
+  function parseStructuredLogEntries(stderr: string): readonly Record<string, unknown>[] {
+    const entries: Record<string, unknown>[] = [];
+    for (const line of stderr.split("\n")) {
+      try {
+        const value = JSON.parse(line) as unknown;
+        if (isRecord(value)) {
+          entries.push(value);
+        }
+      } catch {}
+    }
+    return entries;
+  }
+
+  /** Asserts a malformed journal fails closed before migration 0008 application DDL. */
+  async function expectInvalidJournalBeforeApplicationDdl(database: DatabasePool): Promise<void> {
+    await expect(migrate(database)).rejects.toMatchObject({
+      name: "DatabaseMigrationError",
+      reason: "invalid_journal",
+    });
+
+    const applicationDdl = await database.pool.query<{ readonly exists: boolean }>(
+      `
+        SELECT EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'participant_control_leases'
+            AND column_name = 'superseded_at'
+        ) AS exists
+      `,
+    );
+    expect(applicationDdl.rows[0]?.exists).toBe(false);
   }
 
   /** Seeds duplicate current leases that predate the partial unique index. */
@@ -6127,6 +6956,27 @@ function createGenericApprovalTaskRecord(sessionId: string, taskId: string): Tas
 /** Checks whether a value is a non-null object record. */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+/** Rejects with a diagnostic when an asynchronous E2E operation stops making progress. */
+async function withDiagnosticTimeout<TValue>(
+  operation: Promise<TValue>,
+  timeoutMs: number,
+  message: string,
+): Promise<TValue> {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+    }
+  }
 }
 
 /**

@@ -1,6 +1,7 @@
-import { Effect, Fiber, Layer } from "effect";
+import { Cause, Effect, Fiber, Layer, Option, Runtime } from "effect";
 
 import { ServerConfigLive } from "./config.js";
+import { DatabaseMigrationError, projectDatabaseMigrationFailure } from "./database-migration.js";
 import { DatabaseLive } from "./db.js";
 import { AppServerLive } from "./http.js";
 import { SessionServiceEffectLive } from "./session-service.js";
@@ -35,6 +36,36 @@ async function main(): Promise<void> {
 }
 
 main().catch((error: unknown) => {
-  console.error(error);
+  const migrationError = findDatabaseMigrationError(error);
+  if (migrationError === null) {
+    console.error(error);
+  } else {
+    console.error(
+      JSON.stringify({
+        details: projectDatabaseMigrationFailure(migrationError),
+        event: "database.migration_failed",
+      }),
+    );
+  }
   process.exit(1);
 });
+
+/** Finds a recognized migration failure through Effect and Error cause wrappers. */
+function findDatabaseMigrationError(error: unknown): DatabaseMigrationError | null {
+  const failure = unwrapEffectFailure(error);
+  if (failure instanceof DatabaseMigrationError) {
+    return failure;
+  }
+  if (failure instanceof Error && failure.cause !== undefined) {
+    return findDatabaseMigrationError(failure.cause);
+  }
+  return null;
+}
+
+/** Restores the typed failure value wrapped by Effect's Promise runtime. */
+function unwrapEffectFailure(error: unknown): unknown {
+  if (!Runtime.isFiberFailure(error)) {
+    return error;
+  }
+  return Option.getOrUndefined(Cause.failureOption(error[Runtime.FiberFailureCauseId])) ?? error;
+}
