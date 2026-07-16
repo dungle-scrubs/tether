@@ -1,25 +1,25 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
 import { Effect, Fiber } from "effect";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 
 import {
-  ParticipantRuntimeClient,
-  ParticipantRuntimeClientConfigurationError,
-  TaskCancellationRegistry,
   buildParticipantRuntimeStreamUrl,
+  ParticipantRuntimeClient,
+  type ParticipantRuntimeClientConfig,
+  ParticipantRuntimeClientConfigurationError,
+  type ParticipantRuntimeCommandError,
+  type ParticipantRuntimeCommandTimeoutError,
+  type ParticipantRuntimeCursorStore,
+  type ParticipantTaskExecutor,
+  type RunParticipantRuntimeHooks,
   resolveCommandTimeoutMs,
   resolveResumeSeq,
   resolveServiceAuthToken,
-  taskFromClaimableEvent,
-  type ParticipantRuntimeCommandError,
-  type ParticipantRuntimeCommandTimeoutError,
-  type ParticipantRuntimeClientConfig,
-  type ParticipantRuntimeCursorStore,
-  type RunParticipantRuntimeHooks,
-  type ParticipantTaskExecutor,
-  type SessionEvent,
-  type TaskRecord,
   runParticipantRuntime,
+  type SessionEvent,
+  TaskCancellationRegistry,
+  type TaskRecord,
+  taskFromClaimableEvent,
 } from "../src/index.js";
 
 type RunTaskClaimFlowInput = Parameters<ParticipantRuntimeClient["runTaskClaimFlow"]>[0];
@@ -763,6 +763,39 @@ describe("ParticipantRuntimeClient.runClaimableTasks", () => {
     const event = createTaskReleasedEvent(baseTask, 1);
 
     expect(taskFromClaimableEvent(event)?.taskId).toBe("task_runtime_client");
+  });
+
+  it("passes scheduled task identity to the claimability callback", async () => {
+    const fixture = createTaskLoopFixture();
+    const scheduledTask: TaskRecord = {
+      ...baseTask,
+      schedule: {
+        mailboxScope: { accountId: "acct_opaque_1", provider: "fastmail" },
+        scheduleWindow: {
+          algorithmVersion: 1,
+          endMs: 1_700_002_800_000,
+          intervalMs: 3_600_000,
+          startMs: 1_699_999_200_000,
+        },
+      },
+    };
+    let receivedSchedule: TaskRecord["schedule"];
+    const loop = fixture.client.runClaimableTasks({
+      claimRefreshMs: 1_000,
+      executor: createExecutor(),
+      once: true,
+      shouldClaimTask: (task) => {
+        receivedSchedule = task.schedule;
+        return false;
+      },
+    });
+
+    fixture.emit(createTaskCreatedEvent(scheduledTask, 1));
+    fixture.completeReplay();
+    await loop;
+
+    expect(receivedSchedule).toEqual(scheduledTask.schedule);
+    expect(fixture.actions).toEqual(["close", "unsubscribe"]);
   });
 
   it("buffers replayed claimable tasks until replay completes in once mode", async () => {

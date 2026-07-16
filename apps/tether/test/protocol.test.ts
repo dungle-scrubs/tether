@@ -19,20 +19,20 @@ import {
   heartbeatParticipantSchema,
   parseAfterSeq,
   parseWebSocketServerEnvelope,
-  serializeErrorEnvelope,
   refreshTaskClaimSchema,
   registerParticipantSchema,
   releaseTaskSchema,
   serializeCommandResultEnvelope,
+  serializeErrorEnvelope,
   serializeEventEnvelope,
   taskFromClaimableEvent,
   taskFromCreatedEvent,
   taskIdFromCancelledEvent,
+  wsPublishMessageSchema,
   wsTaskCancelMessageSchema,
   wsTaskClaimMessageSchema,
   wsTaskCompleteMessageSchema,
   wsTaskRefreshMessageSchema,
-  wsPublishMessageSchema,
 } from "../src/protocol.js";
 import type { SessionEvent, TaskRecord } from "../src/types.js";
 
@@ -55,6 +55,19 @@ const baseTask: TaskRecord = {
   result: null,
   sessionId: "sess_test",
   taskId: "task_test",
+};
+
+const scheduledTask: TaskRecord = {
+  ...baseTask,
+  schedule: {
+    mailboxScope: { accountId: "acct_opaque_1", provider: "fastmail" },
+    scheduleWindow: {
+      algorithmVersion: 1,
+      endMs: 1_700_002_800_000,
+      intervalMs: 3_600_000,
+      startMs: 1_699_999_200_000,
+    },
+  },
 };
 
 describe("parseAfterSeq", () => {
@@ -237,6 +250,29 @@ describe("protocol event builders and envelopes", () => {
     expect(eventInput.producerId).toBe("tether");
     expect(eventInput.type).toBe("task.created");
     expect(taskFromCreatedEvent(event)?.taskId).toBe("task_test");
+  });
+
+  it("preserves scheduled task identity through serialization, parsing, and extraction", () => {
+    const eventInput = buildTaskCreatedEventInput({
+      sessionId: "sess_test",
+      task: scheduledTask,
+    });
+    const event: SessionEvent = {
+      createdAt: "2026-05-21T00:00:00.000Z",
+      eventId: eventInput.eventId,
+      payload: eventInput.payload,
+      producerId: eventInput.producerId,
+      seq: 2,
+      sessionId: eventInput.sessionId,
+      type: eventInput.type,
+    };
+    const envelope = parseWebSocketServerEnvelope(JSON.parse(serializeEventEnvelope(event)));
+
+    expect(envelope?.op).toBe("event");
+    if (envelope?.op !== "event") {
+      throw new Error("Expected a parsed WebSocket event envelope");
+    }
+    expect(taskFromCreatedEvent(envelope.event)?.schedule).toEqual(scheduledTask.schedule);
   });
 
   it("builds task cancellation events", () => {

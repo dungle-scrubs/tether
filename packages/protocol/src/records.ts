@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import type { CandidateScheduleIdentity } from "./task-contracts.js";
+import { candidateScheduleIdentitySchema } from "./task-contracts.js";
 
 /**
  * Durable task record returned by Tether task APIs and embedded in task
@@ -44,7 +45,7 @@ export interface TaskRecord {
    * runs; null for manual tasks. Present only when the durable row carries a
    * complete Schedule Window and Mailbox Scope.
    */
-  readonly schedule?: CandidateScheduleIdentity | null;
+  readonly schedule?: CandidateScheduleIdentity | null | undefined;
   /** Durable Tether session that owns the task. */
   readonly sessionId: string;
   /** Durable task id. */
@@ -362,6 +363,7 @@ export const taskRecordSchema = z.object({
   releasedAt: z.string().nullable(),
   releasedBy: z.string().nullable(),
   result: z.record(z.string(), z.unknown()).nullable(),
+  schedule: candidateScheduleIdentitySchema.nullable().optional(),
   sessionId: z.string().min(1),
   taskId: z.string().min(1),
 });

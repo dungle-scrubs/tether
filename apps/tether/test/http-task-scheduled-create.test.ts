@@ -7,15 +7,15 @@ import { describe, expect, it } from "vitest";
 
 import { ScheduledTaskIdentityMismatchError } from "../src/db.js";
 import { handleTaskHttpRoute } from "../src/http-task-route-handlers.js";
+import type { SubscriptionHub } from "../src/hub.js";
 import { computeScheduleWindow, deriveScheduledTaskId } from "../src/protocol.js";
 import type { ResourceLimits } from "../src/resource-limits.js";
+import type { SessionServiceEffect } from "../src/session-service.js";
 import {
   type EnsureScheduledRunRequest,
   type ScheduledRunEnsureResult,
   SessionServicePersistenceError,
 } from "../src/session-service-contracts.js";
-import type { SessionServiceEffect } from "../src/session-service.js";
-import type { SubscriptionHub } from "../src/hub.js";
 import type { TaskRecord } from "../src/types.js";
 
 function taskRecord(taskId: string): TaskRecord {
@@ -121,6 +121,36 @@ function runCreate(input: {
 }
 
 describe("scheduled task REST create routing", () => {
+  it("rejects a scheduled create whose derived window end is unsafe", async () => {
+    const calls: FakeServiceCalls = { createTask: [], ensureScheduledRun: [] };
+    const response = new CapturingResponse();
+    const service = fakeService({
+      calls,
+      ensure: () => Effect.die("unsafe scheduled creates must fail before service dispatch"),
+    });
+
+    await runCreate({
+      body: {
+        kind: "email_organization",
+        objective: "Organize the mailbox",
+        schedule: {
+          mailboxAccountId: mailboxScope.accountId,
+          mailboxProvider: mailboxScope.provider,
+          scheduleAlgorithmVersion: 1,
+          scheduleIntervalMs: 2,
+          scheduleWindowStart: Number.MAX_SAFE_INTEGER - 1,
+        },
+      },
+      hub: new RecordingHub() as unknown as SubscriptionHub,
+      response,
+      service,
+    });
+
+    expect(calls.createTask).toHaveLength(0);
+    expect(calls.ensureScheduledRun).toHaveLength(0);
+    expect(response.statusCode).toBe(400);
+  });
+
   it("routes a scheduled create through the atomic ensure-scheduled-run path", async () => {
     const calls: FakeServiceCalls = { createTask: [], ensureScheduledRun: [] };
     const current = taskRecord(derivedTaskId);

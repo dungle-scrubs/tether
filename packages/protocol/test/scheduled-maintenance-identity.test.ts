@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
 
+import type {
+  MailboxScope,
+  ScheduledMaintenanceIdentity,
+  ScheduledSupersessionCandidate,
+  ScheduleWindow,
+} from "../src/index.js";
 import {
   classifyScheduledSupersession,
   computeScheduleWindow,
@@ -7,9 +13,7 @@ import {
   scheduledSupersessionResultSchema,
   scheduleWindowAlgorithmVersion,
   scheduleWindowKey,
-  type MailboxScope,
-  type ScheduledMaintenanceIdentity,
-  type ScheduledSupersessionCandidate,
+  scheduleWindowSchema,
 } from "../src/index.js";
 
 const mailboxScope: MailboxScope = { accountId: "acct_opaque_1", provider: "fastmail" };
@@ -99,6 +103,102 @@ describe("scheduleWindowKey", () => {
     expect(scheduleWindowKey(window)).toBe("v1:3600000:1699999200000");
   });
 });
+
+describe("scheduleWindowSchema", () => {
+  it("rejects a nonpositive algorithm version", () => {
+    expect(
+      scheduleWindowSchema.safeParse({
+        ...createScheduleWindowFixture(),
+        algorithmVersion: 0,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects a nonpositive interval", () => {
+    expect(
+      scheduleWindowSchema.safeParse({
+        ...createScheduleWindowFixture(),
+        intervalMs: 0,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects a negative start", () => {
+    expect(
+      scheduleWindowSchema.safeParse({
+        ...createScheduleWindowFixture(),
+        startMs: -1,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects a negative end", () => {
+    expect(
+      scheduleWindowSchema.safeParse({
+        ...createScheduleWindowFixture(),
+        endMs: -1,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects an end that differs from start plus interval", () => {
+    const window = createScheduleWindowFixture();
+
+    expect(
+      scheduleWindowSchema.safeParse({
+        ...window,
+        endMs: window.endMs + 1,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects a start-plus-interval sum outside the safe-integer range", () => {
+    const result = scheduleWindowSchema.safeParse({
+      algorithmVersion: 1,
+      endMs: Number.MAX_SAFE_INTEGER,
+      intervalMs: 1,
+      startMs: Number.MAX_SAFE_INTEGER,
+    });
+
+    expect(result.success).toBe(false);
+    if (result.success) {
+      throw new Error("Expected an unsafe Schedule Window sum to fail validation");
+    }
+    expect(result.error.issues).toContainEqual(
+      expect.objectContaining({
+        message: "Schedule Window start plus interval must be a safe integer",
+      }),
+    );
+  });
+
+  it("rejects every unsafe integer field", () => {
+    const unsafeInteger = Number.MAX_SAFE_INTEGER + 1;
+    const fields = ["algorithmVersion", "endMs", "intervalMs", "startMs"] as const;
+
+    for (const field of fields) {
+      const result = scheduleWindowSchema.safeParse({
+        ...createScheduleWindowFixture(),
+        [field]: unsafeInteger,
+      });
+
+      expect(result.success).toBe(false);
+      if (result.success) {
+        throw new Error(`Expected unsafe ${field} to fail validation`);
+      }
+      expect(result.error.issues.some((issue) => issue.path[0] === field)).toBe(true);
+    }
+  });
+});
+
+/** Builds a valid deterministic Schedule Window fixture. */
+function createScheduleWindowFixture(): ScheduleWindow {
+  return {
+    algorithmVersion: 1,
+    endMs: 1_700_002_800_000,
+    intervalMs: 3_600_000,
+    startMs: 1_699_999_200_000,
+  };
+}
 
 describe("classifyScheduledSupersession", () => {
   const currentWindow = computeScheduleWindow(1_700_003_600_000, 3_600_000);
