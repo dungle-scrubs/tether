@@ -6738,13 +6738,13 @@ async function dropDatabase(databaseName: string): Promise<void> {
 }
 
 /**
- * Reserves and releases an available localhost port for the e2e app server.
+ * Reserves and releases a port using the same wildcard bind as the e2e app server.
  */
 async function findOpenPort(): Promise<number> {
   const server = createServer();
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
+    server.listen(0, resolve);
   });
   const address = server.address();
   await new Promise<void>((resolve, reject) => {
