@@ -16,6 +16,7 @@ import {
   broadcastEvents,
   parseJsonBody,
   sendAuthError,
+  sendControlEpochRequired,
   sendControlEpochStale,
   sendControlLeaseConflict,
   sendJson,
@@ -109,58 +110,69 @@ interface TaskInputValidationResult {
   readonly valid: boolean;
 }
 
-const taskHttpRoutes = {
+export const taskHttpRoutes = {
   approval: defineHttpRoute({
+    control: "fenced",
     method: "POST",
     name: "task.approval",
     pattern: /^\/sessions\/([^/]+)\/tasks\/([^/]+)\/approval$/u,
   }),
   cancel: defineHttpRoute({
+    control: "fenced",
     method: "POST",
     name: "task.cancel",
     pattern: /^\/sessions\/([^/]+)\/tasks\/([^/]+)\/cancel$/u,
   }),
   claim: defineHttpRoute({
+    control: "fenced",
     method: "POST",
     name: "task.claim",
     pattern: /^\/sessions\/([^/]+)\/tasks\/([^/]+)\/claim$/u,
   }),
   claimRefresh: defineHttpRoute({
+    control: "fenced",
     method: "POST",
     name: "task.claim.refresh",
     pattern: /^\/sessions\/([^/]+)\/tasks\/([^/]+)\/claim\/refresh$/u,
   }),
   complete: defineHttpRoute({
+    control: "fenced",
     method: "POST",
     name: "task.complete",
     pattern: /^\/sessions\/([^/]+)\/tasks\/([^/]+)\/complete$/u,
   }),
   create: defineHttpRoute({
+    control: "not-applicable",
     method: "POST",
     name: "task.create",
     pattern: /^\/sessions\/([^/]+)\/tasks$/u,
   }),
   fail: defineHttpRoute({
+    control: "fenced",
     method: "POST",
     name: "task.fail",
     pattern: /^\/sessions\/([^/]+)\/tasks\/([^/]+)\/fail$/u,
   }),
   list: defineHttpRoute({
+    control: "not-applicable",
     method: "GET",
     name: "task.list",
     pattern: /^\/sessions\/([^/]+)\/tasks$/u,
   }),
   read: defineHttpRoute({
+    control: "not-applicable",
     method: "GET",
     name: "task.read",
     pattern: /^\/sessions\/([^/]+)\/tasks\/([^/]+)$/u,
   }),
   release: defineHttpRoute({
+    control: "fenced",
     method: "POST",
     name: "task.release",
     pattern: /^\/sessions\/([^/]+)\/tasks\/([^/]+)\/release$/u,
   }),
   supersedeScheduled: defineHttpRoute({
+    control: "not-applicable",
     method: "POST",
     name: "task.scheduled.supersede",
     pattern: /^\/sessions\/([^/]+)\/scheduled-runs\/supersede$/u,
@@ -690,6 +702,10 @@ function sendRestTaskMutationResult(
     sendControlLeaseConflict(response, result.leaseClaim, "rest");
     return;
   }
+  if (result.status === "control_epoch_required") {
+    sendControlEpochRequired(response);
+    return;
+  }
   if (result.status === "control_epoch_stale") {
     sendControlEpochStale(response, result.currentEpoch);
     return;
@@ -722,6 +738,10 @@ function sendRestTaskApprovalResult(
 ): void {
   if (result.status === "control_conflict") {
     sendControlLeaseConflict(response, result.leaseClaim, "rest");
+    return;
+  }
+  if (result.status === "control_epoch_required") {
+    sendControlEpochRequired(response);
     return;
   }
   if (result.status === "control_epoch_stale") {
@@ -761,6 +781,10 @@ function sendRestTaskClaimRefreshResult(
 ): void {
   if (result.status === "control_conflict") {
     sendControlLeaseConflict(response, result.leaseClaim, "rest");
+    return;
+  }
+  if (result.status === "control_epoch_required") {
+    sendControlEpochRequired(response);
     return;
   }
   if (result.status === "control_epoch_stale") {

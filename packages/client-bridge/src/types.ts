@@ -5,6 +5,10 @@ import type {
   TaskListStatus as ProtocolTaskListStatus,
   TaskRecord as ProtocolTaskRecord,
 } from "@dungle-scrubs/tether-protocol";
+import type {
+  RestParticipantControlClient,
+  RestParticipantControlClientDebugInfo,
+} from "@dungle-scrubs/tether-client";
 import type { z } from "zod";
 
 import type { taskContractRecordSchema } from "./schemas.js";
@@ -70,18 +74,30 @@ export type ClientBridgeTaskListStatus = ProtocolTaskListStatus;
 export interface ClientBridgeTaskClientConfig {
   /** Bearer token sent to Tether; falls back to SERVICE_AUTH_TOKEN/TETHER_AUTH_TOKEN when omitted. */
   readonly authToken?: string | null;
+  /** Participant lifecycle identity used by cancellation and approval. */
+  readonly control?: {
+    readonly capabilities?: Readonly<Record<string, unknown>>;
+    readonly displayName?: string;
+    readonly instanceId: string;
+    readonly participantId: string;
+    readonly runtimeKind: string;
+  };
   /** Tether service URL. */
   readonly serviceUrl: string;
 }
 
 /** Optional dependencies for generic client bridge task operations. */
 export interface ClientBridgeTaskClientOptions {
+  /** Prebuilt lifecycle client for focused composition tests. */
+  readonly controlClient?: RestParticipantControlClient;
   /** Fetch implementation, injected by tests and host runtimes. */
   readonly fetch?: ClientBridgeFetch;
 }
 
 /** Runtime diagnostics for a generic client bridge task client. */
 export interface ClientBridgeTaskClientDebugInfo {
+  /** Bounded lifecycle state when protected operations are configured. */
+  readonly control?: RestParticipantControlClientDebugInfo;
   /** Number of HTTP requests issued to Tether by this task client. */
   readonly requestCount: number;
 }
@@ -147,10 +163,6 @@ export interface ClientBridgeCreateScheduledTaskInput {
 
 /** Input for cancelling one Tether task from an external client bridge. */
 export interface ClientBridgeCancelTaskInput {
-  /** Runtime instance id issuing the cancellation. */
-  readonly instanceId: string;
-  /** Participant id issuing the cancellation. */
-  readonly participantId: string;
   /** Optional bridge-specific cancellation context. */
   readonly reason?: Record<string, unknown>;
   /** Durable task id to cancel. */
@@ -161,10 +173,6 @@ export interface ClientBridgeCancelTaskInput {
 export interface ClientBridgeRecordTaskApprovalInput {
   /** Approval decision to record. */
   readonly decision: "approved" | "rejected";
-  /** Runtime instance id issuing the approval decision. */
-  readonly instanceId: string;
-  /** Participant id issuing the approval decision. */
-  readonly participantId: string;
   /** Optional bridge-specific approval context. */
   readonly reason?: Record<string, unknown>;
   /** Durable task id to approve or reject. */

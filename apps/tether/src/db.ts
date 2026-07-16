@@ -1,11 +1,29 @@
-import { and, desc, eq, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
+import { and, desc, eq, isNotNull, isNull, or, type SQL, sql } from "drizzle-orm";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { Context, Effect, Layer } from "effect";
 import pg from "pg";
 
 import { approvalTargetKey } from "./approval-target-key.js";
+import { ServerConfigService } from "./config.js";
 import { ControlEpochStaleError, nextControlEpoch, parseControlEpoch } from "./control-epoch.js";
 import { migrateDatabase } from "./database-migration.js";
+import {
+  type AppendSessionEventInput,
+  type ApprovalDecision,
+  buildParticipantHeartbeatEventInput,
+  buildParticipantRegistrationEventInput,
+  buildTaskApprovalRecordedEventInput,
+  buildTaskCancelledEventInput,
+  buildTaskClaimExpiredEventInput,
+  buildTaskClaimedEventInput,
+  buildTaskCompletedEventInput,
+  buildTaskCreatedEventInput,
+  buildTaskFailedEventInput,
+  buildTaskReleasedEventInput,
+  deriveScheduledTaskId,
+  newSessionId,
+  parsePositiveSafeInteger,
+} from "./protocol.js";
 import * as schema from "./schema.js";
 import {
   clientSessionBindings,
@@ -16,34 +34,16 @@ import {
   taskApprovals,
   tasks,
 } from "./schema.js";
-import { ServerConfigService } from "./config.js";
-import {
-  type AppendSessionEventInput,
-  type ApprovalDecision,
-  buildParticipantHeartbeatEventInput,
-  buildParticipantRegistrationEventInput,
-  buildTaskApprovalRecordedEventInput,
-  buildTaskCancelledEventInput,
-  buildTaskClaimedEventInput,
-  buildTaskClaimExpiredEventInput,
-  buildTaskCompletedEventInput,
-  buildTaskCreatedEventInput,
-  buildTaskFailedEventInput,
-  buildTaskReleasedEventInput,
-  deriveScheduledTaskId,
-  newSessionId,
-  parsePositiveSafeInteger,
-} from "./protocol.js";
-import type { ScheduledMaintenanceIdentity } from "./types.js";
 import type {
   CandidateScheduleIdentity,
+  ClientSessionBindingRecord,
   ControlChannel,
   ControlLeaseSnapshot,
   ControlLeaseStatus,
-  ClientSessionBindingRecord,
   ParticipantRecord,
   ParticipantRuntimeSnapshot,
   ParticipantRuntimeSnapshotStatus,
+  ScheduledMaintenanceIdentity,
   SessionBindingSummary,
   SessionDebugSummary,
   SessionEvent,
@@ -51,20 +51,20 @@ import type {
   SessionListItem,
   SessionRecord,
   TaskApprovalRecord,
-  TaskRecord,
   TaskListStatus,
+  TaskRecord,
   TaskSnapshot,
   TaskSnapshotStatus,
 } from "./types.js";
 
 const { Pool } = pg;
 
-export { DatabaseMigrationError } from "./database-migration.js";
 export type {
   DatabaseMigrationFailureContext,
   DatabaseMigrationFailureReason,
   MigrationJournalHead,
 } from "./database-migration.js";
+export { DatabaseMigrationError } from "./database-migration.js";
 
 export type ParticipantRegistration =
   | {
@@ -87,6 +87,8 @@ export interface PersistedParticipantRegistrationResult {
 }
 
 export interface ControlLease {
+  /** Stable retry identity for one logical REST acquisition, null for legacy and WebSocket rows. */
+  readonly acquisitionId?: string | null;
   readonly claimedAt: string;
   readonly controlChannel: ControlChannel;
   /** Immutable, strictly-monotonic server-issued fencing generation. */
@@ -109,6 +111,17 @@ export type ControlLeaseClaim =
   | { readonly lease: ControlLease; readonly status: "claimed" | "superseded" }
   | { readonly activeLease: ControlLease; readonly status: "conflict" };
 
+/** Composite REST acquisition result committed with participant visibility and events. */
+export type RestControlAcquisition =
+  | {
+      readonly events: readonly SessionEvent[];
+      readonly lease: ControlLease;
+      readonly registration: ParticipantRegistration;
+      readonly status: "claimed" | "replayed" | "superseded";
+    }
+  | { readonly activeLease: ControlLease; readonly status: "conflict" }
+  | { readonly status: "acquisition_stale" };
+
 /**
  * Result of renewing an existing control lease. Renewal preserves and compares
  * the current epoch: `renewed` refreshes the deadline for the current owner;
@@ -120,6 +133,17 @@ export type ControlLeaseRenewal =
   | { readonly currentEpoch: number; readonly status: "stale" }
   | { readonly activeLease: ControlLease; readonly status: "conflict" }
   | { readonly status: "absent" };
+
+/**
+ * Result of an exact REST control release. An already inactive generation is
+ * idempotent, while an active replacement remains distinguishable as stale or
+ * conflicting without mutating that replacement.
+ */
+export type RestControlLeaseRelease =
+  | { readonly status: "inactive" }
+  | { readonly status: "released" }
+  | { readonly currentEpoch: number; readonly status: "stale" }
+  | { readonly activeLease: ControlLease; readonly status: "conflict" };
 
 /** Error raised when the database current-lease invariant rejects a write path. */
 export class ControlLeaseCurrentInvariantError extends Error {
@@ -330,6 +354,7 @@ interface PgTaskApprovalRow {
 }
 
 interface PgControlLeaseRow {
+  readonly acquisitionId: string | null;
   readonly claimedAt: Date;
   readonly controlChannel: string;
   readonly epoch: unknown;
@@ -390,7 +415,10 @@ export class SessionNotFoundError extends Error {
   readonly operation: string;
   readonly sessionId: string;
 
-  constructor(input: { readonly operation: string; readonly sessionId: string }) {
+  constructor(input: {
+    readonly operation: string;
+    readonly sessionId: string;
+  }) {
     super(`Session ${input.sessionId} does not exist for ${input.operation}`);
     this.name = "SessionNotFoundError";
     this.operation = input.operation;
@@ -496,6 +524,16 @@ async function acquireTransactionAdvisoryLock(
   ]);
 }
 
+/** Samples the PostgreSQL wall clock after any preceding lock wait has completed. */
+async function readDatabaseClock(client: TransactionClient): Promise<number> {
+  const result = await client.query<{ readonly now: Date }>(`SELECT clock_timestamp() AS "now"`);
+  const now = result.rows[0]?.now;
+  if (!(now instanceof Date)) {
+    throw new Error("PostgreSQL did not return a wall-clock timestamp");
+  }
+  return now.getTime();
+}
+
 export type PersistedTaskEventResult = {
   readonly event: SessionEvent;
   readonly task: TaskRecord;
@@ -556,7 +594,10 @@ export class SessionEventSequenceRangeError extends Error {
   /** Session whose event append attempted the unsafe sequence. */
   readonly sessionId: string;
 
-  constructor(input: { readonly attemptedSeq: string; readonly sessionId: string }) {
+  constructor(input: {
+    readonly attemptedSeq: string;
+    readonly sessionId: string;
+  }) {
     super(
       `Session event sequence ${input.attemptedSeq} for ${input.sessionId} exceeds safe integer cutoff ${Number.MAX_SAFE_INTEGER}`,
     );
@@ -586,6 +627,7 @@ export type PersistedTaskApprovalResult =
     };
 
 const controlLeaseReturningColumns = `
+  acquisition_id AS "acquisitionId",
   claimed_at AS "claimedAt",
   control_channel AS "controlChannel",
   epoch,
@@ -736,7 +778,7 @@ export async function upsertClientSessionBinding(
       const refreshedRows = await client.query<PgClientSessionBindingRow>(
         `
           UPDATE client_session_bindings
-          SET last_seen_at = now()
+          SET last_seen_at = clock_timestamp()
           WHERE provider = $1
             AND external_id = $2
           RETURNING ${clientSessionBindingReturningColumns}
@@ -760,7 +802,7 @@ export async function upsertClientSessionBinding(
           UPDATE client_session_bindings
           SET
             archived_at = NULL,
-            last_seen_at = now(),
+            last_seen_at = clock_timestamp(),
             session_id = $3
           WHERE provider = $1
             AND external_id = $2
@@ -836,23 +878,24 @@ export async function claimControlLease(
           AND participant_id = $2
           AND released_at IS NULL
           AND superseded_at IS NULL
-          AND lease_expires_at > now()
         ORDER BY lease_expires_at DESC, claimed_at DESC, instance_id
         FOR UPDATE
       `,
       [input.sessionId, input.participantId],
     );
-    const conflictingActiveLease = activeRows.rows
+    const databaseNow = await readDatabaseClock(client);
+    const activeLeases = activeRows.rows
       .map(toControlLease)
-      .find(
-        (lease) =>
-          lease.instanceId !== input.instanceId || lease.controlChannel !== input.controlChannel,
-      );
+      .filter((lease) => Date.parse(lease.leaseExpiresAt) > databaseNow);
+    const conflictingActiveLease = activeLeases.find(
+      (lease) =>
+        lease.instanceId !== input.instanceId || lease.controlChannel !== input.controlChannel,
+    );
     if (conflictingActiveLease) {
       await client.query("COMMIT");
       return { activeLease: conflictingActiveLease, status: "conflict" };
     }
-    const activeLease = activeRows.rows[0] ? toControlLease(activeRows.rows[0]) : null;
+    const activeLease = activeLeases[0] ?? null;
     const newEpoch = await allocateNextControlEpoch(client, input.sessionId, input.participantId);
     // Fence every current row for this participant, INCLUDING a same-instance one.
     // Generations are immutable rows, so the prior epoch's row is superseded in
@@ -864,7 +907,7 @@ export async function claimControlLease(
     await client.query(
       `
         UPDATE participant_control_leases
-        SET superseded_at = now()
+        SET superseded_at = clock_timestamp()
         WHERE session_id = $1
           AND participant_id = $2
           AND released_at IS NULL
@@ -879,14 +922,25 @@ export async function claimControlLease(
     const leasedRows = await client.query<PgControlLeaseRow>(
       `
         INSERT INTO participant_control_leases (
+          claimed_at,
           control_channel,
           epoch,
           instance_id,
+          last_seen_at,
           lease_expires_at,
           participant_id,
           session_id
         )
-        VALUES ($1, $2, $3, now() + $4 * interval '1 millisecond', $5, $6)
+        VALUES (
+          clock_timestamp(),
+          $1,
+          $2,
+          $3,
+          clock_timestamp(),
+          clock_timestamp() + $4 * interval '1 millisecond',
+          $5,
+          $6
+        )
         RETURNING ${controlLeaseReturningColumns}
       `,
       [
@@ -905,6 +959,180 @@ export async function claimControlLease(
     await client.query("ROLLBACK");
     if (isPgUniqueViolation(error, "participant_control_leases_current_unique")) {
       throw new ControlLeaseCurrentInvariantError(input, error);
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Acquires idempotent REST participant control and commits the Lease
+ * Generation, participant visibility, and registration event in one
+ * transaction. The participant advisory lock is taken before either lease or
+ * participant rows so acquisition and fenced mutations share a deterministic
+ * lock order.
+ */
+export async function acquireRestParticipantControl(
+  database: DatabasePool,
+  input: {
+    readonly acquisitionId: string;
+    readonly capabilities: Record<string, unknown>;
+    readonly displayName: string;
+    readonly eventSourceId: string;
+    readonly instanceId: string;
+    readonly leaseTtlMs: number;
+    readonly participantId: string;
+    readonly runtimeKind: string;
+    readonly sessionId: string;
+  },
+): Promise<RestControlAcquisition> {
+  assertPositiveFiniteTtlMs(input.leaseTtlMs, "control lease TTL");
+  const client = await database.pool.connect();
+  try {
+    await client.query("BEGIN");
+    await requireSessionWithClient(client, input.sessionId, "acquireRestParticipantControl");
+    await acquireTransactionAdvisoryLock(client, input.sessionId, input.participantId);
+
+    const acquisitionRows = await client.query<PgControlLeaseRow>(
+      `
+        SELECT ${controlLeaseReturningColumns}
+        FROM participant_control_leases
+        WHERE session_id = $1
+          AND participant_id = $2
+          AND acquisition_id = $3
+        FOR UPDATE
+      `,
+      [input.sessionId, input.participantId, input.acquisitionId],
+    );
+    const priorAcquisition = acquisitionRows.rows[0]
+      ? toControlLease(acquisitionRows.rows[0])
+      : null;
+    if (priorAcquisition) {
+      const databaseNow = await readDatabaseClock(client);
+      const active =
+        priorAcquisition.releasedAt === null &&
+        acquisitionRows.rows[0]?.supersededAt === null &&
+        Date.parse(priorAcquisition.leaseExpiresAt) > databaseNow &&
+        priorAcquisition.controlChannel === "rest" &&
+        priorAcquisition.instanceId === input.instanceId;
+      if (!active) {
+        await client.query("COMMIT");
+        return { status: "acquisition_stale" };
+      }
+      const participantRows = await client.query<PgParticipantRow>(
+        `
+          SELECT ${participantReturningColumns}
+          FROM participants
+          WHERE session_id = $1 AND participant_id = $2
+        `,
+        [input.sessionId, input.participantId],
+      );
+      const participant = toParticipantRecord(participantRows.rows[0]);
+      await client.query("COMMIT");
+      return {
+        events: [],
+        lease: priorAcquisition,
+        registration: { participant, status: "refreshed" },
+        status: "replayed",
+      };
+    }
+
+    const currentRows = await client.query<PgControlLeaseRow>(
+      `
+        SELECT ${controlLeaseReturningColumns}
+        FROM participant_control_leases
+        WHERE session_id = $1
+          AND participant_id = $2
+          AND released_at IS NULL
+          AND superseded_at IS NULL
+        ORDER BY lease_expires_at DESC, claimed_at DESC, instance_id
+        FOR UPDATE
+      `,
+      [input.sessionId, input.participantId],
+    );
+    const databaseNow = await readDatabaseClock(client);
+    const current =
+      currentRows.rows
+        .map(toControlLease)
+        .find((lease) => Date.parse(lease.leaseExpiresAt) > databaseNow) ?? null;
+    if (current && (current.instanceId !== input.instanceId || current.controlChannel !== "rest")) {
+      await client.query("COMMIT");
+      return { activeLease: current, status: "conflict" };
+    }
+
+    const newEpoch = await allocateNextControlEpoch(client, input.sessionId, input.participantId);
+    await client.query(
+      `
+        UPDATE participant_control_leases
+        SET superseded_at = clock_timestamp()
+        WHERE session_id = $1
+          AND participant_id = $2
+          AND released_at IS NULL
+          AND superseded_at IS NULL
+      `,
+      [input.sessionId, input.participantId],
+    );
+    const insertedRows = await client.query<PgControlLeaseRow>(
+      `
+        INSERT INTO participant_control_leases (
+          acquisition_id,
+          claimed_at,
+          control_channel,
+          epoch,
+          instance_id,
+          last_seen_at,
+          lease_expires_at,
+          participant_id,
+          session_id
+        )
+        VALUES (
+          $1,
+          clock_timestamp(),
+          'rest',
+          $2,
+          $3,
+          clock_timestamp(),
+          clock_timestamp() + $4 * interval '1 millisecond',
+          $5,
+          $6
+        )
+        RETURNING ${controlLeaseReturningColumns}
+      `,
+      [
+        input.acquisitionId,
+        newEpoch,
+        input.instanceId,
+        input.leaseTtlMs,
+        input.participantId,
+        input.sessionId,
+      ],
+    );
+    const registration = await upsertParticipantWithEventWithClient(client, input);
+    const lease = toControlLease(insertedRows.rows[0]);
+    await client.query("COMMIT");
+    return {
+      events: registration.events,
+      lease,
+      registration: registration.registration,
+      status: current ? "superseded" : "claimed",
+    };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    if (
+      isPgUniqueViolation(error, "participant_control_leases_current_unique") ||
+      isPgUniqueViolation(error, "participant_control_leases_acquisition_unique")
+    ) {
+      throw new ControlLeaseCurrentInvariantError(
+        {
+          controlChannel: "rest",
+          instanceId: input.instanceId,
+          leaseTtlMs: input.leaseTtlMs,
+          participantId: input.participantId,
+          sessionId: input.sessionId,
+        },
+        error,
+      );
     }
     throw error;
   } finally {
@@ -943,13 +1171,16 @@ export async function renewControlLease(
           AND participant_id = $2
           AND released_at IS NULL
           AND superseded_at IS NULL
-          AND lease_expires_at > now()
         ORDER BY lease_expires_at DESC, claimed_at DESC, instance_id
         FOR UPDATE
       `,
       [input.sessionId, input.participantId],
     );
-    const current = activeRows.rows[0] ? toControlLease(activeRows.rows[0]) : null;
+    const databaseNow = await readDatabaseClock(client);
+    const current =
+      activeRows.rows
+        .map(toControlLease)
+        .find((lease) => Date.parse(lease.leaseExpiresAt) > databaseNow) ?? null;
     if (!current) {
       await client.query("COMMIT");
       return { status: "absent" };
@@ -969,8 +1200,8 @@ export async function renewControlLease(
       `
         UPDATE participant_control_leases
         SET
-          last_seen_at = now(),
-          lease_expires_at = now() + $5 * interval '1 millisecond'
+          last_seen_at = clock_timestamp(),
+          lease_expires_at = clock_timestamp() + $5 * interval '1 millisecond'
         WHERE session_id = $1
           AND participant_id = $2
           AND instance_id = $3
@@ -1038,29 +1269,32 @@ async function assertControlEpochCurrentWithClient(
     readonly controlChannel: string;
     readonly epoch: unknown;
     readonly instanceId: string;
+    readonly leaseExpiresAt: Date;
   }>(
     `
       SELECT
         control_channel AS "controlChannel",
         epoch,
-        instance_id AS "instanceId"
+        instance_id AS "instanceId",
+        lease_expires_at AS "leaseExpiresAt"
       FROM participant_control_leases
       WHERE session_id = $1
         AND participant_id = $2
         AND released_at IS NULL
         AND superseded_at IS NULL
-        AND lease_expires_at > now()
       ORDER BY lease_expires_at DESC, claimed_at DESC, instance_id
       FOR UPDATE
     `,
     [guard.sessionId, guard.participantId],
   );
   const current = rows.rows[0];
+  const databaseNow = await readDatabaseClock(client);
   const currentEpoch = current ? parseControlEpoch(current.epoch) : null;
   if (
     !current ||
     current.instanceId !== guard.instanceId ||
     current.controlChannel !== guard.controlChannel ||
+    current.leaseExpiresAt.getTime() <= databaseNow ||
     currentEpoch === null ||
     currentEpoch !== guard.controlEpoch
   ) {
@@ -1106,8 +1340,8 @@ export async function releaseControlLease(
     readonly participantId: string;
     readonly sessionId: string;
   },
-): Promise<void> {
-  await database.db
+): Promise<boolean> {
+  const released = await database.db
     .update(participantControlLeases)
     .set({ leaseExpiresAt: sql`now()`, releasedAt: sql`now()` })
     .where(
@@ -1125,7 +1359,85 @@ export async function releaseControlLease(
         isNull(participantControlLeases.releasedAt),
         isNull(participantControlLeases.supersededAt),
       ),
+    )
+    .returning({ epoch: participantControlLeases.epoch });
+  return released.length > 0;
+}
+
+/**
+ * Releases only the exact current REST generation under the participant lock.
+ * Classification and mutation share the transaction so a delayed release
+ * cannot observe one generation and deactivate its replacement.
+ */
+export async function releaseRestControlLease(
+  database: DatabasePool,
+  input: {
+    readonly controlEpoch: number;
+    readonly instanceId: string;
+    readonly participantId: string;
+    readonly sessionId: string;
+  },
+): Promise<RestControlLeaseRelease> {
+  const client = await database.pool.connect();
+  try {
+    await client.query("BEGIN");
+    await acquireTransactionAdvisoryLock(client, input.sessionId, input.participantId);
+    const activeRows = await client.query<PgControlLeaseRow>(
+      `
+        SELECT ${controlLeaseReturningColumns}
+        FROM participant_control_leases
+        WHERE session_id = $1
+          AND participant_id = $2
+          AND released_at IS NULL
+          AND superseded_at IS NULL
+        ORDER BY lease_expires_at DESC, claimed_at DESC, instance_id
+        FOR UPDATE
+      `,
+      [input.sessionId, input.participantId],
     );
+    const databaseNow = await readDatabaseClock(client);
+    const current =
+      activeRows.rows
+        .map(toControlLease)
+        .find((lease) => Date.parse(lease.leaseExpiresAt) > databaseNow) ?? null;
+    if (!current) {
+      await client.query("COMMIT");
+      return { status: "inactive" };
+    }
+    if (current.instanceId !== input.instanceId || current.controlChannel !== "rest") {
+      await client.query("COMMIT");
+      return { activeLease: current, status: "conflict" };
+    }
+    if (current.epoch !== input.controlEpoch) {
+      await client.query("COMMIT");
+      return { currentEpoch: current.epoch, status: "stale" };
+    }
+    const releasedRows = await client.query<{ readonly epoch: unknown }>(
+      `
+        UPDATE participant_control_leases
+        SET lease_expires_at = clock_timestamp(), released_at = clock_timestamp()
+        WHERE session_id = $1
+          AND participant_id = $2
+          AND instance_id = $3
+          AND control_channel = 'rest'
+          AND epoch = $4
+          AND released_at IS NULL
+          AND superseded_at IS NULL
+        RETURNING epoch
+      `,
+      [input.sessionId, input.participantId, input.instanceId, input.controlEpoch],
+    );
+    if (!releasedRows.rows[0]) {
+      throw new Error("Current REST control lease disappeared while locked");
+    }
+    await client.query("COMMIT");
+    return { status: "released" };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 /**
@@ -1137,6 +1449,7 @@ export async function listControlLeaseSnapshots(
 ): Promise<ControlLeaseSnapshot[]> {
   const rows = await database.db
     .select({
+      acquisitionId: participantControlLeases.acquisitionId,
       claimedAt: participantControlLeases.claimedAt,
       controlChannel: participantControlLeases.controlChannel,
       epoch: participantControlLeases.epoch,
@@ -1599,35 +1912,51 @@ export async function upsertParticipantWithEvent(
   const client = await database.pool.connect();
   try {
     await client.query("BEGIN");
-    const registration = await upsertParticipantWithClient(client, input);
-    const eventInput =
-      registration.status === "updated"
-        ? buildParticipantRegistrationEventInput({
-            participant: registration.participant,
-            previousParticipant: registration.previousParticipant,
-            sessionId: input.sessionId,
-            status: registration.status,
-          })
-        : buildParticipantRegistrationEventInput({
-            participant: registration.participant,
-            sessionId: input.sessionId,
-            status: registration.status,
-          });
-    const events = eventInput
-      ? [
-          await appendEventWithClient(client, eventInput, input.eventSourceId, {
-            ensureSession: false,
-          }),
-        ]
-      : [];
+    const result = await upsertParticipantWithEventWithClient(client, input);
     await client.query("COMMIT");
-    return { events, registration };
+    return result;
   } catch (error) {
     await client.query("ROLLBACK");
     throw new ParticipantRegistrationTransactionRollbackError("upsertParticipantWithEvent", error);
   } finally {
     client.release();
   }
+}
+
+/** Upserts participant visibility and appends its registration event in an existing transaction. */
+async function upsertParticipantWithEventWithClient(
+  client: TransactionClient,
+  input: {
+    readonly capabilities: Record<string, unknown>;
+    readonly displayName: string;
+    readonly eventSourceId: string;
+    readonly participantId: string;
+    readonly runtimeKind: string;
+    readonly sessionId: string;
+  },
+): Promise<PersistedParticipantRegistrationResult> {
+  const registration = await upsertParticipantWithClient(client, input);
+  const eventInput =
+    registration.status === "updated"
+      ? buildParticipantRegistrationEventInput({
+          participant: registration.participant,
+          previousParticipant: registration.previousParticipant,
+          sessionId: input.sessionId,
+          status: registration.status,
+        })
+      : buildParticipantRegistrationEventInput({
+          participant: registration.participant,
+          sessionId: input.sessionId,
+          status: registration.status,
+        });
+  const events = eventInput
+    ? [
+        await appendEventWithClient(client, eventInput, input.eventSourceId, {
+          ensureSession: false,
+        }),
+      ]
+    : [];
+  return { events, registration };
 }
 
 /** Error raised after participant registration rolls back its transaction. */
@@ -1674,16 +2003,18 @@ async function upsertParticipantWithClient(
       INSERT INTO participants (
         capabilities,
         display_name,
+        joined_at,
+        last_seen_at,
         participant_id,
         runtime_kind,
         session_id
       )
-      VALUES ($1::jsonb, $2, $3, $4, $5)
+      VALUES ($1::jsonb, $2, clock_timestamp(), clock_timestamp(), $3, $4, $5)
       ON CONFLICT (session_id, participant_id) DO UPDATE
       SET
         capabilities = $1::jsonb,
         display_name = $2,
-        last_seen_at = now(),
+        last_seen_at = clock_timestamp(),
         runtime_kind = $4
       RETURNING ${participantReturningColumns}
     `,
@@ -1773,7 +2104,7 @@ export async function heartbeatParticipantWithEvent(
       `
         UPDATE participants
         SET
-          last_seen_at = now()${setCapabilities ? ",\n          capabilities = $3::jsonb" : ""}
+          last_seen_at = clock_timestamp()${setCapabilities ? ",\n          capabilities = $3::jsonb" : ""}
         WHERE session_id = $1
           AND participant_id = $2
         RETURNING ${participantReturningColumns}
@@ -1790,7 +2121,10 @@ export async function heartbeatParticipantWithEvent(
     const participant = toParticipantRecord(participantRow);
     const event = await appendEventWithClient(
       client,
-      buildParticipantHeartbeatEventInput({ participant, sessionId: input.sessionId }),
+      buildParticipantHeartbeatEventInput({
+        participant,
+        sessionId: input.sessionId,
+      }),
       input.eventSourceId,
       { ensureSession: false },
     );
@@ -2246,7 +2580,10 @@ export async function refreshTaskClaim(
 ): Promise<TaskRecord | null> {
   assertPositiveFiniteTtlMs(input.claimLeaseTtlMs, "task claim TTL");
   if (input.controlGuard) {
-    return refreshTaskClaimGuarded(database, { ...input, controlGuard: input.controlGuard });
+    return refreshTaskClaimGuarded(database, {
+      ...input,
+      controlGuard: input.controlGuard,
+    });
   }
   const rows = await database.db
     .update(tasks)
@@ -2486,7 +2823,10 @@ export class ScheduledTaskIdentityMismatchError extends Error {
   readonly derivedTaskId: string;
   readonly suppliedTaskId: string;
 
-  constructor(input: { readonly derivedTaskId: string; readonly suppliedTaskId: string }) {
+  constructor(input: {
+    readonly derivedTaskId: string;
+    readonly suppliedTaskId: string;
+  }) {
     super(
       `Supplied scheduled task id ${input.suppliedTaskId} does not match the derived deterministic identity ${input.derivedTaskId}`,
     );
@@ -2518,7 +2858,11 @@ export interface EnsureScheduledRunInput {
 
 /** Insert-or-replay outcome for the current deterministic scheduled run. */
 export type EnsureScheduledRunCurrent =
-  | { readonly event: SessionEvent; readonly status: "created"; readonly task: TaskRecord }
+  | {
+      readonly event: SessionEvent;
+      readonly status: "created";
+      readonly task: TaskRecord;
+    }
   | { readonly status: "replayed"; readonly task: TaskRecord }
   | { readonly status: "superseded_by_newer"; readonly task: TaskRecord };
 
@@ -2629,7 +2973,10 @@ export async function ensureScheduledRunWithEvents(
 ): Promise<EnsureScheduledRunResult> {
   const identity: ScheduledMaintenanceIdentity = {
     kind: input.kind,
-    mailboxScope: { accountId: input.mailboxAccountId, provider: input.mailboxProvider },
+    mailboxScope: {
+      accountId: input.mailboxAccountId,
+      provider: input.mailboxProvider,
+    },
     scheduleWindow: {
       algorithmVersion: input.scheduleAlgorithmVersion,
       endMs: input.scheduleWindowStart + input.scheduleIntervalMs,
@@ -2738,7 +3085,12 @@ export async function ensureScheduledRunWithEvents(
       }
     }
     await client.query("COMMIT");
-    return { current, supersededEvents, supersededTasks, taskId: current.task.taskId };
+    return {
+      current,
+      supersededEvents,
+      supersededTasks,
+      taskId: current.task.taskId,
+    };
   } catch (error) {
     await client.query("ROLLBACK");
     if (error instanceof ScheduledTaskIdentityMismatchError) {
@@ -3137,7 +3489,10 @@ function compareScheduleIdentity(
 
 /** Normalizes JSON-like values so omitted task input and null compare equal. */
 function jsonLikeEqual(left: unknown, right: unknown): boolean {
-  const options = { omitUndefinedProperties: true, undefinedAsNull: true } as const;
+  const options = {
+    omitUndefinedProperties: true,
+    undefinedAsNull: true,
+  } as const;
   return canonicalJsonString(left, options) === canonicalJsonString(right, options);
 }
 
@@ -3417,6 +3772,7 @@ function toControlLease(row: DbControlLeaseRow | PgControlLeaseRow | undefined):
     throw new Error("Missing participant control lease row");
   }
   return {
+    acquisitionId: row.acquisitionId,
     claimedAt: row.claimedAt.toISOString(),
     controlChannel: row.controlChannel as ControlChannel,
     epoch: parseControlLeaseEpoch(row.epoch, row.sessionId, row.participantId),
@@ -3562,7 +3918,12 @@ function toTaskScheduleIdentity(row: ScheduleIdentityColumns): CandidateSchedule
   }
   return {
     mailboxScope: { accountId, provider },
-    scheduleWindow: { algorithmVersion, endMs: startMs + intervalMs, intervalMs, startMs },
+    scheduleWindow: {
+      algorithmVersion,
+      endMs: startMs + intervalMs,
+      intervalMs,
+      startMs,
+    },
   };
 }
 
@@ -3605,7 +3966,11 @@ function toTaskSnapshot(
   approvals: readonly TaskApprovalRecord[],
 ): TaskSnapshot {
   const task = toTaskRecord(row);
-  return { ...task, approvals, status: deriveTaskSnapshotStatus(task, observedAt) };
+  return {
+    ...task,
+    approvals,
+    status: deriveTaskSnapshotStatus(task, observedAt),
+  };
 }
 
 function groupTaskApprovalsByTask(

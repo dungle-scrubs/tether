@@ -26,9 +26,8 @@ export interface ServerConfig {
   readonly authSigningSecret: string | null;
   /**
    * Whether a control-protected REST request missing its Control Epoch is
-   * rejected. Staged off by default so existing REST callers that do not yet
-   * send an epoch keep working; a supplied epoch is always validated and
-   * WebSocket epoch fencing is always active regardless of this flag.
+   * rejected. Enforcement is the safe default; explicit false selects the
+   * temporary migration-release compatibility mode.
    */
   readonly controlEpochEnforcement: boolean;
   /** Maximum number of connections in the Postgres connection pool. */
@@ -69,8 +68,9 @@ export const serverConfigDescriptor = Config.all({
   authSigningSecret: Config.string("AUTH_SIGNING_SECRET").pipe(
     Config.orElse(() => Config.succeed("")),
   ),
-  controlEpochEnforcement: Config.boolean("CONTROL_EPOCH_ENFORCEMENT").pipe(
-    Config.orElse(() => Config.succeed(false)),
+  controlEpochEnforcement: Config.string("CONTROL_EPOCH_ENFORCEMENT").pipe(
+    Config.orElse(() => Config.succeed("")),
+    Config.mapAttempt(parseBooleanFlag),
   ),
   databasePoolMax: positiveIntegerConfig("DATABASE_POOL_MAX", defaultDatabasePoolMax),
   databaseUrl: Config.string("DATABASE_URL").pipe(Config.orElse(() => Config.succeed(""))),
@@ -333,16 +333,21 @@ function toConfigMap(env: NodeJS.ProcessEnv): Map<string, string> {
 }
 
 /**
- * Parses a boolean feature-flag environment value. Truthy tokens mirror the
- * ones Effect's `Config.boolean` accepts so the two config paths agree; every
- * other value, including an unset flag, is false.
+ * Parses the documented boolean tokens shared by direct and Effect config.
+ * Absence selects enforced mode; an explicit invalid value fails startup.
  */
 function parseBooleanFlag(value: string | undefined): boolean {
-  if (value === undefined) {
-    return false;
+  if (value === undefined || value.trim() === "") {
+    return true;
   }
   const normalized = value.trim().toLowerCase();
-  return normalized === "true" || normalized === "1" || normalized === "yes" || normalized === "on";
+  if (normalized === "true" || normalized === "1" || normalized === "yes" || normalized === "on") {
+    return true;
+  }
+  if (normalized === "false" || normalized === "0" || normalized === "no" || normalized === "off") {
+    return false;
+  }
+  throw new Error("CONTROL_EPOCH_ENFORCEMENT must be a documented boolean");
 }
 
 /**

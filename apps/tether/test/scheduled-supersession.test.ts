@@ -177,11 +177,17 @@ describe("scheduled supersession service effect", () => {
   it("supersedes older matching unclaimed runs and returns them with events", async () => {
     const event = createCancelEvent();
     const effects = createEffects({
-      supersedeScheduled: async () => ({ events: [event], tasks: [olderPendingTask] }),
+      supersedeScheduled: async () => ({
+        events: [event],
+        tasks: [olderPendingTask],
+      }),
     });
 
     const result = await Effect.runPromise(
-      effects.supersedeScheduledRunsEffect({ identity, participantId: "operator_1" }),
+      effects.supersedeScheduledRunsEffect({
+        identity,
+        participantId: "operator_1",
+      }),
     );
 
     expect(result.status).toBe("applied");
@@ -224,7 +230,10 @@ describe("scheduled supersession service effect", () => {
     });
 
     await Effect.runPromise(
-      effects.supersedeScheduledRunsEffect({ identity, participantId: "operator_1" }),
+      effects.supersedeScheduledRunsEffect({
+        identity,
+        participantId: "operator_1",
+      }),
     );
 
     expect(captured[0]).not.toHaveProperty("candidateTaskIds");
@@ -256,7 +265,10 @@ describe("scheduled supersession service effect", () => {
   });
 
   it("returns typed refusals for manual, terminal, and mismatched candidates", async () => {
-    const manualTask = createScheduledTask({ schedule: null, taskId: "task_manual" });
+    const manualTask = createScheduledTask({
+      schedule: null,
+      taskId: "task_manual",
+    });
     const terminalTask = createScheduledTask({
       completedAt: "2026-07-12T00:00:00.000Z",
       schedule: { mailboxScope, scheduleWindow: olderWindow },
@@ -304,7 +316,10 @@ describe("scheduled supersession service effect", () => {
       taskId: "task_expired_pending",
     });
     const effects = createEffects({
-      supersedeScheduled: async () => ({ events: [], tasks: [expiredThenPending] }),
+      supersedeScheduled: async () => ({
+        events: [],
+        tasks: [expiredThenPending],
+      }),
     });
 
     const result = await Effect.runPromise(
@@ -366,7 +381,11 @@ describe("scheduled supersession service effect", () => {
         captured.push(ensureInput);
         return created
           ? {
-              current: { event: createdEvent, status: "created", task: createdTask },
+              current: {
+                event: createdEvent,
+                status: "created",
+                task: createdTask,
+              },
               supersededEvents: [],
               supersededTasks: [],
               taskId: deterministicTaskId,
@@ -437,7 +456,11 @@ describe("scheduled supersession service effect", () => {
       taskId: deterministicTaskId,
     });
     const olderCancelEvent = createCancelEvent();
-    const createdEvent = { ...createCancelEvent(), eventId: "evt_created", type: "task.created" };
+    const createdEvent = {
+      ...createCancelEvent(),
+      eventId: "evt_created",
+      type: "task.created",
+    };
     let ensureCalls = 0;
     const captured: Array<Record<string, unknown>> = [];
     const effects = createEffects({
@@ -448,7 +471,11 @@ describe("scheduled supersession service effect", () => {
         ensureCalls += 1;
         captured.push(ensureInput as unknown as Record<string, unknown>);
         return {
-          current: { event: createdEvent, status: "created", task: createdTask },
+          current: {
+            event: createdEvent,
+            status: "created",
+            task: createdTask,
+          },
           supersededEvents: [olderCancelEvent],
           supersededTasks: [olderPendingTask],
           taskId: deterministicTaskId,
@@ -490,7 +517,9 @@ function createEffects(overrides: Partial<SessionPersistenceStores["tasks"]>) {
     approvalValidators: new Map(),
     assertBroadcastEvents: () => undefined,
     eventSourceId: "src_supersession_test",
-    observability: new ModuleObservability({ moduleName: "ScheduledSupersessionTest" }),
+    observability: new ModuleObservability({
+      moduleName: "ScheduledSupersessionTest",
+    }),
     stores,
     taskClaimLeaseTtlMs: 1_000,
   });
@@ -517,6 +546,9 @@ function createStores(
         throw new Error("unexpected control lease renew");
       },
       release: async () => undefined,
+      releaseRest: async () => {
+        throw new Error("unexpected REST control lease release");
+      },
     },
     events: {
       append: async () => {
@@ -542,11 +574,17 @@ function createStores(
     sessions: {
       create: async () => ({
         created: true,
-        session: { createdAt: "2026-07-12T00:00:00.000Z", sessionId: identity.sessionId },
+        session: {
+          createdAt: "2026-07-12T00:00:00.000Z",
+          sessionId: identity.sessionId,
+        },
       }),
       delete: async () => true,
       list: async () => [],
-      read: async () => ({ createdAt: "2026-07-12T00:00:00.000Z", sessionId: identity.sessionId }),
+      read: async () => ({
+        createdAt: "2026-07-12T00:00:00.000Z",
+        sessionId: identity.sessionId,
+      }),
       readDebugSummary: async () => {
         throw new Error("unexpected debug summary read");
       },

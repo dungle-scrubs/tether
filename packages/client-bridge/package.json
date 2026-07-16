@@ -34,6 +34,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json"
   },
   "dependencies": {
+    "@dungle-scrubs/tether-client": "workspace:*",
     "@dungle-scrubs/tether-protocol": "workspace:*",
     "zod": "^4.4.3"
   },

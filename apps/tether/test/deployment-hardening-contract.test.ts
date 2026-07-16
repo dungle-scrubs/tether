@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
 import { describe, expect, it } from "vitest";
 
+import { canFlipRestControlDefault } from "../src/rest-control-rollout.js";
+
 const testDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(testDir, "../../..");
 const appPortBinding = "$" + "{APP_HOST_BIND:-127.0.0.1}:$" + "{APP_HOST_PORT:-3025}:3025";
@@ -87,6 +89,21 @@ function isPlaceholderSecretValue(value: string): boolean {
 }
 
 describe("deployment hardening contract", () => {
+  it("blocks the REST enforcement flip while any old claim-on-mutation binary is eligible", () => {
+    expect(
+      canFlipRestControlDefault([
+        { idempotentRestAcquisition: true, noClaimCompatibility: true },
+        { idempotentRestAcquisition: false, noClaimCompatibility: false },
+      ]),
+    ).toBe(false);
+    expect(
+      canFlipRestControlDefault([
+        { idempotentRestAcquisition: true, noClaimCompatibility: true },
+        { idempotentRestAcquisition: true, noClaimCompatibility: true },
+      ]),
+    ).toBe(true);
+  });
+
   it("binds the Postgres host port to loopback", async () => {
     const compose = await readRootCompose();
     const postgres = getService(compose, "postgres");

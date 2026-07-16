@@ -10,22 +10,24 @@ import type {
 } from "./db.js";
 
 export type { ControlEpochGuard };
+
 import type { ClientBindingLifecycleStatus } from "./db-store-contracts.js";
 import type {
   BoundaryDebugInfo,
-  ModuleObservabilityOptions,
   ModuleObservability,
+  ModuleObservabilityOptions,
 } from "./observability.js";
 import type { ApprovalDecision } from "./protocol.js";
+import type { RestControlPolicyDebugInfo } from "./rest-control-policy.js";
 import type {
+  ClientSessionBindingRecord,
   ControlChannel,
   ControlLeaseSnapshot,
-  ClientSessionBindingRecord,
   MailboxScope,
   ParticipantRecord,
+  ParticipantRuntimeKind,
   ParticipantRuntimeSnapshot,
   ParticipantTaskContractRecord,
-  ParticipantRuntimeKind,
   ScheduledMaintenanceIdentity,
   ScheduledSupersessionRefusalReason,
   ScheduleWindow,
@@ -36,8 +38,8 @@ import type {
   SessionEventListOptions,
   SessionListItem,
   SessionRecord,
-  TaskRecord,
   TaskListStatus,
+  TaskRecord,
   TaskSnapshot,
 } from "./types.js";
 
@@ -93,12 +95,31 @@ export interface ControlEpochStaleResult {
   readonly status: "control_epoch_stale";
 }
 
+/** Missing Control Epoch rejected before a protected mutation in enforced mode. */
+export interface ControlEpochRequiredResult {
+  readonly status: "control_epoch_required";
+}
+
+/** Missing Acquisition ID rejected at REST registration in enforced mode. */
+export interface ControlAcquisitionIdRequiredResult {
+  readonly status: "control_acquisition_id_required";
+}
+
+/** Inactive Acquisition ID rejected without changing immutable history. */
+export interface ControlAcquisitionStaleResult {
+  readonly status: "control_acquisition_stale";
+}
+
 /**
  * Outcome of validating REST participant control before a protected mutation.
  */
 export type RestControlOutcome =
-  | { readonly status: "ok" }
-  | { readonly leaseClaim: ControlLeaseConflict; readonly status: "control_conflict" }
+  | { readonly leaseExpiresAt?: string | null; readonly status: "ok" }
+  | {
+      readonly leaseClaim: ControlLeaseConflict;
+      readonly status: "control_conflict";
+    }
+  | ControlEpochRequiredResult
   | ControlEpochStaleResult;
 
 /**
@@ -108,6 +129,8 @@ export interface SessionServiceDebugInfo extends BoundaryDebugInfo {
   /** Process-local identifier used to tag emitted event fanout notifications. */
   readonly eventSourceId: string;
   readonly restControlLeaseTtlMs: number;
+  /** Bounded REST participant-control policy state. */
+  readonly restControl?: RestControlPolicyDebugInfo;
   readonly taskClaimLeaseTtlMs: number;
   readonly wsControlLeaseTtlMs: number;
 }
@@ -316,13 +339,15 @@ export interface SessionServiceEffect {
   /** Registers or refreshes a REST-controlled participant. */
   readonly registerRestParticipant: (
     input: RegisterParticipantInput,
-  ) => Effect.Effect<ControlProtectedResult<RegisteredParticipantResult>, SessionServiceFailure>;
+  ) => Effect.Effect<RestParticipantRegistrationResult, SessionServiceFailure>;
   /** Registers or refreshes a WebSocket-controlled participant. */
   readonly registerWebSocketParticipant: (
     input: RegisterWebSocketParticipantInput,
   ) => Effect.Effect<
     ControlProtectedResult<
-      RegisteredParticipantResult & { readonly context: ParticipantControlContext }
+      RegisteredParticipantResult & {
+        readonly context: ParticipantControlContext;
+      }
     >,
     SessionServiceFailure
   >;
@@ -336,10 +361,7 @@ export interface SessionServiceEffect {
   /** Refreshes a REST participant heartbeat and emits a visible event when found. */
   readonly heartbeatRestParticipant: (
     input: HeartbeatParticipantInput,
-  ) => Effect.Effect<
-    ControlProtectedResult<{ readonly participant: ParticipantRecord | null }>,
-    SessionServiceFailure
-  >;
+  ) => Effect.Effect<ControlProtectedResult<RestHeartbeatParticipantResult>, SessionServiceFailure>;
   /** Releases a participant control lease. */
   readonly releaseControlLease: (input: {
     readonly controlChannel: ControlChannel;
@@ -347,7 +369,14 @@ export interface SessionServiceEffect {
     readonly instanceId: string;
     readonly participantId: string;
     readonly sessionId: string;
-  }) => Effect.Effect<void, SessionServiceFailure>;
+  }) => Effect.Effect<boolean, SessionServiceFailure>;
+  /** Releases or classifies an exact REST participant control generation. */
+  readonly releaseRestControlLease: (input: {
+    readonly controlEpoch?: number;
+    readonly instanceId: string;
+    readonly participantId: string;
+    readonly sessionId: string;
+  }) => Effect.Effect<RestControlReleaseResult, SessionServiceFailure>;
 }
 
 /**
@@ -365,6 +394,14 @@ export interface RegisteredParticipantResult {
   readonly participant: ParticipantRecord;
   readonly registrationStatus: ParticipantRegistration["status"];
   readonly status: "ok";
+}
+
+/** REST registration result including its retained lifecycle context. */
+export interface RegisteredRestParticipantResult extends RegisteredParticipantResult {
+  readonly acquisitionId: string;
+  readonly acquisitionStatus: "claimed" | "replayed" | "superseded";
+  readonly leaseExpiresAt: string;
+  readonly renewAfterMs: number;
 }
 
 /**
@@ -418,7 +455,19 @@ export type ControlProtectedResult<TValue extends object> =
       readonly leaseClaim: ControlLeaseConflict;
       readonly status: "control_conflict";
     }
+  | ControlEpochRequiredResult
   | ControlEpochStaleResult;
+
+/** Typed result of the participant-scoped REST control release route. */
+export type RestControlReleaseResult = ControlProtectedResult<{
+  readonly released: boolean;
+}>;
+
+/** REST acquisition result including Acquisition-ID-specific rejection modes. */
+export type RestParticipantRegistrationResult =
+  | ControlProtectedResult<RegisteredRestParticipantResult>
+  | ControlAcquisitionIdRequiredResult
+  | ControlAcquisitionStaleResult;
 
 /**
  * Result for task lifecycle mutations after the control channel has been
@@ -460,6 +509,7 @@ export type RestTaskMutationResult =
       readonly leaseClaim: ControlLeaseConflict;
       readonly status: "control_conflict";
     }
+  | ControlEpochRequiredResult
   | ControlEpochStaleResult;
 
 /**
@@ -471,6 +521,7 @@ export type RestTaskClaimRefreshResult =
       readonly leaseClaim: ControlLeaseConflict;
       readonly status: "control_conflict";
     }
+  | ControlEpochRequiredResult
   | ControlEpochStaleResult;
 
 /** Result for recording approval intent without mutating the task itself. */
@@ -568,9 +619,11 @@ export type RestTaskApprovalResult =
       readonly leaseClaim: ControlLeaseConflict;
       readonly status: "control_conflict";
     }
+  | ControlEpochRequiredResult
   | ControlEpochStaleResult;
 
 export interface RegisterParticipantInput {
+  readonly acquisitionId: string | undefined;
   readonly capabilities: Record<string, unknown>;
   readonly displayName: string | undefined;
   readonly instanceId: string | undefined;
@@ -729,6 +782,14 @@ export interface PublishRestEventInput extends PublishEventInput {
 
 export interface HeartbeatParticipantInput extends RestControlledInput {
   readonly capabilities: Record<string, unknown> | undefined;
+}
+
+/** Successful REST heartbeat result with server-derived renewal guidance. */
+export interface RestHeartbeatParticipantResult {
+  readonly controlEpoch: number | null;
+  readonly leaseExpiresAt: string | null;
+  readonly participant: ParticipantRecord | null;
+  readonly renewAfterMs: number;
 }
 
 export interface SessionServiceEffectRuntimeOptions {

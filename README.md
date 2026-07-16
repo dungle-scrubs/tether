@@ -61,6 +61,9 @@ autonomy, and composability where one agent's output is another's input.
 
 - `apps/tether`: HTTP and WebSocket service, database schema, migrations, and
   service tests.
+- [REST Control Epoch migration](apps/tether/docs/rest-control-migration.md):
+  deployment order, direct lifecycle examples, bridge upgrade, rollback
+  constraints, and compatibility diagnostics.
 - `packages/protocol`: shared protocol records, validators, and event builders.
 - `packages/client`: participant runtime client for REST and WebSocket
   integration.

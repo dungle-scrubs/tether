@@ -34,6 +34,9 @@ class ScriptedClient {
 
   async query<TRow>(sql: string, params?: readonly unknown[]): Promise<{ readonly rows: TRow[] }> {
     this.queries.push({ params, sql });
+    if (sql.includes("clock_timestamp()")) {
+      return { rows: [{ now: new Date("2026-07-16T12:00:00.000Z") }] as TRow[] };
+    }
     return { rows: this.rowsFor(sql) as TRow[] };
   }
 
@@ -55,7 +58,13 @@ const guard: ControlEpochGuard = {
 };
 
 function leaseRow(epoch: number | string, overrides: Record<string, unknown> = {}) {
-  return { controlChannel: "ws", epoch, instanceId: "inst_a", ...overrides };
+  return {
+    controlChannel: "ws",
+    epoch,
+    instanceId: "inst_a",
+    leaseExpiresAt: new Date("2026-07-16T12:01:00.000Z"),
+    ...overrides,
+  };
 }
 
 function isControlLeaseGuardSelect(sql: string): boolean {

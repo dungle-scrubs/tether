@@ -75,7 +75,7 @@ describe("REST publish epoch fencing", () => {
       effects.publishRestEventEffect({ ...basePublish, instanceId: undefined }),
     );
 
-    expect(result).toEqual({ currentEpoch: null, status: "control_epoch_stale" });
+    expect(result).toEqual({ status: "control_epoch_required" });
     // The bypass is closed: no event was appended.
     expect(appends).toEqual([]);
   });

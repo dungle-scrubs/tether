@@ -15,6 +15,20 @@ export type {
 export { observeTaskApprovals, TaskApprovalProcessingError } from "./approval-observer.js";
 export { readServiceAuthToken, resolveServiceAuthToken } from "./auth-token.js";
 export type {
+  RestParticipantControlClientConfig,
+  RestParticipantControlClientDebugInfo,
+  RestParticipantControlClientOptions,
+  RestParticipantControlContext,
+  RestParticipantControlErrorCode,
+  RestParticipantControlFetch,
+  RestParticipantControlTimerHandle,
+  RestParticipantControlTimerScheduler,
+} from "./rest-participant-control-client.js";
+export {
+  RestParticipantControlClient,
+  RestParticipantControlError,
+} from "./rest-participant-control-client.js";
+export type {
   SessionEventStreamClientConfig,
   SessionEventStreamClientDebugInfo,
   SessionEventStreamWebSocketFactory,

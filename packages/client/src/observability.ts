@@ -187,6 +187,7 @@ export class ModuleObservability {
     input: Record<string, unknown>,
     action: () => Promise<TValue>,
     summarize: (value: TValue) => Record<string, unknown> = () => ({}),
+    summarizeError: (error: unknown) => Record<string, unknown> = () => ({}),
   ): Promise<TValue> {
     const traceId = `trace_${randomUUID()}`;
     this.activeOperations += 1;
@@ -200,6 +201,66 @@ export class ModuleObservability {
       async (span) => {
         try {
           const value = await action();
+          const durationMs = Math.round(performance.now() - startedAt);
+          const summary = summarize(value);
+          span.setAttributes(toSpanAttributes({ ...summary, durationMs }));
+          span.setStatus({ code: SpanStatusCode.OK });
+          this.logBoundary("info", "boundary.exit", operation, traceId, {
+            ...summary,
+            durationMs,
+          });
+          return value;
+        } catch (error) {
+          const durationMs = Math.round(performance.now() - startedAt);
+          const errorInfo = toStructuredErrorInfo(error);
+          const errorSummary = summarizeError(error);
+          this.boundaryFailures += 1;
+          this.lastError = errorInfo;
+          span.recordException(error instanceof Error ? error : String(error));
+          span.setAttributes(
+            toSpanAttributes({
+              ...errorSummary,
+              durationMs,
+              errorName: errorInfo.name,
+            }),
+          );
+          span.setStatus({ code: SpanStatusCode.ERROR, message: errorInfo.message });
+          this.logBoundary("error", "boundary.error", operation, traceId, {
+            ...errorSummary,
+            durationMs,
+            error: errorInfo,
+          });
+          throw error;
+        } finally {
+          span.end();
+          this.activeOperations -= 1;
+        }
+      },
+    );
+  }
+
+  /**
+   * Runs one synchronous public boundary method inside logs and an
+   * OpenTelemetry span.
+   */
+  traceBoundarySync<TValue>(
+    operation: string,
+    input: Record<string, unknown>,
+    action: () => TValue,
+    summarize: (value: TValue) => Record<string, unknown> = () => ({}),
+  ): TValue {
+    const traceId = `trace_${randomUUID()}`;
+    this.activeOperations += 1;
+    this.boundaryCalls += 1;
+    this.lastOperation = operation;
+    this.logBoundary("debug", "boundary.enter", operation, traceId, input);
+    const startedAt = performance.now();
+    return this.tracer.startActiveSpan(
+      `${this.moduleName}.${operation}`,
+      { attributes: toSpanAttributes({ ...input, traceId }) },
+      (span) => {
+        try {
+          const value = action();
           const durationMs = Math.round(performance.now() - startedAt);
           const summary = summarize(value);
           span.setAttributes(toSpanAttributes({ ...summary, durationMs }));

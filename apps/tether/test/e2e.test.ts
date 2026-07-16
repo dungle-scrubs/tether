@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { fileURLToPath } from "node:url";
@@ -9,23 +9,25 @@ import { Effect } from "effect";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import WebSocket from "ws";
-
-import { ParticipantRuntimeClient } from "../src/client.js";
-import {
-  DatabaseMigrationError,
-  projectDatabaseMigrationFailure,
-} from "../src/database-migration.js";
 import {
   mintTestAuthToken,
   testAuthSigningKid,
   testAuthSigningSecret,
 } from "../src/auth/test-tokens.js";
 import type { AuthRole } from "../src/auth/token.js";
+import { ParticipantRuntimeClient } from "../src/client.js";
 import {
+  DatabaseMigrationError,
+  projectDatabaseMigrationFailure,
+} from "../src/database-migration.js";
+import type { DatabasePool } from "../src/db.js";
+import {
+  acquireRestParticipantControl,
+  archiveClientSessionBinding,
   claimTaskWithEvent,
   completeTaskWithEvent,
-  createPool,
   createSession as createDbSession,
+  createPool,
   createTaskWithEvent,
   expireTaskClaims,
   getTask,
@@ -33,14 +35,13 @@ import {
   listTaskApprovals,
   migrate,
   recordTaskApproval,
-  archiveClientSessionBinding,
+  releaseControlLease,
   upsertClientSessionBinding,
   upsertParticipant,
   upsertParticipantWithEvent,
 } from "../src/db.js";
-import type { DatabasePool } from "../src/db.js";
-import { createAppServer, createAppServerWithSessionService } from "../src/http.js";
 import type { AppServer, AppServerDebugInfo } from "../src/http.js";
+import { createAppServer, createAppServerWithSessionService } from "../src/http.js";
 import type { StructuredLogEntry } from "../src/observability.js";
 import { sessionEventType, systemProducerId, webSocketOperation } from "../src/protocol.js";
 import { defaultResourceLimits } from "../src/resource-limits.js";
@@ -76,6 +77,7 @@ const generatedMigrationNames = [
   "0010_true_human_torch.sql",
   "0011_special_blue_marvel.sql",
   "0012_control_lease_generation_history.sql",
+  "0013_misty_leo.sql",
 ] as const;
 
 interface JsonResponse {
@@ -335,13 +337,19 @@ interface SessionListResponse extends JsonResponse {
     readonly activeTaskCount: number;
     readonly activity?: "idle" | "queued" | "running" | "settled";
     readonly archived?: boolean;
-    readonly bindings: readonly { readonly externalId: string; readonly provider: string }[];
+    readonly bindings: readonly {
+      readonly externalId: string;
+      readonly provider: string;
+    }[];
     readonly branch?: string | null;
     readonly createdAt: string;
     readonly cwd?: string | null;
     readonly deleted?: boolean;
     readonly eventCount: number;
-    readonly forkedFrom?: { readonly forkSeq: number; readonly parentSessionId: string } | null;
+    readonly forkedFrom?: {
+      readonly forkSeq: number;
+      readonly parentSessionId: string;
+    } | null;
     readonly git?: Record<string, unknown> | null;
     readonly host?: "live" | "none" | "stale";
     readonly lastEventAt: string | null;
@@ -376,7 +384,11 @@ e2e("tether e2e", () => {
     await migrate(pool);
     app = createAppServer(pool, {
       auth: e2eAuthOptions,
-      sessionService: { taskClaimLeaseTtlMs: 200, wsControlLeaseTtlMs: 1_000 },
+      sessionService: {
+        controlEpochEnforcement: false,
+        taskClaimLeaseTtlMs: 200,
+        wsControlLeaseTtlMs: 1_000,
+      },
       taskClaimSweeper: { intervalMs: 50 },
     });
     const port = await findOpenPort();
@@ -507,7 +519,9 @@ e2e("tether e2e", () => {
 
       await migrate(legacyDatabase);
 
-      const columns = await legacyDatabase.pool.query<{ readonly count: number }>(
+      const columns = await legacyDatabase.pool.query<{
+        readonly count: number;
+      }>(
         `
           SELECT count(*)::int AS count
           FROM information_schema.columns
@@ -523,9 +537,9 @@ e2e("tether e2e", () => {
             )
         `,
       );
-      const migrationRows = await legacyDatabase.pool.query<{ readonly count: number }>(
-        `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
-      );
+      const migrationRows = await legacyDatabase.pool.query<{
+        readonly count: number;
+      }>(`SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`);
 
       expect(columns.rows[0]?.count).toBe(4);
       expect(migrationRows.rows[0]?.count).toBeGreaterThanOrEqual(10);
@@ -546,7 +560,9 @@ e2e("tether e2e", () => {
 
       await migrate(database);
 
-      const expectedMigrations = readMigrationFiles({ migrationsFolder: "drizzle" });
+      const expectedMigrations = readMigrationFiles({
+        migrationsFolder: "drizzle",
+      });
       const journal = await database.pool.query<{
         readonly createdAt: string;
         readonly hash: string;
@@ -589,7 +605,9 @@ e2e("tether e2e", () => {
       const journal = await database.pool.query<{ readonly count: number }>(
         `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
       );
-      const applicationMutation = await database.pool.query<{ readonly count: number }>(
+      const applicationMutation = await database.pool.query<{
+        readonly count: number;
+      }>(
         `
           SELECT count(*)::int AS count
           FROM pg_class table_record
@@ -654,7 +672,9 @@ e2e("tether e2e", () => {
       await createDatabase(databaseName);
       await applyLegacyMigrationsThrough0007(database);
       await seedMigrationJournalPrefix(database, 8);
-      const firstMigration = readMigrationFiles({ migrationsFolder: "drizzle" })[0];
+      const firstMigration = readMigrationFiles({
+        migrationsFolder: "drizzle",
+      })[0];
       if (firstMigration === undefined) {
         throw new Error("Expected at least one generated migration");
       }
@@ -745,9 +765,9 @@ e2e("tether e2e", () => {
 
       await migrate(database);
 
-      const unrelatedTable = await database.pool.query<{ readonly exists: boolean }>(
-        `SELECT to_regclass('public.operator_scratchpad') IS NOT NULL AS exists`,
-      );
+      const unrelatedTable = await database.pool.query<{
+        readonly exists: boolean;
+      }>(`SELECT to_regclass('public.operator_scratchpad') IS NOT NULL AS exists`);
       const journal = await database.pool.query<{ readonly count: number }>(
         `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
       );
@@ -771,7 +791,9 @@ e2e("tether e2e", () => {
 
       await migrate(database);
 
-      const additiveColumn = await database.pool.query<{ readonly exists: boolean }>(
+      const additiveColumn = await database.pool.query<{
+        readonly exists: boolean;
+      }>(
         `
           SELECT EXISTS (
             SELECT 1
@@ -831,9 +853,9 @@ e2e("tether e2e", () => {
       const journal = await database.pool.query<{ readonly count: number }>(
         `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
       );
-      const laterApplicationDdl = await database.pool.query<{ readonly exists: boolean }>(
-        `SELECT to_regclass('public.task_approvals') IS NOT NULL AS exists`,
-      );
+      const laterApplicationDdl = await database.pool.query<{
+        readonly exists: boolean;
+      }>(`SELECT to_regclass('public.task_approvals') IS NOT NULL AS exists`);
       expect(journal.rows[0]?.count).toBe(0);
       expect(laterApplicationDdl.rows[0]?.exists).toBe(false);
     } finally {
@@ -856,7 +878,9 @@ e2e("tether e2e", () => {
         "Concurrent migrations did not complete within 5 seconds",
       );
 
-      const expectedMigrations = readMigrationFiles({ migrationsFolder: "drizzle" });
+      const expectedMigrations = readMigrationFiles({
+        migrationsFolder: "drizzle",
+      });
       const journal = await firstDatabase.pool.query<{
         readonly createdAt: string;
         readonly hash: string;
@@ -867,7 +891,9 @@ e2e("tether e2e", () => {
           ORDER BY created_at, id
         `,
       );
-      const duplicates = await firstDatabase.pool.query<{ readonly count: number }>(
+      const duplicates = await firstDatabase.pool.query<{
+        readonly count: number;
+      }>(
         `
           SELECT count(*)::int AS count
           FROM (
@@ -894,8 +920,12 @@ e2e("tether e2e", () => {
 
   it("serializes concurrent migration starts when each pool has one connection", async () => {
     const legacyDatabaseName = `tether_e2e_single_connection_migration_${randomUUID().replaceAll("-", "_")}`;
-    const firstDatabase = createPool(buildDatabaseUrl(legacyDatabaseName), { max: 1 });
-    const secondDatabase = createPool(buildDatabaseUrl(legacyDatabaseName), { max: 1 });
+    const firstDatabase = createPool(buildDatabaseUrl(legacyDatabaseName), {
+      max: 1,
+    });
+    const secondDatabase = createPool(buildDatabaseUrl(legacyDatabaseName), {
+      max: 1,
+    });
     try {
       await createDatabase(legacyDatabaseName);
       await applyLegacyMigrationsThrough0007(firstDatabase);
@@ -906,7 +936,9 @@ e2e("tether e2e", () => {
         "Single-connection concurrent migrations did not complete within 5 seconds",
       );
 
-      const expectedMigrations = readMigrationFiles({ migrationsFolder: "drizzle" });
+      const expectedMigrations = readMigrationFiles({
+        migrationsFolder: "drizzle",
+      });
       const journal = await firstDatabase.pool.query<{
         readonly createdAt: string;
         readonly hash: string;
@@ -932,7 +964,9 @@ e2e("tether e2e", () => {
 
   it("releases failed migration ownership without replacing the original cause", async () => {
     const legacyDatabaseName = `tether_e2e_failed_migration_cleanup_${randomUUID().replaceAll("-", "_")}`;
-    const database = createPool(buildDatabaseUrl(legacyDatabaseName), { max: 1 });
+    const database = createPool(buildDatabaseUrl(legacyDatabaseName), {
+      max: 1,
+    });
     try {
       await createDatabase(legacyDatabaseName);
       await applyLegacyMigrationsThrough0007(database);
@@ -953,7 +987,9 @@ e2e("tether e2e", () => {
       });
 
       await expect(migrate(failingDatabase)).rejects.toMatchObject({
-        cause: expect.objectContaining({ message: "injected migration execution failure" }),
+        cause: expect.objectContaining({
+          message: "injected migration execution failure",
+        }),
       });
       await withDiagnosticTimeout(
         migrate(database),
@@ -961,7 +997,9 @@ e2e("tether e2e", () => {
         "Migration retry did not complete after ownership cleanup",
       );
 
-      const expectedMigrations = readMigrationFiles({ migrationsFolder: "drizzle" });
+      const expectedMigrations = readMigrationFiles({
+        migrationsFolder: "drizzle",
+      });
       const journal = await database.pool.query<{ readonly count: number }>(
         `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
       );
@@ -982,7 +1020,9 @@ e2e("tether e2e", () => {
 
       await migrate(database);
 
-      const expectedMigrations = readMigrationFiles({ migrationsFolder: "drizzle" });
+      const expectedMigrations = readMigrationFiles({
+        migrationsFolder: "drizzle",
+      });
       const journal = await database.pool.query<{
         readonly createdAt: string;
         readonly hash: string;
@@ -1012,7 +1052,9 @@ e2e("tether e2e", () => {
       await createDatabase(legacyDatabaseName);
       await applyLegacyMigrationsThrough0007(database);
       await seedMigrationJournalPrefix(database, 8);
-      const firstMigration = readMigrationFiles({ migrationsFolder: "drizzle" })[0];
+      const firstMigration = readMigrationFiles({
+        migrationsFolder: "drizzle",
+      })[0];
       if (firstMigration === undefined) {
         throw new Error("Expected at least one generated migration");
       }
@@ -1122,7 +1164,9 @@ e2e("tether e2e", () => {
 
   it("rolls back failed legacy journal seeding and permits a clean retry", async () => {
     const legacyDatabaseName = `tether_e2e_seed_rollback_${randomUUID().replaceAll("-", "_")}`;
-    const database = createPool(buildDatabaseUrl(legacyDatabaseName), { max: 1 });
+    const database = createPool(buildDatabaseUrl(legacyDatabaseName), {
+      max: 1,
+    });
     try {
       await createDatabase(legacyDatabaseName);
       await applyLegacyMigrationsThrough0007(database);
@@ -1151,9 +1195,9 @@ e2e("tether e2e", () => {
       await expect(migrate(failingDatabase)).rejects.toThrow(
         "injected legacy journal seed failure",
       );
-      const rowsAfterFailure = await database.pool.query<{ readonly count: number }>(
-        `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
-      );
+      const rowsAfterFailure = await database.pool.query<{
+        readonly count: number;
+      }>(`SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`);
       expect(rowsAfterFailure.rows[0]?.count).toBe(0);
       expect(queryTrace[0]).toBe("BEGIN");
       expect(queryTrace.at(-1)).toBe("ROLLBACK");
@@ -1165,7 +1209,9 @@ e2e("tether e2e", () => {
         5_000,
         "Migration retry did not complete after seed rollback",
       );
-      const expectedMigrations = readMigrationFiles({ migrationsFolder: "drizzle" });
+      const expectedMigrations = readMigrationFiles({
+        migrationsFolder: "drizzle",
+      });
       const journal = await database.pool.query<{
         readonly createdAt: string;
         readonly hash: string;
@@ -1221,7 +1267,9 @@ e2e("tether e2e", () => {
         recognizedPrefix: 4,
       });
 
-      const mutatedColumns = await legacyDatabase.pool.query<{ readonly count: number }>(
+      const mutatedColumns = await legacyDatabase.pool.query<{
+        readonly count: number;
+      }>(
         `
           SELECT count(*)::int AS count
           FROM information_schema.columns
@@ -1230,9 +1278,9 @@ e2e("tether e2e", () => {
             AND column_name IN ('input', 'claim_expired_at', 'claim_expired_by', 'released_by')
         `,
       );
-      const migrationRows = await legacyDatabase.pool.query<{ readonly count: number }>(
-        `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
-      );
+      const migrationRows = await legacyDatabase.pool.query<{
+        readonly count: number;
+      }>(`SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`);
 
       expect(mutatedColumns.rows[0]?.count).toBe(0);
       expect(migrationRows.rows[0]?.count).toBe(0);
@@ -1243,7 +1291,9 @@ e2e("tether e2e", () => {
   });
 
   it("requires REST auth while leaving health open", async () => {
-    await expect(fetch(`${baseUrl}/health`)).resolves.toMatchObject({ status: 200 });
+    await expect(fetch(`${baseUrl}/health`)).resolves.toMatchObject({
+      status: 200,
+    });
 
     await expect(requestFrom(baseUrl, "/sessions", { authToken: null })).rejects.toThrow("401");
   });
@@ -1343,6 +1393,7 @@ e2e("tether e2e", () => {
         eventListDefaultLimit: 2,
         eventListMaxLimit: 3,
       },
+      sessionService: { controlEpochEnforcement: false },
       taskClaimSweeper: { intervalMs: 0 },
     });
     const port = await findOpenPort();
@@ -1350,7 +1401,10 @@ e2e("tether e2e", () => {
     const limitedUrl = `http://127.0.0.1:${port}`;
     try {
       const session = (
-        await requestFrom<SessionResponse>(limitedUrl, "/sessions", { body: {}, method: "POST" })
+        await requestFrom<SessionResponse>(limitedUrl, "/sessions", {
+          body: {},
+          method: "POST",
+        })
       ).session;
       for (const index of [1, 2, 3, 4]) {
         await requestFrom(limitedUrl, `/sessions/${session.sessionId}/events`, {
@@ -1680,7 +1734,10 @@ e2e("tether e2e", () => {
 
   it("streams full events to passive observers without acquiring a control lease", async () => {
     const sessionId = `sess_observer_${randomUUID()}`;
-    await request<SessionResponse>("/sessions", { body: { sessionId }, method: "POST" });
+    await request<SessionResponse>("/sessions", {
+      body: { sessionId },
+      method: "POST",
+    });
     await request(`/sessions/${sessionId}/events`, {
       body: {
         payload: { text: "replayed observer event" },
@@ -1724,7 +1781,9 @@ e2e("tether e2e", () => {
         secondMessages.filter(isEventEnvelope).length >= 2,
     );
 
-    const leaseRows = await currentPool().pool.query<{ readonly count: number }>(
+    const leaseRows = await currentPool().pool.query<{
+      readonly count: number;
+    }>(
       `
         SELECT count(*)::int AS count
         FROM participant_control_leases
@@ -1747,7 +1806,13 @@ e2e("tether e2e", () => {
 
     // A control command over a passive observer is rejected without touching the
     // control path.
-    first.send(JSON.stringify({ op: "task.claim", requestId: "req_observer", taskId: "task_x" }));
+    first.send(
+      JSON.stringify({
+        op: "task.claim",
+        requestId: "req_observer",
+        taskId: "task_x",
+      }),
+    );
     await waitFor(() =>
       firstMessages.some((message) => isErrorEnvelope(message) && /read-only/u.test(message.error)),
     );
@@ -1771,7 +1836,10 @@ e2e("tether e2e", () => {
     let socket: WebSocket | null = null;
     try {
       const session = (
-        await requestFrom<SessionResponse>(limitedUrl, "/sessions", { body: {}, method: "POST" })
+        await requestFrom<SessionResponse>(limitedUrl, "/sessions", {
+          body: {},
+          method: "POST",
+        })
       ).session;
       socket = new WebSocket(
         authenticatedWebSocketUrl(
@@ -1827,7 +1895,10 @@ e2e("tether e2e", () => {
     let socket: WebSocket | null = null;
     try {
       const session = (
-        await requestFrom<SessionResponse>(limitedUrl, "/sessions", { body: {}, method: "POST" })
+        await requestFrom<SessionResponse>(limitedUrl, "/sessions", {
+          body: {},
+          method: "POST",
+        })
       ).session;
       socket = new WebSocket(
         authenticatedWebSocketUrl(
@@ -1869,6 +1940,7 @@ e2e("tether e2e", () => {
       auth: e2eAuthOptions,
       eventFanout: { catchUpPollIntervalMs: 0 },
       resourceLimits: { ...defaultResourceLimits, wsReplayMaxEvents: 1 },
+      sessionService: { controlEpochEnforcement: false },
       taskClaimSweeper: { intervalMs: 0 },
     });
     const port = await findOpenPort();
@@ -1877,7 +1949,10 @@ e2e("tether e2e", () => {
     let socket: WebSocket | null = null;
     try {
       const session = (
-        await requestFrom<SessionResponse>(limitedUrl, "/sessions", { body: {}, method: "POST" })
+        await requestFrom<SessionResponse>(limitedUrl, "/sessions", {
+          body: {},
+          method: "POST",
+        })
       ).session;
       await requestFrom(limitedUrl, `/sessions/${session.sessionId}/events`, {
         body: {
@@ -2128,7 +2203,9 @@ e2e("tether e2e", () => {
       },
       method: "POST",
     });
-    const persisted = await currentPool().pool.query<{ readonly count: number }>(
+    const persisted = await currentPool().pool.query<{
+      readonly count: number;
+    }>(
       `
         SELECT count(*)::int AS count
         FROM session_events
@@ -2207,6 +2284,7 @@ e2e("tether e2e", () => {
         },
       },
       sessionService: {
+        controlEpochEnforcement: false,
         observability: {
           boundaryLogsEnabled: true,
           logger: { log: (entry) => serviceLogs.push(entry) },
@@ -2220,7 +2298,10 @@ e2e("tether e2e", () => {
     const observedUrl = `http://127.0.0.1:${port}`;
     try {
       const session = (
-        await requestFrom<SessionResponse>(observedUrl, "/sessions", { body: {}, method: "POST" })
+        await requestFrom<SessionResponse>(observedUrl, "/sessions", {
+          body: {},
+          method: "POST",
+        })
       ).session;
       const eventBody = {
         eventId: `evt_observed_retry_${randomUUID()}`,
@@ -2239,7 +2320,10 @@ e2e("tether e2e", () => {
         { body: eventBody, method: "POST" },
       );
       await requestStatusFrom(observedUrl, `/sessions/${session.sessionId}/events`, {
-        body: { ...eventBody, payload: { text: "different secret event content" } },
+        body: {
+          ...eventBody,
+          payload: { text: "different secret event content" },
+        },
         method: "POST",
       });
 
@@ -2258,7 +2342,10 @@ e2e("tether e2e", () => {
         method: "POST",
       });
       await requestStatusFrom(observedUrl, `/sessions/${session.sessionId}/tasks`, {
-        body: { ...taskBody, input: { secret: "different secret task input" } },
+        body: {
+          ...taskBody,
+          input: { secret: "different secret task input" },
+        },
         method: "POST",
       });
     } finally {
@@ -2861,7 +2948,10 @@ e2e("tether e2e", () => {
       externalId,
       provider: "external-chat",
     });
-    await archiveClientSessionBinding(currentPool(), { externalId, provider: "external-chat" });
+    await archiveClientSessionBinding(currentPool(), {
+      externalId,
+      provider: "external-chat",
+    });
     await currentPool().pool.query(
       `
         UPDATE client_session_bindings
@@ -2954,7 +3044,10 @@ e2e("tether e2e", () => {
     expect(listed?.activeTaskCount).toBe(1);
     expect(listed?.eventCount).toBeGreaterThanOrEqual(1);
     expect(listed?.lastEventAt).not.toBeNull();
-    expect(listedBound?.bindings).toContainEqual({ externalId, provider: "external-chat" });
+    expect(listedBound?.bindings).toContainEqual({
+      externalId,
+      provider: "external-chat",
+    });
   });
 
   it("runs the REST task lifecycle", async () => {
@@ -3086,7 +3179,10 @@ e2e("tether e2e", () => {
     const participantId = `part_store_registration_race_${randomUUID()}`;
     const database = createParticipantAdvisoryLockBarrierDatabase(currentPool(), 2);
     const baseRegistration = {
-      capabilities: { contracts: [{ taskKind: "software_dev" }], workKinds: ["software_dev"] },
+      capabilities: {
+        contracts: [{ taskKind: "software_dev" }],
+        workKinds: ["software_dev"],
+      },
       displayName: "Store Registration Race",
       participantId,
       runtimeKind: "codex",
@@ -3152,7 +3248,10 @@ e2e("tether e2e", () => {
     const retry = await request<ParticipantRegistrationResponse>(
       `/sessions/${session.sessionId}/participants`,
       {
-        body: { ...body, instanceId: `inst_registration_rollback_retry_${randomUUID()}` },
+        body: {
+          ...body,
+          instanceId: `inst_registration_rollback_retry_${randomUUID()}`,
+        },
         method: "POST",
       },
     );
@@ -3169,7 +3268,10 @@ e2e("tether e2e", () => {
   it("keeps task lifecycle rows and events consistent across transitions", async () => {
     const session = await createSession();
     const sessionId = session.sessionId;
-    const controller = { instanceId: "inst_task_atomicity", participantId: "part_task_atomicity" };
+    const controller = {
+      instanceId: "inst_task_atomicity",
+      participantId: "part_task_atomicity",
+    };
     await request(`/sessions/${sessionId}/participants`, {
       body: {
         capabilities: { workKinds: ["software_dev"] },
@@ -3387,7 +3489,10 @@ e2e("tether e2e", () => {
       }),
     ).rejects.toThrow("injected session event insert failure");
 
-    const afterFailure = await getTask(currentPool(), { sessionId: session.sessionId, taskId });
+    const afterFailure = await getTask(currentPool(), {
+      sessionId: session.sessionId,
+      taskId,
+    });
     expect(afterFailure?.completedAt).toBeNull();
     await expect(
       request<TaskResponse>(`/sessions/${session.sessionId}/tasks/${taskId}/complete`, {
@@ -3398,7 +3503,9 @@ e2e("tether e2e", () => {
         },
         method: "POST",
       }),
-    ).resolves.toMatchObject({ task: { completedAt: expect.any(String) as string } });
+    ).resolves.toMatchObject({
+      task: { completedAt: expect.any(String) as string },
+    });
   });
 
   it("orders concurrent terminal task transitions by committed event state", async () => {
@@ -3476,11 +3583,17 @@ e2e("tether e2e", () => {
       method: "POST",
     });
     const task = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
-      body: { kind: "generic_approval_request", objective: "generic approval" },
+      body: {
+        kind: "generic_approval_request",
+        objective: "generic approval",
+      },
       method: "POST",
     });
     await request(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`, {
-      body: { instanceId: "inst_generic_agent_e2e", participantId: "part_generic_agent_e2e" },
+      body: {
+        instanceId: "inst_generic_agent_e2e",
+        participantId: "part_generic_agent_e2e",
+      },
       method: "POST",
     });
     await request<TaskResponse>(
@@ -3581,7 +3694,10 @@ e2e("tether e2e", () => {
       method: "POST",
     });
     await request(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`, {
-      body: { instanceId: "inst_generic_agent_e2e", participantId: "part_generic_agent_e2e" },
+      body: {
+        instanceId: "inst_generic_agent_e2e",
+        participantId: "part_generic_agent_e2e",
+      },
       method: "POST",
     });
     await request<TaskResponse>(
@@ -3792,7 +3908,9 @@ e2e("tether e2e", () => {
         sessionId: "sess_legacy_backfill",
         taskId: "task_legacy_backfill",
       });
-      const eventCount = await legacyDatabase.pool.query<{ readonly count: number }>(
+      const eventCount = await legacyDatabase.pool.query<{
+        readonly count: number;
+      }>(
         `
           SELECT count(*)::int AS count
           FROM session_events
@@ -3822,11 +3940,17 @@ e2e("tether e2e", () => {
   it("records separate approval decisions for separate email recommendation targets", async () => {
     const session = await createSession();
     const task = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
-      body: { kind: "generic_approval_request", objective: "generic approval" },
+      body: {
+        kind: "generic_approval_request",
+        objective: "generic approval",
+      },
       method: "POST",
     });
     await request(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`, {
-      body: { instanceId: "inst_approval_target_e2e", participantId: "part_approval_target_e2e" },
+      body: {
+        instanceId: "inst_approval_target_e2e",
+        participantId: "part_approval_target_e2e",
+      },
       method: "POST",
     });
     await request<TaskResponse>(
@@ -3932,7 +4056,10 @@ e2e("tether e2e", () => {
   it("rejects approval for tasks without a completed dry-run organization plan", async () => {
     const session = await createSession();
     const uncompletedTask = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
-      body: { kind: "generic_approval_request", objective: "generic approval" },
+      body: {
+        kind: "generic_approval_request",
+        objective: "generic approval",
+      },
       method: "POST",
     });
     const unsupportedTask = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
@@ -3940,7 +4067,10 @@ e2e("tether e2e", () => {
       method: "POST",
     });
     await request(`/sessions/${session.sessionId}/tasks/${unsupportedTask.task.taskId}/claim`, {
-      body: { instanceId: "inst_software_invalid_e2e", participantId: "part_software_invalid_e2e" },
+      body: {
+        instanceId: "inst_software_invalid_e2e",
+        participantId: "part_software_invalid_e2e",
+      },
       method: "POST",
     });
     await request<TaskResponse>(
@@ -3955,11 +4085,17 @@ e2e("tether e2e", () => {
       },
     );
     const invalidPlanTask = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
-      body: { kind: "generic_approval_request", objective: "generic approval" },
+      body: {
+        kind: "generic_approval_request",
+        objective: "generic approval",
+      },
       method: "POST",
     });
     await request(`/sessions/${session.sessionId}/tasks/${invalidPlanTask.task.taskId}/claim`, {
-      body: { instanceId: "inst_email_invalid_e2e", participantId: "part_email_invalid_e2e" },
+      body: {
+        instanceId: "inst_email_invalid_e2e",
+        participantId: "part_email_invalid_e2e",
+      },
       method: "POST",
     });
     await request<TaskResponse>(
@@ -4011,6 +4147,7 @@ e2e("tether e2e", () => {
       auth: e2eAuthOptions,
       sessionService: {
         approvalValidators: [],
+        controlEpochEnforcement: false,
         taskClaimLeaseTtlMs: 200,
         wsControlLeaseTtlMs: 1_000,
       },
@@ -4028,7 +4165,10 @@ e2e("tether e2e", () => {
         unvalidatedOrigin,
         `/sessions/${sessionId}/tasks`,
         {
-          body: { kind: "generic_approval_request", objective: "generic approval" },
+          body: {
+            kind: "generic_approval_request",
+            objective: "generic approval",
+          },
           method: "POST",
         },
       );
@@ -4108,7 +4248,10 @@ e2e("tether e2e", () => {
     });
 
     await request(`/sessions/${session.sessionId}/tasks/${completedTask.task.taskId}/claim`, {
-      body: { instanceId: "inst_codex_filter_e2e", participantId: "part_codex_filter_e2e" },
+      body: {
+        instanceId: "inst_codex_filter_e2e",
+        participantId: "part_codex_filter_e2e",
+      },
       method: "POST",
     });
     await request(`/sessions/${session.sessionId}/tasks/${completedTask.task.taskId}/complete`, {
@@ -4120,7 +4263,10 @@ e2e("tether e2e", () => {
       method: "POST",
     });
     await request(`/sessions/${session.sessionId}/tasks/${cancelledTask.task.taskId}/cancel`, {
-      body: { participantId: "part_filter_canceller_e2e", reason: { message: "not needed" } },
+      body: {
+        participantId: "part_filter_canceller_e2e",
+        reason: { message: "not needed" },
+      },
       method: "POST",
     });
 
@@ -4515,7 +4661,10 @@ e2e("tether e2e", () => {
       method: "POST",
     });
     await request(`/sessions/${session.sessionId}/tasks/${terminalTask.task.taskId}/claim`, {
-      body: { instanceId: "inst_context_generic_e2e", participantId: "part_context_generic_e2e" },
+      body: {
+        instanceId: "inst_context_generic_e2e",
+        participantId: "part_context_generic_e2e",
+      },
       method: "POST",
     });
     await request(`/sessions/${session.sessionId}/tasks/${terminalTask.task.taskId}/complete`, {
@@ -4708,6 +4857,168 @@ e2e("tether e2e", () => {
         ["part_unique_control", session.sessionId],
       ),
     ).rejects.toMatchObject({ code: "23505" });
+  });
+
+  it("replays one Acquisition ID across replicas without duplicate lease or registration effects", async () => {
+    const database = currentPool();
+    const sessionId = `sess_rest_acquisition_${randomUUID()}`;
+    const participantId = "part_rest_acquisition";
+    await createDbSession(database, sessionId);
+    const acquisitionInput = {
+      acquisitionId: "acq_shared_retry",
+      capabilities: {},
+      displayName: "REST acquisition participant",
+      eventSourceId: "e2e-rest-acquisition",
+      instanceId: "inst_rest_acquisition",
+      leaseTtlMs: 60_000,
+      participantId,
+      runtimeKind: "generic_agent",
+      sessionId,
+    } as const;
+
+    const [first, second] = await Promise.all([
+      acquireRestParticipantControl(database, acquisitionInput),
+      acquireRestParticipantControl(database, acquisitionInput),
+    ]);
+
+    expect([first.status, second.status].sort()).toEqual(["claimed", "replayed"]);
+    const generations = await database.pool.query<{ readonly count: number }>(
+      `
+        SELECT count(*)::int AS count
+        FROM participant_control_leases
+        WHERE session_id = $1 AND participant_id = $2
+      `,
+      [sessionId, participantId],
+    );
+    const registrationEvents = await database.pool.query<{
+      readonly count: number;
+    }>(
+      `
+        SELECT count(*)::int AS count
+        FROM session_events
+        WHERE session_id = $1 AND type = 'participant.joined'
+      `,
+      [sessionId],
+    );
+    expect(generations.rows[0]?.count).toBe(1);
+    expect(registrationEvents.rows[0]?.count).toBe(1);
+
+    const replacement = await acquireRestParticipantControl(database, {
+      ...acquisitionInput,
+      acquisitionId: "acq_replacement",
+    });
+    expect(replacement.status).toBe("superseded");
+    const staleReplay = await acquireRestParticipantControl(database, acquisitionInput);
+    expect(staleReplay).toEqual({ status: "acquisition_stale" });
+    if (replacement.status === "conflict" || replacement.status === "acquisition_stale") {
+      throw new Error("Expected replacement acquisition context");
+    }
+    await releaseControlLease(database, {
+      controlChannel: "rest",
+      controlEpoch:
+        first.status === "conflict" || first.status === "acquisition_stale" ? 0 : first.lease.epoch,
+      instanceId: acquisitionInput.instanceId,
+      participantId,
+      sessionId,
+    });
+    const current = await database.pool.query<{ readonly epoch: number }>(
+      `
+        SELECT epoch
+        FROM participant_control_leases
+        WHERE session_id = $1
+          AND participant_id = $2
+          AND released_at IS NULL
+          AND superseded_at IS NULL
+      `,
+      [sessionId, participantId],
+    );
+    expect(Number(current.rows[0]?.epoch)).toBe(replacement.lease.epoch);
+  });
+
+  it("keeps mixed-mode missing-epoch behavior explicit without compatibility lease writes", async () => {
+    const database = currentPool();
+    const sessionId = `sess_rest_mixed_mode_${randomUUID()}`;
+    await createDbSession(database, sessionId);
+    const compatibility = createSessionServiceEffect(database, {
+      controlEpochEnforcement: false,
+    });
+    const enforced = createSessionServiceEffect(database, {
+      controlEpochEnforcement: true,
+    });
+    const publishInput = {
+      eventId: undefined,
+      instanceId: undefined,
+      payload: {},
+      producerId: "part_mixed_mode",
+      sessionId,
+      type: "client.message",
+    } as const;
+
+    const accepted = await Effect.runPromise(compatibility.publishRestEvent(publishInput));
+    expect(accepted.status).toBe("created");
+    const leases = await database.pool.query<{ readonly count: number }>(
+      `
+        SELECT count(*)::int AS count
+        FROM participant_control_leases
+        WHERE session_id = $1
+      `,
+      [sessionId],
+    );
+    expect(leases.rows[0]?.count).toBe(0);
+
+    const required = await Effect.runPromise(enforced.publishRestEvent(publishInput));
+    expect(required).toEqual({ status: "control_epoch_required" });
+    const stale = await Effect.runPromise(
+      compatibility.publishRestEvent({
+        ...publishInput,
+        controlEpoch: 1,
+        instanceId: "inst_mixed_mode",
+      }),
+    );
+    expect(stale).toEqual({
+      currentEpoch: null,
+      status: "control_epoch_stale",
+    });
+    expect(compatibility.debugInfo().restControl).toMatchObject({
+      counts: {
+        "session.events.append": {
+          epoch_stale: 1,
+          unfenced_accepted: 1,
+        },
+      },
+    });
+    expect(enforced.debugInfo().restControl).toMatchObject({
+      counts: {
+        "session.events.append": {
+          epoch_required: 1,
+        },
+      },
+    });
+  });
+
+  it("returns the distinct required error when REST release omits its epoch", async () => {
+    const session = await createSession();
+    const participantId = `part_release_required_${randomUUID()}`;
+    await request(`/sessions/${session.sessionId}/participants`, {
+      body: {
+        displayName: "Release required participant",
+        instanceId: "inst_release_required",
+        participantId,
+        runtimeKind: "generic_agent",
+      },
+      method: "POST",
+    });
+
+    const response = await requestStatus(
+      `/sessions/${session.sessionId}/participants/${participantId}/control/release`,
+      {
+        body: { instanceId: "inst_release_required" },
+        method: "POST",
+      },
+    );
+
+    expect(response.status).toBe(428);
+    expect(response.body).toMatchObject({ code: "CONTROL_EPOCH_REQUIRED" });
   });
 
   it("clears superseded_at when a previously superseded instance reclaims control", async () => {
@@ -5054,7 +5365,10 @@ e2e("tether e2e", () => {
     expect(eventsAfterDebug.events).toHaveLength(eventsBeforeDebug.events.length);
 
     await request(`/sessions/${session.sessionId}/tasks/${releasedTask.task.taskId}/claim`, {
-      body: { instanceId: "inst_task_snapshot", participantId: "part_task_snapshot" },
+      body: {
+        instanceId: "inst_task_snapshot",
+        participantId: "part_task_snapshot",
+      },
       method: "POST",
     });
     snapshots = await request<TaskSnapshotsResponse>(`/sessions/${session.sessionId}/debug/tasks`);
@@ -5062,7 +5376,10 @@ e2e("tether e2e", () => {
     expect(activeSnapshot?.status).toBe("claim_active");
 
     await request(`/sessions/${session.sessionId}/tasks/${releasedTask.task.taskId}/release`, {
-      body: { instanceId: "inst_task_snapshot", participantId: "part_task_snapshot" },
+      body: {
+        instanceId: "inst_task_snapshot",
+        participantId: "part_task_snapshot",
+      },
       method: "POST",
     });
     snapshots = await request<TaskSnapshotsResponse>(`/sessions/${session.sessionId}/debug/tasks`);
@@ -5077,7 +5394,10 @@ e2e("tether e2e", () => {
       method: "POST",
     });
     await request(`/sessions/${session.sessionId}/tasks/${completedTask.task.taskId}/claim`, {
-      body: { instanceId: "inst_task_snapshot", participantId: "part_task_snapshot" },
+      body: {
+        instanceId: "inst_task_snapshot",
+        participantId: "part_task_snapshot",
+      },
       method: "POST",
     });
     await request(`/sessions/${session.sessionId}/tasks/${completedTask.task.taskId}/complete`, {
@@ -5188,8 +5508,8 @@ e2e("tether e2e", () => {
       active: 1,
       expired: 0,
       released: 0,
-      superseded: 4,
-      total: 5,
+      superseded: 0,
+      total: 1,
     });
     expect(summary.summary.tasks).toMatchObject({
       activeClaims: 1,
@@ -5318,7 +5638,10 @@ e2e("tether e2e", () => {
     const firstClaim = await request<TaskResponse>(
       `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`,
       {
-        body: { instanceId: "inst_first_claimant", participantId: "part_first_claimant" },
+        body: {
+          instanceId: "inst_first_claimant",
+          participantId: "part_first_claimant",
+        },
         method: "POST",
       },
     );
@@ -5340,7 +5663,10 @@ e2e("tether e2e", () => {
     const secondClaim = await request<TaskResponse>(
       `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`,
       {
-        body: { instanceId: "inst_second_claimant", participantId: "part_second_claimant" },
+        body: {
+          instanceId: "inst_second_claimant",
+          participantId: "part_second_claimant",
+        },
         method: "POST",
       },
     );
@@ -5467,7 +5793,10 @@ e2e("tether e2e", () => {
 
     const claimed = await withSkewedAppClock(-10_000, () =>
       request<TaskResponse>(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`, {
-        body: { instanceId: "inst_skewed_claim", participantId: "part_skewed_claim" },
+        body: {
+          instanceId: "inst_skewed_claim",
+          participantId: "part_skewed_claim",
+        },
         method: "POST",
       }),
     );
@@ -5495,7 +5824,10 @@ e2e("tether e2e", () => {
       method: "POST",
     });
     await request(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`, {
-      body: { instanceId: "inst_skewed_refresh", participantId: "part_skewed_refresh" },
+      body: {
+        instanceId: "inst_skewed_refresh",
+        participantId: "part_skewed_refresh",
+      },
       method: "POST",
     });
 
@@ -5503,7 +5835,10 @@ e2e("tether e2e", () => {
       request<TaskResponse>(
         `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim/refresh`,
         {
-          body: { instanceId: "inst_skewed_refresh", participantId: "part_skewed_refresh" },
+          body: {
+            instanceId: "inst_skewed_refresh",
+            participantId: "part_skewed_refresh",
+          },
           method: "POST",
         },
       ),
@@ -5528,7 +5863,10 @@ e2e("tether e2e", () => {
   it("broadcasts task claim-expired events from the scheduler", async () => {
     const session = await createSession();
     const task = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
-      body: { kind: "software_dev", objective: "Broadcast this expired claim" },
+      body: {
+        kind: "software_dev",
+        objective: "Broadcast this expired claim",
+      },
       method: "POST",
     });
     const socket = new WebSocket(
@@ -5544,7 +5882,10 @@ e2e("tether e2e", () => {
     await waitFor(() => messages.some(isReplayCompleteEnvelope));
 
     await request(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`, {
-      body: { instanceId: "inst_stale_claimant", participantId: "part_stale_claimant" },
+      body: {
+        instanceId: "inst_stale_claimant",
+        participantId: "part_stale_claimant",
+      },
       method: "POST",
     });
 
@@ -5552,7 +5893,10 @@ e2e("tether e2e", () => {
     const claim = await request<TaskResponse>(
       `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`,
       {
-        body: { instanceId: "inst_recovery_claimant", participantId: "part_recovery_claimant" },
+        body: {
+          instanceId: "inst_recovery_claimant",
+          participantId: "part_recovery_claimant",
+        },
         method: "POST",
       },
     );
@@ -5715,12 +6059,20 @@ e2e("tether e2e", () => {
   it("fans out committed events across app replicas", async () => {
     const replicaA = createAppServer(currentPool(), {
       auth: e2eAuthOptions,
-      sessionService: { taskClaimLeaseTtlMs: 200, wsControlLeaseTtlMs: 200 },
+      sessionService: {
+        controlEpochEnforcement: false,
+        taskClaimLeaseTtlMs: 200,
+        wsControlLeaseTtlMs: 200,
+      },
       taskClaimSweeper: { intervalMs: 0 },
     });
     const replicaB = createAppServer(currentPool(), {
       auth: e2eAuthOptions,
-      sessionService: { taskClaimLeaseTtlMs: 200, wsControlLeaseTtlMs: 200 },
+      sessionService: {
+        controlEpochEnforcement: false,
+        taskClaimLeaseTtlMs: 200,
+        wsControlLeaseTtlMs: 200,
+      },
       taskClaimSweeper: { intervalMs: 0 },
     });
     let replicaAStarted = false;
@@ -5736,7 +6088,10 @@ e2e("tether e2e", () => {
       const replicaAUrl = `http://127.0.0.1:${portA}`;
       const replicaBUrl = `http://127.0.0.1:${portB}`;
       const session = (
-        await requestFrom<SessionResponse>(replicaBUrl, "/sessions", { body: {}, method: "POST" })
+        await requestFrom<SessionResponse>(replicaBUrl, "/sessions", {
+          body: {},
+          method: "POST",
+        })
       ).session;
       await currentPool().pool.query(
         `
@@ -5794,13 +6149,21 @@ e2e("tether e2e", () => {
     const replicaA = createAppServer(currentPool(), {
       auth: e2eAuthOptions,
       eventFanout: { catchUpPollIntervalMs: 50, listenEnabled: false },
-      sessionService: { taskClaimLeaseTtlMs: 200, wsControlLeaseTtlMs: 200 },
+      sessionService: {
+        controlEpochEnforcement: false,
+        taskClaimLeaseTtlMs: 200,
+        wsControlLeaseTtlMs: 200,
+      },
       taskClaimSweeper: { intervalMs: 0 },
     });
     const replicaB = createAppServer(currentPool(), {
       auth: e2eAuthOptions,
       eventFanout: { catchUpPollIntervalMs: 0 },
-      sessionService: { taskClaimLeaseTtlMs: 200, wsControlLeaseTtlMs: 200 },
+      sessionService: {
+        controlEpochEnforcement: false,
+        taskClaimLeaseTtlMs: 200,
+        wsControlLeaseTtlMs: 200,
+      },
       taskClaimSweeper: { intervalMs: 0 },
     });
     let replicaAStarted = false;
@@ -5816,7 +6179,10 @@ e2e("tether e2e", () => {
       const replicaAUrl = `http://127.0.0.1:${portA}`;
       const replicaBUrl = `http://127.0.0.1:${portB}`;
       const session = (
-        await requestFrom<SessionResponse>(replicaBUrl, "/sessions", { body: {}, method: "POST" })
+        await requestFrom<SessionResponse>(replicaBUrl, "/sessions", {
+          body: {},
+          method: "POST",
+        })
       ).session;
       socket = new WebSocket(
         authenticatedWebSocketUrl(
@@ -5866,7 +6232,10 @@ e2e("tether e2e", () => {
    * Creates a session through the public HTTP API for e2e setup.
    */
   async function createSession(): Promise<SessionResponse["session"]> {
-    const response = await request<SessionResponse>("/sessions", { body: {}, method: "POST" });
+    const response = await request<SessionResponse>("/sessions", {
+      body: {},
+      method: "POST",
+    });
     return response.session;
   }
 
@@ -5969,7 +6338,9 @@ e2e("tether e2e", () => {
 
   /** Reads task-claim lease time remaining relative to the database clock. */
   async function readTaskClaimRemainingMs(sessionId: string, taskId: string): Promise<number> {
-    const rows = await currentPool().pool.query<{ readonly remainingMs: string | number | null }>(
+    const rows = await currentPool().pool.query<{
+      readonly remainingMs: string | number | null;
+    }>(
       `
         SELECT EXTRACT(EPOCH FROM (claim_expires_at - now())) * 1000 AS "remainingMs"
         FROM tasks
@@ -5987,7 +6358,9 @@ e2e("tether e2e", () => {
     participantId: string,
     instanceId: string,
   ): Promise<number> {
-    const rows = await currentPool().pool.query<{ readonly remainingMs: string | number | null }>(
+    const rows = await currentPool().pool.query<{
+      readonly remainingMs: string | number | null;
+    }>(
       `
         SELECT EXTRACT(EPOCH FROM (lease_expires_at - now())) * 1000 AS "remainingMs"
         FROM participant_control_leases
@@ -6075,7 +6448,10 @@ e2e("tether e2e", () => {
     idSuffix: string,
   ): Promise<TaskResponse> {
     const task = await request<TaskResponse>(`/sessions/${sessionId}/tasks`, {
-      body: { kind: "generic_approval_request", objective: `generic approval ${idSuffix}` },
+      body: {
+        kind: "generic_approval_request",
+        objective: `generic approval ${idSuffix}`,
+      },
       method: "POST",
     });
     const controller = {
@@ -6146,7 +6522,9 @@ e2e("tether e2e", () => {
         created_at bigint
       )
     `);
-    const migrations = readMigrationFiles({ migrationsFolder: "drizzle" }).slice(0, prefixLength);
+    const migrations = readMigrationFiles({
+      migrationsFolder: "drizzle",
+    }).slice(0, prefixLength);
     for (const migration of migrations) {
       await database.pool.query(
         `INSERT INTO drizzle.__drizzle_migrations (hash, created_at) VALUES ($1, $2)`,
@@ -6263,7 +6641,9 @@ e2e("tether e2e", () => {
       reason: "invalid_journal",
     });
 
-    const applicationDdl = await database.pool.query<{ readonly exists: boolean }>(
+    const applicationDdl = await database.pool.query<{
+      readonly exists: boolean;
+    }>(
       `
         SELECT EXISTS (
           SELECT 1
@@ -6449,16 +6829,32 @@ e2e("tether e2e", () => {
     const method = init.method ?? "GET";
     const sessionId = extractSessionId(path);
     if (path === "/debug/server" || path === "/" || path === "/ui") {
-      return mintE2eToken({ participantId: "part_e2e_admin", role: "admin", sessionId: "*" });
+      return mintE2eToken({
+        participantId: "part_e2e_admin",
+        role: "admin",
+        sessionId: "*",
+      });
     }
     if (path.startsWith("/client-bindings") || (method === "POST" && path === "/sessions")) {
-      return mintE2eToken({ participantId: "part_e2e_service", role: "admin", sessionId: "*" });
+      return mintE2eToken({
+        participantId: "part_e2e_service",
+        role: "admin",
+        sessionId: "*",
+      });
     }
     if (!sessionId) {
-      return mintE2eToken({ participantId: "part_e2e_service", role: "admin", sessionId: "*" });
+      return mintE2eToken({
+        participantId: "part_e2e_service",
+        role: "admin",
+        sessionId: "*",
+      });
     }
     if (path.includes("/debug/")) {
-      return mintE2eToken({ participantId: "part_e2e_admin", role: "admin", sessionId });
+      return mintE2eToken({
+        participantId: "part_e2e_admin",
+        role: "admin",
+        sessionId,
+      });
     }
     if (method === "GET") {
       return mintE2eToken({
@@ -6680,9 +7076,11 @@ function extractSessionId(path: string): string | null {
 
 /** Reads the participant identity carried by a REST mutation body or route path. */
 function readParticipantIdForRequest(path: string, body: unknown): string | null {
-  const heartbeatMatch = path.match(/^\/sessions\/[^/]+\/participants\/([^/]+)\/heartbeat$/u);
-  if (heartbeatMatch?.[1]) {
-    return decodeURIComponent(heartbeatMatch[1]);
+  const participantRouteMatch = path.match(
+    /^\/sessions\/[^/]+\/participants\/([^/]+)\/(?:heartbeat|control\/release)$/u,
+  );
+  if (participantRouteMatch?.[1]) {
+    return decodeURIComponent(participantRouteMatch[1]);
   }
   if (!isRecord(body)) {
     return null;
@@ -6766,7 +7164,11 @@ async function findOpenPort(): Promise<number> {
  * Checks whether a parsed WebSocket message is an event envelope.
  */
 function isEventEnvelope(value: unknown): value is {
-  readonly event: { readonly producerId: string; readonly seq: number; readonly type: string };
+  readonly event: {
+    readonly producerId: string;
+    readonly seq: number;
+    readonly type: string;
+  };
   readonly op: "event";
 } {
   return (

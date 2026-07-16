@@ -24,7 +24,7 @@ interface SessionDebugRouteSpec {
   readonly route: HttpRouteSpec;
 }
 
-const sessionDebugRoutes = [
+export const sessionDebugRoutes = [
   defineSessionDebugRoute("control-leases"),
   defineSessionDebugRoute("participants"),
   defineSessionDebugRoute("summary"),
@@ -85,6 +85,7 @@ function defineSessionDebugRoute(resource: SessionDebugResource): SessionDebugRo
   return {
     resource,
     route: defineHttpRoute({
+      control: "not-applicable",
       method: "GET",
       name: `session.debug.${resource}`,
       pattern: new RegExp(`^/sessions/([^/]+)/debug/${resource}$`, "u"),
