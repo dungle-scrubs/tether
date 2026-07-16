@@ -4485,7 +4485,13 @@ e2e("tether e2e", () => {
       registered: 1,
       total: 1,
     });
-    expect(summary.summary.controlLeases).toMatchObject({ active: 1, total: 1 });
+    expect(summary.summary.controlLeases).toEqual({
+      active: 1,
+      expired: 0,
+      released: 0,
+      superseded: 4,
+      total: 5,
+    });
     expect(summary.summary.tasks).toMatchObject({
       activeClaims: 1,
       claimable: 1,
