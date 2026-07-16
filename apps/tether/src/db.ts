@@ -242,6 +242,12 @@ interface SchemaObjectExistsRow {
   readonly exists: boolean;
 }
 
+/** Structural primary-key identity returned by the PostgreSQL catalogs. */
+interface PrimaryKeySignatureRow {
+  readonly columnNames: readonly string[];
+  readonly constraintType: string;
+}
+
 interface SessionExistenceRow {
   readonly exists: boolean;
 }
@@ -821,11 +827,7 @@ function legacyMigrationProbes(): readonly LegacyMigrationProbe[] {
     },
     {
       label: "0012 control lease generation history primary key including epoch",
-      represented: (database) =>
-        hasConstraint(
-          database,
-          "participant_control_leases_session_id_participant_id_instance_id_epoch_pk",
-        ),
+      represented: hasParticipantControlLeaseGenerationPrimaryKey,
     },
   ];
 }
@@ -900,21 +902,40 @@ async function hasIndex(database: DatabasePool, indexName: string): Promise<bool
   return result.rows[0]?.exists === true;
 }
 
-/** Returns whether one named constraint exists in the public schema. */
-async function hasConstraint(database: DatabasePool, constraintName: string): Promise<boolean> {
-  const result = await database.pool.query<SchemaObjectExistsRow>(
+/**
+ * Returns whether the public Control Lease table has the migration 0012
+ * primary-key structure, independently of PostgreSQL's truncated identifier.
+ */
+async function hasParticipantControlLeaseGenerationPrimaryKey(
+  database: DatabasePool,
+): Promise<boolean> {
+  const result = await database.pool.query<PrimaryKeySignatureRow>(
     `
-      SELECT EXISTS (
-        SELECT 1
-        FROM pg_constraint con
-        JOIN pg_namespace ns ON ns.oid = con.connamespace
-        WHERE ns.nspname = 'public'
-          AND con.conname = $1
-      ) AS "exists"
+      SELECT
+        ARRAY(
+          SELECT attribute.attname
+          FROM unnest(constraint_record.conkey) WITH ORDINALITY AS key_column(attnum, position)
+          JOIN pg_attribute attribute
+            ON attribute.attrelid = constraint_record.conrelid
+            AND attribute.attnum = key_column.attnum
+          ORDER BY key_column.position
+        ) AS "columnNames",
+        constraint_record.contype::text AS "constraintType"
+      FROM pg_constraint constraint_record
+      JOIN pg_class table_record ON table_record.oid = constraint_record.conrelid
+      JOIN pg_namespace namespace_record ON namespace_record.oid = table_record.relnamespace
+      WHERE namespace_record.nspname = 'public'
+        AND table_record.relname = 'participant_control_leases'
+        AND constraint_record.contype = 'p'
     `,
-    [constraintName],
   );
-  return result.rows[0]?.exists === true;
+  const expectedColumnNames = ["session_id", "participant_id", "instance_id", "epoch"] as const;
+  return result.rows.some(
+    (row) =>
+      row.constraintType === "p" &&
+      row.columnNames.length === expectedColumnNames.length &&
+      row.columnNames.every((columnName, index) => columnName === expectedColumnNames[index]),
+  );
 }
 
 /** Returns whether one public index exists and enforces uniqueness. */
