@@ -27,7 +27,14 @@ describe("schedule identity uniqueness", () => {
   });
 
   it("requires a unique schedule-identity index in the 0011 legacy baseline probe", () => {
-    const db = readFileSync(fileURLToPath(new URL("../src/db.ts", import.meta.url)), "utf8");
-    expect(db).toContain('hasUniqueIndex(database, "tasks_schedule_identity_idx")');
+    const migrationModule = readFileSync(
+      fileURLToPath(new URL("../src/database-migration.ts", import.meta.url)),
+      "utf8",
+    );
+    expect(migrationModule).toContain('hasIndexSignature(client, "tasks_schedule_identity_idx", {');
+    expect(migrationModule).toContain("AND index_record.indisunique = $3");
+    expect(migrationModule).toMatch(
+      /hasIndexSignature\(client, "tasks_schedule_identity_idx", \{[\s\S]*?tableName: "tasks",[\s\S]*?unique: true,/u,
+    );
   });
 });
