@@ -1,11 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import type { ClientBridgeFetch, ClientBridgeTaskRecord } from "../src/index.js";
 import {
+  ClientBridgeRequestError,
   ClientBridgeTaskClient,
   computeScheduleWindow,
   deriveScheduledTaskId,
-  type ClientBridgeFetch,
-  type ClientBridgeRequestError,
 } from "../src/index.js";
 
 describe("ClientBridgeTaskClient", () => {
@@ -68,6 +68,7 @@ describe("ClientBridgeTaskClient", () => {
         body: {
           task: createTaskFixture({
             objective: "organize mailbox",
+            schedule: { mailboxScope, scheduleWindow },
             sessionId: "sess_1",
             taskId: expectedTaskId,
           }),
@@ -84,7 +85,10 @@ describe("ClientBridgeTaskClient", () => {
         objective: "organize mailbox",
         scheduleWindow,
       }),
-    ).resolves.toMatchObject({ taskId: expectedTaskId });
+    ).resolves.toMatchObject({
+      schedule: { mailboxScope, scheduleWindow },
+      taskId: expectedTaskId,
+    });
 
     expect(requests).toEqual([
       {
@@ -427,6 +431,65 @@ describe("ClientBridgeTaskClient", () => {
       name: "ClientBridgeRequestError",
     } satisfies Partial<ClientBridgeRequestError>);
   });
+
+  it("maps malformed scheduled responses without exposing the raw payload", async () => {
+    const scheduleWindow = computeScheduleWindow(1_700_000_123_456, 3_600_000);
+    const mailboxScope = { accountId: "raw_payload_marker", provider: "fastmail" };
+    const task = createTaskFixture({
+      objective: "organize mailbox",
+      schedule: { mailboxScope, scheduleWindow },
+      sessionId: "sess_1",
+      taskId: "task_sched_invalid",
+    });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const client = new ClientBridgeTaskClient(
+      { serviceUrl: "http://tether.test" },
+      {
+        fetch: async () =>
+          new Response(
+            JSON.stringify({
+              task: {
+                ...task,
+                schedule: {
+                  mailboxScope,
+                  scheduleWindow: {
+                    ...scheduleWindow,
+                    endMs: scheduleWindow.endMs + 1,
+                  },
+                },
+              },
+            }),
+            { headers: { "content-type": "application/json" }, status: 200 },
+          ),
+      },
+    );
+
+    let caught: unknown;
+    try {
+      await client.createScheduledTask("sess_1", {
+        kind: "email_organization",
+        mailboxScope,
+        objective: "organize mailbox",
+        scheduleWindow,
+      });
+    } catch (error) {
+      caught = error;
+    } finally {
+      consoleError.mockRestore();
+    }
+
+    expect(caught).toBeInstanceOf(ClientBridgeRequestError);
+    if (!(caught instanceof ClientBridgeRequestError)) {
+      throw new Error("Expected malformed response validation to throw ClientBridgeRequestError");
+    }
+    expect(caught.code).toBe("INVALID_RESPONSE");
+    expect(caught.details).toEqual({
+      method: "POST",
+      path: "/sessions/sess_1/tasks",
+    });
+    expect(caught.message).not.toContain("raw_payload_marker");
+    expect(consoleError).not.toHaveBeenCalled();
+  });
 });
 
 interface CapturedRequest {
@@ -473,28 +536,10 @@ function createJsonFetch(
 function createTaskFixture(input: {
   readonly cancelledAt?: string | null;
   readonly objective: string;
+  readonly schedule?: ClientBridgeTaskRecord["schedule"];
   readonly sessionId: string;
   readonly taskId: string;
-}): {
-  readonly cancelledAt: string | null;
-  readonly claimExpiredAt: string | null;
-  readonly claimExpiredBy: string | null;
-  readonly claimExpiresAt: string | null;
-  readonly claimedAt: string | null;
-  readonly claimedBy: string | null;
-  readonly completedAt: string | null;
-  readonly createdAt: string;
-  readonly failedAt: string | null;
-  readonly failure: Record<string, unknown> | null;
-  readonly input: Record<string, unknown> | null;
-  readonly kind: string;
-  readonly objective: string;
-  readonly releasedAt: string | null;
-  readonly releasedBy: string | null;
-  readonly result: Record<string, unknown> | null;
-  readonly sessionId: string;
-  readonly taskId: string;
-} {
+}): ClientBridgeTaskRecord {
   return {
     cancelledAt: input.cancelledAt ?? null,
     claimExpiredAt: null,
@@ -512,6 +557,7 @@ function createTaskFixture(input: {
     releasedAt: null,
     releasedBy: null,
     result: null,
+    ...(input.schedule !== undefined ? { schedule: input.schedule } : {}),
     sessionId: input.sessionId,
     taskId: input.taskId,
   };

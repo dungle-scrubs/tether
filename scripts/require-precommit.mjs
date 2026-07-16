@@ -1,7 +1,8 @@
 import { readFile, rm } from "node:fs/promises";
-import { join } from "node:path";
 
-const markerPath = join(".git", "tether-precommit-ok");
+import { resolvePrecommitMarkerPath } from "./precommit-marker.mjs";
+
+const markerPath = resolvePrecommitMarkerPath();
 const maxMarkerAgeMs = 2 * 60 * 1000;
 
 let marker;

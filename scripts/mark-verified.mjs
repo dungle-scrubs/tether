@@ -1,7 +1,9 @@
 import { mkdir, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 
-const markerPath = join(".git", "tether-precommit-ok");
+import { resolvePrecommitMarkerPath } from "./precommit-marker.mjs";
+
+const markerPath = resolvePrecommitMarkerPath();
 const payload = JSON.stringify({
   createdAt: new Date().toISOString(),
   pid: process.pid,

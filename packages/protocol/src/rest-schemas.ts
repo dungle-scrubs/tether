@@ -76,19 +76,27 @@ export const heartbeatParticipantSchema = z.object({
   instanceId: z.string().min(1).optional(),
 });
 
-/** HTTP body schema for task creation. */
 /**
  * Deterministic schedule and Mailbox Scope identity a scheduled maintenance run
  * carries at creation. Interval and algorithm version are part of task identity.
  */
-export const scheduledTaskIdentitySchema = z.object({
-  mailboxAccountId: z.string().min(1),
-  mailboxProvider: z.string().min(1),
-  scheduleAlgorithmVersion: z.number().int().positive(),
-  scheduleIntervalMs: z.number().int().positive(),
-  scheduleWindowStart: z.number().int().nonnegative(),
-});
+export const scheduledTaskIdentitySchema = z
+  .object({
+    mailboxAccountId: z.string().min(1),
+    mailboxProvider: z.string().min(1),
+    scheduleAlgorithmVersion: z.number().int().positive(),
+    scheduleIntervalMs: z.number().int().positive(),
+    scheduleWindowStart: z.number().int().nonnegative(),
+  })
+  .refine(
+    (identity) => Number.isSafeInteger(identity.scheduleWindowStart + identity.scheduleIntervalMs),
+    {
+      message: "Schedule Window start plus interval must be a safe integer",
+      path: ["scheduleWindowStart"],
+    },
+  );
 
+/** HTTP body schema for task creation. */
 export const createTaskSchema = z.object({
   input: z.record(z.string(), z.unknown()).nullable().optional(),
   kind: z.string().min(1),

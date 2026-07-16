@@ -391,11 +391,26 @@ export const mailboxScopeSchema = z.object({
 });
 
 /** Runtime validator for a deterministic Schedule Window. */
-export const scheduleWindowSchema = z.object({
-  algorithmVersion: z.number().int().positive(),
-  endMs: z.number().int(),
-  intervalMs: z.number().int().positive(),
-  startMs: z.number().int().nonnegative(),
+export const scheduleWindowSchema = z
+  .object({
+    algorithmVersion: z.number().int().positive(),
+    endMs: z.number().int().nonnegative(),
+    intervalMs: z.number().int().positive(),
+    startMs: z.number().int().nonnegative(),
+  })
+  .refine((window) => Number.isSafeInteger(window.startMs + window.intervalMs), {
+    message: "Schedule Window start plus interval must be a safe integer",
+    path: ["startMs"],
+  })
+  .refine((window) => window.endMs === window.startMs + window.intervalMs, {
+    message: "Schedule Window end must equal start plus interval",
+    path: ["endMs"],
+  });
+
+/** Runtime validator for durable schedule identity attached to a task candidate. */
+export const candidateScheduleIdentitySchema = z.object({
+  mailboxScope: mailboxScopeSchema,
+  scheduleWindow: scheduleWindowSchema,
 });
 
 /** Runtime validator for a scheduled-supersession refusal reason. */
