@@ -3,6 +3,7 @@ import { Effect } from "effect";
 import type { SessionPersistenceStores } from "./db-store-contracts.js";
 import type { ModuleObservability } from "./observability.js";
 import { newParticipantId } from "./protocol.js";
+import { RestControlPolicy } from "./rest-control-policy.js";
 import {
   type ControlProtectedResult,
   type HeartbeatParticipantInput,
@@ -11,12 +12,15 @@ import {
   type RegisterWebSocketParticipantInput,
   type RestControlledInput,
   type RestControlOutcome,
+  type RestControlReleaseResult,
+  type RestHeartbeatParticipantResult,
+  type RestParticipantRegistrationResult,
   restControlLeaseTtlMs,
   type SessionServiceFailure,
 } from "./session-service-contracts.js";
 import { catchAtomicEpochStale, trySessionPromise } from "./session-service-runtime.js";
 import type { AssertBroadcastEvents } from "./session-service-task-effects.js";
-import type { ParticipantRecord, ParticipantRuntimeKind } from "./types.js";
+import type { ParticipantRuntimeKind } from "./types.js";
 
 /** Dependencies for participant control and presence Effect builders. */
 export interface SessionControlEffectsInput {
@@ -29,6 +33,7 @@ export interface SessionControlEffectsInput {
   readonly controlEpochEnforcement: boolean;
   readonly eventSourceId: string;
   readonly observability: ModuleObservability;
+  readonly restControlPolicy?: RestControlPolicy;
   readonly stores: SessionPersistenceStores;
   readonly wsControlLeaseTtlMs: number;
 }
@@ -37,13 +42,11 @@ export interface SessionControlEffectsInput {
 export interface SessionControlEffects {
   readonly claimRestControlEffect: (
     input: RestControlledInput,
+    routeName?: string,
   ) => Effect.Effect<RestControlOutcome, SessionServiceFailure>;
   readonly heartbeatRestParticipantEffect: (
     input: HeartbeatParticipantInput,
-  ) => Effect.Effect<
-    ControlProtectedResult<{ readonly participant: ParticipantRecord | null }>,
-    SessionServiceFailure
-  >;
+  ) => Effect.Effect<ControlProtectedResult<RestHeartbeatParticipantResult>, SessionServiceFailure>;
   readonly refreshWebSocketControlLeaseEffect: (input: {
     readonly controlEpoch: number;
     readonly instanceId: string;
@@ -52,7 +55,7 @@ export interface SessionControlEffects {
   }) => Effect.Effect<ControlProtectedResult<{ readonly refreshed: true }>, SessionServiceFailure>;
   readonly registerRestParticipantEffect: (
     input: RegisterParticipantInput,
-  ) => Effect.Effect<ControlProtectedResult<RegisteredParticipantResult>, SessionServiceFailure>;
+  ) => Effect.Effect<RestParticipantRegistrationResult, SessionServiceFailure>;
   readonly registerWebSocketParticipantEffect: (
     input: RegisterWebSocketParticipantInput,
   ) => Effect.Effect<
@@ -73,7 +76,13 @@ export interface SessionControlEffects {
     readonly instanceId: string;
     readonly participantId: string;
     readonly sessionId: string;
-  }) => Effect.Effect<void, SessionServiceFailure>;
+  }) => Effect.Effect<boolean, SessionServiceFailure>;
+  readonly releaseRestControlLeaseEffect: (input: {
+    readonly controlEpoch?: number;
+    readonly instanceId: string;
+    readonly participantId: string;
+    readonly sessionId: string;
+  }) => Effect.Effect<RestControlReleaseResult, SessionServiceFailure>;
 }
 
 /** Builds participant control and presence effects for one service instance. */
@@ -82,9 +91,15 @@ export function createSessionControlEffects(
 ): SessionControlEffects {
   const claimRestControlEffect = (
     restInput: RestControlledInput,
+    routeName = "rest.control",
   ): Effect.Effect<RestControlOutcome, SessionServiceFailure> =>
     trySessionPromise(() =>
-      validateRestControl(input.stores, restInput, input.controlEpochEnforcement),
+      validateRestControl(
+        input.stores,
+        restInput,
+        routeName,
+        input.restControlPolicy ?? new RestControlPolicy(input.controlEpochEnforcement),
+      ),
     );
   const upsertVisibleParticipantEffect = (participantInput: {
     readonly capabilities: Record<string, unknown>;
@@ -118,7 +133,10 @@ export function createSessionControlEffects(
     claimRestControlEffect,
     heartbeatRestParticipantEffect: (heartbeatInput) =>
       Effect.gen(function* () {
-        const control = yield* claimRestControlEffect(heartbeatInput);
+        const control = yield* claimRestControlEffect(
+          heartbeatInput,
+          "session.participant.heartbeat",
+        );
         if (control.status !== "ok") {
           return control;
         }
@@ -155,11 +173,21 @@ export function createSessionControlEffects(
           return heartbeatOrStale;
         }
         if (heartbeatOrStale.participant === null) {
-          return { events: [], participant: null, status: "ok" as const };
+          return {
+            controlEpoch: heartbeatInput.controlEpoch ?? null,
+            events: [],
+            leaseExpiresAt: control.leaseExpiresAt ?? null,
+            participant: null,
+            renewAfterMs: Math.floor(restControlLeaseTtlMs / 2),
+            status: "ok" as const,
+          };
         }
         const result = {
+          controlEpoch: heartbeatInput.controlEpoch ?? null,
           events: [heartbeatOrStale.event],
+          leaseExpiresAt: control.leaseExpiresAt ?? null,
           participant: heartbeatOrStale.participant,
+          renewAfterMs: Math.floor(restControlLeaseTtlMs / 2),
           status: "ok" as const,
         };
         yield* Effect.sync(() =>
@@ -186,7 +214,11 @@ export function createSessionControlEffects(
           }),
         );
         if (renewal.status === "renewed") {
-          return { events: [], refreshed: true as const, status: "ok" as const };
+          return {
+            events: [],
+            refreshed: true as const,
+            status: "ok" as const,
+          };
         }
         if (renewal.status === "conflict") {
           return { leaseClaim: renewal, status: "control_conflict" as const };
@@ -201,6 +233,55 @@ export function createSessionControlEffects(
         const participantId =
           participantInput.participantId ?? newParticipantId(participantInput.runtimeKind);
         const instanceId = participantInput.instanceId ?? participantId;
+        if (
+          input.controlEpochEnforcement &&
+          (participantInput.acquisitionId === undefined ||
+            participantInput.acquisitionId.length === 0)
+        ) {
+          return { status: "control_acquisition_id_required" as const };
+        }
+        if (participantInput.acquisitionId !== undefined) {
+          const acquisitionId = participantInput.acquisitionId;
+          const acquireRest = input.stores.controlLeases.acquireRest;
+          if (!acquireRest) {
+            return yield* trySessionPromise(() =>
+              Promise.reject(new Error("REST control acquisition persistence is unavailable")),
+            );
+          }
+          const acquisition = yield* trySessionPromise(() =>
+            acquireRest({
+              acquisitionId,
+              capabilities: participantInput.capabilities,
+              displayName: participantInput.displayName ?? participantId,
+              eventSourceId: input.eventSourceId,
+              instanceId,
+              leaseTtlMs: restControlLeaseTtlMs,
+              participantId,
+              runtimeKind: participantInput.runtimeKind,
+              sessionId: participantInput.sessionId,
+            }),
+          );
+          if (acquisition.status === "conflict") {
+            return {
+              leaseClaim: acquisition,
+              status: "control_conflict" as const,
+            };
+          }
+          if (acquisition.status === "acquisition_stale") {
+            return { status: "control_acquisition_stale" as const };
+          }
+          return {
+            acquisitionId,
+            acquisitionStatus: acquisition.status,
+            controlEpoch: acquisition.lease.epoch,
+            events: acquisition.events,
+            leaseExpiresAt: acquisition.lease.leaseExpiresAt,
+            participant: acquisition.registration.participant,
+            registrationStatus: acquisition.registration.status,
+            renewAfterMs: Math.floor(restControlLeaseTtlMs / 2),
+            status: "ok" as const,
+          };
+        }
         const claim = yield* trySessionPromise(() =>
           input.stores.controlLeases.claim({
             controlChannel: "rest",
@@ -213,7 +294,7 @@ export function createSessionControlEffects(
         if (claim.status === "conflict") {
           return { leaseClaim: claim, status: "control_conflict" as const };
         }
-        return yield* upsertVisibleParticipantEffect({
+        const registration = yield* upsertVisibleParticipantEffect({
           capabilities: participantInput.capabilities,
           controlEpoch: claim.lease.epoch,
           displayName: participantInput.displayName ?? participantId,
@@ -231,6 +312,13 @@ export function createSessionControlEffects(
             }).pipe(Effect.flatMap(() => Effect.fail(error))),
           ),
         );
+        return {
+          ...registration,
+          acquisitionId: "",
+          acquisitionStatus: claim.status,
+          leaseExpiresAt: claim.lease.leaseExpiresAt,
+          renewAfterMs: Math.floor(restControlLeaseTtlMs / 2),
+        };
       }),
     registerWebSocketParticipantEffect: (participantInput) =>
       Effect.gen(function* () {
@@ -282,7 +370,38 @@ export function createSessionControlEffects(
         );
       }),
     releaseControlLeaseEffect: (leaseInput) =>
-      trySessionPromise(() => input.stores.controlLeases.release(leaseInput)),
+      trySessionPromise(
+        async () => (await input.stores.controlLeases.release(leaseInput)) === true,
+      ),
+    releaseRestControlLeaseEffect: (leaseInput) =>
+      Effect.gen(function* () {
+        if (leaseInput.controlEpoch === undefined) {
+          return { status: "control_epoch_required" as const };
+        }
+        const controlEpoch = leaseInput.controlEpoch;
+        const release = yield* trySessionPromise(() =>
+          input.stores.controlLeases.releaseRest({
+            controlEpoch,
+            instanceId: leaseInput.instanceId,
+            participantId: leaseInput.participantId,
+            sessionId: leaseInput.sessionId,
+          }),
+        );
+        if (release.status === "conflict") {
+          return { leaseClaim: release, status: "control_conflict" as const };
+        }
+        if (release.status === "stale") {
+          return {
+            currentEpoch: release.currentEpoch,
+            status: "control_epoch_stale" as const,
+          };
+        }
+        return {
+          events: [],
+          released: release.status === "released",
+          status: "ok" as const,
+        };
+      }),
   };
 }
 
@@ -312,32 +431,46 @@ function releaseClaimedControlLease(
       participantId: input.participantId,
       sessionId: input.sessionId,
     }),
-  ).pipe(Effect.catchAll(() => Effect.void));
+  ).pipe(
+    Effect.asVoid,
+    Effect.catchAll(() => Effect.void),
+  );
 }
 
 /**
  * Validates REST participant control before a protected mutation. When the
  * caller supplies a Control Epoch it is compared against the current durable
  * generation (renewal). A missing epoch is rejected only when enforcement is
- * enabled; otherwise the legacy acquire-or-supersede path keeps existing
- * callers working.
+ * enabled; otherwise compatibility accepts the request without creating,
+ * renewing, or superseding durable control state.
  */
 async function validateRestControl(
   stores: SessionPersistenceStores,
   input: RestControlledInput,
-  enforcement: boolean,
+  routeName: string,
+  policy: RestControlPolicy,
 ): Promise<RestControlOutcome> {
-  if (input.controlEpoch !== undefined) {
+  const decision = policy.authorize({
+    controlEpoch: input.controlEpoch,
+    routeName,
+  });
+  if (decision.status === "control_epoch_required") {
+    return decision;
+  }
+  if (decision.status === "accepted_unfenced") {
+    return { leaseExpiresAt: null, status: "ok" };
+  }
+  if (decision.status === "validate_fenced") {
     const renewal = await stores.controlLeases.renew({
       controlChannel: "rest",
-      controlEpoch: input.controlEpoch,
+      controlEpoch: decision.controlEpoch,
       instanceId: input.instanceId,
       leaseTtlMs: restControlLeaseTtlMs,
       participantId: input.participantId,
       sessionId: input.sessionId,
     });
     if (renewal.status === "renewed") {
-      return { status: "ok" };
+      return { leaseExpiresAt: renewal.lease.leaseExpiresAt, status: "ok" };
     }
     if (renewal.status === "conflict") {
       return { leaseClaim: renewal, status: "control_conflict" };
@@ -347,17 +480,5 @@ async function validateRestControl(
       status: "control_epoch_stale",
     };
   }
-  if (enforcement) {
-    return { currentEpoch: null, status: "control_epoch_stale" };
-  }
-  const claim = await stores.controlLeases.claim({
-    controlChannel: "rest",
-    instanceId: input.instanceId,
-    leaseTtlMs: restControlLeaseTtlMs,
-    participantId: input.participantId,
-    sessionId: input.sessionId,
-  });
-  return claim.status === "conflict"
-    ? { leaseClaim: claim, status: "control_conflict" }
-    : { status: "ok" };
+  return { status: "control_epoch_required" };
 }

@@ -3,10 +3,10 @@ import { describe, expect, it } from "vitest";
 
 import { ControlEpochStaleError } from "../src/control-epoch.js";
 import type {
-  HeartbeatParticipantWithEventResult,
   ControlLease,
   ControlLeaseClaim,
   ControlLeaseRenewal,
+  HeartbeatParticipantWithEventResult,
 } from "../src/db.js";
 import type {
   ControlLeaseStore,
@@ -14,8 +14,8 @@ import type {
   SessionPersistenceStores,
 } from "../src/db-store-contracts.js";
 import { ModuleObservability } from "../src/observability.js";
-import { createSessionControlEffects } from "../src/session-service-control-effects.js";
 import type { HeartbeatParticipantInput } from "../src/session-service-contracts.js";
+import { createSessionControlEffects } from "../src/session-service-control-effects.js";
 import type { ParticipantRecord, SessionEvent } from "../src/types.js";
 
 /**
@@ -42,8 +42,12 @@ class RenewableControlLeaseStore implements ControlLeaseStore {
     return [];
   }
 
-  async release(): Promise<void> {
-    return undefined;
+  async release(): Promise<boolean> {
+    return false;
+  }
+
+  async releaseRest(): Promise<{ readonly status: "inactive" }> {
+    return { status: "inactive" };
   }
 }
 
@@ -117,7 +121,9 @@ function createHeartbeatEffects(input: {
     assertBroadcastEvents: () => undefined,
     controlEpochEnforcement: false,
     eventSourceId: "src_heartbeat_fence_test",
-    observability: new ModuleObservability({ moduleName: "HeartbeatFenceTest" }),
+    observability: new ModuleObservability({
+      moduleName: "HeartbeatFenceTest",
+    }),
     stores,
     wsControlLeaseTtlMs: 60_000,
   });
@@ -141,7 +147,10 @@ describe("epoch-fenced REST heartbeat", () => {
     });
 
     const result = await Effect.runPromise(
-      effects.heartbeatRestParticipantEffect({ ...heartbeatInput, controlEpoch: 5 }),
+      effects.heartbeatRestParticipantEffect({
+        ...heartbeatInput,
+        controlEpoch: 5,
+      }),
     );
 
     expect(result).toEqual({ currentEpoch: 6, status: "control_epoch_stale" });
@@ -157,7 +166,10 @@ describe("epoch-fenced REST heartbeat", () => {
     });
 
     const result = await Effect.runPromise(
-      effects.heartbeatRestParticipantEffect({ ...heartbeatInput, controlEpoch: 5 }),
+      effects.heartbeatRestParticipantEffect({
+        ...heartbeatInput,
+        controlEpoch: 5,
+      }),
     );
 
     expect(participants.mutated).toBe(true);

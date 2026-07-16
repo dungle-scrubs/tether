@@ -23,18 +23,21 @@ interface ClientBindingHttpRouteHandlerInput {
   readonly url: URL;
 }
 
-const clientBindingRoutes = {
+export const clientBindingRoutes = {
   archive: defineHttpRoute({
+    control: "not-applicable",
     method: "DELETE",
     name: "client-binding.archive",
     pattern: /^\/client-bindings\/([^/]+)\/([^/]+)$/u,
   }),
   list: defineHttpRoute({
+    control: "not-applicable",
     method: "GET",
     name: "client-binding.list",
     pattern: /^\/client-bindings$/u,
   }),
   resolveSession: defineHttpRoute({
+    control: "not-applicable",
     method: "POST",
     name: "client-binding.resolve-session",
     pattern: /^\/client-bindings\/session$/u,

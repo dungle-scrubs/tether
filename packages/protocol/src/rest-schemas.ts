@@ -16,6 +16,9 @@ export const controlEpochSchema = z
     message: "controlEpoch must be a positive safe integer",
   });
 
+/** Client-generated retry identity for one logical REST control acquisition. */
+export const controlAcquisitionIdSchema = z.string().trim().min(1).max(128);
+
 /** Pagination metadata returned by bounded session event-list responses. */
 export const eventListPaginationSchema = z.object({
   afterSeq: z.number().int().nonnegative(),
@@ -61,6 +64,7 @@ export const resolveClientSessionSchema = z.object({
 
 /** HTTP body schema for participant registration. */
 export const registerParticipantSchema = z.object({
+  acquisitionId: controlAcquisitionIdSchema.optional(),
   capabilities: z.record(z.string(), z.unknown()).default({}),
   controlChannel: controlChannelSchema.default("rest"),
   displayName: z.string().min(1).optional(),
@@ -69,11 +73,56 @@ export const registerParticipantSchema = z.object({
   runtimeKind: participantRuntimeKindSchema,
 });
 
+/** HTTP response returned after REST participant control acquisition. */
+export const restControlAcquisitionResponseSchema = z.object({
+  acquisitionId: controlAcquisitionIdSchema,
+  acquisitionStatus: z.union([
+    z.literal("claimed"),
+    z.literal("replayed"),
+    z.literal("superseded"),
+  ]),
+  controlEpoch: controlEpochSchema,
+  leaseExpiresAt: z.string().datetime({ offset: true }),
+  participant: z.record(z.string(), z.unknown()),
+  registrationStatus: z.union([z.literal("joined"), z.literal("refreshed"), z.literal("updated")]),
+  renewAfterMs: z.number().int().positive(),
+});
+
+/** Parsed REST participant control acquisition response. */
+export type RestControlAcquisitionResponse = z.infer<typeof restControlAcquisitionResponseSchema>;
+
 /** HTTP body schema for participant heartbeat refresh. */
 export const heartbeatParticipantSchema = z.object({
   capabilities: z.record(z.string(), z.unknown()).optional(),
   controlEpoch: controlEpochSchema.optional(),
   instanceId: z.string().min(1).optional(),
+});
+
+/** HTTP response returned after exact-epoch REST control renewal. */
+export const restControlRenewalResponseSchema = z.object({
+  controlEpoch: controlEpochSchema,
+  leaseExpiresAt: z.string().datetime({ offset: true }),
+  participant: z.record(z.string(), z.unknown()),
+  renewAfterMs: z.number().int().positive(),
+});
+
+/** Parsed REST participant control renewal response. */
+export type RestControlRenewalResponse = z.infer<typeof restControlRenewalResponseSchema>;
+
+/** HTTP route envelope used to distinguish an absent release epoch from a malformed one. */
+export const releaseParticipantControlEnvelopeSchema = z.object({
+  controlEpoch: controlEpochSchema.optional(),
+  instanceId: z.string().min(1),
+});
+
+/** HTTP body for exact-generation REST participant control release. */
+export const releaseParticipantControlSchema = releaseParticipantControlEnvelopeSchema.extend({
+  controlEpoch: controlEpochSchema,
+});
+
+/** HTTP response for idempotent REST participant control release. */
+export const releaseParticipantControlResponseSchema = z.object({
+  released: z.boolean(),
 });
 
 /**

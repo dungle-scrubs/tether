@@ -1,5 +1,5 @@
-import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
+import type { IncomingMessage, ServerResponse } from "node:http";
 
 import { Effect } from "effect";
 import { ZodError, type z } from "zod";
@@ -7,16 +7,16 @@ import { ZodError, type z } from "zod";
 import { authErrorPayload, authErrorStatus } from "./auth/enforcement.js";
 import type { AuthError } from "./auth/token.js";
 import {
+  type ControlLeaseClaim,
   SessionEventSequenceRangeError,
   SessionNotFoundError,
-  type ControlLeaseClaim,
 } from "./db.js";
 import type { SubscriptionHub } from "./hub.js";
 import {
   bodyTooLargeError,
   isResourceLimitExceeded,
-  resourceLimitReason,
   type ResourceLimitRuntime,
+  resourceLimitReason,
 } from "./resource-limits.js";
 import { SessionServicePersistenceError } from "./session-service-contracts.js";
 import type { ControlChannel, SessionEvent } from "./types.js";
@@ -54,7 +54,10 @@ export function handleCorsPreflight(
     response.end();
     return true;
   }
-  logCorsDenied({ origin: typeof origin === "string" ? origin : null, route: request.url ?? null });
+  logCorsDenied({
+    origin: typeof origin === "string" ? origin : null,
+    route: request.url ?? null,
+  });
   response.writeHead(403, { "content-type": "application/json" });
   response.end(JSON.stringify({ error: "CORS origin not allowed", reason: "cors_denied" }));
   return true;
@@ -250,6 +253,33 @@ export function sendControlEpochStale(response: ServerResponse, currentEpoch: nu
   });
 }
 
+/** Serializes an enforced missing-Control-Epoch rejection. */
+export function sendControlEpochRequired(response: ServerResponse): void {
+  sendJson(response, 428, {
+    code: "CONTROL_EPOCH_REQUIRED",
+    error: "Control epoch is required",
+    recovery: "acquire_control",
+  });
+}
+
+/** Serializes an enforced missing-Acquisition-ID rejection. */
+export function sendControlAcquisitionIdRequired(response: ServerResponse): void {
+  sendJson(response, 428, {
+    code: "CONTROL_ACQUISITION_ID_REQUIRED",
+    error: "Control acquisition ID is required",
+    recovery: "generate_acquisition_id",
+  });
+}
+
+/** Serializes reuse of an inactive Acquisition ID. */
+export function sendControlAcquisitionStale(response: ServerResponse): void {
+  sendJson(response, 409, {
+    code: "CONTROL_ACQUISITION_STALE",
+    error: "Control acquisition is no longer active",
+    recovery: "new_acquisition",
+  });
+}
+
 /** Builds the shared participant control-conflict payload. */
 export function controlLeaseConflictError(
   leaseClaim: Extract<ControlLeaseClaim, { readonly status: "conflict" }>,
@@ -257,6 +287,7 @@ export function controlLeaseConflictError(
 ): Record<string, unknown> {
   return {
     activeControlChannel: leaseClaim.activeLease.controlChannel,
+    code: "CONTROL_CONFLICT",
     error: "Participant already has an active control channel",
     instanceId: leaseClaim.activeLease.instanceId,
     leaseExpiresAt: leaseClaim.activeLease.leaseExpiresAt,

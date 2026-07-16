@@ -38,6 +38,7 @@ export type AppendEventEffect = (
 /** Validates the REST control lease and Control Epoch for a participant operation. */
 export type ClaimRestControlEffect = (
   input: RestControlledInput,
+  routeName?: string,
 ) => Effect.Effect<RestControlOutcome, SessionServiceFailure>;
 
 /** Dependencies for durable session, binding, and event Effect builders. */
@@ -188,14 +189,17 @@ export function createSessionCoreEffects(input: SessionCoreEffectsInput): Sessio
         // whether instanceId was supplied, otherwise enforcement could be
         // bypassed by omitting instanceId.
         if (publishInput.instanceId !== undefined) {
-          const control = yield* input.claimRestControlEffect({
-            ...(publishInput.controlEpoch !== undefined
-              ? { controlEpoch: publishInput.controlEpoch }
-              : {}),
-            instanceId: publishInput.instanceId,
-            participantId: publishInput.producerId,
-            sessionId: publishInput.sessionId,
-          });
+          const control = yield* input.claimRestControlEffect(
+            {
+              ...(publishInput.controlEpoch !== undefined
+                ? { controlEpoch: publishInput.controlEpoch }
+                : {}),
+              instanceId: publishInput.instanceId,
+              participantId: publishInput.producerId,
+              sessionId: publishInput.sessionId,
+            },
+            "session.events.append",
+          );
           if (control.status !== "ok") {
             return control;
           }
@@ -223,7 +227,10 @@ export function createSessionCoreEffects(input: SessionCoreEffectsInput): Sessio
         // unfenced append. The legacy unfenced fallback applies only when neither a
         // controlEpoch nor a control context is supplied and enforcement is off, so
         // existing pre-epoch clients keep working.
-        if (input.controlEpochEnforcement || publishInput.controlEpoch !== undefined) {
+        if (publishInput.controlEpoch === undefined && input.controlEpochEnforcement) {
+          return { status: "control_epoch_required" as const };
+        }
+        if (publishInput.controlEpoch !== undefined) {
           return { currentEpoch: null, status: "control_epoch_stale" as const };
         }
         return yield* publishEventEffect(publishInput);

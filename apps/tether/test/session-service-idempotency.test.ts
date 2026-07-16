@@ -1,8 +1,7 @@
 import { Effect } from "effect";
 import { describe, expect, it } from "vitest";
-
-import type { SessionPersistenceStores } from "../src/db-store-contracts.js";
 import { TaskClaimExpirationDeadlockError } from "../src/db.js";
+import type { SessionPersistenceStores } from "../src/db-store-contracts.js";
 import { ModuleObservability, type StructuredLogEntry } from "../src/observability.js";
 import { sessionEventType } from "../src/protocol.js";
 import { SessionServicePersistenceError } from "../src/session-service-contracts.js";
@@ -39,7 +38,10 @@ describe("session service idempotency classification", () => {
 
     await expect(
       Effect.runPromise(effects.createSessionEffect({ sessionId: "sess_idempotency" })),
-    ).resolves.toMatchObject({ events: [], session: { sessionId: "sess_idempotency" } });
+    ).resolves.toMatchObject({
+      events: [],
+      session: { sessionId: "sess_idempotency" },
+    });
     expect(appendedEvents).toHaveLength(0);
   });
 
@@ -99,7 +101,9 @@ describe("session service idempotency classification", () => {
           sessionId: undefined,
         }),
       ),
-    ).resolves.toMatchObject({ events: [{ type: sessionEventType.sessionCreated }] });
+    ).resolves.toMatchObject({
+      events: [{ type: sessionEventType.sessionCreated }],
+    });
     expect(emittedSessionIds).toEqual(["sess_idempotency"]);
   });
 
@@ -159,7 +163,12 @@ describe("session service idempotency classification", () => {
     );
     expect(failure).toBeInstanceOf(SessionServicePersistenceError);
     const generatedFailure = await Effect.runPromise(
-      Effect.flip(effects.publishEventEffect({ ...createPublishInput(), eventId: undefined })),
+      Effect.flip(
+        effects.publishEventEffect({
+          ...createPublishInput(),
+          eventId: undefined,
+        }),
+      ),
     );
     expect(generatedFailure).toBeInstanceOf(SessionServicePersistenceError);
     if (!(generatedFailure instanceof SessionServicePersistenceError)) {
@@ -171,7 +180,10 @@ describe("session service idempotency classification", () => {
 
   it("classifies task create created, replayed, conflict, and generated-id failures", async () => {
     const task = createTask();
-    const event = createEvent({ payload: { task }, type: sessionEventType.taskCreated });
+    const event = createEvent({
+      payload: { task },
+      type: sessionEventType.taskCreated,
+    });
     const taskIdSources: string[] = [];
     let createWithEvent: SessionPersistenceStores["tasks"]["createWithEvent"] = async (input) => {
       taskIdSources.push(input.taskIdSource);
@@ -186,7 +198,9 @@ describe("session service idempotency classification", () => {
         expect(events).toHaveLength(expectedCount ?? events.length);
       },
       eventSourceId: "src_task_idempotency_test",
-      observability: new ModuleObservability({ moduleName: "TaskIdempotencyTest" }),
+      observability: new ModuleObservability({
+        moduleName: "TaskIdempotencyTest",
+      }),
       stores,
       taskClaimLeaseTtlMs: 1_000,
     });
@@ -312,6 +326,9 @@ function createStores(overrides: StoreOverrides): SessionPersistenceStores {
         throw new Error("unexpected control lease renew");
       },
       release: async () => undefined,
+      releaseRest: async () => {
+        throw new Error("unexpected REST control lease release");
+      },
     },
     events: {
       append: async () => {

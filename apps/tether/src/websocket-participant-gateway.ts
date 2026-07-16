@@ -701,6 +701,16 @@ function registerWebSocketParticipant(
       socket.close(1008, "control epoch stale");
       return null;
     }
+    if (result.status !== "ok") {
+      socket.send(
+        serializeErrorEnvelope({
+          details: { reason: result.status },
+          error: "WebSocket participant registration failed",
+        }),
+      );
+      socket.close(1011, "participant registration failed");
+      return null;
+    }
     // Record this socket as the current control owner for its runtime identity
     // and proactively close any prior-epoch socket for the same key. The new
     // epoch is already committed at this point, so the superseded socket is

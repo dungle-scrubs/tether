@@ -150,6 +150,9 @@ function createApprovalStores(
         throw new Error("unexpected control lease renew");
       },
       release: async () => undefined,
+      releaseRest: async () => {
+        throw new Error("approval service should not release REST control");
+      },
     },
     events: {
       append: async () => {

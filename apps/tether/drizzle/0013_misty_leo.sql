@@ -1,0 +1,2 @@
+ALTER TABLE "participant_control_leases" ADD COLUMN "acquisition_id" text;--> statement-breakpoint
+CREATE UNIQUE INDEX "participant_control_leases_acquisition_unique" ON "participant_control_leases" USING btree ("session_id","participant_id","acquisition_id") WHERE "participant_control_leases"."acquisition_id" IS NOT NULL;

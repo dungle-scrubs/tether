@@ -1,3 +1,7 @@
+import {
+  RestParticipantControlClient,
+  type RestParticipantControlContext,
+} from "@dungle-scrubs/tether-client";
 import { deriveScheduledTaskId } from "@dungle-scrubs/tether-protocol";
 
 import { clientBridgeRoutes } from "./routes.js";
@@ -7,7 +11,11 @@ import {
   taskResponseSchema,
   tasksResponseSchema,
 } from "./schemas.js";
-import { type ClientBridgeTransport, createClientBridgeTransport } from "./transport.js";
+import {
+  ClientBridgeRequestError,
+  type ClientBridgeTransport,
+  createClientBridgeTransport,
+} from "./transport.js";
 import type {
   ClientBridgeCancelTaskInput,
   ClientBridgeCreateScheduledTaskInput,
@@ -28,6 +36,7 @@ import type {
  * response validation.
  */
 export class ClientBridgeTaskClient {
+  private readonly control: RestParticipantControlClient | null;
   private readonly transport: ClientBridgeTransport;
 
   /** Creates a task client for one Tether service URL. */
@@ -37,11 +46,28 @@ export class ClientBridgeTaskClient {
       ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
       serviceUrl: config.serviceUrl,
     });
+    this.control =
+      options.controlClient ??
+      (config.control
+        ? new RestParticipantControlClient(
+            {
+              ...(config.authToken === undefined ? {} : { authToken: config.authToken }),
+              ...config.control,
+              serviceUrl: config.serviceUrl,
+            },
+            {
+              ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+            },
+          )
+        : null);
   }
 
   /** Returns inspectable runtime state for task REST operations. */
   debugInfo(): ClientBridgeTaskClientDebugInfo {
-    return this.transport.debugInfo();
+    return {
+      ...this.transport.debugInfo(),
+      ...(this.control ? { control: this.control.debugInfo() } : {}),
+    };
   }
 
   /** Creates one task in a durable Tether session. */
@@ -131,13 +157,11 @@ export class ClientBridgeTaskClient {
     sessionId: string,
     input: ClientBridgeCancelTaskInput,
   ): Promise<ClientBridgeTaskRecord> {
-    const body = await this.requestTaskResponse({
+    const context = await this.controlContext(sessionId);
+    const body = await this.controlledTaskRequest(context, {
       body: {
-        instanceId: input.instanceId,
-        participantId: input.participantId,
         ...(input.reason === undefined ? {} : { reason: input.reason }),
       },
-      method: "POST",
       path: clientBridgeRoutes.taskCancel(sessionId, input.taskId),
     });
     return body.task;
@@ -148,15 +172,23 @@ export class ClientBridgeTaskClient {
     sessionId: string,
     input: ClientBridgeRecordTaskApprovalInput,
   ): Promise<ClientBridgeTaskApprovalRecord> {
-    const body = await this.requestTaskApprovalResponse({
-      body: {
-        decision: input.decision,
-        instanceId: input.instanceId,
-        participantId: input.participantId,
-        ...(input.reason === undefined ? {} : { reason: input.reason }),
-      },
-      path: clientBridgeRoutes.taskApproval(sessionId, input.taskId),
-    });
+    const context = await this.controlContext(sessionId);
+    let body: Awaited<ReturnType<ClientBridgeTaskClient["requestTaskApprovalResponse"]>>;
+    try {
+      body = await this.requestTaskApprovalResponse({
+        body: {
+          controlEpoch: context.controlEpoch,
+          decision: input.decision,
+          instanceId: context.instanceId,
+          participantId: context.participantId,
+          ...(input.reason === undefined ? {} : { reason: input.reason }),
+        },
+        path: clientBridgeRoutes.taskApproval(sessionId, input.taskId),
+      });
+    } catch (error) {
+      this.invalidateFailedContext(context, error);
+      throw error;
+    }
     return body.status === "recorded"
       ? {
           decision: body.decision,
@@ -172,6 +204,60 @@ export class ClientBridgeTaskClient {
           status: body.status,
           task: body.task,
         };
+  }
+
+  /** Releases every active REST participant context exactly once. */
+  async shutdown(): Promise<void> {
+    await this.control?.stop();
+  }
+
+  /** Returns the configured participant lifecycle context for one session. */
+  private controlContext(sessionId: string): Promise<RestParticipantControlContext> {
+    if (!this.control) {
+      throw new Error("ClientBridgeTaskClient control configuration is required");
+    }
+    return this.control.context(sessionId);
+  }
+
+  /** Sends one fenced task mutation without retrying it. */
+  private async controlledTaskRequest(
+    context: RestParticipantControlContext,
+    input: {
+      readonly body: Record<string, unknown>;
+      readonly path: string;
+    },
+  ) {
+    try {
+      return await this.requestTaskResponse({
+        body: {
+          ...input.body,
+          controlEpoch: context.controlEpoch,
+          instanceId: context.instanceId,
+          participantId: context.participantId,
+        },
+        method: "POST",
+        path: input.path,
+      });
+    } catch (error) {
+      this.invalidateFailedContext(context, error);
+      throw error;
+    }
+  }
+
+  /** Invalidates only the matching generation after stale or uncertain protected outcomes. */
+  private invalidateFailedContext(context: RestParticipantControlContext, error: unknown): void {
+    if (!this.control || !(error instanceof ClientBridgeRequestError)) {
+      return;
+    }
+    const serverCode = error.details.serverCode;
+    const status = error.details.status;
+    const uncertain =
+      error.code === "NETWORK_ERROR" ||
+      error.code === "INVALID_RESPONSE" ||
+      (error.code === "HTTP_ERROR" && typeof status === "number" && status >= 500);
+    if (serverCode === "CONTROL_CONFLICT" || serverCode === "CONTROL_EPOCH_STALE" || uncertain) {
+      this.control.invalidate(context);
+    }
   }
 
   /** Sends a task endpoint request that returns the standard `{ task }` envelope. */

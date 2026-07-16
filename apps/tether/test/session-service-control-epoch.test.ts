@@ -1,18 +1,22 @@
 import { Effect } from "effect";
 import { describe, expect, it } from "vitest";
-
-import type { ControlLease, ControlLeaseClaim, ControlLeaseRenewal } from "../src/db.js";
-import type { ControlLeaseStore, SessionPersistenceStores } from "../src/db-store-contracts.js";
 import { nextControlEpoch } from "../src/control-epoch.js";
+import type {
+  ControlLease,
+  ControlLeaseClaim,
+  ControlLeaseRenewal,
+  RestControlLeaseRelease,
+} from "../src/db.js";
+import type { ControlLeaseStore, SessionPersistenceStores } from "../src/db-store-contracts.js";
 import { ModuleObservability } from "../src/observability.js";
-import {
-  createSessionControlEffects,
-  type SessionControlEffects,
-} from "../src/session-service-control-effects.js";
 import {
   type RestControlledInput,
   SessionServicePersistenceError,
 } from "../src/session-service-contracts.js";
+import {
+  createSessionControlEffects,
+  type SessionControlEffects,
+} from "../src/session-service-control-effects.js";
 
 /**
  * In-memory single-current-lease store that models the acquire-or-supersede,
@@ -45,7 +49,10 @@ class FakeControlLeaseStore implements ControlLeaseStore {
     const epoch = nextControlEpoch(this.maxEpoch === 0 ? null : this.maxEpoch);
     this.maxEpoch = epoch;
     this.current = this.buildLease(input, epoch);
-    return { lease: this.current, status: hadCurrent ? "superseded" : "claimed" };
+    return {
+      lease: this.current,
+      status: hadCurrent ? "superseded" : "claimed",
+    };
   }
 
   async renew(input: {
@@ -81,16 +88,38 @@ class FakeControlLeaseStore implements ControlLeaseStore {
     readonly instanceId: string;
     readonly participantId: string;
     readonly sessionId: string;
-  }): Promise<void> {
+  }): Promise<boolean> {
     if (
       this.current &&
       this.current.instanceId === input.instanceId &&
       this.current.controlChannel === input.controlChannel &&
       (input.controlEpoch === undefined || this.current.epoch === input.controlEpoch)
     ) {
-      this.releaseCalls.push({ controlEpoch: input.controlEpoch, epoch: this.current.epoch });
+      this.releaseCalls.push({
+        controlEpoch: input.controlEpoch,
+        epoch: this.current.epoch,
+      });
       this.current = null;
+      return true;
     }
+    return false;
+  }
+
+  async releaseRest(input: {
+    readonly controlEpoch: number;
+    readonly instanceId: string;
+  }): Promise<RestControlLeaseRelease> {
+    if (!this.current) {
+      return { status: "inactive" };
+    }
+    if (this.current.instanceId !== input.instanceId || this.current.controlChannel !== "rest") {
+      return { activeLease: this.current, status: "conflict" };
+    }
+    if (this.current.epoch !== input.controlEpoch) {
+      return { currentEpoch: this.current.epoch, status: "stale" };
+    }
+    this.current = null;
+    return { status: "released" };
   }
 
   currentEpoch(): number | null {
@@ -147,8 +176,16 @@ const restInput: RestControlledInput = {
 describe("REST control epoch validation", () => {
   it("issues a strictly newer epoch on same-instance reconnect", async () => {
     const store = new FakeControlLeaseStore();
-    const first = await store.claim({ ...restInput, controlChannel: "ws", leaseTtlMs: 1000 });
-    const second = await store.claim({ ...restInput, controlChannel: "ws", leaseTtlMs: 1000 });
+    const first = await store.claim({
+      ...restInput,
+      controlChannel: "ws",
+      leaseTtlMs: 1000,
+    });
+    const second = await store.claim({
+      ...restInput,
+      controlChannel: "ws",
+      leaseTtlMs: 1000,
+    });
     expect(first.status).toBe("claimed");
     expect(second.status).toBe("superseded");
     if (first.status === "conflict" || second.status === "conflict") {
@@ -157,36 +194,58 @@ describe("REST control epoch validation", () => {
     expect(second.lease.epoch).toBeGreaterThan(first.lease.epoch);
   });
 
-  it("accepts a legacy request without an epoch when enforcement is off", async () => {
+  it("accepts a legacy request without claiming a lease when enforcement is off", async () => {
     const store = new FakeControlLeaseStore();
-    const effects = createEffects({ controlEpochEnforcement: false, controlLeases: store });
+    const effects = createEffects({
+      controlEpochEnforcement: false,
+      controlLeases: store,
+    });
     const outcome = await Effect.runPromise(effects.claimRestControlEffect(restInput));
     expect(outcome.status).toBe("ok");
-    expect(store.currentEpoch()).toBe(1);
+    expect(store.currentEpoch()).toBeNull();
   });
 
   it("rejects a request missing its epoch when enforcement is on", async () => {
     const store = new FakeControlLeaseStore();
-    const effects = createEffects({ controlEpochEnforcement: true, controlLeases: store });
+    const effects = createEffects({
+      controlEpochEnforcement: true,
+      controlLeases: store,
+    });
     const outcome = await Effect.runPromise(effects.claimRestControlEffect(restInput));
-    expect(outcome).toEqual({ currentEpoch: null, status: "control_epoch_stale" });
+    expect(outcome).toEqual({ status: "control_epoch_required" });
   });
 
   it("validates a supplied epoch even when enforcement is off", async () => {
     const store = new FakeControlLeaseStore();
-    const claim = await store.claim({ ...restInput, controlChannel: "rest", leaseTtlMs: 1000 });
+    const claim = await store.claim({
+      ...restInput,
+      controlChannel: "rest",
+      leaseTtlMs: 1000,
+    });
     if (claim.status === "conflict") {
       throw new Error("unexpected conflict");
     }
-    const effects = createEffects({ controlEpochEnforcement: false, controlLeases: store });
+    const effects = createEffects({
+      controlEpochEnforcement: false,
+      controlLeases: store,
+    });
     const fresh = await Effect.runPromise(
-      effects.claimRestControlEffect({ ...restInput, controlEpoch: claim.lease.epoch }),
+      effects.claimRestControlEffect({
+        ...restInput,
+        controlEpoch: claim.lease.epoch,
+      }),
     );
     expect(fresh.status).toBe("ok");
     const stale = await Effect.runPromise(
-      effects.claimRestControlEffect({ ...restInput, controlEpoch: claim.lease.epoch - 1 || 99 }),
+      effects.claimRestControlEffect({
+        ...restInput,
+        controlEpoch: claim.lease.epoch - 1 || 99,
+      }),
     );
-    expect(stale).toEqual({ currentEpoch: claim.lease.epoch, status: "control_epoch_stale" });
+    expect(stale).toEqual({
+      currentEpoch: claim.lease.epoch,
+      status: "control_epoch_stale",
+    });
   });
 
   it("reports a different-instance owner as a control conflict without mutating state", async () => {
@@ -199,19 +258,130 @@ describe("REST control epoch validation", () => {
       sessionId: "sess_1",
     });
     const before = store.currentEpoch();
-    const effects = createEffects({ controlEpochEnforcement: true, controlLeases: store });
+    const effects = createEffects({
+      controlEpochEnforcement: true,
+      controlLeases: store,
+    });
     const outcome = await Effect.runPromise(
-      effects.claimRestControlEffect({ ...restInput, controlEpoch: before ?? 1 }),
+      effects.claimRestControlEffect({
+        ...restInput,
+        controlEpoch: before ?? 1,
+      }),
     );
     expect(outcome.status).toBe("control_conflict");
     expect(store.currentEpoch()).toBe(before);
   });
 });
 
+describe("REST control epoch release", () => {
+  it("classifies a missing release epoch before touching persistence", async () => {
+    const store = new FakeControlLeaseStore();
+    const effects = createEffects({
+      controlEpochEnforcement: true,
+      controlLeases: store,
+    });
+
+    await expect(
+      Effect.runPromise(effects.releaseRestControlLeaseEffect(restInput)),
+    ).resolves.toEqual({
+      status: "control_epoch_required",
+    });
+    expect(store.releaseCalls).toEqual([]);
+  });
+
+  it("releases the exact generation and repeats idempotently", async () => {
+    const store = new FakeControlLeaseStore();
+    const effects = createEffects({
+      controlEpochEnforcement: true,
+      controlLeases: store,
+    });
+    const acquired = await store.claim({
+      ...restInput,
+      controlChannel: "rest",
+      leaseTtlMs: 1_000,
+    });
+    if (acquired.status === "conflict") {
+      throw new Error("unexpected conflict");
+    }
+
+    const releaseInput = { ...restInput, controlEpoch: acquired.lease.epoch };
+    await expect(
+      Effect.runPromise(effects.releaseRestControlLeaseEffect(releaseInput)),
+    ).resolves.toEqual({ events: [], released: true, status: "ok" });
+    await expect(
+      Effect.runPromise(effects.releaseRestControlLeaseEffect(releaseInput)),
+    ).resolves.toEqual({ events: [], released: false, status: "ok" });
+  });
+
+  it("classifies a delayed release as stale without touching its replacement", async () => {
+    const store = new FakeControlLeaseStore();
+    const effects = createEffects({
+      controlEpochEnforcement: true,
+      controlLeases: store,
+    });
+    const first = await store.claim({
+      ...restInput,
+      controlChannel: "rest",
+      leaseTtlMs: 1_000,
+    });
+    const replacement = await store.claim({
+      ...restInput,
+      controlChannel: "rest",
+      leaseTtlMs: 1_000,
+    });
+    if (first.status === "conflict" || replacement.status === "conflict") {
+      throw new Error("unexpected conflict");
+    }
+
+    await expect(
+      Effect.runPromise(
+        effects.releaseRestControlLeaseEffect({
+          ...restInput,
+          controlEpoch: first.lease.epoch,
+        }),
+      ),
+    ).resolves.toEqual({
+      currentEpoch: replacement.lease.epoch,
+      status: "control_epoch_stale",
+    });
+    expect(store.currentEpoch()).toBe(replacement.lease.epoch);
+  });
+
+  it("classifies another active owner as a conflict without mutation", async () => {
+    const store = new FakeControlLeaseStore();
+    const owner = await store.claim({
+      controlChannel: "ws",
+      instanceId: "inst_owner",
+      leaseTtlMs: 1_000,
+      participantId: restInput.participantId,
+      sessionId: restInput.sessionId,
+    });
+    if (owner.status === "conflict") {
+      throw new Error("unexpected conflict");
+    }
+    const effects = createEffects({
+      controlEpochEnforcement: true,
+      controlLeases: store,
+    });
+
+    const result = await Effect.runPromise(
+      effects.releaseRestControlLeaseEffect({
+        ...restInput,
+        controlEpoch: owner.lease.epoch,
+      }),
+    );
+    expect(result.status).toBe("control_conflict");
+    expect(store.currentEpoch()).toBe(owner.lease.epoch);
+  });
+});
+
 describe("WebSocket control epoch renewal fencing", () => {
   it("renews the bound epoch and fences a superseded socket", async () => {
     const store = new FakeControlLeaseStore();
-    const effects = createEffects({ controlEpochEnforcement: false, controlLeases: store });
+    const effects = createEffects({
+      controlEpochEnforcement: false,
+      controlLeases: store,
+    });
     const acquired = await store.claim({
       controlChannel: "ws",
       instanceId: "inst_a",
@@ -300,7 +470,9 @@ describe("WebSocket participant registration compensation", () => {
       assertBroadcastEvents: () => undefined,
       controlEpochEnforcement: false,
       eventSourceId: "src_ws_register_compensation_test",
-      observability: new ModuleObservability({ moduleName: "WsRegisterCompensationTest" }),
+      observability: new ModuleObservability({
+        moduleName: "WsRegisterCompensationTest",
+      }),
       stores,
       wsControlLeaseTtlMs: 60_000,
     });

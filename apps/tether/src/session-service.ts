@@ -6,10 +6,12 @@ import { type DatabasePool, DatabaseService } from "./db.js";
 import { createSessionPersistenceStores } from "./db-stores.js";
 import { ModuleObservability, readModuleObservabilityOptions } from "./observability.js";
 import type { AppendSessionEventInput } from "./protocol.js";
+import { RestControlPolicy, type RestControlOutcomeName } from "./rest-control-policy.js";
 import {
   type ControlEpochGuard,
   type PublicSessionEnsureResult,
   type RestControlledInput,
+  type RestControlReleaseResult,
   type RestTaskClaimRefreshResult,
   type RestTaskMutationResult,
   restControlLeaseTtlMs,
@@ -47,6 +49,16 @@ import {
 } from "./session-service-task-effects.js";
 import type { SessionEvent } from "./types.js";
 
+const restTaskRouteNames = {
+  cancelTaskOverRest: "task.cancel",
+  claimTaskOverRest: "task.claim",
+  completeTaskOverRest: "task.complete",
+  failTaskOverRest: "task.fail",
+  releaseTaskOverRest: "task.release",
+} as const;
+
+type RestTaskOperation = keyof typeof restTaskRouteNames;
+
 export type {
   CancelTaskInput,
   ClientSessionBindingResult,
@@ -57,16 +69,19 @@ export type {
   FailTaskInput,
   HeartbeatParticipantInput,
   ParticipantControlContext,
+  PublicSessionEnsureResult,
   PublishEventInput,
   PublishedEventResult,
   PublishRestEventInput,
-  PublicSessionEnsureResult,
   RecordTaskApprovalInput,
   RegisteredParticipantResult,
+  RegisteredRestParticipantResult,
   RegisterParticipantInput,
   RegisterWebSocketParticipantInput,
   ResolveClientSessionInput,
   RestControlledInput,
+  RestControlReleaseResult,
+  RestParticipantRegistrationResult,
   RestTaskApprovalResult,
   RestTaskClaimRefreshResult,
   RestTaskMutationResult,
@@ -114,9 +129,6 @@ export const SessionServiceEffectLive = Layer.effect(
 );
 
 /**
- * Builds a configured Effect-native session service for local wiring and tests.
- */
-/**
  * Attaches the atomic REST Control Epoch fence to a control-protected input. The
  * guard is present only when the caller supplied an epoch; a legacy epoch-less
  * request carries no guard so the mutation preserves today's behavior.
@@ -137,6 +149,9 @@ function withRestControlGuard<TInput extends RestControlledInput & TaskParticipa
   return { ...input, controlGuard };
 }
 
+/**
+ * Builds a configured Effect-native session service for local wiring and tests.
+ */
 export function createSessionServiceEffect(
   database: DatabasePool,
   options: SessionServiceOptions = {},
@@ -150,7 +165,7 @@ export function createSessionServiceEffect(
   );
   return makeSessionServiceEffect(database, {
     approvalValidators,
-    controlEpochEnforcement: options.controlEpochEnforcement ?? false,
+    controlEpochEnforcement: options.controlEpochEnforcement ?? true,
     eventSourceId,
     observability,
     taskClaimLeaseTtlMs: options.taskClaimLeaseTtlMs ?? taskClaimLeaseTtlMs,
@@ -175,6 +190,7 @@ function makeSessionServiceEffect(
   const claimLeaseTtlMs = options.taskClaimLeaseTtlMs ?? taskClaimLeaseTtlMs;
   const wsLeaseTtlMs = options.wsControlLeaseTtlMs ?? wsControlLeaseTtlMs;
   const stores = createSessionPersistenceStores(database);
+  const restControlPolicy = new RestControlPolicy(options.controlEpochEnforcement ?? true);
   const appendEventEffect = (
     input: AppendSessionEventInput,
   ): Effect.Effect<SessionEvent, SessionServiceFailure> =>
@@ -186,11 +202,13 @@ function makeSessionServiceEffect(
     registerRestParticipantEffect,
     registerWebSocketParticipantEffect,
     releaseControlLeaseEffect,
+    releaseRestControlLeaseEffect,
   } = createSessionControlEffects({
     assertBroadcastEvents: assertBroadcastEventsWithObservability,
-    controlEpochEnforcement: options.controlEpochEnforcement ?? false,
+    controlEpochEnforcement: options.controlEpochEnforcement ?? true,
     eventSourceId,
     observability,
+    restControlPolicy,
     stores,
     wsControlLeaseTtlMs: wsLeaseTtlMs,
   });
@@ -215,6 +233,27 @@ function makeSessionServiceEffect(
     taskClaimLeaseTtlMs: claimLeaseTtlMs,
   });
   const traceEffect = createSessionTraceEffect(observability);
+  const withRestControlOutcome = <TValue, TError>(
+    routeName: string,
+    action: Effect.Effect<TValue, TError>,
+    classify: (value: TValue) => RestControlOutcomeName,
+  ): Effect.Effect<TValue, TError> =>
+    action.pipe(
+      Effect.tap((value) =>
+        Effect.sync(() => {
+          restControlPolicy.record(routeName, classify(value));
+        }),
+      ),
+      Effect.tapError(() =>
+        Effect.sync(() => {
+          restControlPolicy.record(routeName, "persistence_failure");
+        }),
+      ),
+    );
+  const restControlTraceInput = (routeName: string): Record<string, unknown> => ({
+    "rest.control.mode": restControlPolicy.mode(),
+    "rest.control.route": routeName,
+  });
   const {
     archiveClientSessionBindingEffect,
     createSessionEffect,
@@ -235,7 +274,7 @@ function makeSessionServiceEffect(
         expectedCount,
       ),
     claimRestControlEffect,
-    controlEpochEnforcement: options.controlEpochEnforcement ?? false,
+    controlEpochEnforcement: options.controlEpochEnforcement ?? true,
     eventSourceId,
     stores,
   });
@@ -255,24 +294,31 @@ function makeSessionServiceEffect(
     readSessionDebugSummaryEffect,
   } = createSessionReadEffects({ stores });
   const withRestTaskMutationControl = <TInput extends RestControlledInput & TaskParticipantInput>(
-    operation: string,
+    operation: RestTaskOperation,
     input: TInput,
     buildAction: (guarded: TInput) => Effect.Effect<TaskMutationResult, SessionServiceFailure>,
   ): Effect.Effect<RestTaskMutationResult, SessionServiceFailure> =>
     traceEffect(
       operation,
-      taskParticipantTraceInput(input),
-      Effect.gen(function* () {
-        const control = yield* claimRestControlEffect(input);
-        if (control.status !== "ok") {
-          return control;
-        }
-        // The pre-check classifies conflicts and renews the deadline; the guard
-        // built here re-validates the epoch atomically inside the mutation
-        // transaction so a same-instance reconnect cannot slip through the gap.
-        return yield* catchAtomicEpochStale(buildAction(withRestControlGuard(input)));
+      restControlTraceInput(restTaskRouteNames[operation]),
+      withRestControlOutcome(
+        restTaskRouteNames[operation],
+        Effect.gen(function* () {
+          const control = yield* claimRestControlEffect(input, restTaskRouteNames[operation]);
+          if (control.status !== "ok") {
+            return control;
+          }
+          // The pre-check classifies conflicts and renews the deadline; the guard
+          // built here re-validates the epoch atomically inside the mutation
+          // transaction so a same-instance reconnect cannot slip through the gap.
+          return yield* catchAtomicEpochStale(buildAction(withRestControlGuard(input)));
+        }),
+        (result) => classifyProtectedRestOutcome(result.status, input.controlEpoch),
+      ),
+      (result) => ({
+        ...summarizeRestTaskMutationResult(result),
+        "rest.control.outcome": classifyProtectedRestOutcome(result.status, input.controlEpoch),
       }),
-      summarizeRestTaskMutationResult,
     );
   const withRestTaskClaimRefreshControl = <
     TInput extends RestControlledInput & TaskParticipantInput,
@@ -282,15 +328,22 @@ function makeSessionServiceEffect(
   ): Effect.Effect<RestTaskClaimRefreshResult, SessionServiceFailure> =>
     traceEffect(
       "refreshTaskClaimOverRest",
-      taskParticipantTraceInput(input),
-      Effect.gen(function* () {
-        const control = yield* claimRestControlEffect(input);
-        if (control.status !== "ok") {
-          return control;
-        }
-        return yield* catchAtomicEpochStale(buildAction(withRestControlGuard(input)));
+      restControlTraceInput("task.claim.refresh"),
+      withRestControlOutcome(
+        "task.claim.refresh",
+        Effect.gen(function* () {
+          const control = yield* claimRestControlEffect(input, "task.claim.refresh");
+          if (control.status !== "ok") {
+            return control;
+          }
+          return yield* catchAtomicEpochStale(buildAction(withRestControlGuard(input)));
+        }),
+        (result) => classifyProtectedRestOutcome(result.status, input.controlEpoch),
+      ),
+      (result) => ({
+        ...summarizeRestTaskClaimRefreshResult(result),
+        "rest.control.outcome": classifyProtectedRestOutcome(result.status, input.controlEpoch),
       }),
-      summarizeRestTaskClaimRefreshResult,
     );
 
   return {
@@ -298,6 +351,7 @@ function makeSessionServiceEffect(
       ...observability.debugInfo(),
       eventSourceId,
       restControlLeaseTtlMs,
+      restControl: restControlPolicy.debugInfo(),
       taskClaimLeaseTtlMs: claimLeaseTtlMs,
       wsControlLeaseTtlMs: wsLeaseTtlMs,
     }),
@@ -379,7 +433,9 @@ function makeSessionServiceEffect(
         "listParticipantRuntimeSnapshots",
         { sessionId },
         listParticipantRuntimeSnapshotsEffect(sessionId),
-        (participantRuntimes) => ({ participantRuntimeCount: participantRuntimes.length }),
+        (participantRuntimes) => ({
+          participantRuntimeCount: participantRuntimes.length,
+        }),
       ),
     buildSessionContextView: (input) =>
       traceEffect(
@@ -577,11 +633,7 @@ function makeSessionServiceEffect(
     recordTaskApproval: (input) =>
       traceEffect(
         "recordTaskApproval",
-        {
-          ...taskParticipantTraceInput(input),
-          decision: input.decision,
-          targetKey: approvalTargetKey(input.reason),
-        },
+        restControlTraceInput("task.approval"),
         mapTaskApprovalRejection(recordTaskApprovalEffect(input)),
         (result) => ({
           decision: result.decision,
@@ -600,23 +652,28 @@ function makeSessionServiceEffect(
           decision: input.decision,
           targetKey: approvalTargetKey(input.reason),
         },
-        Effect.gen(function* () {
-          const control = yield* claimRestControlEffect(input);
-          if (control.status !== "ok") {
-            return control;
-          }
-          return yield* catchAtomicEpochStale(
-            mapTaskApprovalRejection(
-              recordTaskApprovalEffect(withRestControlGuard(input), "recordTaskApprovalOverRest"),
-            ),
-          );
-        }),
+        withRestControlOutcome(
+          "task.approval",
+          Effect.gen(function* () {
+            const control = yield* claimRestControlEffect(input, "task.approval");
+            if (control.status !== "ok") {
+              return control;
+            }
+            return yield* catchAtomicEpochStale(
+              mapTaskApprovalRejection(
+                recordTaskApprovalEffect(withRestControlGuard(input), "recordTaskApprovalOverRest"),
+              ),
+            );
+          }),
+          (result) => classifyProtectedRestOutcome(result.status, input.controlEpoch),
+        ),
         (result) => ({
           decision: "decision" in result ? result.decision : null,
           eventCount: "events" in result ? result.events.length : 0,
           existingDecision: "existingDecision" in result ? result.existingDecision : null,
           eventId: "event" in result ? result.event.eventId : null,
           status: result.status,
+          "rest.control.outcome": classifyProtectedRestOutcome(result.status, input.controlEpoch),
         }),
       ),
     publishEvent: (input) =>
@@ -641,33 +698,31 @@ function makeSessionServiceEffect(
     publishRestEvent: (input) =>
       traceEffect(
         "publishRestEvent",
-        {
-          eventId: input.eventId ?? null,
-          hasInstance: input.instanceId !== undefined,
-          producerId: input.producerId,
-          sessionId: input.sessionId,
-          type: input.type,
-        },
-        publishRestEventEffect(input),
+        restControlTraceInput("session.events.append"),
+        withRestControlOutcome("session.events.append", publishRestEventEffect(input), (result) =>
+          classifyProtectedRestOutcome(result.status, input.controlEpoch),
+        ),
         (result) => ({
           conflictReason: result.status === "conflict" ? "event_id_conflict" : null,
           eventCount: "events" in result ? result.events.length : 0,
           replayReason: result.status === "replayed" ? "event_id_replay" : null,
+          "rest.control.outcome": classifyProtectedRestOutcome(result.status, input.controlEpoch),
           status: result.status,
         }),
       ),
     registerRestParticipant: (input) =>
       traceEffect(
         "registerRestParticipant",
-        {
-          hasParticipantId: input.participantId !== undefined,
-          runtimeKind: input.runtimeKind,
-          sessionId: input.sessionId,
-        },
-        registerRestParticipantEffect(input),
+        restControlTraceInput("session.participant.register"),
+        withRestControlOutcome(
+          "session.participant.register",
+          registerRestParticipantEffect(input),
+          classifyAcquisitionOutcome,
+        ),
         (result) => ({
           eventCount: result.status === "ok" ? result.events.length : 0,
           registrationStatus: result.status === "ok" ? result.registrationStatus : null,
+          "rest.control.outcome": classifyAcquisitionOutcome(result),
           status: result.status,
         }),
       ),
@@ -699,15 +754,16 @@ function makeSessionServiceEffect(
     heartbeatRestParticipant: (input) =>
       traceEffect(
         "heartbeatRestParticipant",
-        {
-          hasCapabilities: input.capabilities !== undefined,
-          participantId: input.participantId,
-          sessionId: input.sessionId,
-        },
-        heartbeatRestParticipantEffect(input),
+        restControlTraceInput("session.participant.heartbeat"),
+        withRestControlOutcome(
+          "session.participant.heartbeat",
+          heartbeatRestParticipantEffect(input),
+          (result) => classifyProtectedRestOutcome(result.status, input.controlEpoch),
+        ),
         (result) => ({
           eventCount: result.status === "ok" ? result.events.length : 0,
           participantFound: result.status === "ok" && result.participant !== null,
+          "rest.control.outcome": classifyProtectedRestOutcome(result.status, input.controlEpoch),
           status: result.status,
         }),
       ),
@@ -721,5 +777,56 @@ function makeSessionServiceEffect(
         },
         releaseControlLeaseEffect(input),
       ),
+    releaseRestControlLease: (
+      input,
+    ): Effect.Effect<RestControlReleaseResult, SessionServiceFailure> =>
+      traceEffect(
+        "releaseRestControlLease",
+        restControlTraceInput("session.participant.control.release"),
+        withRestControlOutcome(
+          "session.participant.control.release",
+          releaseRestControlLeaseEffect(input),
+          (result) => classifyProtectedRestOutcome(result.status, input.controlEpoch),
+        ),
+        (result) => ({
+          released: result.status === "ok" ? result.released : false,
+          "rest.control.outcome": classifyProtectedRestOutcome(result.status, input.controlEpoch),
+          status: result.status,
+        }),
+      ),
   };
+}
+
+/** Maps one final protected REST result onto the bounded control telemetry taxonomy. */
+function classifyProtectedRestOutcome(
+  status: string,
+  controlEpoch: number | undefined,
+): RestControlOutcomeName {
+  if (status === "control_epoch_required") {
+    return "epoch_required";
+  }
+  if (status === "control_epoch_stale") {
+    return "epoch_stale";
+  }
+  if (status === "control_conflict") {
+    return "control_conflict";
+  }
+  return controlEpoch === undefined ? "unfenced_accepted" : "fenced_accepted";
+}
+
+/** Maps one final acquisition result onto the bounded control telemetry taxonomy. */
+function classifyAcquisitionOutcome(result: {
+  readonly acquisitionStatus?: string | undefined;
+  readonly status: string;
+}): RestControlOutcomeName {
+  if (result.status === "control_acquisition_id_required") {
+    return "acquisition_id_required";
+  }
+  if (result.status === "control_acquisition_stale") {
+    return "acquisition_stale";
+  }
+  if (result.status === "control_conflict") {
+    return "control_conflict";
+  }
+  return result.acquisitionStatus === "replayed" ? "acquisition_replayed" : "fenced_accepted";
 }

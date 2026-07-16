@@ -29,6 +29,10 @@ function isActiveLeaseSelect(sql: string): boolean {
   return sql.includes("FROM participant_control_leases") && sql.includes("FOR UPDATE");
 }
 
+function isDatabaseClockSelect(sql: string): boolean {
+  return sql.includes("SELECT clock_timestamp()");
+}
+
 function isMaxEpochSelect(sql: string): boolean {
   return sql.includes("max(epoch)");
 }
@@ -54,6 +58,11 @@ class ScriptedLeaseClient {
 
   async query<TRow>(sql: string, params?: readonly unknown[]): Promise<{ readonly rows: TRow[] }> {
     this.queries.push({ params, sql });
+    if (isDatabaseClockSelect(sql)) {
+      return {
+        rows: [{ now: new Date("2026-07-12T00:00:00.000Z") } as unknown as TRow],
+      };
+    }
     if (isActiveLeaseSelect(sql)) {
       return { rows: [leaseDbRow(this.currentEpoch)] as TRow[] };
     }
@@ -106,7 +115,7 @@ describe("claimControlLease generation history", () => {
     const supersedeSql = supersede?.sql ?? "";
     // The prior generation is retained as an immutable row: the supersession only
     // sets superseded_at (no DELETE), so epoch 7's row still exists as history.
-    expect(supersedeSql).toContain("SET superseded_at = now()");
+    expect(supersedeSql).toContain("SET superseded_at = clock_timestamp()");
     expect(supersedeSql).not.toContain("DELETE");
     // The fence now covers this instance's own current row too (no instance_id <>
     // exclusion), so the same-instance prior generation is superseded rather than
@@ -136,6 +145,11 @@ describe("claimControlLease generation history", () => {
         params?: readonly unknown[],
       ): Promise<{ readonly rows: TRow[] }> {
         this.queries.push({ params, sql });
+        if (isDatabaseClockSelect(sql)) {
+          return {
+            rows: [{ now: new Date("2026-07-12T00:00:00.000Z") } as unknown as TRow],
+          };
+        }
         if (isActiveLeaseSelect(sql)) {
           return { rows: [] };
         }

@@ -1,4 +1,11 @@
+import type {
+  ControlEpochGuard,
+  EnsureScheduledRunInput,
+  ScheduledTaskIdentityInput,
+  SupersedeScheduledRunsInput,
+} from "./db.js";
 import {
+  acquireRestParticipantControl,
   appendEvent,
   appendEventIdempotent,
   archiveClientSessionBinding,
@@ -7,9 +14,9 @@ import {
   claimTaskWithEvent,
   completeTaskWithEvent,
   createSession,
-  deleteSession,
   createTaskWithEventIdempotent,
   type DatabasePool,
+  deleteSession,
   ensureScheduledRunWithEvents,
   expireTaskClaims,
   failTaskWithEvent,
@@ -30,18 +37,13 @@ import {
   recordTaskApproval,
   refreshTaskClaim,
   releaseControlLease,
-  renewControlLease,
+  releaseRestControlLease,
   releaseTaskWithEvent,
+  renewControlLease,
   supersedeScheduledRunsWithEvent,
   upsertClientSessionBinding,
   upsertParticipant,
   upsertParticipantWithEvent,
-} from "./db.js";
-import type {
-  ControlEpochGuard,
-  EnsureScheduledRunInput,
-  ScheduledTaskIdentityInput,
-  SupersedeScheduledRunsInput,
 } from "./db.js";
 import type {
   ClientBindingStore,
@@ -94,6 +96,20 @@ class DbClientBindingStore implements ClientBindingStore {
 class DbControlLeaseStore implements ControlLeaseStore {
   constructor(private readonly database: DatabasePool) {}
 
+  acquireRest(input: {
+    readonly acquisitionId: string;
+    readonly capabilities: Record<string, unknown>;
+    readonly displayName: string;
+    readonly eventSourceId: string;
+    readonly instanceId: string;
+    readonly leaseTtlMs: number;
+    readonly participantId: string;
+    readonly runtimeKind: string;
+    readonly sessionId: string;
+  }) {
+    return acquireRestParticipantControl(this.database, input);
+  }
+
   claim(input: {
     readonly controlChannel: "rest" | "ws";
     readonly instanceId: string;
@@ -128,6 +144,15 @@ class DbControlLeaseStore implements ControlLeaseStore {
   }) {
     return releaseControlLease(this.database, input);
   }
+
+  releaseRest(input: {
+    readonly controlEpoch: number;
+    readonly instanceId: string;
+    readonly participantId: string;
+    readonly sessionId: string;
+  }) {
+    return releaseRestControlLease(this.database, input);
+  }
 }
 
 class DbSessionEventStore implements SessionEventStore {
@@ -135,14 +160,20 @@ class DbSessionEventStore implements SessionEventStore {
 
   append(
     input: AppendSessionEventInput,
-    options: { readonly controlGuard?: ControlEpochGuard | undefined; readonly sourceId: string },
+    options: {
+      readonly controlGuard?: ControlEpochGuard | undefined;
+      readonly sourceId: string;
+    },
   ) {
     return appendEvent(this.database, input, options);
   }
 
   appendIdempotent(
     input: AppendSessionEventInput,
-    options: { readonly controlGuard?: ControlEpochGuard | undefined; readonly sourceId: string },
+    options: {
+      readonly controlGuard?: ControlEpochGuard | undefined;
+      readonly sourceId: string;
+    },
   ) {
     return appendEventIdempotent(this.database, input, options);
   }

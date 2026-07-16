@@ -114,14 +114,24 @@ export async function requestClientBridgeJson<TSchema extends z.ZodType>(
       message: "Failed to reach Tether service",
     });
   }
-  const payload = await readResponseJson(response);
+  let payload: unknown;
+  try {
+    payload = await readResponseJson(response);
+  } catch (error) {
+    throw new ClientBridgeRequestError({
+      cause: error,
+      code: "NETWORK_ERROR",
+      details: { method: input.method, path: input.path },
+      message: "Failed while reading Tether response",
+    });
+  }
   if (!response.ok) {
     throw new ClientBridgeRequestError({
       code: "HTTP_ERROR",
       details: {
         method: input.method,
         path: input.path,
-        payload,
+        serverCode: readServerCode(payload),
         status: response.status,
       },
       message: `Tether request failed with HTTP ${response.status}`,
@@ -137,6 +147,19 @@ export async function requestClientBridgeJson<TSchema extends z.ZodType>(
     });
   }
   return parsed.data;
+}
+
+/** Reads only the stable public error code from an HTTP failure payload. */
+function readServerCode(payload: unknown): string | null {
+  if (
+    typeof payload === "object" &&
+    payload !== null &&
+    "code" in payload &&
+    typeof payload.code === "string"
+  ) {
+    return payload.code;
+  }
+  return null;
 }
 
 /** Fetch implementation used when callers do not inject one. */

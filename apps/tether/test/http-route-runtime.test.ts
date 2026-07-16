@@ -4,15 +4,93 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 
 import { AuthError } from "../src/auth/token.js";
+import { projectHealthResponse } from "../src/http.js";
+import { fencedHttpRouteNames, httpRouteInventory } from "../src/http-route-inventory.js";
 import {
   controlLeaseConflictError,
-  handleHttpRouteError,
-  sendAuthError,
   type HttpRouteErrorLogDetails,
   type HttpRouteErrorLogger,
+  handleHttpRouteError,
+  sendAuthError,
+  sendControlEpochRequired,
 } from "../src/http-route-runtime.js";
+import { RestControlPolicy } from "../src/rest-control-policy.js";
 
 describe("handleHttpRouteError", () => {
+  it("classifies every declared route and inventories participant-owned mutations", () => {
+    expect(httpRouteInventory.every((route) => route.control.length > 0)).toBe(true);
+    expect(
+      httpRouteInventory
+        .filter((route) => route.control === "acquisition")
+        .map((route) => route.name),
+    ).toEqual(["session.participant.register"]);
+    expect(fencedHttpRouteNames).toEqual([
+      "session.events.append",
+      "session.participant.control.release",
+      "session.participant.heartbeat",
+      "task.approval",
+      "task.cancel",
+      "task.claim",
+      "task.claim.refresh",
+      "task.complete",
+      "task.fail",
+      "task.release",
+    ]);
+  });
+
+  it("returns a distinct required response for an enforced missing epoch", () => {
+    const response = createJsonResponseRecorder();
+    const policy = new RestControlPolicy(true);
+
+    expect(
+      policy.authorize({
+        controlEpoch: undefined,
+        routeName: "task.cancel",
+      }),
+    ).toEqual({ status: "control_epoch_required" });
+    policy.record("task.cancel", "epoch_required");
+    sendControlEpochRequired(response.response);
+
+    expect(response.statusCode).toBe(428);
+    expect(response.body).toEqual({
+      code: "CONTROL_EPOCH_REQUIRED",
+      error: "Control epoch is required",
+      recovery: "acquire_control",
+    });
+    expect(policy.debugInfo()).toMatchObject({
+      counts: { "task.cancel": { epoch_required: 1 } },
+      mode: "enforced",
+    });
+  });
+
+  it("accepts a compatibility missing epoch without inventing durable context", () => {
+    const policy = new RestControlPolicy(false);
+
+    expect(
+      policy.authorize({
+        controlEpoch: undefined,
+        routeName: "task.cancel",
+      }),
+    ).toEqual({ status: "accepted_unfenced" });
+    policy.record("task.cancel", "unfenced_accepted");
+    expect(policy.debugInfo()).toMatchObject({
+      counts: { "task.cancel": { unfenced_accepted: 1 } },
+      lastFailure: null,
+      mode: "compatibility",
+    });
+  });
+
+  it("keeps compatibility health ready with one stable warning", () => {
+    const compatibility = new RestControlPolicy(false);
+    const enforced = new RestControlPolicy(true);
+
+    expect(projectHealthResponse(compatibility.debugInfo())).toEqual({
+      ok: true,
+      warnings: ["REST_CONTROL_COMPATIBILITY_ENABLED"],
+    });
+    expect(projectHealthResponse(enforced.debugInfo())).toEqual({ ok: true });
+  });
+
   it("redacts unexpected Error details from public 500 responses and logs them with a request id", () => {
     const response = createJsonResponseRecorder();
     const logs: RouteErrorLog[] = [];
@@ -132,6 +210,7 @@ describe("handleHttpRouteError", () => {
 
     expect(conflict).toEqual({
       activeControlChannel: "ws",
+      code: "CONTROL_CONFLICT",
       error: "Participant already has an active control channel",
       instanceId: "inst_active",
       leaseExpiresAt: "2026-07-06T00:01:00.000Z",

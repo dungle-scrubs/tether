@@ -281,6 +281,10 @@ describe("ClientBridgeTaskClient", () => {
     const requests: CapturedRequest[] = [];
     const fetch = createJsonFetch(requests, [
       {
+        body: createControlAcquisitionFixture(),
+        status: 201,
+      },
+      {
         body: {
           task: createTaskFixture({
             cancelledAt: "2026-01-01T00:00:01.000Z",
@@ -292,12 +296,10 @@ describe("ClientBridgeTaskClient", () => {
         status: 200,
       },
     ]);
-    const client = new ClientBridgeTaskClient({ serviceUrl: "http://tether.test" }, { fetch });
+    const client = new ClientBridgeTaskClient(createControlledTaskClientConfig(), { fetch });
 
     await expect(
       client.cancelTask("sess_1", {
-        instanceId: "inst_bridge",
-        participantId: "part_bridge",
         reason: { chatId: "123", source: "external-chat" },
         taskId: "task_1",
       }),
@@ -309,6 +311,20 @@ describe("ClientBridgeTaskClient", () => {
     expect(requests).toEqual([
       {
         body: {
+          acquisitionId: expect.any(String),
+          capabilities: {},
+          controlChannel: "rest",
+          displayName: "part_bridge",
+          instanceId: "inst_bridge",
+          participantId: "part_bridge",
+          runtimeKind: "generic_agent",
+        },
+        method: "POST",
+        path: "/sessions/sess_1/participants",
+      },
+      {
+        body: {
+          controlEpoch: 1,
           instanceId: "inst_bridge",
           participantId: "part_bridge",
           reason: { chatId: "123", source: "external-chat" },
@@ -328,6 +344,10 @@ describe("ClientBridgeTaskClient", () => {
     });
     const fetch = createJsonFetch(requests, [
       {
+        body: createControlAcquisitionFixture(),
+        status: 201,
+      },
+      {
         body: {
           decision: "approved",
           event: createSessionEventFixture({
@@ -341,13 +361,11 @@ describe("ClientBridgeTaskClient", () => {
         status: 200,
       },
     ]);
-    const client = new ClientBridgeTaskClient({ serviceUrl: "http://tether.test" }, { fetch });
+    const client = new ClientBridgeTaskClient(createControlledTaskClientConfig(), { fetch });
 
     await expect(
       client.recordTaskApproval("sess_1", {
         decision: "approved",
-        instanceId: "inst_bridge",
-        participantId: "part_bridge",
         reason: { chatId: "123", source: "external-chat" },
         taskId: "task_1",
       }),
@@ -366,6 +384,20 @@ describe("ClientBridgeTaskClient", () => {
     expect(requests).toEqual([
       {
         body: {
+          acquisitionId: expect.any(String),
+          capabilities: {},
+          controlChannel: "rest",
+          displayName: "part_bridge",
+          instanceId: "inst_bridge",
+          participantId: "part_bridge",
+          runtimeKind: "generic_agent",
+        },
+        method: "POST",
+        path: "/sessions/sess_1/participants",
+      },
+      {
+        body: {
+          controlEpoch: 1,
           decision: "approved",
           instanceId: "inst_bridge",
           participantId: "part_bridge",
@@ -386,6 +418,10 @@ describe("ClientBridgeTaskClient", () => {
     });
     const fetch = createJsonFetch(requests, [
       {
+        body: createControlAcquisitionFixture(),
+        status: 201,
+      },
+      {
         body: {
           decision: "rejected",
           existingDecision: "approved",
@@ -396,13 +432,11 @@ describe("ClientBridgeTaskClient", () => {
         status: 200,
       },
     ]);
-    const client = new ClientBridgeTaskClient({ serviceUrl: "http://tether.test" }, { fetch });
+    const client = new ClientBridgeTaskClient(createControlledTaskClientConfig(), { fetch });
 
     await expect(
       client.recordTaskApproval("sess_1", {
         decision: "rejected",
-        instanceId: "inst_bridge",
-        participantId: "part_bridge",
         taskId: "task_1",
       }),
     ).resolves.toEqual({
@@ -412,6 +446,236 @@ describe("ClientBridgeTaskClient", () => {
       status: "ignored",
       task,
     });
+  });
+
+  it("reuses one session acquisition for cancellation and approval, then releases on shutdown", async () => {
+    const requests: CapturedRequest[] = [];
+    const task = createTaskFixture({
+      objective: "handle request",
+      sessionId: "sess_1",
+      taskId: "task_1",
+    });
+    const fetch = createJsonFetch(requests, [
+      { body: createControlAcquisitionFixture(), status: 201 },
+      { body: { task }, status: 200 },
+      {
+        body: {
+          decision: "approved",
+          event: createSessionEventFixture({
+            eventId: "evt_approval_reuse",
+            sessionId: "sess_1",
+            type: "approval.recorded",
+          }),
+          status: "recorded",
+          task,
+        },
+        status: 200,
+      },
+      { body: { released: true }, status: 200 },
+    ]);
+    const client = new ClientBridgeTaskClient(createControlledTaskClientConfig(), { fetch });
+
+    await client.cancelTask("sess_1", { taskId: "task_1" });
+    await client.recordTaskApproval("sess_1", {
+      decision: "approved",
+      taskId: "task_1",
+    });
+    await client.shutdown();
+
+    expect(requests.map((request) => request.path)).toEqual([
+      "/sessions/sess_1/participants",
+      "/sessions/sess_1/tasks/task_1/cancel",
+      "/sessions/sess_1/tasks/task_1/approval",
+      "/sessions/sess_1/participants/part_bridge/control/release",
+    ]);
+    expect(requests[1]?.body).toMatchObject({ controlEpoch: 1 });
+    expect(requests[2]?.body).toMatchObject({ controlEpoch: 1 });
+  });
+
+  it("invalidates the matching context after an uncertain protected mutation", async () => {
+    const requests: CapturedRequest[] = [];
+    let requestIndex = 0;
+    const task = createTaskFixture({
+      objective: "handle request",
+      sessionId: "sess_1",
+      taskId: "task_1",
+    });
+    const client = new ClientBridgeTaskClient(createControlledTaskClientConfig(), {
+      fetch: async (url, init) => {
+        const request = {
+          body: typeof init.body === "string" ? JSON.parse(init.body) : null,
+          method: init.method ?? "GET",
+          path: `${url.pathname}${url.search}`,
+        };
+        requests.push(request);
+        requestIndex += 1;
+        if (requestIndex === 1 || requestIndex === 3) {
+          return new Response(
+            JSON.stringify(
+              createControlAcquisitionFixture(
+                typeof request.body === "object" &&
+                  request.body !== null &&
+                  "acquisitionId" in request.body &&
+                  typeof request.body.acquisitionId === "string"
+                  ? request.body.acquisitionId
+                  : "acq_missing",
+              ),
+            ),
+            { status: 201 },
+          );
+        }
+        if (requestIndex === 2) {
+          throw new Error("mutation response lost");
+        }
+        return new Response(
+          JSON.stringify({
+            decision: "approved",
+            event: createSessionEventFixture({
+              eventId: "evt_after_uncertain",
+              sessionId: "sess_1",
+              type: "approval.recorded",
+            }),
+            status: "recorded",
+            task,
+          }),
+          { headers: { "content-type": "application/json" }, status: 200 },
+        );
+      },
+    });
+
+    await expect(client.cancelTask("sess_1", { taskId: "task_1" })).rejects.toMatchObject({
+      code: "NETWORK_ERROR",
+    });
+    await client.recordTaskApproval("sess_1", {
+      decision: "approved",
+      taskId: "task_1",
+    });
+
+    expect(requests.map((request) => request.path)).toEqual([
+      "/sessions/sess_1/participants",
+      "/sessions/sess_1/tasks/task_1/cancel",
+      "/sessions/sess_1/participants",
+      "/sessions/sess_1/tasks/task_1/approval",
+    ]);
+  });
+
+  it("invalidates the matching context when a protected response body is lost", async () => {
+    const requests: CapturedRequest[] = [];
+    let requestIndex = 0;
+    const task = createTaskFixture({
+      objective: "handle request",
+      sessionId: "sess_1",
+      taskId: "task_1",
+    });
+    const client = new ClientBridgeTaskClient(createControlledTaskClientConfig(), {
+      fetch: async (url, init) => {
+        const request: CapturedRequest = {
+          body: typeof init.body === "string" ? JSON.parse(init.body) : null,
+          method: init.method ?? "GET",
+          path: `${url.pathname}${url.search}`,
+        };
+        requests.push(request);
+        requestIndex += 1;
+        if (requestIndex === 1 || requestIndex === 3) {
+          const acquisitionId =
+            typeof request.body === "object" &&
+            request.body !== null &&
+            "acquisitionId" in request.body &&
+            typeof request.body.acquisitionId === "string"
+              ? request.body.acquisitionId
+              : "acq_missing";
+          return new Response(JSON.stringify(createControlAcquisitionFixture(acquisitionId)), {
+            headers: { "content-type": "application/json" },
+            status: 201,
+          });
+        }
+        if (requestIndex === 2) {
+          return new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.error(new Error("response body lost"));
+              },
+            }),
+            {
+              headers: { "content-type": "application/json" },
+              status: 200,
+            },
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            decision: "approved",
+            event: createSessionEventFixture({
+              eventId: "evt_after_body_loss",
+              sessionId: "sess_1",
+              type: "approval.recorded",
+            }),
+            status: "recorded",
+            task,
+          }),
+          { headers: { "content-type": "application/json" }, status: 200 },
+        );
+      },
+    });
+
+    await expect(client.cancelTask("sess_1", { taskId: "task_1" })).rejects.toMatchObject({
+      code: "NETWORK_ERROR",
+    });
+    await client.recordTaskApproval("sess_1", {
+      decision: "approved",
+      taskId: "task_1",
+    });
+
+    expect(requests.map((request) => request.path)).toEqual([
+      "/sessions/sess_1/participants",
+      "/sessions/sess_1/tasks/task_1/cancel",
+      "/sessions/sess_1/participants",
+      "/sessions/sess_1/tasks/task_1/approval",
+    ]);
+  });
+
+  it("invalidates the matching context after a REST control conflict", async () => {
+    const requests: CapturedRequest[] = [];
+    const task = createTaskFixture({
+      objective: "handle request",
+      sessionId: "sess_1",
+      taskId: "task_1",
+    });
+    const fetch = createJsonFetch(requests, [
+      { body: createControlAcquisitionFixture(), status: 201 },
+      { body: { code: "CONTROL_CONFLICT" }, status: 409 },
+      { body: createControlAcquisitionFixture(), status: 201 },
+      {
+        body: {
+          decision: "approved",
+          event: createSessionEventFixture({
+            eventId: "evt_after_conflict",
+            sessionId: "sess_1",
+            type: "approval.recorded",
+          }),
+          status: "recorded",
+          task,
+        },
+        status: 200,
+      },
+    ]);
+    const client = new ClientBridgeTaskClient(createControlledTaskClientConfig(), { fetch });
+
+    await expect(client.cancelTask("sess_1", { taskId: "task_1" })).rejects.toMatchObject({
+      code: "HTTP_ERROR",
+      details: { serverCode: "CONTROL_CONFLICT", status: 409 },
+    });
+    await client.recordTaskApproval("sess_1", {
+      decision: "approved",
+      taskId: "task_1",
+    });
+
+    expect(requests.map((request) => request.path)).toEqual([
+      "/sessions/sess_1/participants",
+      "/sessions/sess_1/tasks/task_1/cancel",
+      "/sessions/sess_1/participants",
+      "/sessions/sess_1/tasks/task_1/approval",
+    ]);
   });
 
   it("returns typed errors for invalid task responses", async () => {
@@ -434,7 +698,10 @@ describe("ClientBridgeTaskClient", () => {
 
   it("maps malformed scheduled responses without exposing the raw payload", async () => {
     const scheduleWindow = computeScheduleWindow(1_700_000_123_456, 3_600_000);
-    const mailboxScope = { accountId: "raw_payload_marker", provider: "fastmail" };
+    const mailboxScope = {
+      accountId: "raw_payload_marker",
+      provider: "fastmail",
+    };
     const task = createTaskFixture({
       objective: "organize mailbox",
       schedule: { mailboxScope, scheduleWindow },
@@ -498,6 +765,29 @@ interface CapturedRequest {
   readonly path: string;
 }
 
+function createControlledTaskClientConfig() {
+  return {
+    control: {
+      instanceId: "inst_bridge",
+      participantId: "part_bridge",
+      runtimeKind: "generic_agent",
+    },
+    serviceUrl: "http://tether.test",
+  } as const;
+}
+
+function createControlAcquisitionFixture(acquisitionId = "acq_bridge") {
+  return {
+    acquisitionId,
+    acquisitionStatus: "claimed",
+    controlEpoch: 1,
+    leaseExpiresAt: "2026-07-16T12:01:00.000Z",
+    participant: { participantId: "part_bridge" },
+    registrationStatus: "joined",
+    renewAfterMs: 30_000,
+  } as const;
+}
+
 interface JsonResponse {
   readonly body: unknown;
   readonly status: number;
@@ -513,17 +803,30 @@ function createJsonFetch(
 ): ClientBridgeFetch {
   let index = 0;
   return async (url, init) => {
-    requests.push({
+    const request: CapturedRequest = {
       body: typeof init.body === "string" ? JSON.parse(init.body) : null,
       method: init.method ?? "GET",
       path: `${url.pathname}${url.search}`,
-    });
+    };
+    requests.push(request);
     const response = responses[index];
     index += 1;
     if (!response) {
       throw new Error("No queued response");
     }
-    return new Response(JSON.stringify(response.body), {
+    const responseBody =
+      typeof response.body === "object" &&
+      response.body !== null &&
+      "acquisitionStatus" in response.body &&
+      typeof request.body === "object" &&
+      request.body !== null &&
+      "acquisitionId" in request.body
+        ? {
+            ...response.body,
+            acquisitionId: (request.body as Record<string, unknown>).acquisitionId,
+          }
+        : response.body;
+    return new Response(JSON.stringify(responseBody), {
       headers: { "content-type": "application/json" },
       status: response.status,
     });

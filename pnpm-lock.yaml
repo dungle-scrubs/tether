@@ -115,6 +115,9 @@ importers:
 
   packages/client-bridge:
     dependencies:
+      '@dungle-scrubs/tether-client':
+        specifier: workspace:*
+        version: link:../client
       '@dungle-scrubs/tether-protocol':
         specifier: workspace:*
         version: link:../protocol

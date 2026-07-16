@@ -10,9 +10,18 @@ import {
 } from "./auth/authorize.js";
 import type { AuthContext } from "./auth/token.js";
 import {
+  findProjectedSession,
+  type HostPresenceRuntime,
+  permanentDeleteEligibility,
+  projectSessionInventory,
+} from "./host-presence.js";
+import {
   broadcastEvents,
   parseJsonBody,
   sendAuthError,
+  sendControlAcquisitionIdRequired,
+  sendControlAcquisitionStale,
+  sendControlEpochRequired,
   sendControlEpochStale,
   sendControlLeaseConflict,
   sendJson,
@@ -25,17 +34,12 @@ import {
   heartbeatParticipantSchema,
   parseAfterSeq,
   registerParticipantSchema,
+  releaseParticipantControlEnvelopeSchema,
 } from "./protocol.js";
 import { parseEventListLimit, type ResourceLimits } from "./resource-limits.js";
 import { authorizeClientPublishedEvent } from "./session-event-publish-policy.js";
 import type { SessionServiceEffect } from "./session-service.js";
 import type { SessionEvent } from "./types.js";
-import {
-  findProjectedSession,
-  permanentDeleteEligibility,
-  projectSessionInventory,
-  type HostPresenceRuntime,
-} from "./host-presence.js";
 
 interface SessionHttpRouteHandlerInput {
   readonly authContext: AuthContext | null;
@@ -48,48 +52,75 @@ interface SessionHttpRouteHandlerInput {
   readonly url: URL;
 }
 
-const sessionResourceRoutes = {
+export const sessionResourceRoutes = {
+  create: defineHttpRoute({
+    control: "not-applicable",
+    method: "POST",
+    name: "session.create",
+    pattern: /^\/sessions$/u,
+  }),
   context: defineHttpRoute({
+    control: "not-applicable",
     method: "GET",
     name: "session.context",
     pattern: /^\/sessions\/([^/]+)\/context$/u,
   }),
   delete: defineHttpRoute({
+    control: "not-applicable",
     method: "POST",
     name: "session.delete",
     pattern: /^\/sessions\/([^/]+)\/delete$/u,
   }),
   eventsAppend: defineHttpRoute({
+    control: "fenced",
     method: "POST",
     name: "session.events.append",
     pattern: /^\/sessions\/([^/]+)\/events$/u,
   }),
   eventsList: defineHttpRoute({
+    control: "not-applicable",
     method: "GET",
     name: "session.events.list",
     pattern: /^\/sessions\/([^/]+)\/events$/u,
   }),
   heartbeat: defineHttpRoute({
+    control: "fenced",
     method: "POST",
     name: "session.participant.heartbeat",
     pattern: /^\/sessions\/([^/]+)\/participants\/([^/]+)\/heartbeat$/u,
   }),
+  controlRelease: defineHttpRoute({
+    control: "fenced",
+    method: "POST",
+    name: "session.participant.control.release",
+    pattern: /^\/sessions\/([^/]+)\/participants\/([^/]+)\/control\/release$/u,
+  }),
   participantList: defineHttpRoute({
+    control: "not-applicable",
     method: "GET",
     name: "session.participant.list",
     pattern: /^\/sessions\/([^/]+)\/participants$/u,
   }),
   participantRegister: defineHttpRoute({
+    control: "acquisition",
     method: "POST",
     name: "session.participant.register",
     pattern: /^\/sessions\/([^/]+)\/participants$/u,
   }),
+  list: defineHttpRoute({
+    control: "not-applicable",
+    method: "GET",
+    name: "session.list",
+    pattern: /^\/sessions$/u,
+  }),
   taskContractList: defineHttpRoute({
+    control: "not-applicable",
     method: "GET",
     name: "session.task-contract.list",
     pattern: /^\/sessions\/([^/]+)\/task-contracts$/u,
   }),
   taskContractRead: defineHttpRoute({
+    control: "not-applicable",
     method: "GET",
     name: "session.task-contract.read",
     pattern: /^\/sessions\/([^/]+)\/task-contracts\/([^/]+)$/u,
@@ -101,6 +132,11 @@ type SessionResourceRouteMatch =
   | { readonly resource: "delete"; readonly sessionId: string }
   | { readonly resource: "events-append"; readonly sessionId: string }
   | { readonly resource: "events-list"; readonly sessionId: string }
+  | {
+      readonly participantId: string;
+      readonly resource: "control-release";
+      readonly sessionId: string;
+    }
   | {
       readonly participantId: string;
       readonly resource: "heartbeat";
@@ -121,7 +157,7 @@ export function handleSessionHttpRoute(
 ): Effect.Effect<boolean, unknown> {
   return Effect.gen(function* () {
     const { hub, request, response, service, url } = input;
-    if (request.method === "GET" && url.pathname === "/sessions") {
+    if (matchHttpRoute(sessionResourceRoutes.list, request.method, url.pathname)) {
       if (!authorizeRoute(input, "read")) {
         return true;
       }
@@ -139,7 +175,7 @@ export function handleSessionHttpRoute(
       });
       return true;
     }
-    if (request.method === "POST" && url.pathname === "/sessions") {
+    if (matchHttpRoute(sessionResourceRoutes.create, request.method, url.pathname)) {
       if (!authorizeRoute(input, "session-create")) {
         return true;
       }
@@ -147,7 +183,9 @@ export function handleSessionHttpRoute(
         maxBytes: input.resourceLimits.httpMaxBodyBytes,
         routeName: "session.create",
       });
-      const result = yield* service.ensurePublicSession({ sessionId: body.sessionId });
+      const result = yield* service.ensurePublicSession({
+        sessionId: body.sessionId,
+      });
       sendJson(response, 201, { session: result.session });
       return true;
     }
@@ -175,7 +213,9 @@ export function handleSessionHttpRoute(
         });
         return true;
       }
-      const deleted = yield* service.deleteSession({ sessionId: route.sessionId });
+      const deleted = yield* service.deleteSession({
+        sessionId: route.sessionId,
+      });
       sendJson(
         response,
         deleted ? 200 : 404,
@@ -223,7 +263,10 @@ export function handleSessionHttpRoute(
         type: body.type,
       });
       if (publishPolicy.status === "denied") {
-        sendJson(response, 403, { error: "Forbidden", reason: publishPolicy.reason });
+        sendJson(response, 403, {
+          error: "Forbidden",
+          reason: publishPolicy.reason,
+        });
         return true;
       }
       const result = yield* service.publishRestEvent({
@@ -237,6 +280,10 @@ export function handleSessionHttpRoute(
       });
       if (result.status === "control_conflict") {
         sendControlLeaseConflict(response, result.leaseClaim, "rest");
+        return true;
+      }
+      if (result.status === "control_epoch_required") {
+        sendControlEpochRequired(response);
         return true;
       }
       if (result.status === "control_epoch_stale") {
@@ -282,10 +329,13 @@ export function handleSessionHttpRoute(
       }
       const participantId = effectiveParticipantId(input.authContext, body.participantId);
       if (body.controlChannel !== "rest") {
-        sendJson(response, 400, { error: "REST registration requires controlChannel=rest" });
+        sendJson(response, 400, {
+          error: "REST registration requires controlChannel=rest",
+        });
         return true;
       }
       const result = yield* service.registerRestParticipant({
+        acquisitionId: body.acquisitionId,
         capabilities: body.capabilities,
         displayName: body.displayName ?? participantId,
         instanceId: body.instanceId,
@@ -297,15 +347,31 @@ export function handleSessionHttpRoute(
         sendControlLeaseConflict(response, result.leaseClaim, "rest");
         return true;
       }
+      if (result.status === "control_acquisition_id_required") {
+        sendControlAcquisitionIdRequired(response);
+        return true;
+      }
+      if (result.status === "control_acquisition_stale") {
+        sendControlAcquisitionStale(response);
+        return true;
+      }
+      if (result.status === "control_epoch_required") {
+        sendControlEpochRequired(response);
+        return true;
+      }
       if (result.status === "control_epoch_stale") {
         sendControlEpochStale(response, result.currentEpoch);
         return true;
       }
       broadcastEvents(hub, result.events);
-      sendJson(response, 201, {
+      sendJson(response, result.acquisitionStatus === "replayed" ? 200 : 201, {
+        ...(result.acquisitionId.length > 0 ? { acquisitionId: result.acquisitionId } : {}),
+        acquisitionStatus: result.acquisitionStatus,
         controlEpoch: result.controlEpoch,
+        leaseExpiresAt: result.leaseExpiresAt,
         participant: result.participant,
         registrationStatus: result.registrationStatus,
+        renewAfterMs: result.renewAfterMs,
       });
       return true;
     }
@@ -329,7 +395,10 @@ export function handleSessionHttpRoute(
         sendJson(response, 404, { error: "Task contract not found" });
         return true;
       }
-      sendJson(response, 200, { taskContract: taskContracts[0], taskContracts });
+      sendJson(response, 200, {
+        taskContract: taskContracts[0],
+        taskContracts,
+      });
       return true;
     }
     if (route?.resource === "context") {
@@ -366,6 +435,10 @@ export function handleSessionHttpRoute(
         sendControlLeaseConflict(response, result.leaseClaim, "rest");
         return true;
       }
+      if (result.status === "control_epoch_required") {
+        sendControlEpochRequired(response);
+        return true;
+      }
       if (result.status === "control_epoch_stale") {
         sendControlEpochStale(response, result.currentEpoch);
         return true;
@@ -375,7 +448,44 @@ export function handleSessionHttpRoute(
         return true;
       }
       broadcastEvents(hub, result.events);
-      sendJson(response, 200, { participant: result.participant });
+      sendJson(response, 200, {
+        controlEpoch: result.controlEpoch,
+        leaseExpiresAt: result.leaseExpiresAt,
+        participant: result.participant,
+        renewAfterMs: result.renewAfterMs,
+      });
+      return true;
+    }
+    if (route?.resource === "control-release") {
+      if (!authorizeRoute(input, "task-mutate", route.sessionId)) {
+        return true;
+      }
+      if (!authorizeParticipant(input, route.participantId)) {
+        return true;
+      }
+      const body = yield* parseJsonBody(request, releaseParticipantControlEnvelopeSchema, {
+        maxBytes: input.resourceLimits.httpMaxBodyBytes,
+        routeName: sessionResourceRoutes.controlRelease.name,
+      });
+      const result = yield* service.releaseRestControlLease({
+        ...(body.controlEpoch === undefined ? {} : { controlEpoch: body.controlEpoch }),
+        instanceId: body.instanceId,
+        participantId: effectiveParticipantId(input.authContext, route.participantId),
+        sessionId: route.sessionId,
+      });
+      if (result.status === "control_conflict") {
+        sendControlLeaseConflict(response, result.leaseClaim, "rest");
+        return true;
+      }
+      if (result.status === "control_epoch_required") {
+        sendControlEpochRequired(response);
+        return true;
+      }
+      if (result.status === "control_epoch_stale") {
+        sendControlEpochStale(response, result.currentEpoch);
+        return true;
+      }
+      sendJson(response, 200, { released: result.released });
       return true;
     }
     return false;
@@ -485,6 +595,14 @@ function matchSessionResourceRoute(
       participantId: decodeURIComponent(heartbeat[2]),
       resource: "heartbeat",
       sessionId: decodeURIComponent(heartbeat[1]),
+    };
+  }
+  const controlRelease = matchHttpRoute(sessionResourceRoutes.controlRelease, method, pathname);
+  if (controlRelease?.[1] && controlRelease[2]) {
+    return {
+      participantId: decodeURIComponent(controlRelease[2]),
+      resource: "control-release",
+      sessionId: decodeURIComponent(controlRelease[1]),
     };
   }
   return null;

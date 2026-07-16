@@ -116,6 +116,7 @@ export const participants = pgTable(
 export const participantControlLeases = pgTable(
   "participant_control_leases",
   {
+    acquisitionId: text("acquisition_id"),
     claimedAt: timestamp("claimed_at", { withTimezone: true }).notNull().defaultNow(),
     controlChannel: text("control_channel").notNull(),
     epoch: bigint("epoch", { mode: "number" }).notNull().default(1),
@@ -141,6 +142,9 @@ export const participantControlLeases = pgTable(
     uniqueIndex("participant_control_leases_current_unique")
       .on(table.sessionId, table.participantId)
       .where(sql`${table.releasedAt} IS NULL AND ${table.supersededAt} IS NULL`),
+    uniqueIndex("participant_control_leases_acquisition_unique")
+      .on(table.sessionId, table.participantId, table.acquisitionId)
+      .where(sql`${table.acquisitionId} IS NOT NULL`),
   ],
 );
 

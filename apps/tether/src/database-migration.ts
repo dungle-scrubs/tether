@@ -507,6 +507,24 @@ function legacyMigrationProbes(): readonly LegacyMigrationProbe[] {
       label: "0012 control lease generation history primary key including epoch",
       represented: hasParticipantControlLeaseGenerationPrimaryKey,
     },
+    {
+      label: "0013 REST control acquisition identity",
+      contradictionObserved: (client) =>
+        hasNamedIndexContradiction(client, "participant_control_leases_acquisition_unique", {
+          columnNames: ["session_id", "participant_id", "acquisition_id"],
+          predicate: "acquisition_id IS NOT NULL",
+          tableName: "participant_control_leases",
+          unique: true,
+        }),
+      represented: async (client) =>
+        (await hasColumn(client, "participant_control_leases", "acquisition_id")) &&
+        (await hasIndexSignature(client, "participant_control_leases_acquisition_unique", {
+          columnNames: ["session_id", "participant_id", "acquisition_id"],
+          predicate: "acquisition_id IS NOT NULL",
+          tableName: "participant_control_leases",
+          unique: true,
+        })),
+    },
   ];
 }
 
@@ -670,13 +688,12 @@ async function hasConstraintSignature(
   const result = await client.query<ConstraintSignatureRow>(
     `
       SELECT
-        ARRAY(
-          SELECT attribute.attname
+        (
+          SELECT jsonb_agg(attribute.attname ORDER BY key_column.position)
           FROM unnest(constraint_record.conkey) WITH ORDINALITY AS key_column(attnum, position)
           JOIN pg_attribute attribute
             ON attribute.attrelid = constraint_record.conrelid
             AND attribute.attnum = key_column.attnum
-          ORDER BY key_column.position
         ) AS "columnNames",
         constraint_record.contype::text AS "constraintType",
         table_record.relname AS "tableName"

@@ -4,25 +4,28 @@ import { URL } from "node:url";
 import { Context, Effect, Layer } from "effect";
 import { authorize } from "./auth/authorize.js";
 import {
-  authErrorFromUnknown,
-  authRuntimeOptionsFromConfig,
-  createAuthRuntime,
   type AuthRuntime,
   type AuthRuntimeDebugInfo,
   type AuthRuntimeLogger,
   type AuthRuntimeOptions,
+  authErrorFromUnknown,
+  authRuntimeOptionsFromConfig,
+  createAuthRuntime,
 } from "./auth/enforcement.js";
 import type { AuthContext } from "./auth/token.js";
 import { ServerConfigService } from "./config.js";
 import { type DatabasePool, DatabaseService } from "./db.js";
+import { HostPresenceRuntime } from "./host-presence.js";
 import { handleClientBindingHttpRoute } from "./http-client-binding-route-handlers.js";
+import { directHttpRoutes } from "./http-direct-routes.js";
+import { matchHttpRoute } from "./http-route-spec.js";
 import {
   applyCorsResponseHeaders,
   broadcastEvents,
   type CorsOptions,
+  type HttpRouteErrorOptions,
   handleCorsPreflight,
   handleHttpRouteError,
-  type HttpRouteErrorOptions,
   readCorsOptionsFromEnv,
   sendAuthError,
   sendJson,
@@ -34,10 +37,11 @@ import { handleUiHttpRoute } from "./http-ui-route-handlers.js";
 import { SubscriptionHub, type SubscriptionHubDebugInfo } from "./hub.js";
 import {
   defaultResourceLimits,
-  ResourceLimitRuntime,
   type ResourceLimitDebugInfo,
+  ResourceLimitRuntime,
   type ResourceLimits,
 } from "./resource-limits.js";
+import type { RestControlPolicyDebugInfo } from "./rest-control-policy.js";
 import { SessionEventFanout, type SessionEventFanoutDebugInfo } from "./session-event-fanout.js";
 import {
   createSessionServiceEffect,
@@ -51,7 +55,6 @@ import {
   type TaskClaimSweeperConfig,
   type TaskClaimSweeperDebugInfo,
 } from "./task-claim-sweeper.js";
-import { HostPresenceRuntime } from "./host-presence.js";
 import { createParticipantWebSocketGateway } from "./websocket-participant-gateway.js";
 
 /** Allows compact participant contract advertisements to fit in WebSocket URLs. */
@@ -111,6 +114,13 @@ export interface AppServerOptions {
   readonly httpRouteErrors?: HttpRouteErrorOptions;
   /** Process-local resource limits for transports, replay, fanout, and hub sends. */
   readonly resourceLimits?: ResourceLimits;
+  /** Structured logger for one compatibility-mode startup warning. */
+  readonly restControlLogger?: {
+    readonly warn: (
+      event: "rest_control.compatibility_enabled",
+      details: { readonly mode: "compatibility"; readonly warningCode: string },
+    ) => void;
+  };
   /** Durable session service configuration. */
   readonly sessionService?: SessionServiceOptions;
   /** Task claim expiration scheduler configuration. */
@@ -224,6 +234,15 @@ export function createAppServerWithSessionService(
     taskClaimSweeper: taskClaimSweeper.debugInfo(),
     hostPresence: hostPresence.debugInfo(),
   });
+  if (service.debugInfo().restControl?.mode === "compatibility") {
+    (options.restControlLogger ?? defaultRestControlLogger).warn(
+      "rest_control.compatibility_enabled",
+      {
+        mode: "compatibility",
+        warningCode: "REST_CONTROL_COMPATIBILITY_ENABLED",
+      },
+    );
+  }
   const server = createServer(
     { maxHeaderSize: participantStreamMaxHeaderSizeBytes },
     (request, response) => {
@@ -357,15 +376,16 @@ function handleHttpRequest(
       return;
     }
     applyCorsResponseHeaders(request, response, corsOptions);
-    if (request.method === "GET" && url.pathname === "/health") {
-      sendJson(response, 200, { ok: true });
+    if (matchHttpRoute(directHttpRoutes.health, request.method, url.pathname)) {
+      const restControl = readAppServerDebugInfo().service.restControl;
+      sendJson(response, 200, projectHealthResponse(restControl));
       return;
     }
     const authContext = authenticateHttpRequest(auth, request, response, url);
     if (authContext === undefined) {
       return;
     }
-    if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/ui")) {
+    if (matchHttpRoute(directHttpRoutes.ui, request.method, url.pathname)) {
       if (!authorizeHttp(response, authContext, { action: "admin" })) {
         return;
       }
@@ -375,7 +395,7 @@ function handleHttpRequest(
     if (handleUiHttpRoute({ request, response, url })) {
       return;
     }
-    if (request.method === "GET" && url.pathname === "/debug/server") {
+    if (matchHttpRoute(directHttpRoutes.serverDebug, request.method, url.pathname)) {
       if (!authorizeHttp(response, authContext, { action: "admin" })) {
         return;
       }
@@ -395,7 +415,15 @@ function handleHttpRequest(
     ) {
       return;
     }
-    if (yield* handleSessionDebugHttpRoute({ authContext, request, response, service, url })) {
+    if (
+      yield* handleSessionDebugHttpRoute({
+        authContext,
+        request,
+        response,
+        service,
+        url,
+      })
+    ) {
       return;
     }
     if (
@@ -430,6 +458,28 @@ function handleHttpRequest(
     sendJson(response, 404, { error: "Not found" });
   });
 }
+
+/** Projects REST control mode into a ready health response with bounded warnings. */
+export function projectHealthResponse(
+  restControl: RestControlPolicyDebugInfo | undefined,
+): Record<string, unknown> {
+  return {
+    ok: true,
+    ...(restControl?.mode === "compatibility"
+      ? { warnings: ["REST_CONTROL_COMPATIBILITY_ENABLED"] }
+      : {}),
+  };
+}
+
+/** Default identity-free logger for the compatibility startup boundary. */
+const defaultRestControlLogger = {
+  warn: (
+    event: "rest_control.compatibility_enabled",
+    details: { readonly mode: "compatibility"; readonly warningCode: string },
+  ): void => {
+    process.stderr.write(`${JSON.stringify({ details, event })}\n`);
+  },
+};
 
 /** Authenticates a REST request and writes the rejection response on failure. */
 function authenticateHttpRequest(

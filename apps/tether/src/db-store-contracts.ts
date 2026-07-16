@@ -1,4 +1,3 @@
-import type { AppendSessionEventInput, ApprovalDecision } from "./protocol.js";
 import type {
   ControlEpochGuard,
   ControlLeaseClaim,
@@ -8,15 +7,18 @@ import type {
   EnsureScheduledRunResult,
   HeartbeatParticipantWithEventResult,
   ParticipantRegistration,
-  PersistedParticipantRegistrationResult,
   PersistedEventAppendResult,
-  PersistedTaskCreateResult,
+  PersistedParticipantRegistrationResult,
   PersistedTaskApprovalResult,
+  PersistedTaskCreateResult,
   PersistedTaskEventResult,
+  RestControlAcquisition,
+  RestControlLeaseRelease,
   ScheduledTaskIdentityInput,
   SupersededScheduledRunsResult,
   SupersedeScheduledRunsInput,
 } from "./db.js";
+import type { AppendSessionEventInput, ApprovalDecision } from "./protocol.js";
 import type {
   ClientSessionBindingRecord,
   ControlLeaseSnapshot,
@@ -95,6 +97,18 @@ export type ClientSessionBindingUpsertResult =
 
 /** Persistence for participant control leases. */
 export interface ControlLeaseStore {
+  /** Atomically acquires REST control with participant registration effects. */
+  readonly acquireRest?: (input: {
+    readonly acquisitionId: string;
+    readonly capabilities: Record<string, unknown>;
+    readonly displayName: string;
+    readonly eventSourceId: string;
+    readonly instanceId: string;
+    readonly leaseTtlMs: number;
+    readonly participantId: string;
+    readonly runtimeKind: string;
+    readonly sessionId: string;
+  }) => Promise<RestControlAcquisition>;
   /** Acquires or supersedes control, advancing the Control Epoch on reconnect. */
   readonly claim: (input: {
     readonly controlChannel: "rest" | "ws";
@@ -119,18 +133,31 @@ export interface ControlLeaseStore {
     readonly instanceId: string;
     readonly participantId: string;
     readonly sessionId: string;
-  }) => Promise<void>;
+  }) => Promise<boolean | undefined>;
+  /** Atomically classifies and releases an exact current REST generation. */
+  readonly releaseRest: (input: {
+    readonly controlEpoch: number;
+    readonly instanceId: string;
+    readonly participantId: string;
+    readonly sessionId: string;
+  }) => Promise<RestControlLeaseRelease>;
 }
 
 /** Persistence for durable session events. */
 export interface SessionEventStore {
   readonly append: (
     input: AppendSessionEventInput,
-    options: { readonly controlGuard?: ControlEpochGuard | undefined; readonly sourceId: string },
+    options: {
+      readonly controlGuard?: ControlEpochGuard | undefined;
+      readonly sourceId: string;
+    },
   ) => Promise<SessionEvent>;
   readonly appendIdempotent: (
     input: AppendSessionEventInput,
-    options: { readonly controlGuard?: ControlEpochGuard | undefined; readonly sourceId: string },
+    options: {
+      readonly controlGuard?: ControlEpochGuard | undefined;
+      readonly sourceId: string;
+    },
   ) => Promise<PersistedEventAppendResult>;
   readonly list: (
     sessionId: string,

@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
 import { Effect } from "effect";
+import { describe, expect, it } from "vitest";
 
 import { readConfig, ServerConfigService, serverConfigLayerFromEnv } from "../src/config.js";
 import { defaultResourceLimits } from "../src/resource-limits.js";
@@ -30,7 +30,7 @@ describe("server config", () => {
       authMode: "required",
       authSigningKid: "default",
       authSigningSecret: "test-secret",
-      controlEpochEnforcement: false,
+      controlEpochEnforcement: true,
       databasePoolMax: 20,
       databaseUrl: "postgres://example.test/tether",
       eventFanoutCatchUpPollMs: 500,
@@ -146,7 +146,9 @@ describe("server config", () => {
   it("parses auth key id and accepted signing-secret rotation map", () => {
     expect(
       readConfig({
-        AUTH_ACCEPTED_SIGNING_SECRETS: JSON.stringify({ previous: "old-secret" }),
+        AUTH_ACCEPTED_SIGNING_SECRETS: JSON.stringify({
+          previous: "old-secret",
+        }),
         AUTH_SIGNING_KID: "current",
         AUTH_SIGNING_SECRET: "new-secret",
         DATABASE_URL: "postgres://example.test/tether",
@@ -159,13 +161,13 @@ describe("server config", () => {
     });
   });
 
-  it("stages control epoch enforcement off by default and enables it explicitly", () => {
+  it("defaults control epoch enforcement on and permits only an explicit false override", () => {
     expect(
       readConfig({
         AUTH_SIGNING_SECRET: "test-secret",
         DATABASE_URL: "postgres://example.test/tether",
       }).controlEpochEnforcement,
-    ).toBe(false);
+    ).toBe(true);
     expect(
       readConfig({
         AUTH_SIGNING_SECRET: "test-secret",
@@ -176,10 +178,33 @@ describe("server config", () => {
     expect(
       readConfig({
         AUTH_SIGNING_SECRET: "test-secret",
-        CONTROL_EPOCH_ENFORCEMENT: "nonsense",
+        CONTROL_EPOCH_ENFORCEMENT: "false",
         DATABASE_URL: "postgres://example.test/tether",
       }).controlEpochEnforcement,
     ).toBe(false);
+    expect(() =>
+      readConfig({
+        AUTH_SIGNING_SECRET: "test-secret",
+        CONTROL_EPOCH_ENFORCEMENT: "nonsense",
+        DATABASE_URL: "postgres://example.test/tether",
+      }),
+    ).toThrow("CONTROL_EPOCH_ENFORCEMENT must be a documented boolean");
+  });
+
+  it("rejects invalid explicit control enforcement through Effect configuration", async () => {
+    await expect(
+      Effect.runPromise(
+        ServerConfigService.pipe(
+          Effect.provide(
+            serverConfigLayerFromEnv({
+              AUTH_SIGNING_SECRET: "test-secret",
+              CONTROL_EPOCH_ENFORCEMENT: "nonsense",
+              DATABASE_URL: "postgres://example.test/tether",
+            }),
+          ),
+        ),
+      ),
+    ).rejects.toThrow("CONTROL_EPOCH_ENFORCEMENT must be a documented boolean");
   });
 
   it("uses the default auth key id for blank config values", () => {
