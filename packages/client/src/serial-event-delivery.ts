@@ -4,6 +4,13 @@
  * The module deliberately excludes sockets, reconnection, command correlation,
  * persistence, and client-specific recent-event policy so both observer and
  * participant transports can share one delivery state machine.
+ *
+ * Delivery is bounded by both a retained item count and a retained raw-frame
+ * byte high-water mark. Queued event frames, the active item, and replay
+ * markers all participate in the byte accounting so retained in-memory delivery
+ * work stays finite. Handlers receive an `AbortSignal`; a handler timeout aborts
+ * the signal and pauses delivery, and the module never begins a replayed
+ * invocation of the same event until the timed-out invocation settles.
  */
 
 /** Minimal event shape required by the serial delivery state machine. */
@@ -11,8 +18,22 @@ export interface SequencedDeliveryEvent {
   readonly seq: number;
 }
 
+/** Fixed byte cost charged for one retained replay-complete marker. */
+export const replayMarkerByteCost = 64;
+
+/** Handler invoked for one delivered event with a cancellation signal. */
+export type SerialEventDeliveryHandler<TEvent extends SequencedDeliveryEvent> = (
+  event: TEvent,
+  signal: AbortSignal,
+) => void | Promise<void>;
+
 /** Successful outcomes emitted at the delivery Module Interface. */
 export type SerialEventDeliveryOutcome<TEvent extends SequencedDeliveryEvent> =
+  | {
+      readonly kind: "delivery-byte-overflow";
+      readonly maxQueueBytes: number;
+      readonly observedQueueBytes: number;
+    }
   | { readonly event: TEvent; readonly kind: "duplicate-ignored" }
   | {
       readonly kind: "delivery-queue-overflow";
@@ -49,6 +70,9 @@ export interface SerialEventDeliveryOptions<TEvent extends SequencedDeliveryEven
   readonly clock?: SerialEventDeliveryClock;
   readonly handlerTimeoutMs: number;
   readonly initialSeq: number;
+  /** Positive, finite retained raw-frame byte high-water mark. */
+  readonly maxQueueBytes: number;
+  /** Positive, finite retained item high-water mark. */
   readonly maxQueueSize: number;
   readonly onOutcome: (outcome: SerialEventDeliveryOutcome<TEvent>) => void;
 }
@@ -67,12 +91,18 @@ export interface SerialEventDeliveryDebugInfo {
   readonly handlerCount: number;
   readonly lastHandledSeq: number;
   readonly lastReceivedSeq: number;
+  readonly maxQueueBytes: number;
+  readonly maxQueueSize: number;
+  /** Count of timed-out handler invocations still settling. */
+  readonly pendingSettlementCount: number;
+  /** Retained raw-frame bytes across queued items and the active item. */
+  readonly queueBytes: number;
   readonly queueSize: number;
 }
 
 type SerialEventDeliveryQueueItem<TEvent extends SequencedDeliveryEvent> =
-  | { readonly event: TEvent; readonly kind: "event" }
-  | { readonly kind: "replay-complete" };
+  | { readonly byteCost: number; readonly event: TEvent; readonly kind: "event" }
+  | { readonly byteCost: number; readonly kind: "replay-complete" };
 
 type HandlerInvocationResult =
   | { readonly kind: "completed" }
@@ -86,22 +116,34 @@ const systemDeliveryClock: SerialEventDeliveryClock = {
   setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
 };
 
+/** Rejects a configured bound that is not a positive, finite number. */
+function assertPositiveFiniteBound(label: string, value: number): void {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`Serial event delivery ${label} must be a positive finite number`);
+  }
+}
+
 /**
  * Serializes event handler snapshots and replay markers behind a small queue
  * Interface. Transport owners map its typed outcomes to their own recovery.
  */
 export class SerialEventDelivery<TEvent extends SequencedDeliveryEvent> {
   private activeDeliverySeq: number | null = null;
-  private readonly handlers = new Set<(event: TEvent) => void | Promise<void>>();
+  private readonly handlers = new Set<SerialEventDeliveryHandler<TEvent>>();
   private readonly queue: SerialEventDeliveryQueueItem<TEvent>[] = [];
+  private readonly pendingSettlements = new Set<Promise<void>>();
   private draining = false;
   private halted = false;
   private lastHandledSeq: number;
   private lastReceivedSeq: number;
+  private queueBytes = 0;
   private readonly settlementWaiters = new Set<() => void>();
   private stopping = false;
 
   constructor(private readonly options: SerialEventDeliveryOptions<TEvent>) {
+    assertPositiveFiniteBound("handlerTimeoutMs", options.handlerTimeoutMs);
+    assertPositiveFiniteBound("maxQueueSize", options.maxQueueSize);
+    assertPositiveFiniteBound("maxQueueBytes", options.maxQueueBytes);
     this.lastHandledSeq = options.initialSeq;
     this.lastReceivedSeq = options.initialSeq;
   }
@@ -116,14 +158,26 @@ export class SerialEventDelivery<TEvent extends SequencedDeliveryEvent> {
       handlerCount: this.handlers.size,
       lastHandledSeq: this.lastHandledSeq,
       lastReceivedSeq: this.lastReceivedSeq,
+      maxQueueBytes: this.options.maxQueueBytes,
+      maxQueueSize: this.options.maxQueueSize,
+      pendingSettlementCount: this.pendingSettlements.size,
+      queueBytes: this.queueBytes,
       queueSize: this.queue.length,
     };
   }
 
-  /** Enqueues one event for ordered delivery. */
-  enqueueEvent(event: TEvent): void {
+  /**
+   * Enqueues one event for ordered delivery. `frameByteLength` is the raw
+   * WebSocket frame size and participates in the retained byte high-water mark.
+   */
+  enqueueEvent(event: TEvent, frameByteLength: number): void {
     if (this.halted || this.stopping) {
       return;
+    }
+    if (!Number.isFinite(frameByteLength) || frameByteLength < 0) {
+      throw new Error(
+        "Serial event delivery frame byte length must be a non-negative finite number",
+      );
     }
     if (event.seq <= this.lastReceivedSeq) {
       this.options.onOutcome({ event, kind: "duplicate-ignored" });
@@ -149,8 +203,19 @@ export class SerialEventDelivery<TEvent extends SequencedDeliveryEvent> {
       });
       return;
     }
+    const observedQueueBytes = this.queueBytes + frameByteLength;
+    if (observedQueueBytes > this.options.maxQueueBytes) {
+      this.halted = true;
+      this.options.onOutcome({
+        kind: "delivery-byte-overflow",
+        maxQueueBytes: this.options.maxQueueBytes,
+        observedQueueBytes,
+      });
+      return;
+    }
     this.lastReceivedSeq = event.seq;
-    this.queue.push({ event, kind: "event" });
+    this.queue.push({ byteCost: frameByteLength, event, kind: "event" });
+    this.queueBytes = observedQueueBytes;
     this.assertInternalInvariants();
     void this.drain();
   }
@@ -160,12 +225,13 @@ export class SerialEventDelivery<TEvent extends SequencedDeliveryEvent> {
     if (this.halted || this.stopping) {
       return;
     }
-    this.queue.push({ kind: "replay-complete" });
+    this.queue.push({ byteCost: replayMarkerByteCost, kind: "replay-complete" });
+    this.queueBytes += replayMarkerByteCost;
     void this.drain();
   }
 
   /** Registers an event handler and returns an unsubscribe callback. */
-  onEvent(handler: (event: TEvent) => void | Promise<void>): () => void {
+  onEvent(handler: SerialEventDeliveryHandler<TEvent>): () => void {
     this.handlers.add(handler);
     void this.drain();
     return () => {
@@ -173,9 +239,13 @@ export class SerialEventDelivery<TEvent extends SequencedDeliveryEvent> {
     };
   }
 
-  /** Resolves after the currently active serial drain has settled. */
+  /**
+   * Resolves after the currently active serial drain has settled, including any
+   * timed-out handler invocation that is still running. Transport owners await
+   * this before replaying so a timed-out handler cannot overlap its replay.
+   */
   waitForSettlement(): Promise<void> {
-    if (!this.draining && this.activeDeliverySeq === null) {
+    if (this.isSettled()) {
       return Promise.resolve();
     }
     return new Promise((resolve) => {
@@ -187,7 +257,7 @@ export class SerialEventDelivery<TEvent extends SequencedDeliveryEvent> {
   stop(): void {
     this.stopping = true;
     if (!this.draining) {
-      this.queue.splice(0);
+      this.clearQueue();
     }
   }
 
@@ -213,7 +283,7 @@ export class SerialEventDelivery<TEvent extends SequencedDeliveryEvent> {
           return;
         }
         if (item.kind === "replay-complete") {
-          this.queue.shift();
+          this.shiftHead();
           this.options.onOutcome({ kind: "replay-complete" });
           continue;
         }
@@ -223,8 +293,11 @@ export class SerialEventDelivery<TEvent extends SequencedDeliveryEvent> {
         }
         this.activeDeliverySeq = item.event.seq;
         this.assertInternalInvariants();
+        const controller = new AbortController();
+        let paused = false;
         for (const [handlerIndex, handler] of handlers.entries()) {
-          const result = await this.invokeHandler(handler, item.event);
+          const invocation = this.invokeHandler(handler, item.event, controller.signal);
+          const result = await invocation.result;
           if (result.kind === "failed") {
             this.halted = true;
             this.activeDeliverySeq = null;
@@ -234,9 +307,12 @@ export class SerialEventDelivery<TEvent extends SequencedDeliveryEvent> {
               handlerIndex,
               kind: "handler-failed",
             });
-            return;
+            paused = true;
+            break;
           }
           if (result.kind === "timeout") {
+            controller.abort();
+            this.trackPendingSettlement(invocation.settled);
             this.halted = true;
             this.activeDeliverySeq = null;
             this.options.onOutcome({
@@ -245,10 +321,14 @@ export class SerialEventDelivery<TEvent extends SequencedDeliveryEvent> {
               kind: "handler-timeout",
               timeoutMs: this.options.handlerTimeoutMs,
             });
-            return;
+            paused = true;
+            break;
           }
         }
-        this.queue.shift();
+        if (paused) {
+          return;
+        }
+        this.shiftHead();
         this.activeDeliverySeq = null;
         this.lastHandledSeq = item.event.seq;
         this.assertInternalInvariants();
@@ -265,14 +345,50 @@ export class SerialEventDelivery<TEvent extends SequencedDeliveryEvent> {
       this.activeDeliverySeq = null;
       this.draining = false;
       if (this.stopping) {
-        this.queue.splice(0);
+        this.clearQueue();
       }
       this.assertInternalInvariants();
-      for (const resolve of this.settlementWaiters) {
-        resolve();
-      }
-      this.settlementWaiters.clear();
+      this.maybeNotifySettlement();
     }
+  }
+
+  /** Removes the head item and releases its retained byte cost. */
+  private shiftHead(): void {
+    const item = this.queue.shift();
+    if (item) {
+      this.queueBytes -= item.byteCost;
+    }
+  }
+
+  /** Discards all queued work and resets retained byte accounting. */
+  private clearQueue(): void {
+    this.queue.splice(0);
+    this.queueBytes = 0;
+  }
+
+  /** Records a still-running timed-out invocation as a settlement barrier. */
+  private trackPendingSettlement(settled: Promise<void>): void {
+    const tracked = settled.finally(() => {
+      this.pendingSettlements.delete(tracked);
+      this.maybeNotifySettlement();
+    });
+    this.pendingSettlements.add(tracked);
+  }
+
+  /** Returns whether no drain and no timed-out invocation remain outstanding. */
+  private isSettled(): boolean {
+    return !this.draining && this.activeDeliverySeq === null && this.pendingSettlements.size === 0;
+  }
+
+  /** Resolves settlement waiters once the delivery machine is fully settled. */
+  private maybeNotifySettlement(): void {
+    if (!this.isSettled()) {
+      return;
+    }
+    for (const resolve of this.settlementWaiters) {
+      resolve();
+    }
+    this.settlementWaiters.clear();
   }
 
   /** Fails at the mutation site when the delivery state violates its own rules. */
@@ -282,6 +398,12 @@ export class SerialEventDelivery<TEvent extends SequencedDeliveryEvent> {
     }
     if (this.queue.length > this.options.maxQueueSize) {
       throw new Error("Serial event delivery queue exceeds its configured maximum");
+    }
+    if (this.queueBytes > this.options.maxQueueBytes) {
+      throw new Error("Serial event delivery retained bytes exceed the configured maximum");
+    }
+    if (this.queueBytes < 0) {
+      throw new Error("Serial event delivery retained bytes fell below zero");
     }
     if (!this.draining && this.activeDeliverySeq !== null) {
       throw new Error("Serial event delivery has an active sequence outside a drain");
@@ -294,11 +416,17 @@ export class SerialEventDelivery<TEvent extends SequencedDeliveryEvent> {
     }
   }
 
-  /** Invokes one handler under the configured finite delivery deadline. */
-  private async invokeHandler(
-    handler: (event: TEvent) => void | Promise<void>,
+  /**
+   * Invokes one handler under the configured finite delivery deadline. Returns
+   * both the raced result and a `settled` promise that resolves only when the
+   * underlying invocation actually finishes, so a timed-out handler can be
+   * awaited before replay begins.
+   */
+  private invokeHandler(
+    handler: SerialEventDeliveryHandler<TEvent>,
     event: TEvent,
-  ): Promise<HandlerInvocationResult> {
+    signal: AbortSignal,
+  ): { readonly result: Promise<HandlerInvocationResult>; readonly settled: Promise<void> } {
     const clock = this.options.clock ?? systemDeliveryClock;
     let timeoutHandle: unknown;
     const timeout = new Promise<HandlerInvocationResult>((resolve) => {
@@ -308,13 +436,19 @@ export class SerialEventDelivery<TEvent extends SequencedDeliveryEvent> {
       );
     });
     const invocation: Promise<HandlerInvocationResult> = Promise.resolve()
-      .then(() => handler(event))
+      .then(() => handler(event, signal))
       .then(
         (): HandlerInvocationResult => ({ kind: "completed" }),
         (cause: unknown): HandlerInvocationResult => ({ cause, kind: "failed" }),
       );
-    const result = await Promise.race([invocation, timeout]);
-    clock.clearTimeout(timeoutHandle);
-    return result;
+    const result = Promise.race([invocation, timeout]).then((raced) => {
+      clock.clearTimeout(timeoutHandle);
+      return raced;
+    });
+    const settled = invocation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return { result, settled };
   }
 }

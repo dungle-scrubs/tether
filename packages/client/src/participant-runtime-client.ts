@@ -43,9 +43,11 @@ const defaultCursorPersistRetryBaseDelayMs = 100;
 const defaultCursorPersistRetryMaxDelayMs = 2_000;
 const defaultCursorPersistWriteTimeoutMs = 5_000;
 const defaultParticipantHandlerTimeoutMs = 30_000;
+const defaultParticipantMaxQueueBytes = 16 * 1024 * 1024;
 const defaultParticipantMaxQueueSize = 2_000;
 const defaultParticipantMaxRecoveryAttempts = 5;
 const defaultParticipantShutdownTimeoutMs = 30_000;
+const participantMaxErrorBacklog = 32;
 
 interface PendingCommand {
   readonly op: string;
@@ -258,6 +260,7 @@ export type ParticipantRuntimeShutdownPhase = "cursor" | "delivery" | "socket";
 
 /** Machine-readable reasons that put participant delivery into Paused State. */
 export type ParticipantRuntimePausedReason =
+  | "delivery_byte_overflow"
   | "delivery_queue_overflow"
   | "delivery_retry_exhausted"
   | "invalid_server_envelope"
@@ -358,6 +361,8 @@ export interface ParticipantRuntimeCursorPersistPolicy {
 export interface ParticipantRuntimeEventDeliveryPolicy {
   /** Maximum time one handler may run before recovery begins. */
   readonly handlerTimeoutMs?: number;
+  /** Maximum retained raw-frame bytes across queued events and replay markers. */
+  readonly maxQueueBytes?: number;
   /** Maximum queued events and replay markers retained per connection. */
   readonly maxQueueSize?: number;
   /** Failed deliveries of one sequence allowed before Paused State. */
@@ -486,6 +491,8 @@ export interface ParticipantRuntimeClientDebugInfo extends BoundaryDebugInfo {
   readonly eventDeliveryFailureCount: number;
   /** Number of failed durable cursor write attempts since startup. */
   readonly cursorPersistFailureCount: number;
+  /** Number of errors dropped from the bounded error backlog before any handler subscribed. */
+  readonly droppedErrorCount: number;
   /** Highest event sequence whose non-empty handler snapshot completed. */
   readonly lastHandledSeq: number;
   /** Highest event sequence acknowledged by the durable cursor store. */
@@ -643,6 +650,8 @@ export class ParticipantRuntimeClient {
   private deliveryRecoveryAttempts = 0;
   private deliveryRecoverySeq: number | null = null;
   private readonly deliveryUnsubscribers = new Map<ParticipantRuntimeEventHandler, () => void>();
+  /** Count of errors evicted from the bounded backlog before any handler subscribed. */
+  private droppedErrorCount = 0;
   private readonly errorBacklog: Error[] = [];
   private readonly eventHandlers = new Set<ParticipantRuntimeEventHandler>();
   private readonly errorHandlers = new Set<(error: Error) => void>();
@@ -654,6 +663,7 @@ export class ParticipantRuntimeClient {
   private readonly cursorPersistEventCount: number;
   private readonly commandTimeoutMs: number;
   private readonly handlerTimeoutMs: number;
+  private readonly maxDeliveryQueueBytes: number;
   private readonly maxDeliveryQueueSize: number;
   private readonly maxRecoveryAttempts: number;
   private readonly observability = new ModuleObservability(
@@ -682,7 +692,6 @@ export class ParticipantRuntimeClient {
    * Attaches protocol message handling to an already-created WebSocket.
    */
   private constructor(private readonly config: ParticipantRuntimeClientConfig) {
-    this.delivery = this.createDelivery(config.afterSeq);
     this.lastHandledSeq = config.afterSeq;
     this.cursorWriter = this.createCursorWriter(config.afterSeq);
     this.commandTimeoutMs = resolveCommandTimeoutMs(config.commandTimeoutMs);
@@ -691,11 +700,17 @@ export class ParticipantRuntimeClient {
       config.eventDelivery?.handlerTimeoutMs,
       defaultParticipantHandlerTimeoutMs,
     );
+    this.maxDeliveryQueueBytes = resolvePositiveIntegerConfig(
+      "eventDelivery.maxQueueBytes",
+      config.eventDelivery?.maxQueueBytes,
+      defaultParticipantMaxQueueBytes,
+    );
     this.maxDeliveryQueueSize = resolvePositiveIntegerConfig(
       "eventDelivery.maxQueueSize",
       config.eventDelivery?.maxQueueSize,
       defaultParticipantMaxQueueSize,
     );
+    this.delivery = this.createDelivery(config.afterSeq);
     this.maxRecoveryAttempts = resolvePositiveIntegerConfig(
       "eventDelivery.maxRecoveryAttempts",
       config.eventDelivery?.maxRecoveryAttempts,
@@ -852,6 +867,7 @@ export class ParticipantRuntimeClient {
       activeDeliverySeq: delivery.activeDeliverySeq,
       connectionGeneration: this.connectionGeneration,
       cursorPersistFailureCount: cursor.failureCount,
+      droppedErrorCount: this.droppedErrorCount,
       eventBacklogSize: delivery.queueSize,
       eventHandlerCount: this.eventHandlers.size,
       eventDeliveryFailureCount: this.deliveryFailureCount,
@@ -1172,6 +1188,8 @@ export class ParticipantRuntimeClient {
     }
     let parsed: unknown;
     try {
+      const frameByteLength =
+        typeof data === "string" ? Buffer.byteLength(data) : Buffer.byteLength(String(data));
       parsed = JSON.parse(String(data)) as unknown;
       const envelope = parseWebSocketServerEnvelope(parsed);
       if (!envelope) {
@@ -1179,7 +1197,7 @@ export class ParticipantRuntimeClient {
         return;
       }
       if (envelope.op === webSocketOperation.event) {
-        this.delivery.enqueueEvent(envelope.event);
+        this.delivery.enqueueEvent(envelope.event, frameByteLength);
         return;
       }
       if (envelope.op === webSocketOperation.commandResult) {
@@ -1253,6 +1271,7 @@ export class ParticipantRuntimeClient {
     return new SerialEventDelivery<SessionEvent>({
       handlerTimeoutMs: this.handlerTimeoutMs,
       initialSeq: afterSeq,
+      maxQueueBytes: this.maxDeliveryQueueBytes,
       maxQueueSize: this.maxDeliveryQueueSize,
       onOutcome: (outcome) => this.handleDeliveryOutcome(outcome, generation),
     });
@@ -1279,6 +1298,17 @@ export class ParticipantRuntimeClient {
       return;
     }
     switch (outcome.kind) {
+      case "delivery-byte-overflow":
+        this.enterPausedState(
+          "delivery_byte_overflow",
+          undefined,
+          {
+            maxQueueBytes: outcome.maxQueueBytes,
+            observedQueueBytes: outcome.observedQueueBytes,
+          },
+          generation,
+        );
+        return;
       case "delivery-queue-overflow":
         this.enterPausedState(
           "delivery_queue_overflow",
@@ -1440,6 +1470,10 @@ export class ParticipantRuntimeClient {
    */
   private emitError(error: Error): void {
     if (this.errorHandlers.size === 0) {
+      if (this.errorBacklog.length >= participantMaxErrorBacklog) {
+        this.errorBacklog.shift();
+        this.droppedErrorCount += 1;
+      }
       this.errorBacklog.push(error);
       return;
     }

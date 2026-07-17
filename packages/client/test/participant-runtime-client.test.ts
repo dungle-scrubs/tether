@@ -3250,6 +3250,7 @@ function createCursorFixture(
     lastHandledSeq: afterSeq,
     lastPersistedSeq: afterSeq,
     handlerTimeoutMs: 30_000,
+    maxDeliveryQueueBytes: 16 * 1024 * 1024,
     maxDeliveryQueueSize: 2_000,
     maxRecoveryAttempts: 5,
     observability: {

@@ -7,6 +7,9 @@ interface TestEvent {
   readonly seq: number;
 }
 
+const defaultFrameBytes = 10;
+const defaultMaxQueueBytes = 1_000;
+
 describe("SerialEventDelivery", () => {
   it("settles a replay marker after its preceding event", async () => {
     const actions: string[] = [];
@@ -17,6 +20,7 @@ describe("SerialEventDelivery", () => {
     const delivery = new SerialEventDelivery<TestEvent>({
       handlerTimeoutMs: 1_000,
       initialSeq: 0,
+      maxQueueBytes: defaultMaxQueueBytes,
       maxQueueSize: 10,
       onOutcome: (outcome) => {
         if (outcome.kind === "replay-complete") {
@@ -29,7 +33,7 @@ describe("SerialEventDelivery", () => {
       actions.push(`event:${event.seq}`);
     });
 
-    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 });
+    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 }, defaultFrameBytes);
     delivery.enqueueReplayComplete();
     await replaySettled;
 
@@ -46,6 +50,7 @@ describe("SerialEventDelivery", () => {
     const delivery = new SerialEventDelivery<TestEvent>({
       handlerTimeoutMs: 1_000,
       initialSeq: 0,
+      maxQueueBytes: defaultMaxQueueBytes,
       maxQueueSize: 10,
       onOutcome: (outcome) => {
         if (outcome.kind === "event-handled" && outcome.event.seq === 2) {
@@ -64,8 +69,8 @@ describe("SerialEventDelivery", () => {
       exited.push(event.seq);
     });
 
-    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 });
-    delivery.enqueueEvent({ eventId: "evt_2", seq: 2 });
+    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 }, defaultFrameBytes);
+    delivery.enqueueEvent({ eventId: "evt_2", seq: 2 }, defaultFrameBytes);
     await Promise.resolve();
 
     expect(entered).toEqual([1]);
@@ -84,6 +89,7 @@ describe("SerialEventDelivery", () => {
     const delivery = new SerialEventDelivery<TestEvent>({
       handlerTimeoutMs: 1_000,
       initialSeq: 0,
+      maxQueueBytes: defaultMaxQueueBytes,
       maxQueueSize: 10,
       onOutcome: (outcome) => {
         outcomes.push(outcome.kind);
@@ -96,8 +102,8 @@ describe("SerialEventDelivery", () => {
       }
     });
 
-    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 });
-    delivery.enqueueEvent({ eventId: "evt_2", seq: 2 });
+    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 }, defaultFrameBytes);
+    delivery.enqueueEvent({ eventId: "evt_2", seq: 2 }, defaultFrameBytes);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(outcomes).toEqual(["handler-failed"]);
@@ -109,6 +115,7 @@ describe("SerialEventDelivery", () => {
     const delivery = new SerialEventDelivery<TestEvent>({
       handlerTimeoutMs: 1_000,
       initialSeq: 0,
+      maxQueueBytes: defaultMaxQueueBytes,
       maxQueueSize: 10,
       onOutcome: (outcome) => {
         outcomes.push(outcome.kind);
@@ -119,7 +126,7 @@ describe("SerialEventDelivery", () => {
       throw new Error("async handler failed");
     });
 
-    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 });
+    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 }, defaultFrameBytes);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(outcomes).toEqual(["handler-failed"]);
@@ -132,6 +139,7 @@ describe("SerialEventDelivery", () => {
     const delivery = new SerialEventDelivery<TestEvent>({
       handlerTimeoutMs: 1_000,
       initialSeq: 0,
+      maxQueueBytes: defaultMaxQueueBytes,
       maxQueueSize: 10,
       onOutcome: (outcome) => {
         if (outcome.kind === "event-handled" && outcome.event.seq === 2) {
@@ -145,13 +153,13 @@ describe("SerialEventDelivery", () => {
       actions.push(`first:end:${event.seq}`);
     });
 
-    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 });
+    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 }, defaultFrameBytes);
     await Promise.resolve();
     unsubscribeFirst();
     delivery.onEvent((event) => {
       actions.push(`second:${event.seq}`);
     });
-    delivery.enqueueEvent({ eventId: "evt_2", seq: 2 });
+    delivery.enqueueEvent({ eventId: "evt_2", seq: 2 }, defaultFrameBytes);
     firstHandler.resolve();
     await secondHandled.promise;
 
@@ -163,6 +171,7 @@ describe("SerialEventDelivery", () => {
     const delivery = new SerialEventDelivery<TestEvent>({
       handlerTimeoutMs: 1_000,
       initialSeq: 0,
+      maxQueueBytes: defaultMaxQueueBytes,
       maxQueueSize: 10,
       onOutcome: (outcome) => {
         if (outcome.kind === "event-handled") {
@@ -171,11 +180,12 @@ describe("SerialEventDelivery", () => {
       },
     });
 
-    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 });
+    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 }, defaultFrameBytes);
     await Promise.resolve();
 
     expect(delivery.debugInfo()).toMatchObject({
       lastHandledSeq: 0,
+      queueBytes: defaultFrameBytes,
       queueSize: 1,
     });
 
@@ -184,6 +194,7 @@ describe("SerialEventDelivery", () => {
 
     expect(delivery.debugInfo()).toMatchObject({
       lastHandledSeq: 1,
+      queueBytes: 0,
       queueSize: 0,
     });
   });
@@ -194,6 +205,7 @@ describe("SerialEventDelivery", () => {
     const delivery = new SerialEventDelivery<TestEvent>({
       handlerTimeoutMs: 1_000,
       initialSeq: 0,
+      maxQueueBytes: defaultMaxQueueBytes,
       maxQueueSize: 10,
       onOutcome: (outcome) => {
         if (outcome.kind === "event-handled") {
@@ -205,9 +217,9 @@ describe("SerialEventDelivery", () => {
       delivered.push(event.seq);
     });
 
-    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 });
+    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 }, defaultFrameBytes);
     await handled.promise;
-    delivery.enqueueEvent({ eventId: "evt_1_duplicate", seq: 1 });
+    delivery.enqueueEvent({ eventId: "evt_1_duplicate", seq: 1 }, defaultFrameBytes);
     await Promise.resolve();
 
     expect(delivered).toEqual([1]);
@@ -224,6 +236,7 @@ describe("SerialEventDelivery", () => {
     const delivery = new SerialEventDelivery<TestEvent>({
       handlerTimeoutMs: 1_000,
       initialSeq: 0,
+      maxQueueBytes: defaultMaxQueueBytes,
       maxQueueSize: 10,
       onOutcome: (outcome) => {
         outcomes.push(outcome.kind);
@@ -233,7 +246,7 @@ describe("SerialEventDelivery", () => {
       delivered.push(event.seq);
     });
 
-    delivery.enqueueEvent({ eventId: "evt_2", seq: 2 });
+    delivery.enqueueEvent({ eventId: "evt_2", seq: 2 }, defaultFrameBytes);
     await Promise.resolve();
 
     expect(outcomes).toEqual(["non-contiguous-event"]);
@@ -260,6 +273,7 @@ describe("SerialEventDelivery", () => {
       },
       handlerTimeoutMs: 25,
       initialSeq: 0,
+      maxQueueBytes: defaultMaxQueueBytes,
       maxQueueSize: 10,
       onOutcome: (outcome) => {
         outcomes.push(outcome.kind);
@@ -270,7 +284,7 @@ describe("SerialEventDelivery", () => {
     });
     delivery.onEvent(() => new Promise<void>(() => undefined));
 
-    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 });
+    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 }, defaultFrameBytes);
     await Promise.resolve();
     deadline?.();
     await timedOut.promise;
@@ -283,12 +297,13 @@ describe("SerialEventDelivery", () => {
     });
   });
 
-  it("rejects an event that would exceed the queue limit", async () => {
+  it("rejects an event that would exceed the queue count limit", async () => {
     const firstHandler = createDeferred<void>();
     const outcomes: string[] = [];
     const delivery = new SerialEventDelivery<TestEvent>({
       handlerTimeoutMs: 1_000,
       initialSeq: 0,
+      maxQueueBytes: defaultMaxQueueBytes,
       maxQueueSize: 1,
       onOutcome: (outcome) => {
         outcomes.push(outcome.kind);
@@ -298,9 +313,9 @@ describe("SerialEventDelivery", () => {
       await firstHandler.promise;
     });
 
-    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 });
+    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 }, defaultFrameBytes);
     await Promise.resolve();
-    delivery.enqueueEvent({ eventId: "evt_2", seq: 2 });
+    delivery.enqueueEvent({ eventId: "evt_2", seq: 2 }, defaultFrameBytes);
 
     expect(outcomes).toEqual(["delivery-queue-overflow"]);
     expect(delivery.debugInfo()).toMatchObject({
@@ -312,12 +327,162 @@ describe("SerialEventDelivery", () => {
     firstHandler.resolve();
   });
 
+  it("rejects an event that would exceed the retained byte limit below the count limit", async () => {
+    const firstHandler = createDeferred<void>();
+    const outcomes: SerialEventDeliveryByteOverflow[] = [];
+    const delivery = new SerialEventDelivery<TestEvent>({
+      handlerTimeoutMs: 1_000,
+      initialSeq: 0,
+      maxQueueBytes: 100,
+      maxQueueSize: 100,
+      onOutcome: (outcome) => {
+        if (outcome.kind === "delivery-byte-overflow") {
+          outcomes.push({
+            maxQueueBytes: outcome.maxQueueBytes,
+            observedQueueBytes: outcome.observedQueueBytes,
+          });
+        }
+      },
+    });
+    delivery.onEvent(async () => {
+      await firstHandler.promise;
+    });
+
+    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 }, 60);
+    await Promise.resolve();
+    delivery.enqueueEvent({ eventId: "evt_2", seq: 2 }, 60);
+
+    expect(outcomes).toEqual([{ maxQueueBytes: 100, observedQueueBytes: 120 }]);
+    expect(delivery.debugInfo()).toMatchObject({
+      halted: true,
+      lastReceivedSeq: 1,
+      queueBytes: 60,
+      queueSize: 1,
+    });
+
+    firstHandler.resolve();
+  });
+
+  it("passes an abort signal to handlers and aborts it on timeout", async () => {
+    let deadline: (() => void) | undefined;
+    const timedOut = createDeferred<void>();
+    let observedSignal: AbortSignal | undefined;
+    let abortedAtSettlement = false;
+    const invocationSettled = createDeferred<void>();
+    const delivery = new SerialEventDelivery<TestEvent>({
+      clock: {
+        clearTimeout: () => undefined,
+        setTimeout: (callback) => {
+          deadline = callback;
+          return "deadline-1";
+        },
+      },
+      handlerTimeoutMs: 25,
+      initialSeq: 0,
+      maxQueueBytes: defaultMaxQueueBytes,
+      maxQueueSize: 10,
+      onOutcome: (outcome) => {
+        if (outcome.kind === "handler-timeout") {
+          timedOut.resolve();
+        }
+      },
+    });
+    delivery.onEvent(async (_event, signal) => {
+      observedSignal = signal;
+      await new Promise<void>((resolve) => {
+        signal.addEventListener("abort", () => {
+          abortedAtSettlement = signal.aborted;
+          resolve();
+          invocationSettled.resolve();
+        });
+      });
+    });
+
+    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 }, defaultFrameBytes);
+    await Promise.resolve();
+    expect(observedSignal?.aborted).toBe(false);
+    deadline?.();
+    await timedOut.promise;
+    await invocationSettled.promise;
+
+    expect(abortedAtSettlement).toBe(true);
+    expect(observedSignal?.aborted).toBe(true);
+  });
+
+  it("does not settle until a timed-out handler invocation finishes", async () => {
+    let deadline: (() => void) | undefined;
+    const timedOut = createDeferred<void>();
+    const releaseHandler = createDeferred<void>();
+    const delivery = new SerialEventDelivery<TestEvent>({
+      clock: {
+        clearTimeout: () => undefined,
+        setTimeout: (callback) => {
+          deadline = callback;
+          return "deadline-1";
+        },
+      },
+      handlerTimeoutMs: 25,
+      initialSeq: 0,
+      maxQueueBytes: defaultMaxQueueBytes,
+      maxQueueSize: 10,
+      onOutcome: (outcome) => {
+        if (outcome.kind === "handler-timeout") {
+          timedOut.resolve();
+        }
+      },
+    });
+    delivery.onEvent(async () => {
+      await releaseHandler.promise;
+    });
+
+    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 }, defaultFrameBytes);
+    await Promise.resolve();
+    deadline?.();
+    await timedOut.promise;
+
+    let settled = false;
+    const settlement = delivery.waitForSettlement().then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(delivery.debugInfo().pendingSettlementCount).toBe(1);
+
+    releaseHandler.resolve();
+    await settlement;
+
+    expect(settled).toBe(true);
+    expect(delivery.debugInfo().pendingSettlementCount).toBe(0);
+  });
+
+  it("rejects non-positive or non-finite delivery bounds", () => {
+    const base = {
+      handlerTimeoutMs: 1_000,
+      initialSeq: 0,
+      maxQueueBytes: defaultMaxQueueBytes,
+      maxQueueSize: 10,
+      onOutcome: () => undefined,
+    };
+    for (const invalid of [0, -1, Number.POSITIVE_INFINITY, Number.NaN]) {
+      expect(
+        () => new SerialEventDelivery<TestEvent>({ ...base, maxQueueSize: invalid }),
+      ).toThrow();
+      expect(
+        () => new SerialEventDelivery<TestEvent>({ ...base, maxQueueBytes: invalid }),
+      ).toThrow();
+      expect(
+        () => new SerialEventDelivery<TestEvent>({ ...base, handlerTimeoutMs: invalid }),
+      ).toThrow();
+    }
+  });
+
   it("exposes readonly queue and active-delivery diagnostics", async () => {
     const handler = createDeferred<void>();
     const handled = createDeferred<void>();
     const delivery = new SerialEventDelivery<TestEvent>({
       handlerTimeoutMs: 1_000,
       initialSeq: 0,
+      maxQueueBytes: defaultMaxQueueBytes,
       maxQueueSize: 10,
       onOutcome: (outcome) => {
         if (outcome.kind === "event-handled") {
@@ -329,7 +494,7 @@ describe("SerialEventDelivery", () => {
       await handler.promise;
     });
 
-    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 });
+    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 }, defaultFrameBytes);
     await Promise.resolve();
     await Promise.resolve();
 
@@ -340,6 +505,10 @@ describe("SerialEventDelivery", () => {
       handlerCount: 1,
       lastHandledSeq: 0,
       lastReceivedSeq: 1,
+      maxQueueBytes: defaultMaxQueueBytes,
+      maxQueueSize: 10,
+      pendingSettlementCount: 0,
+      queueBytes: defaultFrameBytes,
       queueSize: 1,
     });
 
@@ -353,6 +522,10 @@ describe("SerialEventDelivery", () => {
       handlerCount: 1,
       lastHandledSeq: 1,
       lastReceivedSeq: 1,
+      maxQueueBytes: defaultMaxQueueBytes,
+      maxQueueSize: 10,
+      pendingSettlementCount: 0,
+      queueBytes: 0,
       queueSize: 0,
     });
   });
@@ -362,13 +535,14 @@ describe("SerialEventDelivery", () => {
     const delivery = new SerialEventDelivery<TestEvent>({
       handlerTimeoutMs: 1_000,
       initialSeq: 0,
+      maxQueueBytes: defaultMaxQueueBytes,
       maxQueueSize: 10,
       onOutcome: () => undefined,
     });
     delivery.onEvent(async () => {
       await handler.promise;
     });
-    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 });
+    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 }, defaultFrameBytes);
     await Promise.resolve();
     let settled = false;
     const settlement = delivery.waitForSettlement().then(() => {
@@ -390,6 +564,7 @@ describe("SerialEventDelivery", () => {
     const delivery = new SerialEventDelivery<TestEvent>({
       handlerTimeoutMs: 1_000,
       initialSeq: 0,
+      maxQueueBytes: defaultMaxQueueBytes,
       maxQueueSize: 10,
       onOutcome: () => undefined,
     });
@@ -399,12 +574,12 @@ describe("SerialEventDelivery", () => {
         await handler.promise;
       }
     });
-    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 });
-    delivery.enqueueEvent({ eventId: "evt_2", seq: 2 });
+    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 }, defaultFrameBytes);
+    delivery.enqueueEvent({ eventId: "evt_2", seq: 2 }, defaultFrameBytes);
     await Promise.resolve();
 
     delivery.stop();
-    delivery.enqueueEvent({ eventId: "evt_3", seq: 3 });
+    delivery.enqueueEvent({ eventId: "evt_3", seq: 3 }, defaultFrameBytes);
     handler.resolve();
     await delivery.waitForSettlement();
 
@@ -413,10 +588,16 @@ describe("SerialEventDelivery", () => {
       halted: true,
       lastHandledSeq: 1,
       lastReceivedSeq: 2,
+      queueBytes: 0,
       queueSize: 0,
     });
   });
 });
+
+interface SerialEventDeliveryByteOverflow {
+  readonly maxQueueBytes: number;
+  readonly observedQueueBytes: number;
+}
 
 interface Deferred<TValue> {
   readonly promise: Promise<TValue>;

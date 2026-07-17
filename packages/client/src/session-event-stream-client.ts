@@ -16,7 +16,10 @@ import type { SessionEvent } from "./types.js";
 const defaultReconnectBaseDelayMs = 100;
 const defaultReconnectMaxDelayMs = 2_000;
 const observerHandlerTimeoutMs = 30_000;
+const observerMaxErrorBacklog = 32;
+const observerMaxQueueBytes = 16 * 1024 * 1024;
 const observerMaxQueueSize = 2_000;
+const observerMaxRecoveryAttempts = 5;
 
 /** Factory for observer WebSocket connections, injectable by tests and hosts. */
 export type SessionEventStreamWebSocketFactory = (url: string) => WebSocket;
@@ -46,12 +49,16 @@ export interface SessionEventStreamClientConfig {
 export interface SessionEventStreamClientDebugInfo {
   /** Number of WebSocket connections opened. */
   readonly connectCount: number;
+  /** Number of errors dropped from the bounded error backlog before any handler subscribed. */
+  readonly droppedErrorCount: number;
   /** Number of durable events delivered by the stream. */
   readonly eventCount: number;
   /** Number of registered event handlers. */
   readonly eventHandlerCount: number;
   /** Highest event sequence whose handlers have all resolved; the durable resume cursor. */
   readonly lastObservedSeq: number;
+  /** Terminal reason the observer paused delivery recovery, or null while active. */
+  readonly pausedReason: string | null;
   /** Number of failed reconnect attempts since startup. */
   readonly reconnectFailureCount: number;
   /** Number of successful reconnects since startup. */
@@ -102,9 +109,17 @@ export class SessionEventStreamClient {
   );
   private closePromise: Promise<void> = Promise.resolve();
   private connectCount = 0;
+  /** Failed recovery attempts for the current failing target sequence. */
+  private deliveryRecoveryAttempts = 0;
+  /** Target resume sequence the current recovery cycle is retrying, or null. */
+  private deliveryRecoverySeq: number | null = null;
+  /** Count of errors evicted from the bounded backlog before any handler subscribed. */
+  private droppedErrorCount = 0;
   private eventCount = 0;
   /** Highest sequence whose handlers have all resolved; the durable resume cursor. */
   private lastObservedSeq: number;
+  /** Terminal reason the observer paused delivery recovery, or null while active. */
+  private pausedReason: string | null = null;
   private reconnectFailureCount = 0;
   private reconnectPromise: Promise<void> | null = null;
   private reconnectSuccessCount = 0;
@@ -141,9 +156,11 @@ export class SessionEventStreamClient {
   debugInfo(): SessionEventStreamClientDebugInfo {
     return {
       connectCount: this.connectCount,
+      droppedErrorCount: this.droppedErrorCount,
       eventCount: this.eventCount,
       eventHandlerCount: this.eventHandlers.size,
       lastObservedSeq: this.lastObservedSeq,
+      pausedReason: this.pausedReason,
       reconnectFailureCount: this.reconnectFailureCount,
       reconnectSuccessCount: this.reconnectSuccessCount,
       replayCompleteCount: this.replayCompleteCount,
@@ -298,6 +315,8 @@ export class SessionEventStreamClient {
       return;
     }
     try {
+      const frameByteLength =
+        typeof data === "string" ? Buffer.byteLength(data) : Buffer.byteLength(String(data));
       const envelope = parseWebSocketServerEnvelope(JSON.parse(String(data)) as unknown);
       if (!envelope) {
         this.delivery.rejectInvalidEnvelope();
@@ -305,7 +324,7 @@ export class SessionEventStreamClient {
       }
       if (envelope.op === webSocketOperation.event) {
         this.eventCount += 1;
-        this.delivery.enqueueEvent(envelope.event);
+        this.delivery.enqueueEvent(envelope.event, frameByteLength);
         return;
       }
       if (envelope.op === webSocketOperation.replayComplete) {
@@ -333,6 +352,7 @@ export class SessionEventStreamClient {
     return new SerialEventDelivery<SessionEvent>({
       handlerTimeoutMs: observerHandlerTimeoutMs,
       initialSeq: afterSeq,
+      maxQueueBytes: observerMaxQueueBytes,
       maxQueueSize: observerMaxQueueSize,
       onOutcome: (outcome) => this.handleDeliveryOutcome(outcome, generation),
     });
@@ -359,6 +379,12 @@ export class SessionEventStreamClient {
       return;
     }
     switch (outcome.kind) {
+      case "delivery-byte-overflow":
+        this.emitError(
+          new Error("Session event delivery retained bytes exceeded their configured limit"),
+        );
+        this.recoverFromDeliveryFailure(generation);
+        return;
       case "delivery-queue-overflow":
         this.emitError(new Error("Session event delivery queue exceeded its configured limit"));
         this.recoverFromDeliveryFailure(generation);
@@ -367,6 +393,10 @@ export class SessionEventStreamClient {
         return;
       case "event-handled":
         this.lastObservedSeq = outcome.event.seq;
+        if (this.deliveryRecoverySeq === outcome.event.seq) {
+          this.deliveryRecoveryAttempts = 0;
+          this.deliveryRecoverySeq = null;
+        }
         return;
       case "handler-failed":
         this.emitError(
@@ -397,22 +427,51 @@ export class SessionEventStreamClient {
   /**
    * Recovers after a handler rejection by discarding un-acknowledged events and
    * reconnecting from the last successfully handled sequence, so the server
-   * replays the failed event rather than the stream advancing past it.
+   * replays the failed event rather than the stream advancing past it. Recovery
+   * is bounded per failing target sequence: after `observerMaxRecoveryAttempts`
+   * failed attempts the observer enters an inspectable Paused State instead of
+   * reconnecting forever. Before reopening, it awaits the old delivery's
+   * settlement barrier so a timed-out handler cannot overlap its own replay.
    */
   private recoverFromDeliveryFailure(generation: number): void {
     if (this.stopped || generation !== this.connectionGeneration) {
       return;
     }
+    const targetSeq = this.lastObservedSeq + 1;
+    if (this.deliveryRecoverySeq !== targetSeq) {
+      this.deliveryRecoveryAttempts = 0;
+      this.deliveryRecoverySeq = targetSeq;
+    }
+    this.deliveryRecoveryAttempts += 1;
     const socket = this.socket;
+    if (this.deliveryRecoveryAttempts >= observerMaxRecoveryAttempts) {
+      this.pausedReason = "delivery_recovery_exhausted";
+      this.stopped = true;
+      this.settleReplayCompleteError(new Error("Observer delivery failed before replay completed"));
+      this.emitError(
+        new SessionEventStreamError({
+          message: "Session event observer paused after exhausting delivery recovery attempts",
+          safeDetails: { attempts: this.deliveryRecoveryAttempts, targetSeq },
+        }),
+      );
+      this.socket = null;
+      socket?.close();
+      return;
+    }
+    const settlingDelivery = this.delivery;
     this.settleReplayCompleteError(new Error("Observer delivery failed before replay completed"));
     this.socket = null;
     socket?.close();
-    void this.requestReconnect();
+    void settlingDelivery.waitForSettlement().then(() => this.requestReconnect());
   }
 
   /** Routes operational failures to registered error handlers. */
   private emitError(error: Error): void {
     if (this.errorHandlers.size === 0) {
+      if (this.errorBacklog.length >= observerMaxErrorBacklog) {
+        this.errorBacklog.shift();
+        this.droppedErrorCount += 1;
+      }
       this.errorBacklog.push(error);
       return;
     }
