@@ -7,7 +7,7 @@ import {
   createAuthContext,
   type AuthContext,
   type AuthSigningSecrets,
-  verifyAuthToken,
+  verifyLegacyAuthToken,
 } from "./token.js";
 
 export interface AuthRuntimeDebugInfo {
@@ -145,7 +145,7 @@ function authenticateBearerToken(input: AuthenticateBearerTokenInput): AuthConte
   }
   try {
     return createAuthContext(
-      verifyAuthToken(input.token, {
+      verifyLegacyAuthToken(input.token, {
         secrets: input.secrets,
       }),
     );

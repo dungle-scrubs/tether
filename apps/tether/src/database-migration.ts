@@ -5,6 +5,8 @@
  * it does not own normal application persistence.
  */
 
+import { createHash } from "node:crypto";
+
 import { readMigrationFiles } from "drizzle-orm/migrator";
 import type { MigrationMeta } from "drizzle-orm/migrator";
 import { drizzle } from "drizzle-orm/node-postgres";
@@ -14,6 +16,9 @@ import type pg from "pg";
 const MIGRATION_ADVISORY_LOCK_KEY = "8387255305985817959";
 const migrationsFolder = "drizzle";
 const tetherTableNames = [
+  "auth_grant_audit_events",
+  "auth_grants",
+  "auth_tickets",
   "client_session_bindings",
   "participant_control_leases",
   "participants",
@@ -84,8 +89,41 @@ interface IndexSignature {
   readonly unique: boolean;
 }
 
+interface NamedConstraintExpectation {
+  readonly constraintName: string;
+  readonly constraintType: "c" | "f" | "p";
+  readonly requiredDefinitionFragments: readonly string[];
+  readonly tableName: string;
+}
+
+interface NamedConstraintRow {
+  readonly constraintName: string;
+  readonly constraintType: string;
+  readonly deleteAction: string | null;
+  readonly definition: string;
+  readonly tableName: string;
+  readonly updateAction: string | null;
+  readonly validated: boolean;
+}
+
 interface SchemaObjectExistsRow {
   readonly exists: boolean;
+}
+
+interface AuthColumnExpectation {
+  readonly columnDefault: string | null;
+  readonly columnName: string;
+  readonly dataType: "jsonb" | "text" | "timestamp with time zone";
+  readonly isNullable: "NO" | "YES";
+  readonly tableName: "auth_grant_audit_events" | "auth_grants" | "auth_tickets";
+}
+
+interface AuthColumnRow {
+  readonly columnDefault: string | null;
+  readonly columnName: string;
+  readonly dataType: string;
+  readonly isNullable: string;
+  readonly tableName: string;
 }
 
 interface UnlockRow {
@@ -525,7 +563,247 @@ function legacyMigrationProbes(): readonly LegacyMigrationProbe[] {
           unique: true,
         })),
     },
+    {
+      label: "0014 authentication grant foundation",
+      contradictionObserved: async (client) =>
+        (await hasAnyAuthFoundationArtifact(client)) && !(await hasAuthFoundationMigration(client)),
+      represented: hasAuthFoundationMigration,
+    },
   ];
+}
+
+const authFoundationColumns: readonly AuthColumnExpectation[] = [
+  authColumn("auth_grant_audit_events", "action", "text", "NO"),
+  authColumn("auth_grant_audit_events", "actor_subject", "text", "NO"),
+  authColumn("auth_grant_audit_events", "audit_id", "text", "NO"),
+  authColumn("auth_grant_audit_events", "grant_jti", "text", "NO"),
+  authColumn("auth_grant_audit_events", "metadata", "jsonb", "NO"),
+  authColumn("auth_grant_audit_events", "occurred_at", "timestamp with time zone", "NO", "now()"),
+  authColumn("auth_grant_audit_events", "reason_code", "text", "NO"),
+  authColumn("auth_grants", "audience", "text", "NO"),
+  authColumn("auth_grants", "expires_at", "timestamp with time zone", "NO"),
+  authColumn("auth_grants", "issued_at", "timestamp with time zone", "NO"),
+  authColumn("auth_grants", "issuer", "text", "NO"),
+  authColumn("auth_grants", "jti", "text", "NO"),
+  authColumn("auth_grants", "kid", "text", "NO"),
+  authColumn("auth_grants", "metadata", "jsonb", "NO"),
+  authColumn("auth_grants", "revoked_at", "timestamp with time zone", "YES"),
+  authColumn("auth_grants", "role", "text", "NO"),
+  authColumn("auth_grants", "session_scope", "text", "NO"),
+  authColumn("auth_grants", "subject", "text", "NO"),
+  authColumn("auth_tickets", "admission_metadata", "jsonb", "NO"),
+  authColumn("auth_tickets", "audience", "text", "NO"),
+  authColumn("auth_tickets", "consumed_at", "timestamp with time zone", "YES"),
+  authColumn("auth_tickets", "created_at", "timestamp with time zone", "NO"),
+  authColumn("auth_tickets", "expires_at", "timestamp with time zone", "NO"),
+  authColumn("auth_tickets", "parent_grant_jti", "text", "NO"),
+  authColumn("auth_tickets", "ticket_hash", "text", "NO"),
+];
+
+const authFoundationIndexes: readonly (IndexSignature & { readonly indexName: string })[] = [
+  {
+    columnNames: ["grant_jti", "occurred_at"],
+    indexName: "auth_grant_audit_grant_occurred_idx",
+    predicate: null,
+    tableName: "auth_grant_audit_events",
+    unique: false,
+  },
+  {
+    columnNames: ["occurred_at"],
+    indexName: "auth_grant_audit_occurred_idx",
+    predicate: null,
+    tableName: "auth_grant_audit_events",
+    unique: false,
+  },
+  {
+    columnNames: ["expires_at"],
+    indexName: "auth_grants_expiry_idx",
+    predicate: null,
+    tableName: "auth_grants",
+    unique: false,
+  },
+  {
+    columnNames: ["revoked_at", "expires_at"],
+    indexName: "auth_grants_revoked_expiry_idx",
+    predicate: null,
+    tableName: "auth_grants",
+    unique: false,
+  },
+  {
+    columnNames: ["consumed_at"],
+    indexName: "auth_tickets_consumed_idx",
+    predicate: null,
+    tableName: "auth_tickets",
+    unique: false,
+  },
+  {
+    columnNames: ["expires_at"],
+    indexName: "auth_tickets_expiry_idx",
+    predicate: null,
+    tableName: "auth_tickets",
+    unique: false,
+  },
+  {
+    columnNames: ["parent_grant_jti", "expires_at"],
+    indexName: "auth_tickets_parent_expiry_idx",
+    predicate: null,
+    tableName: "auth_tickets",
+    unique: false,
+  },
+];
+
+/** Creates one exact expected auth column fact. */
+function authColumn(
+  tableName: AuthColumnExpectation["tableName"],
+  columnName: string,
+  dataType: AuthColumnExpectation["dataType"],
+  isNullable: AuthColumnExpectation["isNullable"],
+  columnDefault: string | null = null,
+): AuthColumnExpectation {
+  return { columnDefault, columnName, dataType, isNullable, tableName };
+}
+
+const authFoundationConstraints: readonly NamedConstraintExpectation[] = [
+  constraint("auth_grants_pkey", "p", "auth_grants", ["PRIMARY KEY (jti)"]),
+  constraint("auth_grant_audit_events_pkey", "p", "auth_grant_audit_events", [
+    "PRIMARY KEY (audit_id)",
+  ]),
+  constraint("auth_tickets_pkey", "p", "auth_tickets", ["PRIMARY KEY (ticket_hash)"]),
+  constraint(
+    "auth_grant_audit_events_grant_jti_auth_grants_jti_fk",
+    "f",
+    "auth_grant_audit_events",
+    ["FOREIGN KEY (grant_jti) REFERENCES auth_grants(jti)"],
+  ),
+  constraint("auth_tickets_parent_grant_jti_auth_grants_jti_fk", "f", "auth_tickets", [
+    "FOREIGN KEY (parent_grant_jti) REFERENCES auth_grants(jti)",
+  ]),
+  constraint("auth_grants_audience_check", "c", "auth_grants", ["audience = 'tether-rest'"]),
+  constraint("auth_grants_expiry_check", "c", "auth_grants", ["expires_at > issued_at"]),
+  constraint("auth_grants_lifetime_check", "c", "auth_grants", [
+    "expires_at <= issued_at + '7 days'",
+  ]),
+  constraint("auth_grants_issuer_length_check", "c", "auth_grants", [
+    "char_length(issuer) >= 1",
+    "char_length(issuer) <= 512",
+  ]),
+  constraint("auth_grants_jti_length_check", "c", "auth_grants", [
+    "char_length(jti) >= 1",
+    "char_length(jti) <= 128",
+  ]),
+  constraint("auth_grants_kid_length_check", "c", "auth_grants", [
+    "char_length(kid) >= 1",
+    "char_length(kid) <= 128",
+  ]),
+  constraint("auth_grants_metadata_size_check", "c", "auth_grants", [
+    "octet_length(metadata::text) <= 4096",
+  ]),
+  constraint("auth_grants_metadata_shape_check", "c", "auth_grants", [
+    "jsonb_typeof(metadata) = 'object'",
+    "jsonb_typeof(metadata->'source') = 'string'",
+    "metadata->>'source' = ANY (ARRAY['admin', 'bootstrap', 'migration'])",
+    "metadata->>'requestId' ~ '^req_[A-Za-z0-9_-]{1,120}$'",
+  ]),
+  constraint("auth_grants_revoked_check", "c", "auth_grants", [
+    "revoked_at IS NULL OR revoked_at >= issued_at",
+  ]),
+  constraint("auth_grants_role_check", "c", "auth_grants", [
+    "role = ANY (ARRAY['observer', 'participant', 'admin'])",
+  ]),
+  constraint("auth_grants_session_scope_length_check", "c", "auth_grants", [
+    "char_length(session_scope) >= 1",
+    "char_length(session_scope) <= 255",
+  ]),
+  constraint("auth_grants_subject_length_check", "c", "auth_grants", [
+    "char_length(subject) >= 1",
+    "char_length(subject) <= 255",
+  ]),
+  constraint("auth_grant_audit_action_check", "c", "auth_grant_audit_events", [
+    "action = ANY (ARRAY['grant.created', 'grant.revoked'])",
+  ]),
+  constraint("auth_grant_audit_action_length_check", "c", "auth_grant_audit_events", [
+    "char_length(action) >= 1",
+    "char_length(action) <= 64",
+  ]),
+  constraint("auth_grant_audit_actor_length_check", "c", "auth_grant_audit_events", [
+    "char_length(actor_subject) >= 1",
+    "char_length(actor_subject) <= 255",
+  ]),
+  constraint("auth_grant_audit_id_length_check", "c", "auth_grant_audit_events", [
+    "char_length(audit_id) >= 1",
+    "char_length(audit_id) <= 128",
+  ]),
+  constraint("auth_grant_audit_metadata_size_check", "c", "auth_grant_audit_events", [
+    "octet_length(metadata::text) <= 4096",
+  ]),
+  constraint("auth_grant_audit_metadata_shape_check", "c", "auth_grant_audit_events", [
+    "jsonb_typeof(metadata) = 'object'",
+    "metadata->>'requestId' ~ '^req_[A-Za-z0-9_-]{1,120}$'",
+  ]),
+  constraint("auth_grant_audit_reason_check", "c", "auth_grant_audit_events", [
+    "reason_code = ANY (ARRAY['bootstrap', 'key-rotation', 'migration', 'operator-request', 'security-response'])",
+  ]),
+  constraint("auth_grant_audit_reason_length_check", "c", "auth_grant_audit_events", [
+    "char_length(reason_code) >= 1",
+    "char_length(reason_code) <= 64",
+  ]),
+  constraint("auth_tickets_admission_metadata_size_check", "c", "auth_tickets", [
+    "octet_length(admission_metadata::text) <= 4096",
+  ]),
+  constraint("auth_tickets_admission_metadata_shape_check", "c", "auth_tickets", [
+    "jsonb_typeof(admission_metadata) = 'object'",
+    "jsonb_typeof(admission_metadata->'replicaId') = 'string'",
+    "jsonb_typeof(admission_metadata->'transport') = 'string'",
+    "admission_metadata->>'transport' = 'websocket'",
+  ]),
+  constraint("auth_tickets_audience_check", "c", "auth_tickets", ["audience = 'tether-websocket'"]),
+  constraint("auth_tickets_consumed_check", "c", "auth_tickets", [
+    "consumed_at IS NULL OR consumed_at >= created_at AND consumed_at <= expires_at",
+  ]),
+  constraint("auth_tickets_expiry_check", "c", "auth_tickets", ["expires_at > created_at"]),
+  constraint("auth_tickets_lifetime_check", "c", "auth_tickets", [
+    "expires_at <= created_at + '00:00:30'",
+  ]),
+  constraint("auth_tickets_hash_check", "c", "auth_tickets", ["ticket_hash ~ '^[0-9a-f]{64}$'"]),
+];
+
+/** Exact normalized 0014 constraints; regenerate only with its schema and migration. */
+const authFoundationConstraintFingerprint =
+  "c5a21e2a79a5e62a2025c70eb95f998d9e3480afffcf4341545655898455f31b";
+
+/** Creates one named constraint expectation without exposing mutable arrays. */
+function constraint(
+  constraintName: string,
+  constraintType: NamedConstraintExpectation["constraintType"],
+  tableName: string,
+  requiredDefinitionFragments: readonly string[],
+): NamedConstraintExpectation {
+  return { constraintName, constraintType, requiredDefinitionFragments, tableName };
+}
+
+/** Recognizes only the complete security-relevant auth foundation migration. */
+async function hasAuthFoundationMigration(client: pg.PoolClient): Promise<boolean> {
+  if (
+    !(await hasExactAuthFoundationColumns(client)) ||
+    !(await hasNamedConstraintExpectations(client, authFoundationConstraints))
+  ) {
+    return false;
+  }
+  for (const { indexName, ...signature } of authFoundationIndexes) {
+    if (!(await hasIndexSignature(client, indexName, signature))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Detects any partial auth migration artifact so startup rejects before DDL mutation. */
+async function hasAnyAuthFoundationArtifact(client: pg.PoolClient): Promise<boolean> {
+  return (
+    (await hasTable(client, "auth_grants")) ||
+    (await hasTable(client, "auth_grant_audit_events")) ||
+    (await hasTable(client, "auth_tickets"))
+  );
 }
 
 /** Returns whether all named public tables exist. */
@@ -559,6 +837,37 @@ async function hasColumns(
     }
   }
   return true;
+}
+
+/** Requires the exact generated auth column set, types, nullability, and defaults. */
+async function hasExactAuthFoundationColumns(client: pg.PoolClient): Promise<boolean> {
+  const result = await client.query<AuthColumnRow>(
+    `
+      SELECT
+        column_default AS "columnDefault",
+        column_name AS "columnName",
+        data_type AS "dataType",
+        is_nullable AS "isNullable",
+        table_name AS "tableName"
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = ANY($1::text[])
+    `,
+    [["auth_grant_audit_events", "auth_grants", "auth_tickets"]],
+  );
+  return (
+    result.rows.length === authFoundationColumns.length &&
+    authFoundationColumns.every((expected) =>
+      result.rows.some(
+        (row) =>
+          row.columnDefault === expected.columnDefault &&
+          row.columnName === expected.columnName &&
+          row.dataType === expected.dataType &&
+          row.isNullable === expected.isNullable &&
+          row.tableName === expected.tableName,
+      ),
+    )
+  );
 }
 
 /** Returns whether one column exists on one public table. */
@@ -713,4 +1022,88 @@ async function hasConstraintSignature(
       row.columnNames.length === expected.columnNames.length &&
       row.columnNames.every((columnName, index) => columnName === expected.columnNames[index]),
   );
+}
+
+/** Verifies named constraints by type, owning table, and normalized definition fragments. */
+async function hasNamedConstraintExpectations(
+  client: pg.PoolClient,
+  expectations: readonly NamedConstraintExpectation[],
+): Promise<boolean> {
+  const result = await client.query<NamedConstraintRow>(
+    `
+      SELECT
+        constraint_record.conname AS "constraintName",
+        constraint_record.contype::text AS "constraintType",
+        CASE WHEN constraint_record.contype = 'f'
+          THEN constraint_record.confdeltype::text
+          ELSE NULL
+        END AS "deleteAction",
+        pg_get_constraintdef(constraint_record.oid, true) AS definition,
+        table_record.relname AS "tableName",
+        CASE WHEN constraint_record.contype = 'f'
+          THEN constraint_record.confupdtype::text
+          ELSE NULL
+        END AS "updateAction",
+        constraint_record.convalidated AS validated
+      FROM pg_constraint constraint_record
+      JOIN pg_class table_record ON table_record.oid = constraint_record.conrelid
+      JOIN pg_namespace namespace_record ON namespace_record.oid = table_record.relnamespace
+      WHERE namespace_record.nspname = 'public'
+        AND table_record.relname = ANY($1::text[])
+    `,
+    [["auth_grant_audit_events", "auth_grants", "auth_tickets"]],
+  );
+  const expectedConstraintsPresent = expectations.every((expectation) => {
+    const row = result.rows.find(
+      (candidate) =>
+        candidate.constraintName === expectation.constraintName &&
+        candidate.constraintType === expectation.constraintType &&
+        candidate.tableName === expectation.tableName,
+    );
+    if (row === undefined) {
+      return false;
+    }
+    const normalizedDefinition = normalizeConstraintDefinition(row.definition);
+    return expectation.requiredDefinitionFragments.every((fragment) =>
+      normalizedDefinition.includes(normalizeConstraintDefinition(fragment)),
+    );
+  });
+  return (
+    expectedConstraintsPresent &&
+    result.rows.length === expectations.length &&
+    fingerprintAuthConstraints(result.rows) === authFoundationConstraintFingerprint
+  );
+}
+
+/** Fingerprints exact normalized auth constraints, validation state, and FK actions. */
+function fingerprintAuthConstraints(rows: readonly NamedConstraintRow[]): string {
+  const facts = rows
+    .map((row) => ({
+      constraintName: row.constraintName,
+      constraintType: row.constraintType,
+      definition: normalizeConstraintDefinition(row.definition),
+      deleteAction: row.deleteAction,
+      tableName: row.tableName,
+      updateAction: row.updateAction,
+      validated: row.validated,
+    }))
+    .sort((left, right) =>
+      `${left.tableName}:${left.constraintName}`.localeCompare(
+        `${right.tableName}:${right.constraintName}`,
+      ),
+    );
+  return createHash("sha256").update(JSON.stringify(facts)).digest("hex");
+}
+
+/** Normalizes catalog-rendered constraint SQL without discarding operators or literals. */
+function normalizeConstraintDefinition(value: string): string {
+  return value
+    .toLowerCase()
+    .replaceAll('"', "")
+    .replaceAll("::text", "")
+    .replaceAll("::jsonb", "")
+    .replaceAll("::interval", "")
+    .replaceAll("(", "")
+    .replaceAll(")", "")
+    .replaceAll(/\s+/gu, "");
 }

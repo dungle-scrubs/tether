@@ -59,6 +59,32 @@ describe("auth enforcement runtime", () => {
       },
     ]);
   });
+
+  it("rejects tgr2 through the legacy runtime without exposing credential material", () => {
+    const warnings: AuthWarning[] = [];
+    const runtime = createAuthRuntime({
+      activeKid: "default",
+      logger: collectWarnings(warnings),
+      mode: "required",
+      secrets: { default: "secret" },
+    });
+    const bearer = "tgr2.secret_payload_marker.secret_signature_marker";
+
+    expect(() =>
+      runtime.authenticateHttpRequest(
+        {
+          headers: { authorization: `Bearer ${bearer}` },
+          method: "GET",
+        } as IncomingMessage,
+        new URL("http://localhost/sessions"),
+      ),
+    ).toThrowError(new Error(AuthError.Malformed));
+
+    const diagnostics = JSON.stringify({ debug: runtime.debugInfo(), warnings });
+    expect(diagnostics).not.toContain(bearer);
+    expect(diagnostics).not.toContain("secret_payload_marker");
+    expect(diagnostics).not.toContain("secret_signature_marker");
+  });
 });
 
 interface AuthWarning {

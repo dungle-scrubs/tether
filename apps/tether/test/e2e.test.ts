@@ -15,6 +15,12 @@ import {
   testAuthSigningSecret,
 } from "../src/auth/test-tokens.js";
 import type { AuthRole } from "../src/auth/token.js";
+import { createAuthPersistenceStores } from "../src/auth/db-grant-stores.js";
+import type {
+  AuthGrantAuditMetadata,
+  AuthGrantMetadata,
+  AuthTicketAdmissionMetadata,
+} from "../src/auth/grant-stores.js";
 import { ParticipantRuntimeClient } from "../src/client.js";
 import {
   DatabaseMigrationError,
@@ -109,6 +115,7 @@ const generatedMigrationNames = [
   "0011_special_blue_marvel.sql",
   "0012_control_lease_generation_history.sql",
   "0013_misty_leo.sql",
+  "0014_wealthy_kinsey_walden.sql",
 ] as const;
 
 interface JsonResponse {
@@ -439,6 +446,394 @@ e2e("tether e2e", () => {
     });
 
     expect(response.session.sessionId).toMatch(/^sess_/u);
+  });
+
+  it("persists grant authority, bounded audit state, and hashed tickets through narrow stores", async () => {
+    const stores = createAuthPersistenceStores(currentPool());
+    const issuedAt = new Date("2026-01-01T00:00:00.000Z");
+    const expiresAt = new Date("2026-01-02T00:00:00.000Z");
+    const jti = `grant_${randomUUID()}`;
+    const ticketHash = "a".repeat(64);
+    const auditId = `audit_${randomUUID()}`;
+
+    await stores.createGrantWithAudit({
+      audit: {
+        action: "grant.created",
+        actorSubject: "part_e2e_store",
+        auditId,
+        metadata: { requestId: "req_e2e_create" },
+        occurredAt: issuedAt,
+        reasonCode: "bootstrap",
+      },
+      grant: {
+        audience: "tether-rest",
+        expiresAt,
+        issuedAt,
+        issuer: "https://auth.e2e.tether.local",
+        jti,
+        kid: testAuthSigningKid,
+        metadata: { requestId: "req_e2e_create", source: "bootstrap" },
+        revokedAt: null,
+        role: "admin",
+        sessionScope: "*",
+        subject: "part_e2e_store",
+      },
+    });
+    await stores.tickets.create({
+      admissionMetadata: {
+        remoteAddressHash: null,
+        replicaId: "replica_e2e",
+        transport: "websocket",
+      },
+      audience: "tether-websocket",
+      consumedAt: null,
+      createdAt: issuedAt,
+      expiresAt: new Date("2026-01-01T00:00:30.000Z"),
+      parentGrantJti: jti,
+      ticketHash,
+    });
+
+    await expect(stores.grants.findByJti(jti)).resolves.toMatchObject({
+      audience: "tether-rest",
+      jti,
+      revokedAt: null,
+      subject: "part_e2e_store",
+    });
+    await expect(stores.audits.listForGrant(jti, 10)).resolves.toEqual([
+      expect.objectContaining({ action: "grant.created", grantJti: jti }),
+    ]);
+    await expect(stores.tickets.findByHash(ticketHash)).resolves.toMatchObject({
+      parentGrantJti: jti,
+      ticketHash,
+    });
+
+    const rolledBackJti = `grant_${randomUUID()}`;
+    await expect(
+      stores.createGrantWithAudit({
+        audit: {
+          action: "grant.created",
+          actorSubject: "part_e2e_store",
+          auditId,
+          metadata: { requestId: "req_e2e_rollback" },
+          occurredAt: issuedAt,
+          reasonCode: "bootstrap",
+        },
+        grant: {
+          audience: "tether-rest",
+          expiresAt,
+          issuedAt,
+          issuer: "https://auth.e2e.tether.local",
+          jti: rolledBackJti,
+          kid: testAuthSigningKid,
+          metadata: { requestId: "req_e2e_rollback", source: "bootstrap" },
+          revokedAt: null,
+          role: "observer",
+          sessionScope: "*",
+          subject: "part_e2e_rollback",
+        },
+      }),
+    ).rejects.toThrow("auth_grant_create_failed");
+    await expect(stores.grants.findByJti(rolledBackJti)).resolves.toBeNull();
+
+    const revokeRollbackJti = `grant_${randomUUID()}`;
+    await stores.createGrantWithAudit({
+      audit: {
+        action: "grant.created",
+        actorSubject: "part_e2e_store",
+        auditId: `audit_${randomUUID()}`,
+        metadata: { requestId: "req_e2e_revoke_rollback_create" },
+        occurredAt: issuedAt,
+        reasonCode: "bootstrap",
+      },
+      grant: {
+        audience: "tether-rest",
+        expiresAt,
+        issuedAt,
+        issuer: "https://auth.e2e.tether.local",
+        jti: revokeRollbackJti,
+        kid: testAuthSigningKid,
+        metadata: { requestId: "req_e2e_revoke_rollback_create", source: "bootstrap" },
+        revokedAt: null,
+        role: "observer",
+        sessionScope: "*",
+        subject: "part_e2e_revoke_rollback",
+      },
+    });
+    await expect(
+      stores.revokeGrantWithAudit({
+        audit: {
+          action: "grant.revoked",
+          actorSubject: "part_e2e_store",
+          auditId,
+          metadata: { requestId: "req_e2e_revoke_rollback" },
+          occurredAt: new Date("2026-01-01T00:01:00.000Z"),
+          reasonCode: "operator-request",
+        },
+        jti: revokeRollbackJti,
+        revokedAt: new Date("2026-01-01T00:01:00.000Z"),
+      }),
+    ).rejects.toThrow("auth_grant_revoke_failed");
+    await expect(stores.grants.findByJti(revokeRollbackJti)).resolves.toMatchObject({
+      revokedAt: null,
+    });
+    await expect(stores.audits.listForGrant(revokeRollbackJti, 10)).resolves.toHaveLength(1);
+
+    const overlongGrantJti = `grant_${randomUUID()}`;
+    await expect(
+      stores.createGrantWithAudit({
+        audit: {
+          action: "grant.created",
+          actorSubject: "part_e2e_store",
+          auditId: `audit_${randomUUID()}`,
+          metadata: { requestId: "req_e2e_overlong" },
+          occurredAt: issuedAt,
+          reasonCode: "bootstrap",
+        },
+        grant: {
+          audience: "tether-rest",
+          expiresAt: new Date("2026-01-08T00:00:00.001Z"),
+          issuedAt,
+          issuer: "https://auth.e2e.tether.local",
+          jti: overlongGrantJti,
+          kid: testAuthSigningKid,
+          metadata: { requestId: "req_e2e_overlong", source: "bootstrap" },
+          revokedAt: null,
+          role: "observer",
+          sessionScope: "*",
+          subject: "part_e2e_overlong",
+        },
+      }),
+    ).rejects.toThrow("auth_grant_create_failed");
+    await expect(stores.grants.findByJti(overlongGrantJti)).resolves.toBeNull();
+
+    const credentialMarker = "tgr2.secret_payload.secret_signature";
+    const unsafeGrantMetadata = {
+      bearer: credentialMarker,
+      requestId: null,
+      source: "bootstrap",
+    } as unknown as AuthGrantMetadata;
+    const rejectedMetadataWrite = stores.createGrantWithAudit({
+      audit: {
+        action: "grant.created",
+        actorSubject: "part_e2e_store",
+        auditId: `audit_${randomUUID()}`,
+        metadata: { requestId: null },
+        occurredAt: issuedAt,
+        reasonCode: "bootstrap",
+      },
+      grant: {
+        audience: "tether-rest",
+        expiresAt,
+        issuedAt,
+        issuer: "https://auth.e2e.tether.local",
+        jti: `grant_${randomUUID()}`,
+        kid: testAuthSigningKid,
+        metadata: unsafeGrantMetadata,
+        revokedAt: null,
+        role: "observer",
+        sessionScope: "*",
+        subject: "part_e2e_rejected_metadata",
+      },
+    });
+    await expect(rejectedMetadataWrite).rejects.toThrow("auth_metadata_invalid");
+    await rejectedMetadataWrite.catch((error: unknown) => {
+      expect(String(error)).not.toContain(credentialMarker);
+      expect(String(error)).not.toContain("part_e2e_rejected_metadata");
+    });
+
+    const unsafeAuditMetadata = {
+      authorization: credentialMarker,
+      requestId: null,
+    } as unknown as AuthGrantAuditMetadata;
+    await expect(
+      stores.createGrantWithAudit({
+        audit: {
+          action: "grant.created",
+          actorSubject: "part_e2e_store",
+          auditId: `audit_${randomUUID()}`,
+          metadata: unsafeAuditMetadata,
+          occurredAt: issuedAt,
+          reasonCode: "bootstrap",
+        },
+        grant: {
+          audience: "tether-rest",
+          expiresAt,
+          issuedAt,
+          issuer: "https://auth.e2e.tether.local",
+          jti: `grant_${randomUUID()}`,
+          kid: testAuthSigningKid,
+          metadata: { requestId: null, source: "bootstrap" },
+          revokedAt: null,
+          role: "observer",
+          sessionScope: "*",
+          subject: "part_e2e_rejected_audit_metadata",
+        },
+      }),
+    ).rejects.toThrow("auth_metadata_invalid");
+
+    const unsafeAdmissionMetadata = {
+      remoteAddressHash: null,
+      replicaId: "replica_e2e",
+      ticket: credentialMarker,
+      transport: "websocket",
+    } as unknown as AuthTicketAdmissionMetadata;
+    await expect(
+      stores.tickets.create({
+        admissionMetadata: unsafeAdmissionMetadata,
+        audience: "tether-websocket",
+        consumedAt: null,
+        createdAt: issuedAt,
+        expiresAt: new Date("2026-01-01T00:00:30.000Z"),
+        parentGrantJti: jti,
+        ticketHash: "b".repeat(64),
+      }),
+    ).rejects.toThrow("auth_metadata_invalid");
+
+    const overlongTicketHash = "d".repeat(64);
+    await expect(
+      stores.tickets.create({
+        admissionMetadata: {
+          remoteAddressHash: null,
+          replicaId: "replica_e2e",
+          transport: "websocket",
+        },
+        audience: "tether-websocket",
+        consumedAt: null,
+        createdAt: issuedAt,
+        expiresAt: new Date("2026-01-01T00:00:30.001Z"),
+        parentGrantJti: jti,
+        ticketHash: overlongTicketHash,
+      }),
+    ).rejects.toThrow("auth_ticket_create_failed");
+    await expect(stores.tickets.findByHash(overlongTicketHash)).resolves.toBeNull();
+
+    const revokedAt = new Date("2026-01-01T00:01:00.000Z");
+    await expect(
+      stores.revokeGrantWithAudit({
+        audit: {
+          action: "grant.revoked",
+          actorSubject: "part_e2e_store",
+          auditId: `audit_${randomUUID()}`,
+          metadata: { requestId: "req_e2e_revoke" },
+          occurredAt: revokedAt,
+          reasonCode: "operator-request",
+        },
+        jti,
+        revokedAt,
+      }),
+    ).resolves.toBe("revoked");
+    await expect(
+      stores.revokeGrantWithAudit({
+        audit: {
+          action: "grant.revoked",
+          actorSubject: "part_e2e_store",
+          auditId: `audit_${randomUUID()}`,
+          metadata: { requestId: "req_e2e_revoke_retry" },
+          occurredAt: revokedAt,
+          reasonCode: "operator-request",
+        },
+        jti,
+        revokedAt,
+      }),
+    ).resolves.toBe("already_revoked");
+    await expect(stores.audits.listForGrant(jti, 10)).resolves.toHaveLength(2);
+
+    const authColumns = await currentPool().pool.query<{ readonly columnName: string }>(`
+      SELECT column_name AS "columnName"
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name IN ('auth_grants', 'auth_grant_audit_events', 'auth_tickets')
+    `);
+    const authColumnNames = authColumns.rows.map((row) => row.columnName);
+    for (const forbiddenColumnName of ["bearer", "token", "ticket"]) {
+      expect(authColumnNames).not.toContain(forbiddenColumnName);
+    }
+
+    await expect(
+      currentPool().pool.query(
+        `
+          INSERT INTO auth_grants (
+            audience, expires_at, issued_at, issuer, jti, kid, metadata,
+            revoked_at, role, session_scope, subject
+          ) VALUES (
+            'tether-rest', $1, $2, 'https://auth.e2e.tether.local', $3,
+            $4, $5::jsonb, NULL, 'observer', '*', 'part_invalid_metadata'
+          )
+        `,
+        [
+          expiresAt,
+          issuedAt,
+          `grant_${randomUUID()}`,
+          testAuthSigningKid,
+          JSON.stringify({ requestId: null, source: null }),
+        ],
+      ),
+    ).rejects.toThrow();
+
+    await expect(
+      currentPool().pool.query(
+        `
+          INSERT INTO auth_grants (
+            audience, expires_at, issued_at, issuer, jti, kid, metadata,
+            revoked_at, role, session_scope, subject
+          ) VALUES (
+            'tether-rest', $1, $2, 'https://auth.e2e.tether.local', $3,
+            $4, $5::jsonb, NULL, 'observer', '*', 'part_overlong_database_grant'
+          )
+        `,
+        [
+          new Date("2026-01-08T00:00:00.001Z"),
+          issuedAt,
+          `grant_${randomUUID()}`,
+          testAuthSigningKid,
+          JSON.stringify({ requestId: null, source: "bootstrap" }),
+        ],
+      ),
+    ).rejects.toThrow();
+
+    await expect(
+      currentPool().pool.query(
+        `
+          INSERT INTO auth_tickets (
+            admission_metadata, audience, consumed_at, created_at, expires_at,
+            parent_grant_jti, ticket_hash
+          ) VALUES (
+            $1::jsonb, 'tether-websocket', NULL, $3, $2, $4, $5
+          )
+        `,
+        [
+          JSON.stringify({ remoteAddressHash: null, replicaId: null, transport: "websocket" }),
+          new Date("2026-01-01T00:00:30.000Z"),
+          issuedAt,
+          jti,
+          "c".repeat(64),
+        ],
+      ),
+    ).rejects.toThrow();
+
+    await expect(
+      currentPool().pool.query(
+        `
+          INSERT INTO auth_tickets (
+            admission_metadata, audience, consumed_at, created_at, expires_at,
+            parent_grant_jti, ticket_hash
+          ) VALUES (
+            $1::jsonb, 'tether-websocket', NULL, $2, $3, $4, $5
+          )
+        `,
+        [
+          JSON.stringify({
+            remoteAddressHash: null,
+            replicaId: "replica_e2e",
+            transport: "websocket",
+          }),
+          issuedAt,
+          new Date("2026-01-01T00:00:30.001Z"),
+          jti,
+          "e".repeat(64),
+        ],
+      ),
+    ).rejects.toThrow();
   });
 
   it("rejects session-scoped writes for unknown sessions without creating phantom rows", async () => {
@@ -841,6 +1236,129 @@ e2e("tether e2e", () => {
       expect(journal.rows[0]?.count).toBe(
         readMigrationFiles({ migrationsFolder: "drizzle" }).length,
       );
+    } finally {
+      await database.end();
+      await dropDatabase(databaseName);
+    }
+  });
+
+  it("rejects a journal-less auth schema with a weakened lifetime constraint", async () => {
+    const databaseName = `tether_e2e_weakened_auth_${randomUUID().replaceAll("-", "_")}`;
+    const database = createPool(buildDatabaseUrl(databaseName));
+    try {
+      await createDatabase(databaseName);
+      await applyLegacyMigrationPrefix(database, generatedMigrationNames.length - 1);
+      await database.pool.query(`
+        ALTER TABLE auth_grants DROP CONSTRAINT auth_grants_lifetime_check;
+        ALTER TABLE auth_grants ADD CONSTRAINT auth_grants_lifetime_check
+          CHECK (expires_at > issued_at);
+      `);
+
+      await expect(migrate(database)).rejects.toMatchObject({
+        name: "DatabaseMigrationError",
+        reason: "unsupported_schema",
+        recognizedPrefix: generatedMigrationNames.length - 2,
+      });
+
+      const journal = await database.pool.query<{ readonly count: number }>(
+        `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
+      );
+      expect(journal.rows[0]?.count).toBe(0);
+    } finally {
+      await database.end();
+      await dropDatabase(databaseName);
+    }
+  });
+
+  it("rejects a partial journal-less auth migration before generated DDL", async () => {
+    const databaseName = `tether_e2e_partial_auth_${randomUUID().replaceAll("-", "_")}`;
+    const database = createPool(buildDatabaseUrl(databaseName));
+    try {
+      await createDatabase(databaseName);
+      await applyLegacyMigrationPrefix(database, generatedMigrationNames.length - 2);
+      await database.pool.query(`CREATE TABLE auth_grants (jti text PRIMARY KEY NOT NULL)`);
+
+      await expect(migrate(database)).rejects.toMatchObject({
+        name: "DatabaseMigrationError",
+        reason: "unsupported_schema",
+        recognizedPrefix: generatedMigrationNames.length - 2,
+      });
+
+      const journal = await database.pool.query<{ readonly count: number }>(
+        `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
+      );
+      const laterAuthTable = await database.pool.query<{ readonly exists: boolean }>(
+        `SELECT to_regclass('public.auth_tickets') IS NOT NULL AS exists`,
+      );
+      expect(journal.rows[0]?.count).toBe(0);
+      expect(laterAuthTable.rows[0]?.exists).toBe(false);
+    } finally {
+      await database.end();
+      await dropDatabase(databaseName);
+    }
+  });
+
+  it.each([
+    {
+      label: "removed nullability",
+      mutationSql: "ALTER TABLE auth_grants ALTER COLUMN subject DROP NOT NULL",
+    },
+    {
+      label: "changed column type",
+      mutationSql: "ALTER TABLE auth_grants ALTER COLUMN issuer TYPE varchar(512)",
+    },
+    {
+      label: "changed column default",
+      mutationSql: "ALTER TABLE auth_tickets ALTER COLUMN created_at SET DEFAULT now()",
+    },
+    {
+      label: "credential-bearing extra column",
+      mutationSql:
+        "ALTER TABLE auth_grants ADD COLUMN bearer text NOT NULL DEFAULT 'tgr2.secret.signature'",
+    },
+    {
+      label: "weakened constraint suffix",
+      mutationSql: `
+        ALTER TABLE auth_grants DROP CONSTRAINT auth_grants_lifetime_check;
+        ALTER TABLE auth_grants ADD CONSTRAINT auth_grants_lifetime_check
+          CHECK (expires_at <= issued_at + interval '7 days' OR true);
+      `,
+    },
+    {
+      label: "unvalidated constraint",
+      mutationSql: `
+        ALTER TABLE auth_tickets DROP CONSTRAINT auth_tickets_hash_check;
+        ALTER TABLE auth_tickets ADD CONSTRAINT auth_tickets_hash_check
+          CHECK (ticket_hash ~ '^[0-9a-f]{64}$') NOT VALID;
+      `,
+    },
+    {
+      label: "altered foreign-key action",
+      mutationSql: `
+        ALTER TABLE auth_tickets
+          DROP CONSTRAINT auth_tickets_parent_grant_jti_auth_grants_jti_fk;
+        ALTER TABLE auth_tickets
+          ADD CONSTRAINT auth_tickets_parent_grant_jti_auth_grants_jti_fk
+          FOREIGN KEY (parent_grant_jti) REFERENCES auth_grants(jti) ON DELETE CASCADE;
+      `,
+    },
+  ])("rejects journal-less auth schema with $label", async ({ label, mutationSql }) => {
+    const databaseName = `tether_e2e_auth_fact_${label.replaceAll(/[^a-z]+/gu, "_")}_${randomUUID().replaceAll("-", "_")}`;
+    const database = createPool(buildDatabaseUrl(databaseName));
+    try {
+      await createDatabase(databaseName);
+      await applyLegacyMigrationPrefix(database, generatedMigrationNames.length - 1);
+      await database.pool.query(mutationSql);
+
+      await expect(migrate(database)).rejects.toMatchObject({
+        name: "DatabaseMigrationError",
+        reason: "unsupported_schema",
+        recognizedPrefix: generatedMigrationNames.length - 2,
+      });
+      const journal = await database.pool.query<{ readonly count: number }>(
+        `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
+      );
+      expect(journal.rows[0]?.count).toBe(0);
     } finally {
       await database.end();
       await dropDatabase(databaseName);
@@ -1326,6 +1844,29 @@ e2e("tether e2e", () => {
     });
 
     await expect(requestFrom(baseUrl, "/sessions", { authToken: null })).rejects.toThrow("401");
+  });
+
+  it("reproduces that a current legacy bearer has no server-side revocation lifecycle", async () => {
+    const authToken = mintE2eToken({
+      participantId: "part_e2e_non_revocable",
+      role: "admin",
+      sessionId: "*",
+    });
+
+    await expect(
+      requestFrom<SessionListResponse>(baseUrl, "/sessions", { authToken }),
+    ).resolves.toEqual(expect.objectContaining({ sessions: expect.any(Array) }));
+
+    const attemptedRevocation = await requestStatusFrom(baseUrl, "/auth/grants/revoke", {
+      authToken,
+      body: {},
+      method: "POST",
+    });
+    expect(attemptedRevocation.status).toBe(404);
+
+    await expect(
+      requestFrom<SessionListResponse>(baseUrl, "/sessions", { authToken }),
+    ).resolves.toEqual(expect.objectContaining({ sessions: expect.any(Array) }));
   });
 
   it("enforces REST role and session scope", async () => {

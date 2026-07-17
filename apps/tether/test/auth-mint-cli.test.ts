@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { mintAuthTokenFromCli, parseMintCliOptions } from "../src/auth/mint-cli.js";
-import { verifyAuthToken } from "../src/auth/token.js";
+import { verifyLegacyAuthToken } from "../src/auth/token.js";
 
 describe("tether-mint CLI", () => {
   it("mints a token for participant, session, role, and ttl", () => {
@@ -21,7 +21,7 @@ describe("tether-mint CLI", () => {
     );
 
     expect(
-      verifyAuthToken(token, {
+      verifyLegacyAuthToken(token, {
         now: new Date("2026-01-01T00:00:30.000Z"),
         secrets: { cli: "cli-secret" },
       }),
@@ -42,7 +42,7 @@ describe("tether-mint CLI", () => {
     );
 
     expect(
-      verifyAuthToken(token, {
+      verifyLegacyAuthToken(token, {
         now: new Date("2026-01-01T00:00:30.000Z"),
         secrets: { default: "cli-secret" },
       }),

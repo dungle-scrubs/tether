@@ -24,6 +24,7 @@ services:
         condition: service_healthy
     environment:
       AUTH_MODE: ${AUTH_MODE:-required}
+      AUTH_ISSUER: ${AUTH_ISSUER:-}
       AUTH_SIGNING_KID: ${AUTH_SIGNING_KID:-default}
       AUTH_SIGNING_SECRET: ${AUTH_SIGNING_SECRET:-}
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}

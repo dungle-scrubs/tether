@@ -72,8 +72,11 @@ export function mintAuthToken(payload: AuthTokenPayload, secrets: AuthSigningSec
   return `${encodedPayload}.${signEncodedPayload(encodedPayload, secret)}`;
 }
 
-/** Verifies a signed stateless auth token and returns its validated payload. */
-export function verifyAuthToken(token: string, options: VerifyAuthTokenOptions): AuthTokenPayload {
+/** Verifies the legacy two-segment stateless token format. */
+export function verifyLegacyAuthToken(
+  token: string,
+  options: VerifyAuthTokenOptions,
+): AuthTokenPayload {
   const [encodedPayload, encodedSignature, extra] = token.split(".");
   if (!encodedPayload || !encodedSignature || extra !== undefined) {
     throw new Error(AuthError.Malformed);

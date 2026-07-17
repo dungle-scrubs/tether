@@ -23,6 +23,8 @@ export type RuntimeTopology = "multi" | "single";
 export interface ServerConfig {
   /** Additional accepted verification secrets keyed by signing key id. */
   readonly authAcceptedSigningSecrets: Readonly<Record<string, string>>;
+  /** Token issuer required for durable grant issuance and verification. */
+  readonly authIssuer: string | null;
   /** Whether HTTP and WebSocket auth enforcement is active. */
   readonly authMode: AuthMode;
   /** Active signing key id used by minting tools and diagnostics. */
@@ -66,6 +68,7 @@ export const serverConfigDescriptor = Config.all({
     Config.orElse(() => Config.succeed("{}")),
     Config.mapAttempt(parseAuthAcceptedSigningSecrets),
   ),
+  authIssuer: Config.string("AUTH_ISSUER").pipe(Config.orElse(() => Config.succeed(""))),
   authMode: Config.literal(
     "required",
     "disabled",
@@ -176,6 +179,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     authAcceptedSigningSecrets: parseAuthAcceptedSigningSecrets(
       env.AUTH_ACCEPTED_SIGNING_SECRETS ?? "{}",
     ),
+    authIssuer: env.AUTH_ISSUER ?? "",
     authMode: parseAuthMode(env.AUTH_MODE),
     authSigningKid: env.AUTH_SIGNING_KID ?? defaultAuthSigningKid,
     authSigningSecret: env.AUTH_SIGNING_SECRET ?? "",
@@ -240,6 +244,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
 
 interface RawServerConfig {
   readonly authAcceptedSigningSecrets: Readonly<Record<string, string>>;
+  readonly authIssuer: string;
   readonly authMode: AuthMode;
   readonly authSigningKid: string;
   readonly authSigningSecret: string;
@@ -257,10 +262,17 @@ interface RawServerConfig {
 
 /** Applies cross-field auth validation after primitive config parsing. */
 function normalizeServerConfig(config: RawServerConfig): ServerConfig {
+  const authIssuer = config.authIssuer.trim();
   const authSigningKid = config.authSigningKid.trim() || defaultAuthSigningKid;
   const authSigningSecret = config.authSigningSecret.trim();
   if (config.authMode === "required" && authSigningSecret.length === 0) {
     throw new Error("AUTH_SIGNING_SECRET is required when AUTH_MODE=required");
+  }
+  if (config.authMode === "required" && authIssuer.length === 0) {
+    throw new Error("AUTH_ISSUER is required when AUTH_MODE=required");
+  }
+  if (authIssuer.length > 512) {
+    throw new Error("AUTH_ISSUER exceeds maximum length 512");
   }
   const databaseUrl = config.databaseUrl.trim();
   if (databaseUrl.length === 0) {
@@ -268,6 +280,7 @@ function normalizeServerConfig(config: RawServerConfig): ServerConfig {
   }
   return {
     ...config,
+    authIssuer: authIssuer.length > 0 ? authIssuer : null,
     authSigningKid,
     authSigningSecret: authSigningSecret.length > 0 ? authSigningSecret : null,
     databaseUrl,
