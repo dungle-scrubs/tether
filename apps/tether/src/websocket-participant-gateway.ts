@@ -48,7 +48,9 @@ import {
 import {
   createWebSocketMessageRateLimiter,
   type ResourceLimitRuntime,
+  type ResourceLimits,
   resourceLimitReason,
+  sessionEventByteLength,
 } from "./resource-limits.js";
 import { authorizeClientPublishedEvent } from "./session-event-publish-policy.js";
 import type {
@@ -57,6 +59,7 @@ import type {
   TaskClaimRefreshResult,
   TaskMutationResult,
 } from "./session-service.js";
+import type { SessionEvent } from "./types.js";
 import { findClientWebSocketCommandSpec } from "./websocket-command-spec.js";
 
 interface ParticipantWebSocketGatewayInput {
@@ -329,6 +332,28 @@ function handleWebSocket(
       return;
     }
     const hostPresenceStream = classifyHostPresenceStream(searchParams.get("runtimeKind"));
+    if (hostPresenceStream === "host") {
+      // Host presence is a state-mutating projection: an injected live host
+      // blocks permanent delete and pollutes every viewer's inventory on this
+      // replica. Read-only principals (the observer role) pass the read check
+      // above but must not present as a host, so host streams require the same
+      // role gate as task mutation.
+      const hostDenied = authorize({
+        action: "task-mutate",
+        context: authContext,
+        sessionId,
+      });
+      if (hostDenied) {
+        socket.send(
+          serializeErrorEnvelope({
+            details: { reason: hostDenied },
+            error: "WebSocket host presence is not authorized",
+          }),
+        );
+        socket.close(1008, "unauthorized");
+        return;
+      }
+    }
     const authStreamKind: AuthSocketStreamKind = hostPresenceStream ?? "participant";
     const unregisterAuthSocket = authContext
       ? authSocketRegistry.register({
@@ -357,6 +382,16 @@ function handleWebSocket(
       });
       return;
     }
+    // A close that fires while the durable registration transaction is in
+    // flight would race the cleanup handler attached below: ws emits close
+    // exactly once, so a handler attached after the fact never runs. Track the
+    // close with a flag armed before the first await so a mid-registration
+    // disconnect always reaches the full cleanup path.
+    let closedDuringRegistration = false;
+    const markClosedDuringRegistration = (): void => {
+      closedDuringRegistration = true;
+    };
+    socket.once("close", markClosedDuringRegistration);
     const participantContext = yield* registerWebSocketParticipant(
       service,
       authContext,
@@ -366,23 +401,15 @@ function handleWebSocket(
       socket,
       controlSocketRegistry,
     );
+    socket.off("close", markClosedDuringRegistration);
     if (participantContext) {
-      const unregisterNativeSocket = hostPresence.registerNativeSocket();
       const controlKey = controlSocketKey(
         sessionId,
         participantContext.participantId,
         participantContext.instanceId,
       );
-      const stopControlLeaseRefresh = startWebSocketControlLeaseRefresh({
-        participantContext,
-        service,
-        sessionId,
-        socket,
-      });
-      socket.on("close", () => {
-        unregisterNativeSocket();
+      const releaseParticipantRegistration = (): void => {
         controlSocketRegistry.remove(controlKey, socket);
-        stopControlLeaseRefresh();
         void Effect.runPromise(
           service.releaseControlLease({
             controlChannel: "ws",
@@ -396,6 +423,26 @@ function handleWebSocket(
           // be logged so it does not surface as an unhandled rejection.
           console.error(error);
         });
+      };
+      if (closedDuringRegistration || socket.readyState !== socket.OPEN) {
+        // The peer disconnected during the registration transaction, so the
+        // close handler below could never fire. Release the durable lease and
+        // registry entry here; the native-socket counter was never incremented
+        // and the refresh loop was never started, so nothing else leaks.
+        releaseParticipantRegistration();
+        return;
+      }
+      const unregisterNativeSocket = hostPresence.registerNativeSocket();
+      const stopControlLeaseRefresh = startWebSocketControlLeaseRefresh({
+        participantContext,
+        service,
+        sessionId,
+        socket,
+      });
+      socket.on("close", () => {
+        unregisterNativeSocket();
+        stopControlLeaseRefresh();
+        releaseParticipantRegistration();
       });
     }
     if (socket.readyState !== socket.OPEN) {
@@ -449,28 +496,25 @@ function handleWebSocket(
     // has delivered a contiguous prefix from the requested cursor through the
     // replay and buffered-live boundary, or the socket has been closed with a
     // typed replay_gap_unrepaired error.
-    const replayLimit = resourceLimitRuntime.limits.wsReplayMaxEvents;
-    const events = yield* service.listEvents(sessionId, afterSeq, {
-      limit: replayLimit + 1,
+    const replayLimits = replayWindowLimits(resourceLimitRuntime.limits);
+    const replay = yield* listReplayWindowEvents({
+      afterSeq,
+      fetchPageSize: replayLimits.fetchPageSize,
+      maxBytes: replayLimits.maxBytes,
+      maxEvents: replayLimits.maxEvents,
+      service,
+      sessionId,
     });
-    if (events.length > replayLimit) {
-      resourceLimitRuntime.recordReplayWindowExceeded();
-      safeSendWebSocketEnvelope(socket, {
-        details: {
-          limit: replayLimit,
-          reason: resourceLimitReason.replayWindowExceeded,
-        },
-        error: "WebSocket replay window exceeded",
-      });
-      safeCloseWebSocket(socket, 1013, resourceLimitReason.replayWindowExceeded);
+    if (replay.kind !== "ok") {
+      closeExceededReplayWindow(socket, resourceLimitRuntime, replayLimits, replay);
       return;
     }
-    for (const event of events) {
+    for (const event of replay.events) {
       hub.sendReplayEvent(sessionId, socket, event);
     }
     yield* repairReplayGaps({
       hub,
-      replayLimit,
+      limits: replayLimits,
       service,
       sessionId,
       socket,
@@ -563,28 +607,25 @@ function handleHostPresenceWebSocket(
             : "Host-presence stream is read-only",
       });
     });
-    const replayLimit = input.resourceLimitRuntime.limits.wsReplayMaxEvents;
-    const events = yield* input.service.listEvents(input.sessionId, afterSeq, {
-      limit: replayLimit + 1,
+    const replayLimits = replayWindowLimits(input.resourceLimitRuntime.limits);
+    const replay = yield* listReplayWindowEvents({
+      afterSeq,
+      fetchPageSize: replayLimits.fetchPageSize,
+      maxBytes: replayLimits.maxBytes,
+      maxEvents: replayLimits.maxEvents,
+      service: input.service,
+      sessionId: input.sessionId,
     });
-    if (events.length > replayLimit) {
-      input.resourceLimitRuntime.recordReplayWindowExceeded();
-      safeSendWebSocketEnvelope(input.socket, {
-        details: {
-          limit: replayLimit,
-          reason: resourceLimitReason.replayWindowExceeded,
-        },
-        error: "WebSocket replay window exceeded",
-      });
-      safeCloseWebSocket(input.socket, 1013, resourceLimitReason.replayWindowExceeded);
+    if (replay.kind !== "ok") {
+      closeExceededReplayWindow(input.socket, input.resourceLimitRuntime, replayLimits, replay);
       return;
     }
-    for (const event of events) {
+    for (const event of replay.events) {
       input.hub.sendReplayEvent(input.sessionId, input.socket, event);
     }
     yield* repairReplayGaps({
       hub: input.hub,
-      replayLimit,
+      limits: replayLimits,
       service: input.service,
       sessionId: input.sessionId,
       socket: input.socket,
@@ -599,10 +640,108 @@ function handleHostPresenceWebSocket(
 
 interface ReplayGapRepairInput {
   readonly hub: SubscriptionHub;
-  readonly replayLimit: number;
+  readonly limits: ReplayWindowLimits;
   readonly service: SessionServiceEffect;
   readonly sessionId: string;
   readonly socket: WebSocket;
+}
+
+/** Count, byte, and fetch-page bounds applied to one socket's replay window. */
+interface ReplayWindowLimits {
+  readonly fetchPageSize: number;
+  readonly maxBytes: number;
+  readonly maxEvents: number;
+}
+
+/** One bounded replay-window fetch outcome. */
+type ReplayWindowFetchResult =
+  | { readonly byteLength: number; readonly events: SessionEvent[]; readonly kind: "ok" }
+  | { readonly kind: "bytes_exceeded"; readonly observedBytes: number }
+  | { readonly kind: "count_exceeded" };
+
+/**
+ * Derives replay-window bounds from the configured resource limits. The fetch
+ * page size is sized so even a page of maximum-payload events stays near the
+ * byte budget, keeping transient materialization bounded by roughly twice the
+ * budget instead of by the full event count.
+ */
+function replayWindowLimits(
+  limits: Pick<ResourceLimits, "wsMaxPayloadBytes" | "wsReplayMaxBytes" | "wsReplayMaxEvents">,
+): ReplayWindowLimits {
+  return {
+    fetchPageSize: Math.min(
+      limits.wsReplayMaxEvents + 1,
+      Math.max(1, Math.floor(limits.wsReplayMaxBytes / limits.wsMaxPayloadBytes)),
+    ),
+    maxBytes: limits.wsReplayMaxBytes,
+    maxEvents: limits.wsReplayMaxEvents,
+  };
+}
+
+/**
+ * Fetches one replay window in bounded pages so neither the event count nor
+ * the cumulative payload bytes can materialize unbounded memory before the
+ * window check runs. Exceeding either bound stops fetching immediately and
+ * reports the typed exceeded outcome instead of the events.
+ */
+function listReplayWindowEvents(input: {
+  readonly afterSeq: number;
+  readonly fetchPageSize: number;
+  readonly maxBytes: number;
+  readonly maxEvents: number;
+  readonly service: SessionServiceEffect;
+  readonly sessionId: string;
+}): Effect.Effect<ReplayWindowFetchResult, unknown> {
+  return Effect.gen(function* () {
+    const events: SessionEvent[] = [];
+    let byteLength = 0;
+    let cursor = input.afterSeq;
+    for (;;) {
+      // Fetch maxEvents + 1 in total so one extra event still detects an
+      // exceeded count window, exactly like the previous limit + 1 fetch.
+      const pageLimit = Math.min(input.fetchPageSize, input.maxEvents + 1 - events.length);
+      const page = yield* input.service.listEvents(input.sessionId, cursor, { limit: pageLimit });
+      for (const event of page) {
+        byteLength += sessionEventByteLength(event);
+        if (byteLength > input.maxBytes) {
+          return { kind: "bytes_exceeded", observedBytes: byteLength } as const;
+        }
+        events.push(event);
+      }
+      if (events.length > input.maxEvents) {
+        return { kind: "count_exceeded" } as const;
+      }
+      if (page.length < pageLimit) {
+        return { byteLength, events, kind: "ok" } as const;
+      }
+      cursor = events[events.length - 1]?.seq ?? cursor;
+    }
+  });
+}
+
+/** Emits the typed replay-window rejection and closes the socket. */
+function closeExceededReplayWindow(
+  socket: WebSocket,
+  resourceLimitRuntime: ResourceLimitRuntime,
+  limits: ReplayWindowLimits,
+  result: Exclude<ReplayWindowFetchResult, { readonly kind: "ok" }>,
+): void {
+  resourceLimitRuntime.recordReplayWindowExceeded();
+  safeSendWebSocketEnvelope(socket, {
+    details:
+      result.kind === "bytes_exceeded"
+        ? {
+            byteLimit: limits.maxBytes,
+            observedBytes: result.observedBytes,
+            reason: resourceLimitReason.replayWindowExceeded,
+          }
+        : {
+            limit: limits.maxEvents,
+            reason: resourceLimitReason.replayWindowExceeded,
+          },
+    error: "WebSocket replay window exceeded",
+  });
+  safeCloseWebSocket(socket, 1013, resourceLimitReason.replayWindowExceeded);
 }
 
 /** Structured diagnostics for a WebSocket replay gap repair failure. */
@@ -616,32 +755,39 @@ interface ReplayGapRepairFailureLogDetails {
 /** Repairs buffered live gaps before replay.complete is emitted. */
 function repairReplayGaps(input: ReplayGapRepairInput): Effect.Effect<void, unknown> {
   return Effect.gen(function* () {
+    let repairedByteLength = 0;
     let repairedEventCount = 0;
     while (input.socket.readyState === input.socket.OPEN) {
       const state = input.hub.replayState(input.sessionId, input.socket);
       if (!state || state.pendingEventCount === 0) {
         return;
       }
-      if (repairedEventCount >= input.replayLimit) {
+      if (
+        repairedEventCount >= input.limits.maxEvents ||
+        repairedByteLength >= input.limits.maxBytes
+      ) {
         closeUnrepairedReplayGap(input, state);
         return;
       }
-      const remainingLimit = input.replayLimit - repairedEventCount;
-      const repairEvents = yield* input.service.listEvents(
-        input.sessionId,
-        state.contiguousDeliveredSeq,
-        { limit: remainingLimit + 1 },
-      );
-      if (repairEvents.length === 0 || repairEvents.length > remainingLimit) {
+      const repair = yield* listReplayWindowEvents({
+        afterSeq: state.contiguousDeliveredSeq,
+        fetchPageSize: input.limits.fetchPageSize,
+        maxBytes: input.limits.maxBytes - repairedByteLength,
+        maxEvents: input.limits.maxEvents - repairedEventCount,
+        service: input.service,
+        sessionId: input.sessionId,
+      });
+      if (repair.kind !== "ok" || repair.events.length === 0) {
         closeUnrepairedReplayGap(input, state);
         return;
       }
-      input.hub.recordReplayGapRepair(repairEvents.length);
+      input.hub.recordReplayGapRepair(repair.events.length);
       const beforeRepairSeq = state.contiguousDeliveredSeq;
-      for (const event of repairEvents) {
+      for (const event of repair.events) {
         input.hub.sendReplayEvent(input.sessionId, input.socket, event);
       }
-      repairedEventCount += repairEvents.length;
+      repairedByteLength += repair.byteLength;
+      repairedEventCount += repair.events.length;
       const repairedState = input.hub.replayState(input.sessionId, input.socket);
       if (!repairedState || repairedState.contiguousDeliveredSeq <= beforeRepairSeq) {
         closeUnrepairedReplayGap(input, state);
