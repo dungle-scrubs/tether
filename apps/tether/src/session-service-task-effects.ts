@@ -7,6 +7,7 @@ import type {
 } from "./db-store-contracts.js";
 import {
   type EnsureScheduledRunResult,
+  ScheduledRunIdentityConflictError,
   ScheduledTaskIdentityMismatchError,
   TaskClaimExpirationDeadlockError,
 } from "./db.js";
@@ -487,12 +488,34 @@ function createScheduledTaskEffect(
         ),
       );
     }
-    const ensured = yield* ensureScheduledRunStoreEffect(input, {
+    const ensuredOrConflict = yield* ensureScheduledRunStoreEffect(input, {
       ...(taskInput.taskId !== undefined ? { expectedTaskId: taskInput.taskId } : {}),
       identity,
       input: taskInput.input ?? null,
       objective: taskInput.objective,
-    });
+    }).pipe(
+      Effect.map((ensured) => ({ ensured, outcome: "ensured" as const })),
+      Effect.catchAll((error) => {
+        // An unrelated task occupying the derived deterministic id is the same
+        // caller-visible situation as a duplicate caller-supplied task id, so
+        // it maps to the generic create's typed conflict result instead of an
+        // opaque persistence failure.
+        const conflict = scheduledRunIdentityConflictFromFailure(error);
+        return conflict !== null
+          ? Effect.succeed({ conflict, outcome: "conflict" as const })
+          : Effect.fail(error);
+      }),
+    );
+    if (ensuredOrConflict.outcome === "conflict") {
+      return {
+        conflictingFields: ensuredOrConflict.conflict.conflictingFields,
+        events: [],
+        status: "conflict",
+        task: null,
+        taskId: ensuredOrConflict.conflict.taskId,
+      };
+    }
+    const ensured = ensuredOrConflict.ensured;
     const createdEvents = ensured.current.status === "created" ? [ensured.current.event] : [];
     const events = [...ensured.supersededEvents, ...createdEvents];
     yield* Effect.sync(() =>
@@ -508,6 +531,19 @@ function createScheduledTaskEffect(
     }
     return { events, status: "replayed", task: ensured.current.task };
   });
+}
+
+/** Extracts a scheduled-run occupant conflict from a service-wrapped failure. */
+function scheduledRunIdentityConflictFromFailure(
+  error: SessionServiceFailure,
+): ScheduledRunIdentityConflictError | null {
+  if (
+    error instanceof SessionServicePersistenceError &&
+    error.cause instanceof ScheduledRunIdentityConflictError
+  ) {
+    return error.cause;
+  }
+  return null;
 }
 
 /**

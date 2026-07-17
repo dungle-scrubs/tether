@@ -8,6 +8,7 @@ import type {
   ControlEpochGuard,
   ControlLeaseClaim,
   ParticipantRegistration,
+  PermanentSessionDeleteResult,
   PersistedEventAppendResult,
   PersistedTaskCreateResult,
   ScheduledTaskIdentityInput,
@@ -185,10 +186,16 @@ export interface SessionServiceEffect {
   readonly ensurePublicSession: (input: {
     readonly sessionId: string | undefined;
   }) => Effect.Effect<PublicSessionEnsureResult, SessionServiceFailure>;
-  /** Permanently deletes one eligible session after route-level compatibility checks. */
+  /**
+   * Permanently deletes one eligible session. Route-level compatibility checks
+   * remain advisory; eligibility is re-verified inside the delete transaction
+   * under row locks, with the optional `hasLiveHost` probe re-checking
+   * process-local Host Presence between the locks and the delete.
+   */
   readonly deleteSession: (input: {
+    readonly hasLiveHost?: (() => boolean) | undefined;
     readonly sessionId: string;
-  }) => Effect.Effect<boolean, SessionServiceFailure>;
+  }) => Effect.Effect<PermanentSessionDeleteResult, SessionServiceFailure>;
   /** Lists every session with aggregate activity counts for the operator UI. */
   readonly listSessions: () => Effect.Effect<SessionListItem[], SessionServiceFailure>;
   /** Resolves an external client conversation to a durable Tether session. */

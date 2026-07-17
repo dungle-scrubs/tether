@@ -11,7 +11,7 @@ import {
   effectiveParticipantId,
 } from "./auth/authorize.js";
 import type { AuthContext } from "./auth/token.js";
-import { ScheduledTaskIdentityMismatchError } from "./db.js";
+import { ScheduledRunIdentityConflictError, ScheduledTaskIdentityMismatchError } from "./db.js";
 import {
   broadcastEvents,
   parseJsonBody,
@@ -573,6 +573,18 @@ function handleScheduledTaskCreate(
         return true;
       }),
       Effect.catchAll((error) => {
+        const occupant = scheduledRunIdentityConflictFromUnknown(error);
+        if (occupant) {
+          return Effect.sync(() => {
+            sendJson(response, 409, {
+              conflictingFields: occupant.conflictingFields,
+              error: "Derived scheduled-run id is occupied by a task with a different identity",
+              reason: "scheduled_run_identity_conflict",
+              taskId: occupant.taskId,
+            });
+            return true;
+          });
+        }
         const mismatch = scheduledTaskIdentityMismatchFromUnknown(error);
         if (!mismatch) {
           return Effect.fail(error);
@@ -588,6 +600,22 @@ function handleScheduledTaskCreate(
         });
       }),
     );
+}
+
+/** Extracts a scheduled-run occupant conflict from a direct or service-wrapped error. */
+function scheduledRunIdentityConflictFromUnknown(
+  error: unknown,
+): ScheduledRunIdentityConflictError | null {
+  if (error instanceof ScheduledRunIdentityConflictError) {
+    return error;
+  }
+  if (
+    error instanceof SessionServicePersistenceError &&
+    error.cause instanceof ScheduledRunIdentityConflictError
+  ) {
+    return error.cause;
+  }
+  return null;
 }
 
 /** Extracts a scheduled-identity mismatch from a direct or service-wrapped error. */

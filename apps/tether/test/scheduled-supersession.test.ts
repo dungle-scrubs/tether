@@ -585,7 +585,7 @@ function createStores(
           sessionId: identity.sessionId,
         },
       }),
-      delete: async () => true,
+      delete: async () => ({ status: "deleted" }) as const,
       list: async () => [],
       read: async () => ({
         createdAt: "2026-07-12T00:00:00.000Z",

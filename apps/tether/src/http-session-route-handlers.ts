@@ -37,9 +37,14 @@ import {
   registerParticipantSchema,
   releaseParticipantControlEnvelopeSchema,
 } from "./protocol.js";
-import { parseEventListLimit, type ResourceLimits } from "./resource-limits.js";
+import {
+  parseEventListLimit,
+  type ResourceLimits,
+  sessionEventByteLength,
+} from "./resource-limits.js";
 import { authorizeClientPublishedEvent } from "./session-event-publish-policy.js";
 import type { SessionServiceEffect } from "./session-service.js";
+import type { SessionEvent } from "./types.js";
 
 interface SessionHttpRouteHandlerInput {
   readonly authContext: AuthContext | null;
@@ -206,6 +211,10 @@ export function handleSessionHttpRoute(
         liveHosts: input.hostPresence.hosts(route.sessionId),
         session,
       });
+      // Advisory pre-check for a fast, well-shaped refusal. The authoritative
+      // check runs again inside the delete transaction under row locks, so a
+      // host connect or task claim between this snapshot and the delete cannot
+      // slip a protected session through.
       const eligibility = permanentDeleteEligibility(projected);
       if (!eligibility.ok) {
         sendJson(response, eligibility.reason === "not-found" ? 404 : 409, {
@@ -215,16 +224,26 @@ export function handleSessionHttpRoute(
         });
         return true;
       }
-      const deleted = yield* service.deleteSession({
+      const result = yield* service.deleteSession({
+        // Re-checked inside the delete transaction after the row locks are
+        // held, shrinking the unfenced process-local presence window to the
+        // final probe before the delete statement.
+        hasLiveHost: () => input.hostPresence.hosts(route.sessionId).length > 0,
         sessionId: route.sessionId,
       });
-      sendJson(
-        response,
-        deleted ? 200 : 404,
-        deleted
-          ? { ok: true, sessionId: route.sessionId }
-          : { detail: "session not found", ok: false, reason: "not-found" },
-      );
+      if (result.status === "deleted") {
+        sendJson(response, 200, { ok: true, sessionId: route.sessionId });
+        return true;
+      }
+      if (result.status === "not_found") {
+        sendJson(response, 404, { detail: "session not found", ok: false, reason: "not-found" });
+        return true;
+      }
+      sendJson(response, 409, {
+        detail: result.detail,
+        ok: false,
+        reason: result.reason,
+      });
       return true;
     }
     if (route?.resource === "events-list") {
@@ -233,17 +252,21 @@ export function handleSessionHttpRoute(
       }
       const afterSeq = parseAfterSeq(url.searchParams.get("after"));
       const limit = parseEventListLimit(url.searchParams.get("limit"), input.resourceLimits);
-      const eventsWithLookahead = yield* service.listEvents(route.sessionId, afterSeq, {
-        limit: limit + 1,
+      const page = yield* listEventPageWithinByteBudget({
+        afterSeq,
+        limit,
+        maxBytes: input.resourceLimits.restEventListMaxBytes,
+        maxEventBytes: input.resourceLimits.httpMaxBodyBytes,
+        service,
+        sessionId: route.sessionId,
       });
-      const hasMore = eventsWithLookahead.length > limit;
-      const events = hasMore ? eventsWithLookahead.slice(0, limit) : eventsWithLookahead;
+      const { events } = page;
       const nextAfterSeq = events.at(-1)?.seq ?? afterSeq;
       sendJson(response, 200, {
         events,
         pagination: {
           afterSeq,
-          hasMore,
+          hasMore: page.hasMore,
           limit,
           nextAfterSeq,
           returned: events.length,
@@ -491,6 +514,64 @@ export function handleSessionHttpRoute(
       return true;
     }
     return false;
+  });
+}
+
+/** Bounded REST event-list page and whether more events remain past it. */
+interface EventListPage {
+  readonly events: SessionEvent[];
+  readonly hasMore: boolean;
+}
+
+/**
+ * Fetches one REST event-list page bounded by both the row limit and a
+ * cumulative byte budget. Events are read in bounded pages so a session of
+ * near-max events cannot materialize unbounded memory before the response is
+ * serialized, mirroring the WebSocket replay-window byte budget. Truncation at
+ * the byte boundary is surfaced through the existing pagination contract:
+ * fewer events plus hasMore, with the caller's next-cursor advancing past the
+ * last returned event. At least one event is always returned when any remain so
+ * a single oversized event cannot stall pagination.
+ */
+function listEventPageWithinByteBudget(input: {
+  readonly afterSeq: number;
+  readonly limit: number;
+  readonly maxBytes: number;
+  readonly maxEventBytes: number;
+  readonly service: SessionServiceEffect;
+  readonly sessionId: string;
+}): Effect.Effect<EventListPage, unknown> {
+  return Effect.gen(function* () {
+    // One page never holds more than the byte budget plus a single event, so
+    // peak materialization stays bounded regardless of how many events exist.
+    const fetchPageSize = Math.max(1, Math.floor(input.maxBytes / input.maxEventBytes));
+    const events: SessionEvent[] = [];
+    let byteLength = 0;
+    let cursor = input.afterSeq;
+    for (;;) {
+      // Fetch one row beyond the requested page size so a full page still
+      // detects that more events remain, matching the prior limit + 1 lookahead.
+      const pageLimit = Math.min(fetchPageSize, input.limit + 1 - events.length);
+      const page = yield* input.service.listEvents(input.sessionId, cursor, { limit: pageLimit });
+      for (const event of page) {
+        if (events.length >= input.limit) {
+          // Lookahead row: more events exist past the requested page size.
+          return { events, hasMore: true };
+        }
+        const nextByteLength = byteLength + sessionEventByteLength(event);
+        if (events.length > 0 && nextByteLength > input.maxBytes) {
+          // Stop at the byte boundary; remaining events are reachable
+          // through the next-cursor on a follow-up request.
+          return { events, hasMore: true };
+        }
+        byteLength = nextByteLength;
+        events.push(event);
+      }
+      if (page.length < pageLimit) {
+        return { events, hasMore: false };
+      }
+      cursor = events[events.length - 1]?.seq ?? cursor;
+    }
   });
 }
 

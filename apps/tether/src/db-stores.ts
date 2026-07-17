@@ -246,8 +246,13 @@ class DbSessionStore implements SessionStore {
     return createSession(this.database, sessionId);
   }
 
-  delete(sessionId: string) {
-    return deleteSession(this.database, sessionId);
+  delete(
+    sessionId: string,
+    options?: {
+      readonly hasLiveHost?: (() => boolean) | undefined;
+    },
+  ) {
+    return deleteSession(this.database, sessionId, options);
   }
 
   list() {

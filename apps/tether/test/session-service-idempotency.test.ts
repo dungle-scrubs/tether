@@ -369,7 +369,7 @@ function createStores(overrides: StoreOverrides): SessionPersistenceStores {
             sessionId: "sess_idempotency",
           },
         })),
-      delete: async () => true,
+      delete: async () => ({ status: "deleted" }) as const,
       list: async () => [],
       read:
         overrides.readSession ??

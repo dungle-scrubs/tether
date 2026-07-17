@@ -8,6 +8,7 @@ import type { DatabasePool } from "../src/db.js";
 import { HostPresenceRuntime, projectSessionInventory } from "../src/host-presence.js";
 import { createAppServerWithSessionService, type AppServer } from "../src/http.js";
 import { hostPresenceInventorySchema } from "../src/protocol.js";
+import { defaultResourceLimits, sessionEventByteLength } from "../src/resource-limits.js";
 import type { SessionEvent } from "../src/types.js";
 import type {
   SessionServiceDebugInfo,
@@ -234,6 +235,107 @@ describe("HTTP app server error boundary", () => {
     await waitForSocketClose(socket);
   });
 });
+
+describe("REST events-list byte budget", () => {
+  const openApps: AppServer[] = [];
+
+  afterEach(async () => {
+    const apps = openApps.splice(0);
+    await Promise.all(apps.map((app) => app.close()));
+  });
+
+  it("truncates a page whose events exceed the byte budget and signals more", async () => {
+    const sessionId = "sess_events_budget";
+    const events = Array.from({ length: 12 }, (_, index) =>
+      createSessionEvent(index + 1, sessionId, { blob: "x".repeat(400) }),
+    );
+    const perEventBytes = sessionEventByteLength(
+      createSessionEvent(1, sessionId, { blob: "x".repeat(400) }),
+    );
+    const maxBytes = perEventBytes * 3 + 1;
+    const app = createAppServerWithSessionService(
+      createUnusedDatabasePool(),
+      createEventListSessionService(events),
+      {
+        auth: { activeKid: "disabled", mode: "disabled", secrets: {} },
+        eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+        resourceLimits: { ...defaultResourceLimits, restEventListMaxBytes: maxBytes },
+        taskClaimSweeper: { intervalMs: 0 },
+      },
+    );
+    openApps.push(app);
+    const port = await findOpenPort();
+    await app.listen(port);
+
+    const response = await fetch(`http://127.0.0.1:${port}/sessions/${sessionId}/events`);
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      readonly events: SessionEvent[];
+      readonly pagination: { readonly hasMore: boolean; readonly nextAfterSeq: number };
+    };
+
+    expect(body.events.length).toBeGreaterThan(0);
+    expect(body.events.length).toBeLessThan(events.length);
+    expect(body.pagination.hasMore).toBe(true);
+    expect(body.pagination.nextAfterSeq).toBe(body.events.at(-1)?.seq);
+    // The returned page fits the budget, and the first dropped event would have
+    // pushed it past the boundary.
+    const returnedBytes = body.events.reduce(
+      (total, event) => total + sessionEventByteLength(event),
+      0,
+    );
+    expect(returnedBytes).toBeLessThanOrEqual(maxBytes);
+    const nextEvent = events[body.events.length];
+    expect(nextEvent).toBeDefined();
+    expect(returnedBytes + (nextEvent ? sessionEventByteLength(nextEvent) : 0)).toBeGreaterThan(
+      maxBytes,
+    );
+  });
+
+  it("returns a small page whole when it fits within the byte budget", async () => {
+    const sessionId = "sess_events_small";
+    const events = [
+      createSessionEvent(1, sessionId, { blob: "a" }),
+      createSessionEvent(2, sessionId, { blob: "b" }),
+      createSessionEvent(3, sessionId, { blob: "c" }),
+    ];
+    const app = createAppServerWithSessionService(
+      createUnusedDatabasePool(),
+      createEventListSessionService(events),
+      {
+        auth: { activeKid: "disabled", mode: "disabled", secrets: {} },
+        eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+        taskClaimSweeper: { intervalMs: 0 },
+      },
+    );
+    openApps.push(app);
+    const port = await findOpenPort();
+    await app.listen(port);
+
+    const response = await fetch(`http://127.0.0.1:${port}/sessions/${sessionId}/events`);
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      readonly events: SessionEvent[];
+      readonly pagination: { readonly hasMore: boolean; readonly returned: number };
+    };
+
+    expect(body.events.map((event) => event.seq)).toEqual([1, 2, 3]);
+    expect(body.pagination.hasMore).toBe(false);
+    expect(body.pagination.returned).toBe(3);
+  });
+});
+
+/** Serves an in-memory event log paged by afterSeq for events-list tests. */
+function createEventListSessionService(events: readonly SessionEvent[]): SessionServiceEffect {
+  return {
+    debugInfo: createSessionServiceDebugInfo,
+    expireTaskClaims: () => Effect.succeed({ events: [], expiredCount: 0 }),
+    listEvents: (_sessionId: string, afterSeq: number, options?: { readonly limit?: number }) =>
+      Effect.succeed(
+        events.filter((event) => event.seq > afterSeq).slice(0, options?.limit ?? events.length),
+      ),
+  } as unknown as SessionServiceEffect;
+}
 
 interface RouteErrorLog {
   readonly details: {
