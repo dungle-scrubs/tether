@@ -81,6 +81,7 @@ export {
   taskIdFromCancelledEvent,
 } from "./protocol.js";
 export { TaskCancellationRegistry } from "./task-cancellation-registry.js";
+export { ParticipantTaskExecutionError } from "./participant-task-execution-error.js";
 
 export type {
   ClientSessionBindingRecord,

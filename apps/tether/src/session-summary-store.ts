@@ -907,7 +907,7 @@ function assertTaskOwner(task: SummaryTaskFenceRow, claimantId: string): void {
   }
 }
 
-/** Requires the current durable REST Control Epoch in the candidate transaction. */
+/** Requires the current durable participant Control Epoch in the candidate transaction. */
 async function assertControlFence(
   client: SessionSummaryStoreClient,
   submission: SessionSummaryCandidateSubmission,
@@ -932,7 +932,7 @@ async function assertControlFence(
   const current = result.rows[0];
   if (
     !current ||
-    current.controlChannel !== "rest" ||
+    (current.controlChannel !== "rest" && current.controlChannel !== "ws") ||
     current.instanceId !== submission.instanceId ||
     !current.leaseActive ||
     parseSafeSequence(current.epoch, "controlEpoch") !== submission.controlEpoch

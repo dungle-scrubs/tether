@@ -15,6 +15,7 @@ import {
   ParticipantRuntimeShutdownError,
   type ParticipantRuntimeWebSocketFactory,
   type ParticipantTaskExecutor,
+  ParticipantTaskExecutionError,
   type RunParticipantRuntimeHooks,
   resolveCommandTimeoutMs,
   resolveResumeSeq,
@@ -792,6 +793,25 @@ describe("ParticipantRuntimeClient.runTaskClaimFlow", () => {
     expect(runtime.actions).toEqual(["claim"]);
     expect(runtime.failures).toEqual([]);
     expect(runtime.diagnostics).toContain("task.claim_transport_unknown");
+  });
+
+  it("persists bounded structured executor failure metadata", async () => {
+    const runtime = createRuntimeClientFixture();
+
+    await runtime.client.runTaskClaimFlow({
+      cancellation: createCancellationFixture().cancellation,
+      claimRefreshMs: 1_000,
+      executor: async () => {
+        throw new ParticipantTaskExecutionError("Summary generation failed", {
+          attempt: 2,
+          code: "poison_range",
+          retryable: false,
+        });
+      },
+      task: baseTask,
+    });
+
+    expect(runtime.failures).toEqual([{ attempt: 2, code: "poison_range", retryable: false }]);
   });
 
   it("does not start a refresh loop or leave stale cancellation state when claim transport rejects", async () => {

@@ -5,6 +5,7 @@ import type {
   ParticipantTaskExecutor,
   ParticipantTaskExecutorContext,
 } from "./participant-runtime-client.js";
+import { ParticipantTaskExecutionError } from "./participant-task-execution-error.js";
 import {
   type AppendSessionEventInput,
   buildTaskOutputEventInput,
@@ -156,9 +157,12 @@ export function buildParticipantTaskClaimFlow(
       if (execution.type === "executor_failed") {
         if (!shouldStop()) {
           yield* Effect.tryPromise(() =>
-            client.failTask(input.task.taskId, {
-              error: execution.error.message,
-            }),
+            client.failTask(
+              input.task.taskId,
+              execution.error instanceof ParticipantTaskExecutionError
+                ? { ...execution.error.failure }
+                : { error: execution.error.message },
+            ),
           );
         }
         return;

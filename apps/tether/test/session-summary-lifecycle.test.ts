@@ -55,6 +55,17 @@ describe("Session Summary lifecycle persistence", () => {
     );
   });
 
+  it("accepts the current WebSocket control fence used by an external participant runtime", async () => {
+    const job = generationJob();
+    const client = new CandidateInsertionClient(job, null, "ws");
+    const store = createSessionSummaryStore({ connect: async () => client });
+
+    await expect(store.submitCandidate(candidateSubmission(job))).resolves.toMatchObject({
+      status: "published",
+      summaryId: job.summaryId,
+    });
+  });
+
   it("rejects a candidate submitted by a participant that does not own the task claim", async () => {
     const job = generationJob();
     const store = createSessionSummaryStore({
@@ -290,6 +301,7 @@ class CandidateInsertionClient implements SessionSummaryStoreClient {
   constructor(
     private readonly job: SessionSummaryGenerationJob,
     private readonly existingContent: SessionSummaryContent | null = null,
+    private readonly controlChannel: "rest" | "ws" = "rest",
   ) {}
 
   async query<TRow>(sql: string): Promise<{ readonly rows: TRow[] }> {
@@ -336,7 +348,7 @@ class CandidateInsertionClient implements SessionSummaryStoreClient {
       return {
         rows: [
           {
-            controlChannel: "rest",
+            controlChannel: this.controlChannel,
             epoch: "4",
             instanceId: "inst_worker_1",
             leaseActive: true,

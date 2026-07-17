@@ -27,6 +27,28 @@ importers:
         specifier: ^6.0.3
         version: 6.0.3
 
+  apps/session-summary-worker:
+    dependencies:
+      '@dungle-scrubs/tether-client':
+        specifier: workspace:*
+        version: link:../../packages/client
+      '@dungle-scrubs/tether-protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
+      '@opentelemetry/api':
+        specifier: ^1.9.1
+        version: 1.9.1
+      zod:
+        specifier: ^4.4.3
+        version: 4.4.3
+    devDependencies:
+      '@types/node':
+        specifier: ^25.9.1
+        version: 25.9.1
+      vitest:
+        specifier: ^4.1.7
+        version: 4.1.7(@opentelemetry/api@1.9.1)(@types/node@25.9.1)(vite@8.0.13(@types/node@25.9.1)(esbuild@0.25.12)(tsx@4.22.3)(yaml@2.9.0))
+
   apps/tether:
     dependencies:
       '@dungle-scrubs/tether-client':
