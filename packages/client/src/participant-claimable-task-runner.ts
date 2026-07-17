@@ -22,8 +22,12 @@ export interface TaskCancellationContext {
 export interface ParticipantClaimableTaskRunnerClient {
   /** Intentionally closes the participant client. */
   readonly close: () => void;
+  /** Returns the transport generation currently admitting event callbacks. */
+  readonly connectionGeneration: () => number;
   /** Returns whether the participant client is intentionally stopped. */
   readonly isStopped: () => boolean;
+  /** Returns whether terminal delivery policy requires explicit remediation. */
+  readonly isPaused: () => boolean;
   /** Registers a live/replayed event handler. */
   readonly onEvent: (handler: (event: SessionEvent) => void) => () => void;
   /** Reconnects the participant stream using the client's configured backoff. */
@@ -49,8 +53,9 @@ export function buildParticipantClaimableTaskLoop(
   const cancellations = new TaskCancellationRegistry();
   const processing = new Set<string>();
   const pendingWork = new Set<Promise<void>>();
-  const replayTasks = new Map<string, TaskRecord>();
-  let replayComplete = false;
+  const replayTasks = new Map<string, { readonly generation: number; readonly task: TaskRecord }>();
+  let replayReadyGeneration: number | null = null;
+  let replayEpoch = 0;
 
   const startTask = (task: TaskRecord): void => {
     if (cancellations.isCancelled(task.taskId)) {
@@ -83,44 +88,93 @@ export function buildParticipantClaimableTaskLoop(
       if (!task || !isDispatchableClaimableTask(task) || !options.shouldClaimTask(task)) {
         return;
       }
-      if (!replayComplete) {
-        replayTasks.set(task.taskId, task);
+      const eventGeneration = client.connectionGeneration();
+      if (replayReadyGeneration !== eventGeneration) {
+        replayTasks.set(task.taskId, {
+          generation: eventGeneration,
+          task,
+        });
         return;
       }
       startTask(task);
     });
 
-  const loop = Effect.gen(function* () {
+  const runLoop = async (): Promise<void> => {
     while (!client.isStopped()) {
-      replayComplete = false;
-      const replayReady = Effect.tryPromise(() => client.waitForReplayComplete()).pipe(
-        Effect.map(() => {
-          replayComplete = true;
-          for (const task of replayTasks.values()) {
-            startTask(task);
+      const currentEpoch = replayEpoch + 1;
+      const currentGeneration = client.connectionGeneration();
+      replayEpoch = currentEpoch;
+      replayReadyGeneration = null;
+      const replayReady = client.waitForReplayComplete().then(
+        async () => {
+          try {
+            await options.replayBarrier?.();
+          } catch (error) {
+            return { error, kind: "barrier-failed", replayEpoch: currentEpoch } as const;
           }
-          replayTasks.clear();
-          return "replay_complete" as const;
-        }),
+          return { kind: "replay-ready", replayEpoch: currentEpoch } as const;
+        },
+        (error: unknown) => ({ error, kind: "replay-failed", replayEpoch: currentEpoch }) as const,
       );
-      const closeReady = Effect.tryPromise(() => client.waitForClose()).pipe(
-        Effect.as("closed" as const),
-      );
-      const firstResult = yield* Effect.race(replayReady, closeReady);
+      const closeReady = client
+        .waitForClose()
+        .then(() => ({ kind: "closed", replayEpoch: currentEpoch }) as const);
+      const firstResult = await Promise.race([replayReady, closeReady]);
 
-      if (firstResult === "replay_complete") {
+      if (firstResult.kind === "barrier-failed") {
+        throw firstResult.error;
+      }
+      if (firstResult.kind === "replay-failed") {
+        replayEpoch += 1;
+        discardReplayTasks(currentGeneration);
+        if (client.isPaused()) {
+          throw firstResult.error;
+        }
+        await closeReady;
+      } else if (firstResult.kind === "replay-ready") {
+        if (firstResult.replayEpoch !== replayEpoch) {
+          continue;
+        }
+        replayReadyGeneration = currentGeneration;
+        for (const replayTask of replayTasks.values()) {
+          if (replayTask.generation === currentGeneration) {
+            startTask(replayTask.task);
+          }
+        }
+        discardReplayTasks(currentGeneration);
         if (options.once) {
-          yield* Effect.promise(() => Promise.allSettled([...pendingWork]));
+          await Promise.allSettled([...pendingWork]);
           client.close();
           return;
         }
-        yield* closeReady;
+        await closeReady;
+        replayEpoch += 1;
+        replayReadyGeneration = null;
+        discardReplayTasks(currentGeneration);
+      } else {
+        replayEpoch += 1;
+        replayReadyGeneration = null;
+        discardReplayTasks(currentGeneration);
       }
       if (!client.isStopped()) {
-        yield* Effect.tryPromise(() => client.reconnectAfterClose());
+        await client.reconnectAfterClose();
       }
     }
+  };
+
+  const loop = Effect.tryPromise({
+    catch: (error) => error,
+    try: runLoop,
   });
+
+  /** Discards only replay work owned by one superseded transport generation. */
+  function discardReplayTasks(generation: number): void {
+    for (const [taskId, replayTask] of replayTasks) {
+      if (replayTask.generation === generation) {
+        replayTasks.delete(taskId);
+      }
+    }
+  }
 
   return Effect.acquireUseRelease(
     Effect.sync(subscribe),

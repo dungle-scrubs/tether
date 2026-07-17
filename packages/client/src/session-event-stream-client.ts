@@ -5,21 +5,16 @@ import { resolveServiceAuthToken } from "./auth-token.js";
 import { sleepUnrefEffect } from "./effect-timing.js";
 import { ModuleObservability, readModuleObservabilityOptions } from "./observability.js";
 import { parseWebSocketServerEnvelope, webSocketOperation } from "./protocol.js";
+import { SerialEventDelivery, type SerialEventDeliveryOutcome } from "./serial-event-delivery.js";
 import type { SessionEvent } from "./types.js";
 
 const defaultReconnectBaseDelayMs = 100;
 const defaultReconnectMaxDelayMs = 2_000;
+const observerHandlerTimeoutMs = 30_000;
+const observerMaxQueueSize = 2_000;
 
 /** Factory for observer WebSocket connections, injectable by tests and hosts. */
 export type SessionEventStreamWebSocketFactory = (url: string) => WebSocket;
-
-/**
- * One item on the serial delivery queue: either a durable event awaiting
- * handling or a replay-completion marker ordered after its preceding events.
- */
-type SessionEventStreamQueueItem =
-  | { readonly kind: "event"; readonly event: SessionEvent }
-  | { readonly kind: "replay-complete" };
 
 /** Connection settings for a passive session event observer stream. */
 export interface SessionEventStreamClientConfig {
@@ -71,7 +66,12 @@ export interface SessionEventStreamClientDebugInfo {
  * participant events, claim tasks, refresh claims, or complete task work.
  */
 export class SessionEventStreamClient {
-  private readonly deliveryQueue: SessionEventStreamQueueItem[] = [];
+  private connectionGeneration = 0;
+  private delivery: SerialEventDelivery<SessionEvent>;
+  private readonly deliveryUnsubscribers = new Map<
+    (event: SessionEvent) => void | Promise<void>,
+    () => void
+  >();
   private readonly eventHandlers = new Set<(event: SessionEvent) => void | Promise<void>>();
   private readonly errorBacklog: Error[] = [];
   private readonly errorHandlers = new Set<(error: Error) => void>();
@@ -80,11 +80,11 @@ export class SessionEventStreamClient {
   );
   private closePromise: Promise<void> = Promise.resolve();
   private connectCount = 0;
-  private draining = false;
   private eventCount = 0;
   /** Highest sequence whose handlers have all resolved; the durable resume cursor. */
   private lastObservedSeq: number;
   private reconnectFailureCount = 0;
+  private reconnectPromise: Promise<void> | null = null;
   private reconnectSuccessCount = 0;
   private replayComplete: Promise<void> = Promise.resolve();
   private replayCompleteCount = 0;
@@ -97,6 +97,7 @@ export class SessionEventStreamClient {
 
   /** Creates an observer around the supplied stream configuration. */
   private constructor(private readonly config: SessionEventStreamClientConfig) {
+    this.delivery = this.createDelivery(config.afterSeq, this.connectionGeneration);
     this.lastObservedSeq = config.afterSeq;
     this.webSocketFactory = config.webSocketFactory ?? ((url) => new WebSocket(url));
   }
@@ -143,9 +144,11 @@ export class SessionEventStreamClient {
   /** Registers an event callback and resumes serial delivery of any backlog. */
   onEvent(handler: (event: SessionEvent) => void | Promise<void>): () => void {
     this.eventHandlers.add(handler);
-    void this.drainDeliveryQueue();
+    this.deliveryUnsubscribers.set(handler, this.delivery.onEvent(handler));
     return () => {
       this.eventHandlers.delete(handler);
+      this.deliveryUnsubscribers.get(handler)?.();
+      this.deliveryUnsubscribers.delete(handler);
     };
   }
 
@@ -153,7 +156,7 @@ export class SessionEventStreamClient {
   async reconnect(): Promise<SessionEventStreamClient> {
     this.socket?.close();
     await this.waitForClose().catch(() => undefined);
-    await this.reconnectWithBackoff(0);
+    await this.requestReconnect(0);
     return this;
   }
 
@@ -173,10 +176,9 @@ export class SessionEventStreamClient {
       "open",
       { afterSeq, sessionId: this.config.sessionId },
       async () => {
-        // Each connect resumes from lastObservedSeq, so the server replays every
-        // event after it. Discard any un-acknowledged items queued from a prior
-        // socket to avoid delivering them twice once replay re-sends them.
-        this.deliveryQueue.length = 0;
+        const generation = this.connectionGeneration + 1;
+        this.connectionGeneration = generation;
+        this.replaceDelivery(afterSeq, generation);
         this.replayCompleteSettled = false;
         const replayComplete = new Promise<void>((resolve, reject) => {
           this.rejectReplayComplete = reject;
@@ -194,19 +196,21 @@ export class SessionEventStreamClient {
         this.connectCount += 1;
         this.closePromise = new Promise((resolve) => {
           socket.once("close", () => {
-            if (this.socket === socket) {
+            if (this.connectionGeneration === generation && this.socket === socket) {
               this.socket = null;
+              this.settleReplayCompleteError(new Error("WebSocket closed before replay completed"));
             }
-            this.settleReplayCompleteError(new Error("WebSocket closed before replay completed"));
             resolve();
           });
         });
         socket.on("error", (error) => {
-          this.settleReplayCompleteError(error);
-          this.emitError(error);
+          if (this.connectionGeneration === generation) {
+            this.settleReplayCompleteError(error);
+            this.emitError(error);
+          }
         });
         socket.on("message", (data) => {
-          this.handleMessage(data);
+          this.handleMessage(data, generation);
         });
         await new Promise<void>((resolve, reject) => {
           socket.once("open", resolve);
@@ -219,6 +223,21 @@ export class SessionEventStreamClient {
   /** Reopens the stream with bounded retry backoff. */
   private async reconnectWithBackoff(initialDelayMs: number | null = null): Promise<void> {
     await Effect.runPromise(this.buildReconnectWithBackoff(initialDelayMs));
+  }
+
+  /** Coalesces caller-triggered and automatic observer reconnect ownership. */
+  private requestReconnect(initialDelayMs: number | null = null): Promise<void> {
+    if (this.reconnectPromise) {
+      return this.reconnectPromise;
+    }
+    const reconnect = this.reconnectWithBackoff(initialDelayMs);
+    this.reconnectPromise = reconnect;
+    void reconnect.finally(() => {
+      if (this.reconnectPromise === reconnect) {
+        this.reconnectPromise = null;
+      }
+    });
+    return reconnect;
   }
 
   /** Builds the bounded reconnect loop as an Effect program. */
@@ -252,23 +271,24 @@ export class SessionEventStreamClient {
   }
 
   /** Parses one server envelope and enqueues it for serial, in-order delivery. */
-  private handleMessage(data: WebSocket.RawData): void {
+  private handleMessage(data: WebSocket.RawData, generation: number): void {
+    if (generation !== this.connectionGeneration) {
+      return;
+    }
     try {
       const envelope = parseWebSocketServerEnvelope(JSON.parse(String(data)) as unknown);
       if (!envelope) {
-        this.emitError(new Error("Unsupported WebSocket envelope"));
+        this.delivery.rejectInvalidEnvelope();
         return;
       }
       if (envelope.op === webSocketOperation.event) {
         this.eventCount += 1;
-        this.deliveryQueue.push({ event: envelope.event, kind: "event" });
-        void this.drainDeliveryQueue();
+        this.delivery.enqueueEvent(envelope.event);
         return;
       }
       if (envelope.op === webSocketOperation.replayComplete) {
         this.replayCompleteCount += 1;
-        this.deliveryQueue.push({ kind: "replay-complete" });
-        void this.drainDeliveryQueue();
+        this.delivery.enqueueReplayComplete();
         return;
       }
       if (envelope.op === webSocketOperation.error) {
@@ -276,67 +296,75 @@ export class SessionEventStreamClient {
         this.settleReplayCompleteError(error);
         this.emitError(error);
       }
-    } catch (error) {
-      this.emitError(
-        error instanceof Error ? error : new Error("Failed to handle WebSocket message"),
-      );
+    } catch {
+      this.delivery.rejectInvalidEnvelope();
     }
   }
 
-  /**
-   * Drains queued events through registered handlers strictly one at a time and
-   * in sequence order. A single drain runs at a time, so handlers never overlap
-   * and later events wait behind in-flight delivery. The resume cursor advances
-   * only after an event's handlers all resolve, and a rejection halts delivery
-   * without acknowledging the failed event so the stream reconnects and replays
-   * from the last successfully handled position instead of skipping past it.
-   */
-  private async drainDeliveryQueue(): Promise<void> {
-    if (this.draining) {
+  /** Creates a generation-owned shared delivery state machine. */
+  private createDelivery(afterSeq: number, generation: number): SerialEventDelivery<SessionEvent> {
+    return new SerialEventDelivery<SessionEvent>({
+      handlerTimeoutMs: observerHandlerTimeoutMs,
+      initialSeq: afterSeq,
+      maxQueueSize: observerMaxQueueSize,
+      onOutcome: (outcome) => this.handleDeliveryOutcome(outcome, generation),
+    });
+  }
+
+  /** Replaces generation-local delivery while preserving public subscriptions. */
+  private replaceDelivery(afterSeq: number, generation: number): void {
+    for (const unsubscribe of this.deliveryUnsubscribers.values()) {
+      unsubscribe();
+    }
+    this.deliveryUnsubscribers.clear();
+    this.delivery = this.createDelivery(afterSeq, generation);
+    for (const handler of this.eventHandlers) {
+      this.deliveryUnsubscribers.set(handler, this.delivery.onEvent(handler));
+    }
+  }
+
+  /** Maps shared delivery outcomes to observer cursor, replay, and recovery policy. */
+  private handleDeliveryOutcome(
+    outcome: SerialEventDeliveryOutcome<SessionEvent>,
+    generation: number,
+  ): void {
+    if (generation !== this.connectionGeneration) {
       return;
     }
-    this.draining = true;
-    try {
-      while (!this.stopped && this.deliveryQueue.length > 0) {
-        const next = this.deliveryQueue[0];
-        if (!next) {
-          break;
-        }
-        if (next.kind === "replay-complete") {
-          this.deliveryQueue.shift();
-          this.settleReplayComplete();
-          continue;
-        }
-        if (this.eventHandlers.size === 0) {
-          // Preserve the backlog until a handler registers and resumes delivery.
-          break;
-        }
-        // Take ownership before awaiting so a concurrent reconnect that clears
-        // the queue cannot re-deliver the event now in flight.
-        this.deliveryQueue.shift();
-        const delivered = await this.deliverEventToHandlers(next.event);
-        if (!delivered) {
-          this.recoverFromDeliveryFailure();
-          return;
-        }
-        this.lastObservedSeq = Math.max(this.lastObservedSeq, next.event.seq);
-      }
-    } finally {
-      this.draining = false;
+    switch (outcome.kind) {
+      case "delivery-queue-overflow":
+        this.emitError(new Error("Session event delivery queue exceeded its configured limit"));
+        this.recoverFromDeliveryFailure(generation);
+        return;
+      case "duplicate-ignored":
+        return;
+      case "event-handled":
+        this.lastObservedSeq = outcome.event.seq;
+        return;
+      case "handler-failed":
+        this.emitError(
+          outcome.cause instanceof Error
+            ? outcome.cause
+            : new Error("Session event handler failed"),
+        );
+        this.recoverFromDeliveryFailure(generation);
+        return;
+      case "handler-timeout":
+        this.emitError(new Error("Session event handler timed out"));
+        this.recoverFromDeliveryFailure(generation);
+        return;
+      case "invalid-server-envelope":
+        this.emitError(new Error("Unsupported WebSocket envelope"));
+        this.recoverFromDeliveryFailure(generation);
+        return;
+      case "non-contiguous-event":
+        this.emitError(new Error("Session event stream contained a sequence gap"));
+        this.recoverFromDeliveryFailure(generation);
+        return;
+      case "replay-complete":
+        this.settleReplayComplete();
+        return;
     }
-  }
-
-  /** Awaits every registered handler in turn; returns false on the first rejection. */
-  private async deliverEventToHandlers(event: SessionEvent): Promise<boolean> {
-    for (const handler of [...this.eventHandlers]) {
-      try {
-        await handler(event);
-      } catch (error) {
-        this.emitError(error instanceof Error ? error : new Error("Session event handler failed"));
-        return false;
-      }
-    }
-    return true;
   }
 
   /**
@@ -344,15 +372,15 @@ export class SessionEventStreamClient {
    * reconnecting from the last successfully handled sequence, so the server
    * replays the failed event rather than the stream advancing past it.
    */
-  private recoverFromDeliveryFailure(): void {
-    if (this.stopped) {
+  private recoverFromDeliveryFailure(generation: number): void {
+    if (this.stopped || generation !== this.connectionGeneration) {
       return;
     }
-    this.deliveryQueue.length = 0;
     const socket = this.socket;
+    this.settleReplayCompleteError(new Error("Observer delivery failed before replay completed"));
     this.socket = null;
     socket?.close();
-    void this.reconnectWithBackoff();
+    void this.requestReconnect();
   }
 
   /** Routes operational failures to registered error handlers. */

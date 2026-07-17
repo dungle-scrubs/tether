@@ -84,6 +84,7 @@ export const webSocketErrorEnvelopeSchema = z
   .object({
     error: z.string(),
     op: z.literal(webSocketOperation.error),
+    reason: z.string().min(1).optional(),
     requestId: z.string().min(1).optional(),
   })
   .passthrough();

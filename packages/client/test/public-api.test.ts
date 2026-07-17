@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 
 import * as Client from "../src/index.js";
 
@@ -9,12 +9,18 @@ type PromiseReturning<TArgs extends readonly unknown[], TValue> = (
 interface ParticipantRuntimePromiseContract {
   readonly claimTask: PromiseReturning<[string], Client.TaskRecord | null>;
   readonly completeTask: PromiseReturning<[string, Record<string, unknown>], void>;
+  readonly closeAndWait: PromiseReturning<[], void>;
   readonly connect: PromiseReturning<
+    [Client.ParticipantRuntimeClientConfig],
+    Client.ParticipantRuntimeClient
+  >;
+  readonly create: PromiseReturning<
     [Client.ParticipantRuntimeClientConfig],
     Client.ParticipantRuntimeClient
   >;
   readonly failTask: PromiseReturning<[string, Record<string, unknown>], void>;
   readonly reconnect: PromiseReturning<[], Client.ParticipantRuntimeClient>;
+  readonly open: PromiseReturning<[], Client.ParticipantRuntimeClient>;
   readonly refreshTaskClaim: PromiseReturning<[string], Client.TaskRecord | null>;
   readonly runClaimableTasks: PromiseReturning<[Client.ParticipantRuntimeTaskLoopOptions], void>;
   readonly runParticipantRuntime: PromiseReturning<[Client.RunParticipantRuntimeInput], void>;
@@ -34,9 +40,12 @@ interface SessionEventStreamPromiseContract {
 
 const participantRuntimePromiseContract: ParticipantRuntimePromiseContract = {
   claimTask: Client.ParticipantRuntimeClient.prototype.claimTask,
+  closeAndWait: Client.ParticipantRuntimeClient.prototype.closeAndWait,
   completeTask: Client.ParticipantRuntimeClient.prototype.completeTask,
   connect: Client.ParticipantRuntimeClient.connect,
+  create: Client.ParticipantRuntimeClient.create,
   failTask: Client.ParticipantRuntimeClient.prototype.failTask,
+  open: Client.ParticipantRuntimeClient.prototype.open,
   reconnect: Client.ParticipantRuntimeClient.prototype.reconnect,
   refreshTaskClaim: Client.ParticipantRuntimeClient.prototype.refreshTaskClaim,
   runClaimableTasks: Client.ParticipantRuntimeClient.prototype.runClaimableTasks,
@@ -56,9 +65,12 @@ describe("@dungle-scrubs/tether-client public API", () => {
   it("keeps participant runtime APIs Promise-based", () => {
     expect(Object.keys(participantRuntimePromiseContract).sort()).toEqual([
       "claimTask",
+      "closeAndWait",
       "completeTask",
       "connect",
+      "create",
       "failTask",
+      "open",
       "reconnect",
       "refreshTaskClaim",
       "runClaimableTasks",
@@ -66,6 +78,75 @@ describe("@dungle-scrubs/tether-client public API", () => {
       "waitForClose",
       "waitForReplayComplete",
     ]);
+  });
+
+  it("types participant event handlers as synchronous or asynchronous", () => {
+    type ParticipantEventHandler = Client.ParticipantRuntimeEventHandler;
+
+    expectTypeOf<ReturnType<ParticipantEventHandler>>().toEqualTypeOf<void | Promise<void>>();
+  });
+
+  it("types subscriber-first lifecycle hooks and finite runtime policies", () => {
+    const hooks = {
+      onClientReady: (client: Client.ParticipantRuntimeClient) => client.onEvent(() => undefined),
+      onReplayComplete: async (_client: Client.ParticipantRuntimeClient) => {
+        await Promise.resolve();
+        return () => undefined;
+      },
+    } satisfies Client.RunParticipantRuntimeHooks;
+    const config = {
+      afterSeq: 0,
+      capabilities: {},
+      cursorPersist: {
+        retryAttempts: 5,
+        retryBaseDelayMs: 100,
+        retryMaxDelayMs: 2_000,
+        writeTimeoutMs: 5_000,
+      },
+      displayName: "Runtime",
+      eventDelivery: {
+        handlerTimeoutMs: 30_000,
+        maxQueueSize: 2_000,
+        maxRecoveryAttempts: 5,
+      },
+      instanceId: "inst_1",
+      participantId: "part_1",
+      runtimeKind: "generic_agent",
+      serviceUrl: "http://127.0.0.1:4123",
+      sessionId: "sess_1",
+      shutdownTimeoutMs: 30_000,
+    } satisfies Client.ParticipantRuntimeClientConfig;
+
+    expectTypeOf(hooks).toMatchTypeOf<Client.RunParticipantRuntimeHooks>();
+    expectTypeOf(config).toMatchTypeOf<Client.ParticipantRuntimeClientConfig>();
+  });
+
+  it("exports typed participant recovery errors and additive diagnostics", () => {
+    const recoveryErrors: readonly (new (...args: never[]) => Error)[] = [
+      Client.ParticipantRuntimeCommandOutcomeUnknownError,
+      Client.ParticipantRuntimeCursorPersistError,
+      Client.ParticipantRuntimeEventDeliveryError,
+      Client.ParticipantRuntimeShutdownError,
+      Client.ParticipantRuntimeTerminalStreamError,
+    ];
+    type ParticipantDiagnostics = Pick<
+      Client.ParticipantRuntimeClientDebugInfo,
+      | "activeDeliverySeq"
+      | "connectionGeneration"
+      | "cursorPersistFailureCount"
+      | "eventDeliveryFailureCount"
+      | "lastHandledSeq"
+      | "lastObservedSeq"
+      | "lastPersistedSeq"
+      | "lastReceivedSeq"
+      | "pausedReason"
+      | "pendingCursorSeq"
+      | "recoveryCount"
+    >;
+
+    expect(recoveryErrors).toHaveLength(5);
+    expectTypeOf<ParticipantDiagnostics["lastObservedSeq"]>().toEqualTypeOf<number>();
+    expectTypeOf<ParticipantDiagnostics["lastHandledSeq"]>().toEqualTypeOf<number>();
   });
 
   it("does not export Effect as a top-level adapter API", () => {

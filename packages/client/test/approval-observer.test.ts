@@ -246,6 +246,7 @@ function createApprovalObserverFixture(): {
 
 /** Minimal WebSocket used to drive a real SessionEventStreamClient in observer tests. */
 class ApprovalFakeWebSocket extends EventEmitter {
+  private nextSeq = 1;
   readyState = WebSocket.CONNECTING;
 
   constructor() {
@@ -268,7 +269,7 @@ class ApprovalFakeWebSocket extends EventEmitter {
   }
 
   emitServerEvent(event: SessionEvent): void {
-    this.emit("message", JSON.stringify({ event, op: "event" }));
+    this.emit("message", JSON.stringify({ event: { ...event, seq: this.nextSeq++ }, op: "event" }));
   }
 
   emitReplayComplete(): void {
