@@ -73,6 +73,8 @@ function jsonRequest(method: string, body: Record<string, unknown>): IncomingMes
 function authContext(role: AuthContext["role"], participantId: string): AuthContext {
   return {
     expiresAt: "2099-01-01T00:00:00.000Z",
+    grantJti: null,
+    issuer: null,
     kid: "default",
     participantId,
     role,

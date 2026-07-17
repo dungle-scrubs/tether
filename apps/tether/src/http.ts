@@ -247,13 +247,17 @@ export function createAppServerWithSessionService(
     mode: "disabled",
     secrets: {},
   };
-  const auth = createAuthRuntime(authOptions);
+  const authPersistenceStores = createAuthPersistenceStores(pool);
+  const auth = createAuthRuntime({
+    ...authOptions,
+    grantStore: authOptions.grantStore ?? authPersistenceStores.grants,
+  });
   const authGrantLifecycle = createAuthGrantLifecycle({
     activeKid: authOptions.activeKid,
     issuer: authOptions.issuer ?? null,
     issuanceEnabled: authOptions.preEnforcementGrantIssuanceEnabled ?? false,
     secrets: authOptions.secrets,
-    stores: createAuthPersistenceStores(pool),
+    stores: authPersistenceStores,
   });
   /**
    * Reads process-local diagnostics for the app server and its child modules.
@@ -446,7 +450,9 @@ function handleHttpRequest(
       sendJson(response, readiness.status, { ...readiness.body });
       return;
     }
-    const authContext = authenticateHttpRequest(auth, request, response, url);
+    const authContext = yield* Effect.promise(() =>
+      authenticateHttpRequest(auth, request, response, url),
+    );
     if (authContext === undefined) {
       return;
     }
@@ -561,14 +567,14 @@ const defaultRestControlLogger = {
 };
 
 /** Authenticates a REST request and writes the rejection response on failure. */
-function authenticateHttpRequest(
+async function authenticateHttpRequest(
   auth: AuthRuntime,
   request: IncomingMessage,
   response: ServerResponse,
   url: URL,
-): AuthContext | null | undefined {
+): Promise<AuthContext | null | undefined> {
   try {
-    return auth.authenticateHttpRequest(request, url);
+    return await auth.authenticateHttpRequest(request, url);
   } catch (error) {
     sendAuthError(response, authErrorFromUnknown(error));
     return undefined;

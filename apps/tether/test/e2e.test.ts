@@ -1901,8 +1901,8 @@ e2e("tether e2e", () => {
   it("creates, inspects, lists, and idempotently revokes a durable auth grant", async () => {
     const created = await requestFrom<AuthGrantCreateResponse>(baseUrl, "/auth/grants", {
       body: {
-        role: "participant",
-        sessionScope: "sess_auth_lifecycle",
+        role: "admin",
+        sessionScope: "*",
         subject: "part_auth_lifecycle",
         ttlSeconds: 3_600,
       },
@@ -1913,11 +1913,15 @@ e2e("tether e2e", () => {
     expect(created.grant).toMatchObject({
       audience: "tether-rest",
       revokedAt: null,
-      role: "participant",
-      sessionScope: "sess_auth_lifecycle",
+      role: "admin",
+      sessionScope: "*",
       subject: "part_auth_lifecycle",
     });
     expect(created.grant).not.toHaveProperty("metadata");
+
+    await expect(
+      requestFrom<SessionListResponse>(baseUrl, "/sessions", { authToken: created.bearer }),
+    ).resolves.toEqual(expect.objectContaining({ sessions: expect.any(Array) }));
 
     const inspected = await requestFrom<AuthGrantReadResponse>(
       baseUrl,
@@ -1950,6 +1954,15 @@ e2e("tether e2e", () => {
     expect(repeated.body.status).toBe("already_revoked");
     expect(repeated.body.grant.revokedAt).toBe(revoked.body.grant.revokedAt);
 
+    const deniedAfterRevocation = await requestStatusFrom(baseUrl, "/sessions", {
+      authToken: created.bearer,
+    });
+    expect(deniedAfterRevocation.status).toBe(401);
+    expect(deniedAfterRevocation.body).toEqual({
+      error: "Unauthorized",
+      reason: "auth_grant_revoked",
+    });
+
     const audits = await createAuthPersistenceStores(currentPool()).audits.listForGrant(
       created.grant.jti,
       10,
@@ -1968,6 +1981,281 @@ e2e("tether e2e", () => {
     const invalidJti = await requestStatusFrom(baseUrl, "/auth/grants/not-a-grant");
     expect(invalidJti.status).toBe(400);
     expect(invalidJti.text).not.toContain(created.bearer);
+  });
+
+  it("reauthorizes established WebSocket commands against durable revocation", async () => {
+    const session = await createSession();
+    const participantId = `part_ws_grant_${randomUUID()}`;
+    const task = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
+      body: { kind: "text", objective: "Remain unclaimed after grant revocation" },
+      method: "POST",
+    });
+    const created = await request<AuthGrantCreateResponse>("/auth/grants", {
+      body: {
+        role: "participant",
+        sessionScope: session.sessionId,
+        subject: participantId,
+        ttlSeconds: 3_600,
+      },
+      method: "POST",
+    });
+    const url = new URL(`${baseUrl.replace("http:", "ws:")}/sessions/${session.sessionId}/stream`);
+    url.searchParams.set("access_token", created.bearer);
+    url.searchParams.set("after", "0");
+    url.searchParams.set("instanceId", `inst_ws_grant_${randomUUID()}`);
+    url.searchParams.set("participantId", participantId);
+    url.searchParams.set("runtimeKind", "codex");
+    const socket = new WebSocket(url);
+    const messages: unknown[] = [];
+    socket.on("message", (data) => messages.push(JSON.parse(String(data)) as unknown));
+
+    try {
+      await waitForSocketOpen(socket);
+      await waitFor(() => messages.some(isReplayCompleteEnvelope));
+
+      const allowedEventId = `evt_ws_grant_allowed_${randomUUID()}`;
+      const allowedRequestId = `req_ws_grant_allowed_${randomUUID()}`;
+      socket.send(
+        JSON.stringify({
+          eventId: allowedEventId,
+          op: webSocketOperation.publish,
+          payload: { text: "authorized before revocation" },
+          producerId: participantId,
+          requestId: allowedRequestId,
+          type: sessionEventType.userMessage,
+        }),
+      );
+      await waitFor(() =>
+        messages.some(
+          (message) => isCommandResultEnvelope(message) && message.requestId === allowedRequestId,
+        ),
+      );
+
+      await request(`/auth/grants/${created.grant.jti}/revoke`, {
+        body: {},
+        method: "POST",
+      });
+      const deniedEventId = `evt_ws_grant_denied_${randomUUID()}`;
+      const deniedPublishRequestId = `req_ws_grant_denied_publish_${randomUUID()}`;
+      const deniedTaskCommands = [
+        webSocketOperation.taskClaim,
+        webSocketOperation.taskCancel,
+        webSocketOperation.taskRefresh,
+        webSocketOperation.taskComplete,
+        webSocketOperation.taskFail,
+        webSocketOperation.taskRelease,
+      ] as const;
+      const deniedTaskRequests = deniedTaskCommands.map((op) => ({
+        op,
+        requestId: `req_ws_grant_denied_${op.replace(".", "_")}_${randomUUID()}`,
+      }));
+      socket.send(
+        JSON.stringify({
+          eventId: deniedEventId,
+          op: webSocketOperation.publish,
+          payload: { text: "must not persist after revocation" },
+          producerId: participantId,
+          requestId: deniedPublishRequestId,
+          type: sessionEventType.userMessage,
+        }),
+      );
+      for (const command of deniedTaskRequests) {
+        socket.send(JSON.stringify({ ...command, taskId: task.task.taskId }));
+      }
+      await waitFor(
+        () =>
+          messages.some((message) =>
+            isErrorEnvelopeWithReason(message, deniedPublishRequestId, "auth_grant_revoked"),
+          ) &&
+          deniedTaskRequests.every(({ op, requestId }) =>
+            messages.some(
+              (message) =>
+                isErrorEnvelopeWithReason(message, requestId, "auth_grant_revoked") &&
+                message.command === op,
+            ),
+          ),
+      );
+
+      const events = await request<EventsResponse>(`/sessions/${session.sessionId}/events?after=0`);
+      const tasks = await request<TasksResponse>(`/sessions/${session.sessionId}/tasks`);
+      expect(events.events.map((event) => event.eventId)).toContain(allowedEventId);
+      expect(events.events.map((event) => event.eventId)).not.toContain(deniedEventId);
+      expect(
+        tasks.tasks.find((candidate) => candidate.taskId === task.task.taskId)?.claimedBy,
+      ).toBe(null);
+      const [, encodedPayload, encodedSignature] = created.bearer.split(".");
+      const diagnostics = JSON.stringify(messages);
+      expect(diagnostics).not.toContain(created.bearer);
+      expect(diagnostics).not.toContain(encodedPayload);
+      expect(diagnostics).not.toContain(encodedSignature);
+    } finally {
+      if (socket.readyState !== WebSocket.CLOSED) {
+        socket.close();
+        await waitForSocketClose(socket);
+      }
+    }
+  });
+
+  it("does not positively cache established WebSocket grants and fails closed on store outage", async () => {
+    const session = await createSession();
+    const participantId = `part_ws_store_${randomUUID()}`;
+    const created = await request<AuthGrantCreateResponse>("/auth/grants", {
+      body: {
+        role: "participant",
+        sessionScope: session.sessionId,
+        subject: participantId,
+        ttlSeconds: 3_600,
+      },
+      method: "POST",
+    });
+    let authReadCount = 0;
+    let failAuthReads = false;
+    const durableGrantStore = createAuthPersistenceStores(currentPool()).grants;
+    const observedGrantStore = {
+      findByJti: async (jti: string) => {
+        authReadCount += 1;
+        if (failAuthReads) throw new Error("injected auth store credential detail");
+        return durableGrantStore.findByJti(jti);
+      },
+      list: durableGrantStore.list,
+    };
+    const authorityApp = createAppServer(currentPool(), {
+      auth: { ...e2eAuthOptions, grantStore: observedGrantStore },
+      eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+      sessionService: {
+        controlEpochEnforcement: false,
+        taskClaimLeaseTtlMs: 200,
+        wsControlLeaseTtlMs: 1_000,
+      },
+      taskClaimSweeper: { intervalMs: 0 },
+    });
+    const port = await findOpenPort();
+    await authorityApp.listen(port);
+    const url = new URL(`ws://127.0.0.1:${port}/sessions/${session.sessionId}/stream`);
+    url.searchParams.set("access_token", created.bearer);
+    url.searchParams.set("after", "0");
+    url.searchParams.set("instanceId", `inst_ws_store_${randomUUID()}`);
+    url.searchParams.set("participantId", participantId);
+    url.searchParams.set("runtimeKind", "codex");
+    const socket = new WebSocket(url);
+    const messages: unknown[] = [];
+    socket.on("message", (data) => messages.push(JSON.parse(String(data)) as unknown));
+
+    try {
+      await waitForSocketOpen(socket);
+      await waitFor(() => messages.some(isReplayCompleteEnvelope));
+      expect(authReadCount).toBe(1);
+
+      const allowedEventId = `evt_ws_store_allowed_${randomUUID()}`;
+      const allowedRequestId = `req_ws_store_allowed_${randomUUID()}`;
+      socket.send(
+        JSON.stringify({
+          eventId: allowedEventId,
+          op: webSocketOperation.publish,
+          payload: { text: "requires a second grant read" },
+          producerId: participantId,
+          requestId: allowedRequestId,
+          type: sessionEventType.userMessage,
+        }),
+      );
+      await waitFor(() =>
+        messages.some(
+          (message) => isCommandResultEnvelope(message) && message.requestId === allowedRequestId,
+        ),
+      );
+      expect(authReadCount).toBe(2);
+
+      failAuthReads = true;
+      const deniedEventId = `evt_ws_store_denied_${randomUUID()}`;
+      const deniedRequestId = `req_ws_store_denied_${randomUUID()}`;
+      socket.send(
+        JSON.stringify({
+          eventId: deniedEventId,
+          op: webSocketOperation.publish,
+          payload: { text: "must fail closed during outage" },
+          producerId: participantId,
+          requestId: deniedRequestId,
+          type: sessionEventType.userMessage,
+        }),
+      );
+      await waitFor(() =>
+        messages.some((message) =>
+          isErrorEnvelopeWithReason(message, deniedRequestId, "auth_store_unavailable"),
+        ),
+      );
+      expect(authReadCount).toBe(3);
+
+      const events = await request<EventsResponse>(`/sessions/${session.sessionId}/events?after=0`);
+      expect(events.events.map((event) => event.eventId)).toContain(allowedEventId);
+      expect(events.events.map((event) => event.eventId)).not.toContain(deniedEventId);
+    } finally {
+      if (socket.readyState !== WebSocket.CLOSED) {
+        socket.close();
+        await waitForSocketClose(socket);
+      }
+      await authorityApp.close();
+    }
+  });
+
+  it("absorbs an asynchronous upgrade rejection after the peer disconnects", async () => {
+    const session = await createSession();
+    const participantId = `part_ws_disconnect_${randomUUID()}`;
+    const created = await request<AuthGrantCreateResponse>("/auth/grants", {
+      body: {
+        role: "participant",
+        sessionScope: session.sessionId,
+        subject: participantId,
+        ttlSeconds: 3_600,
+      },
+      method: "POST",
+    });
+    let markAuthReadStarted = (): void => undefined;
+    const authReadStarted = new Promise<void>((resolve) => {
+      markAuthReadStarted = resolve;
+    });
+    let releaseAuthRead = (): void => undefined;
+    const authReadRelease = new Promise<void>((resolve) => {
+      releaseAuthRead = resolve;
+    });
+    const durableGrantStore = createAuthPersistenceStores(currentPool()).grants;
+    const delayedFailureGrantStore = {
+      findByJti: async (_jti: string) => {
+        markAuthReadStarted();
+        await authReadRelease;
+        throw new Error("injected delayed auth read failure");
+      },
+      list: durableGrantStore.list,
+    };
+    const delayedFailureApp = createAppServer(currentPool(), {
+      auth: { ...e2eAuthOptions, grantStore: delayedFailureGrantStore },
+      eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+      taskClaimSweeper: { intervalMs: 0 },
+    });
+    const port = await findOpenPort();
+    await delayedFailureApp.listen(port);
+    const url = new URL(`ws://127.0.0.1:${port}/sessions/${session.sessionId}/stream`);
+    url.searchParams.set("access_token", created.bearer);
+    url.searchParams.set("participantId", participantId);
+    const socket = new WebSocket(url);
+    socket.on("error", () => undefined);
+    const unhandledRejections: unknown[] = [];
+    const observeUnhandled = (reason: unknown): void => {
+      unhandledRejections.push(reason);
+    };
+    process.on("unhandledRejection", observeUnhandled);
+
+    try {
+      await authReadStarted;
+      socket.terminate();
+      releaseAuthRead();
+      await sleep(50);
+      expect(unhandledRejections).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", observeUnhandled);
+      releaseAuthRead();
+      if (socket.readyState !== WebSocket.CLOSED) socket.terminate();
+      await delayedFailureApp.close();
+    }
   });
 
   it("authorizes grant lifecycle routes before revealing grant existence", async () => {
@@ -9149,6 +9437,7 @@ function isErrorEnvelopeWithReason(
   requestId: string,
   reason: string,
 ): value is {
+  readonly command?: string;
   readonly error: string;
   readonly op: "error";
   readonly reason: string;

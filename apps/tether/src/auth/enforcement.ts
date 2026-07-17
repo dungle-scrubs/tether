@@ -3,6 +3,12 @@ import type { URL } from "node:url";
 
 import type { AuthMode, ServerConfig } from "../config.js";
 import {
+  AuthGrantAuthorityError,
+  createAuthGrantAuthority,
+  type AuthGrantAuthority,
+} from "./grant-authority.js";
+import type { AuthGrantStore } from "./grant-stores.js";
+import {
   AuthError,
   createAuthContext,
   type AuthContext,
@@ -19,6 +25,10 @@ export interface AuthRuntimeDebugInfo {
   readonly authMode: AuthMode;
   /** Provisional pre-enforcement tgr2 issuance gate, replaced by M7 rollout readiness. */
   readonly grantIssuanceEnabled: boolean;
+  /** Current bounded durable-grant denial cache size. */
+  readonly negativeGrantCacheEntries: number;
+  /** Hard cap for the durable-grant denial cache. */
+  readonly negativeGrantCacheMaximumEntries: number;
 }
 
 export interface AuthRuntimeOptions {
@@ -26,10 +36,14 @@ export interface AuthRuntimeOptions {
   readonly activeKid: string;
   /** Durable grant issuer used by lifecycle operations, when configured. */
   readonly issuer?: string | null;
+  /** PostgreSQL grant reader required for tgr2 acceptance. */
+  readonly grantStore?: AuthGrantStore;
   /** Structured warning sink for auth boundary events. */
   readonly logger?: AuthRuntimeLogger;
   /** Auth enforcement mode. */
   readonly mode: AuthMode;
+  /** Injectable authorization clock. */
+  readonly now?: () => Date;
   /** Provisional test-only issuance gate until M7 supplies mixed-replica readiness. */
   readonly preEnforcementGrantIssuanceEnabled?: boolean;
   /** Accepted verification secrets keyed by kid. */
@@ -47,9 +61,23 @@ export interface AuthRuntime {
   /** Returns auth diagnostics without exposing secrets. */
   readonly debugInfo: () => AuthRuntimeDebugInfo;
   /** Authenticates one REST request, or returns null when auth is disabled. */
-  readonly authenticateHttpRequest: (request: IncomingMessage, url: URL) => AuthContext | null;
-  /** Authenticates one WebSocket upgrade, or returns null when auth is disabled. */
-  readonly authenticateWebSocketUpgrade: (request: IncomingMessage, url: URL) => AuthContext | null;
+  readonly authenticateHttpRequest: (
+    request: IncomingMessage,
+    url: URL,
+  ) => Promise<AuthContext | null>;
+  /** Authenticates one WebSocket upgrade and retains private command reauthorization. */
+  readonly authenticateWebSocketUpgrade: (
+    request: IncomingMessage,
+    url: URL,
+  ) => Promise<AuthenticatedWebSocketAuth>;
+}
+
+/** Authenticated socket context plus a bearer-private command authorization closure. */
+export interface AuthenticatedWebSocketAuth {
+  /** Nonsecret authorization context shared with command handlers. */
+  readonly context: AuthContext | null;
+  /** Revalidates the original credential at current key, expiry, and PostgreSQL state. */
+  readonly authorizeCommand: () => Promise<void>;
 }
 
 const disabledWarningIntervalMs = 5 * 60 * 1_000;
@@ -60,15 +88,17 @@ const noopAuthRuntimeLogger: AuthRuntimeLogger = {
 /** Creates the process-local auth enforcement runtime for HTTP and WebSocket boundaries. */
 export function createAuthRuntime(options: AuthRuntimeOptions): AuthRuntime {
   const logger = options.logger ?? noopAuthRuntimeLogger;
-  const sortedKids = Object.keys(options.secrets).sort();
   const disabledWarning = options.mode === "disabled" ? startDisabledModeWarning(logger) : null;
+  const authority = createConfiguredGrantAuthority(options);
   return {
-    authenticateHttpRequest: (request, url) => {
+    authenticateHttpRequest: async (request, url) => {
       if (options.mode === "disabled") {
         return null;
       }
       return authenticateBearerToken({
+        authority,
         method: request.method,
+        now: options.now,
         route: url.pathname,
         token: extractBearerToken(request.headers.authorization),
         type: "http",
@@ -76,28 +106,52 @@ export function createAuthRuntime(options: AuthRuntimeOptions): AuthRuntime {
         secrets: options.secrets,
       });
     },
-    authenticateWebSocketUpgrade: (request, url) => {
+    authenticateWebSocketUpgrade: async (request, url) => {
       if (options.mode === "disabled") {
-        return null;
+        return { authorizeCommand: async () => undefined, context: null };
       }
-      return authenticateBearerToken({
+      const token = url.searchParams.get("access_token");
+      const route = url.pathname;
+      const context = await authenticateBearerToken({
+        authority,
         method: request.method,
-        route: url.pathname,
-        token: url.searchParams.get("access_token"),
+        now: options.now,
+        route,
+        token,
         type: "ws",
         logger,
         secrets: options.secrets,
       });
+      return {
+        authorizeCommand: async () => {
+          await authenticateBearerToken({
+            authority,
+            logger,
+            method: "COMMAND",
+            now: options.now,
+            route,
+            secrets: options.secrets,
+            token,
+            type: "ws-command",
+          });
+        },
+        context,
+      };
     },
     close: () => {
       disabledWarning?.stop();
     },
-    debugInfo: () => ({
-      acceptedKids: sortedKids,
-      activeKid: options.activeKid,
-      authMode: options.mode,
-      grantIssuanceEnabled: options.preEnforcementGrantIssuanceEnabled ?? false,
-    }),
+    debugInfo: () => {
+      const authorityDebug = authority?.debugInfo();
+      return {
+        acceptedKids: Object.keys(options.secrets).sort(),
+        activeKid: options.activeKid,
+        authMode: options.mode,
+        grantIssuanceEnabled: options.preEnforcementGrantIssuanceEnabled ?? false,
+        negativeGrantCacheEntries: authorityDebug?.negativeCacheEntries ?? 0,
+        negativeGrantCacheMaximumEntries: authorityDebug?.negativeCacheMaximumEntries ?? 0,
+      };
+    },
   };
 }
 
@@ -113,6 +167,7 @@ export function authRuntimeOptionsFromConfig(config: ServerConfig): AuthRuntimeO
 
 /** Converts an auth error into an HTTP status code. */
 export function authErrorStatus(error: AuthError): number {
+  if (error === AuthError.StoreUnavailable) return 503;
   return error === AuthError.RoleDenied || error === AuthError.ScopeDenied ? 403 : 401;
 }
 
@@ -122,7 +177,12 @@ export function authErrorPayload(error: AuthError): {
   readonly reason: AuthError;
 } {
   return {
-    error: authErrorStatus(error) === 401 ? "Unauthorized" : "Forbidden",
+    error:
+      authErrorStatus(error) === 503
+        ? "Service Unavailable"
+        : authErrorStatus(error) === 401
+          ? "Unauthorized"
+          : "Forbidden",
     reason: error,
   };
 }
@@ -133,12 +193,14 @@ export function authErrorFromUnknown(error: unknown): AuthError {
 }
 
 interface AuthenticateBearerTokenInput {
+  readonly authority: AuthGrantAuthority | null;
   readonly logger: AuthRuntimeLogger;
   readonly method: string | undefined;
+  readonly now?: (() => Date) | undefined;
   readonly route: string;
   readonly secrets: AuthSigningSecrets;
   readonly token: string | null;
-  readonly type: "http" | "ws";
+  readonly type: "http" | "ws" | "ws-command";
 }
 
 interface DisabledWarning {
@@ -146,14 +208,19 @@ interface DisabledWarning {
 }
 
 /** Verifies one bearer-style token and logs redacted rejection context. */
-function authenticateBearerToken(input: AuthenticateBearerTokenInput): AuthContext {
+async function authenticateBearerToken(input: AuthenticateBearerTokenInput): Promise<AuthContext> {
   if (!input.token) {
     logAuthReject(input, AuthError.Missing);
     throw new Error(AuthError.Missing);
   }
   try {
+    if (input.token.startsWith("tgr2.")) {
+      if (!input.authority) throw new AuthGrantAuthorityError("auth_claim_invalid");
+      return await input.authority.authenticateRestBearer(input.token);
+    }
     return createAuthContext(
       verifyLegacyAuthToken(input.token, {
+        ...(input.now === undefined ? {} : { now: input.now() }),
         secrets: input.secrets,
       }),
     );
@@ -162,6 +229,17 @@ function authenticateBearerToken(input: AuthenticateBearerTokenInput): AuthConte
     logAuthReject(input, reason);
     throw new Error(reason);
   }
+}
+
+function createConfiguredGrantAuthority(options: AuthRuntimeOptions): AuthGrantAuthority | null {
+  return options.issuer && options.grantStore
+    ? createAuthGrantAuthority({
+        issuer: options.issuer,
+        ...(options.now === undefined ? {} : { now: options.now }),
+        secrets: options.secrets,
+        store: options.grantStore,
+      })
+    : null;
 }
 
 /** Extracts a Bearer token from an Authorization header value. */
@@ -182,6 +260,9 @@ function buildSigningSecrets(config: ServerConfig): AuthSigningSecrets {
 
 /** Normalizes thrown auth failures back into the typed reason set. */
 function parseAuthError(error: unknown): AuthError {
+  if (error instanceof AuthGrantAuthorityError) {
+    return error.code as AuthError;
+  }
   if (error instanceof Error && Object.values(AuthError).includes(error.message as AuthError)) {
     return error.message as AuthError;
   }

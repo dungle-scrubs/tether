@@ -287,6 +287,8 @@ describe("auth token", () => {
     expect(verified).toEqual(payload);
     expect(createAuthContext(verified)).toEqual({
       expiresAt: new Date(payload.exp * 1_000).toISOString(),
+      grantJti: null,
+      issuer: null,
       kid: "current",
       participantId: "part_auth",
       role: "participant",

@@ -11,7 +11,11 @@ import {
   authorizeParticipantIdentity,
   effectiveParticipantId,
 } from "./auth/authorize.js";
-import { authErrorFromUnknown, type AuthRuntime } from "./auth/enforcement.js";
+import {
+  authErrorFromUnknown,
+  type AuthenticatedWebSocketAuth,
+  type AuthRuntime,
+} from "./auth/enforcement.js";
 import type { AuthContext } from "./auth/token.js";
 import { sleepUnrefEffect } from "./effect-runtime.js";
 import { broadcastEvents, controlLeaseConflictError } from "./http-route-runtime.js";
@@ -185,7 +189,7 @@ export function createParticipantWebSocketGateway(
   const heartbeat = startWebSocketHeartbeat(wsServer);
   const controlSocketRegistry = new ControlSocketRegistry();
   input.server.on("upgrade", (request, socket, head) => {
-    handleParticipantWebSocketUpgrade({
+    void handleParticipantWebSocketUpgrade({
       head,
       auth: input.auth,
       controlSocketRegistry,
@@ -197,6 +201,8 @@ export function createParticipantWebSocketGateway(
       service: input.service,
       socket,
       wsServer,
+    }).catch(() => {
+      socket.destroy();
     });
   });
   const originalClose = wsServer.close.bind(wsServer);
@@ -222,7 +228,9 @@ interface ParticipantWebSocketUpgradeInput {
 }
 
 /** Handles one participant stream upgrade request. */
-function handleParticipantWebSocketUpgrade(input: ParticipantWebSocketUpgradeInput): void {
+async function handleParticipantWebSocketUpgrade(
+  input: ParticipantWebSocketUpgradeInput,
+): Promise<void> {
   const url = input.request.url ? new URL(input.request.url, "http://localhost") : null;
   const match = url?.pathname.match(/^\/sessions\/([^/]+)\/stream$/u);
   const sessionId = match?.[1] ? decodeURIComponent(match[1]) : null;
@@ -230,11 +238,12 @@ function handleParticipantWebSocketUpgrade(input: ParticipantWebSocketUpgradeInp
     input.socket.destroy();
     return;
   }
-  let authContext: AuthContext | null;
+  let authenticated: AuthenticatedWebSocketAuth;
   try {
-    authContext = input.auth.authenticateWebSocketUpgrade(input.request, url);
+    authenticated = await input.auth.authenticateWebSocketUpgrade(input.request, url);
   } catch (error) {
     const reason = authErrorFromUnknown(error);
+    redactWebSocketAccessToken(input.request, url);
     input.wsServer.handleUpgrade(input.request, input.socket, input.head, (webSocket) => {
       input.wsServer.emit("connection", webSocket, input.request);
       observeWebSocketPayloadErrors(webSocket, input.resourceLimitRuntime);
@@ -246,6 +255,7 @@ function handleParticipantWebSocketUpgrade(input: ParticipantWebSocketUpgradeInp
     });
     return;
   }
+  const streamSearchParams = redactWebSocketAccessToken(input.request, url);
   input.wsServer.handleUpgrade(input.request, input.socket, input.head, (webSocket) => {
     input.wsServer.emit("connection", webSocket, input.request);
     observeWebSocketPayloadErrors(webSocket, input.resourceLimitRuntime);
@@ -255,9 +265,9 @@ function handleParticipantWebSocketUpgrade(input: ParticipantWebSocketUpgradeInp
         input.hub,
         input.resourceLimitRuntime,
         input.replicaId,
-        authContext,
+        authenticated,
         sessionId,
-        url.searchParams,
+        streamSearchParams,
         webSocket,
         input.hostPresence,
         input.controlSocketRegistry,
@@ -269,13 +279,21 @@ function handleParticipantWebSocketUpgrade(input: ParticipantWebSocketUpgradeInp
   });
 }
 
+/** Removes a captured bearer before request metadata enters long-lived socket surfaces. */
+export function redactWebSocketAccessToken(request: IncomingMessage, url: URL): URLSearchParams {
+  const redactedUrl = new URL(url);
+  redactedUrl.searchParams.delete("access_token");
+  request.url = `${redactedUrl.pathname}${redactedUrl.search}`;
+  return new URLSearchParams(redactedUrl.searchParams);
+}
+
 /** Registers an upgraded WebSocket, replays historical events, and attaches live command handling. */
 function handleWebSocket(
   service: SessionServiceEffect,
   hub: SubscriptionHub,
   resourceLimitRuntime: ResourceLimitRuntime,
   replicaId: string,
-  authContext: AuthContext | null,
+  authenticated: AuthenticatedWebSocketAuth,
   sessionId: string,
   searchParams: URLSearchParams,
   socket: WebSocket,
@@ -283,6 +301,7 @@ function handleWebSocket(
   controlSocketRegistry: ControlSocketRegistry,
 ): Effect.Effect<void, unknown> {
   return Effect.gen(function* () {
+    const authContext = authenticated.context;
     const readDenied = authorize({ action: "read", context: authContext, sessionId });
     if (readDenied) {
       socket.send(
@@ -381,7 +400,7 @@ function handleWebSocket(
           hub,
           sessionId,
           participantContext,
-          authContext,
+          authenticated,
           socket,
           data,
         ).pipe(
@@ -746,7 +765,7 @@ function handleWebSocketMessage(
   hub: SubscriptionHub,
   sessionId: string,
   participantContext: ParticipantControlContext | null,
-  authContext: AuthContext | null,
+  authenticated: AuthenticatedWebSocketAuth,
   socket: WebSocket,
   data: WebSocket.RawData,
 ): Effect.Effect<void, unknown> {
@@ -761,7 +780,7 @@ function handleWebSocketMessage(
       hub,
       sessionId,
       participantContext,
-      authContext,
+      authenticated,
       socket,
       raw,
       commandContext,
@@ -792,17 +811,32 @@ function handleParsedWebSocketMessage(
   hub: SubscriptionHub,
   sessionId: string,
   participantContext: ParticipantControlContext | null,
-  authContext: AuthContext | null,
+  authenticated: AuthenticatedWebSocketAuth,
   socket: WebSocket,
   raw: unknown,
   commandContext: WebSocketCommandContext | null,
 ): Effect.Effect<void, unknown> {
   return Effect.gen(function* () {
+    const authContext = authenticated.context;
     const op = commandContext?.op ?? readWebSocketOp(raw);
     const commandSpec = findClientWebSocketCommandSpec(op);
     if (!commandSpec) {
       sendCommandContextError(socket, commandContext, `Unsupported WebSocket op: ${op}`, {
         category: "unsupported_command",
+      });
+      return;
+    }
+    const commandAuthority = yield* Effect.either(
+      Effect.tryPromise({
+        catch: (error) => error,
+        try: authenticated.authorizeCommand,
+      }),
+    );
+    if (commandAuthority._tag === "Left") {
+      const reason = authErrorFromUnknown(commandAuthority.left);
+      sendCommandContextError(socket, commandContext, "WebSocket command is not authorized", {
+        category: "authorization_failed",
+        reason,
       });
       return;
     }
