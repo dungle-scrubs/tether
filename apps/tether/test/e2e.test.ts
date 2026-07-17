@@ -52,6 +52,7 @@ import {
   createPool,
   createTaskWithEvent,
   expireTaskClaims,
+  failTaskWithEvent,
   getTask,
   listContextEventSuffix,
   listEvents,
@@ -59,7 +60,10 @@ import {
   listTaskApprovals,
   migrate,
   recordTaskApproval,
+  refreshTaskClaim,
   releaseControlLease,
+  releaseTaskWithEvent,
+  taskClaimLockQuery,
   upsertClientSessionBinding,
   upsertParticipant,
   upsertParticipantWithEvent,
@@ -8995,6 +8999,392 @@ e2e("tether e2e", () => {
       "part_first_claimant",
       secondClaim.task.sessionId,
     );
+  });
+
+  // Milestone M4 (RFC D-008/D-009): a claim attempt on an ELAPSED claim atomically
+  // expires and re-claims the task in one transaction, so the task never waits for
+  // the background sweeper. These tests run on an isolated database with NO
+  // background sweeper, so every reclaim is exercised deterministically.
+  describe("atomic on-demand reclaim", () => {
+    const reclaimDatabaseName = `tether_e2e_reclaim_${randomUUID().replaceAll("-", "_")}`;
+    let reclaimPool: DatabasePool | null = null;
+
+    beforeAll(async () => {
+      await createDatabase(reclaimDatabaseName);
+      reclaimPool = createPool(buildDatabaseUrl(reclaimDatabaseName));
+      await migrate(reclaimPool);
+    }, 30_000);
+
+    afterAll(async () => {
+      await reclaimPool?.end();
+      await dropDatabase(reclaimDatabaseName);
+    }, 30_000);
+
+    /** Returns the isolated, sweeper-free reclaim database pool. */
+    function pool(): DatabasePool {
+      if (reclaimPool === null) {
+        throw new Error("Reclaim database pool is not initialized");
+      }
+      return reclaimPool;
+    }
+
+    /** Forces one live claim to elapse relative to the database clock. */
+    async function elapseClaim(sessionId: string, taskId: string): Promise<void> {
+      await pool().pool.query(
+        `
+          UPDATE tasks
+          SET claim_expires_at = now() - interval '1 second'
+          WHERE session_id = $1 AND task_id = $2
+        `,
+        [sessionId, taskId],
+      );
+    }
+
+    /** Counts committed events of one type for a single task. */
+    async function countTaskEvents(
+      sessionId: string,
+      taskId: string,
+      type: SessionEvent["type"],
+    ): Promise<number> {
+      const events = await listEvents(pool(), sessionId, 0);
+      return events.filter(
+        (event) => event.type === type && taskIdFromEventPayload(event) === taskId,
+      ).length;
+    }
+
+    /** Seeds a task with an initial claim and then elapses that claim's lease. */
+    async function prepareElapsedClaim(suffix: string): Promise<{
+      readonly previousClaimId: string;
+      readonly previousClaimedBy: string;
+      readonly sessionId: string;
+      readonly taskId: string;
+    }> {
+      const sessionId = `sess_reclaim_${suffix}_${randomUUID()}`;
+      const taskId = `task_reclaim_${suffix}_${randomUUID()}`;
+      const previousClaimedBy = `part_prev_${suffix}`;
+      await createDbSession(pool(), sessionId);
+      await createTaskWithEvent(pool(), {
+        eventSourceId: "src_reclaim_setup_e2e",
+        kind: "software_dev",
+        objective: "Reclaim this elapsed claim",
+        sessionId,
+        taskId,
+      });
+      const firstClaim = await claimTaskWithEvent(pool(), {
+        claimLeaseTtlMs: 60_000,
+        eventSourceId: "src_reclaim_setup_e2e",
+        participantId: previousClaimedBy,
+        sessionId,
+        taskId,
+      });
+      const previousClaimId = firstClaim?.task.claimId ?? null;
+      if (firstClaim === null || previousClaimId === null) {
+        throw new Error("Failed to seed the initial claim");
+      }
+      await elapseClaim(sessionId, taskId);
+      return { previousClaimId, previousClaimedBy, sessionId, taskId };
+    }
+
+    it("atomically expires and re-claims an elapsed claim without the sweeper", async () => {
+      const { previousClaimId, previousClaimedBy, sessionId, taskId } =
+        await prepareElapsedClaim("solo");
+      const reclaimer = "part_reclaimer_solo";
+
+      const result = await claimTaskWithEvent(pool(), {
+        claimLeaseTtlMs: 60_000,
+        eventSourceId: "src_reclaim_solo_e2e",
+        participantId: reclaimer,
+        sessionId,
+        taskId,
+      });
+
+      expect(result).not.toBeNull();
+      if (result === null) {
+        throw new Error("Reclaim returned null");
+      }
+      // The reclaim commits an ordered pair: claim_expired (old owner) then
+      // claimed (new owner), with a strictly lower sequence for the expiry.
+      expect(result.events.map((event) => event.type)).toEqual([
+        "task.claim_expired",
+        "task.claimed",
+      ]);
+      const [expiredEvent, claimedEvent] = result.events;
+      expect(expiredEvent?.seq ?? 0).toBeLessThan(claimedEvent?.seq ?? 0);
+      expect(expiredEvent?.payload.previousClaimedBy).toBe(previousClaimedBy);
+      // A fresh server-issued Claim ID replaces the elapsed one.
+      expect(result.task.claimId).not.toBe(previousClaimId);
+      expect(result.task.claimId).not.toBeNull();
+      expect(result.task.claimedBy).toBe(reclaimer);
+      // No sweeper ran, yet the durable event log carries exactly one expiry and
+      // the two claims (initial plus reclaim).
+      expect(await countTaskEvents(sessionId, taskId, "task.claim_expired")).toBe(1);
+      expect(await countTaskEvents(sessionId, taskId, "task.claimed")).toBe(2);
+    });
+
+    it("lets exactly one of two racing claimants reclaim an elapsed task", async () => {
+      const { sessionId, taskId } = await prepareElapsedClaim("race");
+      const coordinator = createPostgresConcurrencyCoordinator(pool(), {
+        actors: ["winner", "loser"],
+        barrierTimeoutMs: 5_000,
+        phases: [
+          {
+            // The winner is held immediately after it has locked the task row via
+            // FOR UPDATE, so the loser must block on the same row. This boundary
+            // runs exactly once per claim, unlike the event-sequence allocator that
+            // a reclaim visits twice.
+            actors: ["winner"],
+            name: "winner-holds-task-lock",
+            position: "after",
+            query: { class: "task-claim-lock", text: taskClaimLockQuery },
+            release: "manual",
+          },
+        ],
+        transactionTimeouts: { lockTimeoutMs: 5_000, statementTimeoutMs: 10_000 },
+      });
+
+      const { loserResult, lockWait, winnerResult } = await coordinator.run(
+        async ({ databaseFor, releasePhase, waitForLockWait, waitForPhase }) => {
+          const winner = claimTaskWithEvent(databaseFor("winner"), {
+            claimLeaseTtlMs: 60_000,
+            eventSourceId: "src_reclaim_winner_e2e",
+            participantId: "part_winner",
+            sessionId,
+            taskId,
+          });
+          await waitForPhase("winner-holds-task-lock");
+          const loser = claimTaskWithEvent(databaseFor("loser"), {
+            claimLeaseTtlMs: 60_000,
+            eventSourceId: "src_reclaim_loser_e2e",
+            participantId: "part_loser",
+            sessionId,
+            taskId,
+          });
+          const lockWait = await waitForLockWait("loser");
+          releasePhase("winner-holds-task-lock");
+          const [winnerResult, loserResult] = await Promise.all([winner, loser]);
+          return { loserResult, lockWait, winnerResult };
+        },
+      );
+
+      // The loser blocked on the task row FOR UPDATE the winner held.
+      expect(lockWait).toMatchObject({ blocked: true, waitEventType: "Lock" });
+      // Exactly one claimant won and performed the atomic reclaim.
+      expect(winnerResult).not.toBeNull();
+      expect(winnerResult?.events.map((event) => event.type)).toEqual([
+        "task.claim_expired",
+        "task.claimed",
+      ]);
+      expect(winnerResult?.task.claimedBy).toBe("part_winner");
+      // The loser observed the fresh live claim and did NOT double-expire it.
+      expect(loserResult).toBeNull();
+      expect(await countTaskEvents(sessionId, taskId, "task.claim_expired")).toBe(1);
+      expect(await countTaskEvents(sessionId, taskId, "task.claimed")).toBe(2);
+      const durable = await getTask(pool(), { sessionId, taskId });
+      expect(durable?.claimedBy).toBe("part_winner");
+      expect(durable?.claimId).toBe(winnerResult?.task.claimId);
+    });
+
+    it("skips a reclaiming claimant's locked task during a concurrent sweep", async () => {
+      const { sessionId, taskId } = await prepareElapsedClaim("sweeper");
+      const coordinator = createPostgresConcurrencyCoordinator(pool(), {
+        actors: ["claimant"],
+        barrierTimeoutMs: 5_000,
+        phases: [
+          {
+            // Hold the claimant right after it locks the task row (once per claim).
+            actors: ["claimant"],
+            name: "claimant-holds-task-lock",
+            position: "after",
+            query: { class: "task-claim-lock", text: taskClaimLockQuery },
+            release: "manual",
+          },
+        ],
+        transactionTimeouts: { lockTimeoutMs: 5_000, statementTimeoutMs: 10_000 },
+      });
+
+      const { claimResult, sweepEvents } = await coordinator.run(
+        async ({ databaseFor, releasePhase, waitForPhase }) => {
+          const claim = claimTaskWithEvent(databaseFor("claimant"), {
+            claimLeaseTtlMs: 60_000,
+            eventSourceId: "src_reclaim_claimant_e2e",
+            participantId: "part_claimant",
+            sessionId,
+            taskId,
+          });
+          await waitForPhase("claimant-holds-task-lock");
+          // The sweeper runs while the claimant holds the task row lock. Its
+          // `FOR UPDATE SKIP LOCKED` skips the locked row rather than deadlocking.
+          const sweepEvents = await expireTaskClaims(pool(), {
+            batchSize: 10,
+            sourceId: "src_reclaim_sweep_e2e",
+          });
+          releasePhase("claimant-holds-task-lock");
+          const claimResult = await claim;
+          return { claimResult, sweepEvents };
+        },
+      );
+
+      // The sweeper skipped the locked task, so it emitted no expiry for it.
+      expect(sweepEvents.filter((event) => taskIdFromEventPayload(event) === taskId)).toHaveLength(
+        0,
+      );
+      // The claimant completed the atomic reclaim after the sweep finished.
+      expect(claimResult?.events.map((event) => event.type)).toEqual([
+        "task.claim_expired",
+        "task.claimed",
+      ]);
+      expect(claimResult?.task.claimedBy).toBe("part_claimant");
+      // No duplicate expiration: exactly one claim_expired for the task.
+      expect(await countTaskEvents(sessionId, taskId, "task.claim_expired")).toBe(1);
+    });
+
+    it("fences stale claim generations after an atomic reclaim", async () => {
+      const { previousClaimId, previousClaimedBy, sessionId, taskId } =
+        await prepareElapsedClaim("fence");
+
+      const reclaim = await claimTaskWithEvent(pool(), {
+        claimLeaseTtlMs: 60_000,
+        eventSourceId: "src_reclaim_fence_e2e",
+        participantId: "part_new_owner",
+        sessionId,
+        taskId,
+      });
+      const newClaimId = reclaim?.task.claimId ?? null;
+      expect(newClaimId).not.toBeNull();
+      expect(newClaimId).not.toBe(previousClaimId);
+
+      const eventCountBefore = (await listEvents(pool(), sessionId, 0)).length;
+      // The stale generation (old owner + old Claim ID) cannot refresh, complete,
+      // fail, or release the replacement claim.
+      const refreshed = await refreshTaskClaim(pool(), {
+        claimId: previousClaimId,
+        claimLeaseTtlMs: 60_000,
+        participantId: previousClaimedBy,
+        sessionId,
+        taskId,
+      });
+      expect(refreshed).toBeNull();
+      const completed = await completeTaskWithEvent(pool(), {
+        claimId: previousClaimId,
+        eventSourceId: "src_reclaim_fence_e2e",
+        participantId: previousClaimedBy,
+        result: { summary: "stale complete" },
+        sessionId,
+        taskId,
+      });
+      expect(completed).toBeNull();
+      const failed = await failTaskWithEvent(pool(), {
+        claimId: previousClaimId,
+        eventSourceId: "src_reclaim_fence_e2e",
+        failure: { reason: "stale fail" },
+        participantId: previousClaimedBy,
+        sessionId,
+        taskId,
+      });
+      expect(failed).toBeNull();
+      const released = await releaseTaskWithEvent(pool(), {
+        claimId: previousClaimId,
+        eventSourceId: "src_reclaim_fence_e2e",
+        participantId: previousClaimedBy,
+        sessionId,
+        taskId,
+      });
+      expect(released).toBeNull();
+
+      // None of the stale mutations appended an event or displaced the owner.
+      expect((await listEvents(pool(), sessionId, 0)).length).toBe(eventCountBefore);
+      const durable = await getTask(pool(), { sessionId, taskId });
+      expect(durable?.claimId).toBe(newClaimId);
+      expect(durable?.claimedBy).toBe("part_new_owner");
+      expect(durable?.completedAt).toBeNull();
+      expect(durable?.failedAt).toBeNull();
+    });
+
+    it("keeps a legacy claim without a Claim ID immutable until it is reclaimed", async () => {
+      const sessionId = `sess_reclaim_legacy_${randomUUID()}`;
+      const taskId = `task_reclaim_legacy_${randomUUID()}`;
+      const legacyOwner = "part_legacy_owner";
+      await createDbSession(pool(), sessionId);
+      await createTaskWithEvent(pool(), {
+        eventSourceId: "src_reclaim_legacy_e2e",
+        kind: "software_dev",
+        objective: "Legacy claim without a Claim ID",
+        sessionId,
+        taskId,
+      });
+      await claimTaskWithEvent(pool(), {
+        claimLeaseTtlMs: 60_000,
+        eventSourceId: "src_reclaim_legacy_e2e",
+        participantId: legacyOwner,
+        sessionId,
+        taskId,
+      });
+      // Simulate a pre-Claim-ID migration row: an active claim whose claim_id is
+      // NULL and whose lease has not yet elapsed.
+      await pool().pool.query(
+        `UPDATE tasks SET claim_id = NULL WHERE session_id = $1 AND task_id = $2`,
+        [sessionId, taskId],
+      );
+
+      // Claim-owned mutations require the exact current Claim ID, so a NULL-id row
+      // cannot be completed, failed, released, or refreshed.
+      expect(
+        await completeTaskWithEvent(pool(), {
+          claimId: "claim_missing",
+          eventSourceId: "src_reclaim_legacy_e2e",
+          participantId: legacyOwner,
+          result: { summary: "legacy complete" },
+          sessionId,
+          taskId,
+        }),
+      ).toBeNull();
+      expect(
+        await releaseTaskWithEvent(pool(), {
+          claimId: "claim_missing",
+          eventSourceId: "src_reclaim_legacy_e2e",
+          participantId: legacyOwner,
+          sessionId,
+          taskId,
+        }),
+      ).toBeNull();
+      expect(
+        await refreshTaskClaim(pool(), {
+          claimId: "claim_missing",
+          claimLeaseTtlMs: 60_000,
+          participantId: legacyOwner,
+          sessionId,
+          taskId,
+        }),
+      ).toBeNull();
+      // The claim is still live, so another participant cannot win it yet.
+      expect(
+        await claimTaskWithEvent(pool(), {
+          claimLeaseTtlMs: 60_000,
+          eventSourceId: "src_reclaim_legacy_e2e",
+          participantId: "part_early_challenger",
+          sessionId,
+          taskId,
+        }),
+      ).toBeNull();
+
+      // Once the legacy claim elapses it can be atomically reclaimed.
+      await elapseClaim(sessionId, taskId);
+      const reclaim = await claimTaskWithEvent(pool(), {
+        claimLeaseTtlMs: 60_000,
+        eventSourceId: "src_reclaim_legacy_e2e",
+        participantId: "part_reclaimer_legacy",
+        sessionId,
+        taskId,
+      });
+      expect(reclaim?.events.map((event) => event.type)).toEqual([
+        "task.claim_expired",
+        "task.claimed",
+      ]);
+      const [legacyExpired] = reclaim?.events ?? [];
+      expect(legacyExpired?.payload.previousClaimedBy).toBe(legacyOwner);
+      expect(reclaim?.task.claimedBy).toBe("part_reclaimer_legacy");
+      expect(reclaim?.task.claimId).not.toBeNull();
+    });
   });
 
   it("expires concurrent task claim batches without duplicate or missing claim-expired events", async () => {

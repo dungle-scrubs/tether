@@ -493,7 +493,10 @@ export type RestParticipantRegistrationResult =
  */
 export type TaskMutationResult =
   | {
-      readonly events: readonly [SessionEvent];
+      // Single-event mutations (complete, fail, release, cancel) commit exactly
+      // one event; an atomic claim that reclaims an elapsed claim commits the
+      // ordered pair `task.claim_expired` then `task.claimed`, so this is a list.
+      readonly events: readonly SessionEvent[];
       readonly status: "applied";
       readonly task: TaskRecord;
     }

@@ -10,6 +10,7 @@ import type {
   PersistedEventAppendResult,
   PersistedParticipantRegistrationResult,
   PersistedTaskApprovalResult,
+  PersistedTaskClaimResult,
   PersistedTaskCreateResult,
   PersistedTaskEventResult,
   RestControlAcquisition,
@@ -242,7 +243,7 @@ export interface TaskStore {
     readonly participantId: string;
     readonly sessionId: string;
     readonly taskId: string;
-  }) => Promise<PersistedTaskEventResult>;
+  }) => Promise<PersistedTaskClaimResult>;
   readonly completeWithEvent: (input: {
     readonly claimId: string;
     readonly controlGuard?: ControlEpochGuard | undefined;

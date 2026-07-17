@@ -71,6 +71,64 @@ function isControlLeaseGuardSelect(sql: string): boolean {
   return sql.includes("FROM participant_control_leases") && sql.includes("FOR UPDATE");
 }
 
+/** Matches the claimant's task-row lock, which must run before any event write. */
+function isTaskLockSelect(sql: string): boolean {
+  return sql.includes("FROM tasks") && sql.includes("FOR UPDATE");
+}
+
+/** Builds an unclaimed task row for the FOR UPDATE lock read. */
+function unclaimedTaskLockRow(overrides: Record<string, unknown> = {}) {
+  return {
+    cancelledAt: null,
+    claimExpiredAt: null,
+    claimExpiredBy: null,
+    claimExpiresAt: null,
+    claimId: null,
+    claimedAt: null,
+    claimedBy: null,
+    completedAt: null,
+    createdAt: new Date("2026-07-16T11:00:00.000Z"),
+    // The claimant samples now() in the lock read; the elapsed decision uses it.
+    databaseNow: new Date("2026-07-16T12:00:00.000Z"),
+    failedAt: null,
+    failure: null,
+    input: null,
+    kind: "projection-test",
+    mailboxAccountId: null,
+    mailboxProvider: null,
+    objective: "Preserve lock ordering",
+    releasedAt: null,
+    releasedBy: null,
+    result: null,
+    scheduleAlgorithmVersion: null,
+    scheduleIntervalMs: null,
+    scheduleWindowStart: null,
+    sessionId: "sess_1",
+    taskId: "task_1",
+    ...overrides,
+  };
+}
+
+/** Builds the claimed task row returned by the claim UPDATE. */
+function claimedTaskRow() {
+  return unclaimedTaskLockRow({
+    claimExpiresAt: new Date("2026-07-16T12:01:00.000Z"),
+    claimId: "claim_new",
+    claimedAt: new Date("2026-07-16T12:00:00.000Z"),
+    claimedBy: "part_1",
+  });
+}
+
+const claimedEventRow = {
+  createdAt: new Date("2026-07-16T12:00:00.000Z"),
+  eventId: "evt_claim_projection",
+  payload: {},
+  producerId: "part_1",
+  seq: "1",
+  sessionId: "sess_1",
+  type: "task.claimed",
+};
+
 describe("atomic control epoch fence in task mutations", () => {
   it("locks the current lease and rejects a fenced epoch before the mutation runs", async () => {
     // The current durable generation is 6; the caller still carries epoch 5.
@@ -92,89 +150,35 @@ describe("atomic control epoch fence in task mutations", () => {
     const sqls = client.queries.map((query) => query.sql);
     expect(sqls[0]).toBe("BEGIN");
     // The epoch guard SELECT ... FOR UPDATE runs inside the transaction, before
-    // any task mutation, and the transaction rolls back without touching tasks.
+    // the task row is even locked, and the transaction rolls back without
+    // touching tasks.
     expect(sqls.some(isControlLeaseGuardSelect)).toBe(true);
+    expect(sqls.some(isTaskLockSelect)).toBe(false);
     expect(sqls.some((sql) => sql.includes("UPDATE tasks"))).toBe(false);
     expect(sqls.at(-1)).toBe("ROLLBACK");
     expect(client.releaseCount).toBe(1);
   });
 
-  it("passes the mutation through when the supplied epoch is current", async () => {
+  it("locks the task after a current epoch passes the fence, then claims it", async () => {
     // Current generation equals the supplied epoch (returned as a bigint string).
-    const client = new ScriptedClient((sql) =>
-      isControlLeaseGuardSelect(sql) ? [leaseRow("5")] : [],
-    );
-
-    const result = await claimTaskWithEvent(scriptedDatabase(client), {
-      claimLeaseTtlMs: 1_000,
-      controlGuard: guard,
-      eventSourceId: "src_atomic_test",
-      participantId: "part_1",
-      sessionId: "sess_1",
-      taskId: "task_1",
-    });
-
-    // The task UPDATE returned no row (already terminal/unclaimed mismatch), so
-    // the operation commits with a null result rather than failing.
-    expect(result).toBeNull();
-    const sqls = client.queries.map((query) => query.sql);
-    const guardIndex = sqls.findIndex(isControlLeaseGuardSelect);
-    const updateIndex = sqls.findIndex((sql) => sql.includes("UPDATE tasks"));
-    expect(guardIndex).toBeGreaterThanOrEqual(0);
-    expect(updateIndex).toBeGreaterThan(guardIndex);
-    expect(sqls.at(-1)).toBe("COMMIT");
-  });
-
-  it("preserves the fenced-mutation order through projection persistence", async () => {
-    const taskRow = {
-      cancelledAt: null,
-      claimExpiredAt: null,
-      claimExpiredBy: null,
-      claimExpiresAt: new Date("2026-07-16T12:01:00.000Z"),
-      claimedAt: new Date("2026-07-16T12:00:00.000Z"),
-      claimedBy: "part_1",
-      completedAt: null,
-      createdAt: new Date("2026-07-16T11:00:00.000Z"),
-      failedAt: null,
-      failure: null,
-      input: null,
-      kind: "projection-test",
-      mailboxAccountId: null,
-      mailboxProvider: null,
-      objective: "Preserve lock ordering",
-      releasedAt: null,
-      releasedBy: null,
-      result: null,
-      scheduleAlgorithmVersion: null,
-      scheduleIntervalMs: null,
-      scheduleWindowStart: null,
-      sessionId: "sess_1",
-      taskId: "task_1",
-    };
-    const eventRow = {
-      createdAt: new Date("2026-07-16T12:00:00.000Z"),
-      eventId: "evt_claim_projection",
-      payload: {},
-      producerId: "part_1",
-      seq: "1",
-      sessionId: "sess_1",
-      type: "task.claimed",
-    };
     const client = new ScriptedClient((sql) => {
       if (isControlLeaseGuardSelect(sql)) {
         return [leaseRow("5")];
+      }
+      if (isTaskLockSelect(sql)) {
+        return [unclaimedTaskLockRow()];
       }
       if (sql.includes("SELECT EXISTS")) {
         return [{ exists: true }];
       }
       if (sql.includes("UPDATE tasks")) {
-        return [taskRow];
+        return [claimedTaskRow()];
       }
       if (sql.includes("UPDATE session_event_sequences")) {
         return [{ seq: "1" }];
       }
       if (sql.includes("INSERT INTO session_events")) {
-        return [eventRow];
+        return [claimedEventRow];
       }
       return [];
     });
@@ -188,9 +192,56 @@ describe("atomic control epoch fence in task mutations", () => {
       taskId: "task_1",
     });
 
-    expect(result?.event.type).toBe("task.claimed");
+    // The task row was unclaimed, so the claim commits one task.claimed event.
+    expect(result?.events).toHaveLength(1);
+    expect(result?.events[0]?.type).toBe("task.claimed");
     const sqls = client.queries.map((query) => query.sql);
     const guardIndex = sqls.findIndex(isControlLeaseGuardSelect);
+    const lockIndex = sqls.findIndex(isTaskLockSelect);
+    const updateIndex = sqls.findIndex((sql) => sql.includes("UPDATE tasks"));
+    // The guard fences first, THEN the task row is locked, THEN the claim writes.
+    expect(guardIndex).toBeGreaterThanOrEqual(0);
+    expect(lockIndex).toBeGreaterThan(guardIndex);
+    expect(updateIndex).toBeGreaterThan(lockIndex);
+    expect(sqls.at(-1)).toBe("COMMIT");
+  });
+
+  it("preserves the fenced-mutation order through projection persistence", async () => {
+    const client = new ScriptedClient((sql) => {
+      if (isControlLeaseGuardSelect(sql)) {
+        return [leaseRow("5")];
+      }
+      if (isTaskLockSelect(sql)) {
+        return [unclaimedTaskLockRow()];
+      }
+      if (sql.includes("SELECT EXISTS")) {
+        return [{ exists: true }];
+      }
+      if (sql.includes("UPDATE tasks")) {
+        return [claimedTaskRow()];
+      }
+      if (sql.includes("UPDATE session_event_sequences")) {
+        return [{ seq: "1" }];
+      }
+      if (sql.includes("INSERT INTO session_events")) {
+        return [claimedEventRow];
+      }
+      return [];
+    });
+
+    const result = await claimTaskWithEvent(scriptedDatabase(client), {
+      claimLeaseTtlMs: 1_000,
+      controlGuard: guard,
+      eventSourceId: "src_atomic_test",
+      participantId: "part_1",
+      sessionId: "sess_1",
+      taskId: "task_1",
+    });
+
+    expect(result?.events[0]?.type).toBe("task.claimed");
+    const sqls = client.queries.map((query) => query.sql);
+    const guardIndex = sqls.findIndex(isControlLeaseGuardSelect);
+    const lockIndex = sqls.findIndex(isTaskLockSelect);
     const mutationIndex = sqls.findIndex((sql) => sql.includes("UPDATE tasks"));
     const eventIndex = sqls.findIndex((sql) => sql.includes("INSERT INTO session_events"));
     const projectionIndex = sqls.findIndex((sql) =>
@@ -199,7 +250,10 @@ describe("atomic control epoch fence in task mutations", () => {
     const notifyIndex = sqls.findIndex((sql) => sql.includes("pg_notify"));
     const commitIndex = sqls.indexOf("COMMIT");
     expect(guardIndex).toBeGreaterThanOrEqual(0);
-    expect(mutationIndex).toBeGreaterThan(guardIndex);
+    // The task row is locked before the event sequence is allocated: guard, then
+    // task lock, then mutation, then event, then projection, then notify.
+    expect(lockIndex).toBeGreaterThan(guardIndex);
+    expect(mutationIndex).toBeGreaterThan(lockIndex);
     expect(eventIndex).toBeGreaterThan(mutationIndex);
     expect(projectionIndex).toBeGreaterThan(eventIndex);
     expect(notifyIndex).toBeGreaterThan(projectionIndex);

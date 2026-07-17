@@ -547,6 +547,20 @@ export type PersistedTaskEventResult = {
   readonly task: TaskRecord;
 } | null;
 
+/**
+ * Persistence result for an atomic task claim. A claim commits either one
+ * `task.claimed` event (a normal claim of an unclaimed task) or, when it
+ * reclaims an elapsed claim, an ordered pair of `task.claim_expired` then
+ * `task.claimed` events. The list therefore carries every committed event so the
+ * caller can broadcast all of them, rather than a single event.
+ */
+export type PersistedTaskClaimResult = {
+  /** Committed events in sequence order: reclaim yields `[claimExpired, claimed]`. */
+  readonly events: readonly SessionEvent[];
+  /** The final claimed task row after the transaction commits. */
+  readonly task: TaskRecord;
+} | null;
+
 /** Persistence result for caller-supplied event ids. */
 export type PersistedEventAppendResult =
   | {
@@ -674,6 +688,21 @@ const taskReturningColumns = `
   session_id AS "sessionId",
   task_id AS "taskId"
 `;
+
+/**
+ * Exact task-row lock read a claimant runs before allocating any event sequence.
+ * Locking the task row first (then `session_event_sequences` inside
+ * `appendEventWithClient`) is the mandatory lock order (D-009) and matches the
+ * sweeper's `FOR UPDATE SKIP LOCKED` on tasks. Exported so concurrency tests can
+ * rendezvous on this lock boundary. `now()` is sampled in the same statement so
+ * the elapsed decision uses the transaction clock the reclaim UPDATEs use.
+ */
+export const taskClaimLockQuery = `
+        SELECT ${taskReturningColumns}, now() AS "databaseNow"
+        FROM tasks
+        WHERE session_id = $1 AND task_id = $2
+        FOR UPDATE
+      `;
 
 const taskApprovalReturningColumns = `
   approval_event_id AS "approvalEventId",
@@ -2546,46 +2575,140 @@ export async function claimTaskWithEvent(
     readonly sessionId: string;
     readonly taskId: string;
   },
-): Promise<PersistedTaskEventResult> {
+): Promise<PersistedTaskClaimResult> {
   assertPositiveFiniteTtlMs(input.claimLeaseTtlMs, "task claim TTL");
-  const claimId = generateClaimId();
-  return runTaskEventTransaction(database, {
-    controlGuard: input.controlGuard,
-    operation: "claimTask",
-    sourceId: input.eventSourceId,
-    mutate: async (client) => {
-      const rows = await client.query<PgTaskRow>(
+  const newClaimId = generateClaimId();
+  const client = await database.pool.connect();
+  try {
+    await client.query("BEGIN");
+    // The optional epoch fence locks the lease row BEFORE the task is touched, so
+    // a fenced caller can never observe or mutate the task row.
+    if (input.controlGuard) {
+      await assertControlEpochCurrentWithClient(client, input.controlGuard);
+    }
+    // Lock the task row FIRST, before any event-sequence allocation. The
+    // event-sequence row is locked later inside appendEventWithClient, so this
+    // establishes the mandatory lock order (task row, then
+    // session_event_sequences). It matches the sweeper's `FOR UPDATE SKIP LOCKED`
+    // on tasks, so a claimant and the sweeper acquire the same rows in the same
+    // order and cannot deadlock (D-009). `now()` is sampled in the same statement
+    // and is stable for the rest of the transaction, so the elapsed decision below
+    // uses the identical clock the reclaim UPDATEs use.
+    const lockedRows = await client.query<PgTaskRow & { readonly databaseNow: Date }>(
+      taskClaimLockQuery,
+      [input.sessionId, input.taskId],
+    );
+    const lockedRow = lockedRows.rows[0];
+    if (!lockedRow) {
+      // Task does not exist; nothing to claim.
+      await client.query("COMMIT");
+      return null;
+    }
+    const lockedTask = toTaskRecord(lockedRow);
+    if (
+      lockedTask.completedAt !== null ||
+      lockedTask.failedAt !== null ||
+      lockedTask.cancelledAt !== null
+    ) {
+      // Terminal tasks can never be claimed.
+      await client.query("COMMIT");
+      return null;
+    }
+    const databaseNowMs = lockedRow.databaseNow.getTime();
+    const claimExpiresAtMs = lockedRow.claimExpiresAt?.getTime() ?? null;
+    const isElapsed = claimExpiresAtMs !== null && claimExpiresAtMs <= databaseNowMs;
+    if (lockedTask.claimedAt !== null && !isElapsed) {
+      // A live claim (or a claim without a known deadline) still holds the task;
+      // this claim attempt does not win it.
+      await client.query("COMMIT");
+      return null;
+    }
+    const events: SessionEvent[] = [];
+    if (lockedTask.claimedAt !== null) {
+      // RECLAIM: the current claim has elapsed. Materialize its expiration, append
+      // `task.claim_expired` first (so it receives the lower sequence), then apply
+      // the new claim generation and append `task.claimed`.
+      const previousClaimedBy = lockedTask.claimedBy;
+      if (previousClaimedBy === null) {
+        // Defensive: an elapsed claim with no recorded owner cannot produce a
+        // well-formed claim-expired event; leave it for the sweeper.
+        await client.query("COMMIT");
+        return null;
+      }
+      const expiredRows = await client.query<PgTaskRow>(
         `
           UPDATE tasks
           SET
-            claimed_at = now(),
-            claimed_by = $1,
-            claim_expires_at = now() + ($2::text || ' milliseconds')::interval,
-            claim_id = $5,
-            claim_expired_at = NULL,
-            claim_expired_by = NULL,
+            claim_expired_at = now(),
+            claim_expired_by = $3,
+            claim_expires_at = NULL,
+            claim_id = NULL,
+            claimed_at = NULL,
+            claimed_by = NULL,
             released_at = NULL,
             released_by = NULL
-          WHERE session_id = $3
-            AND task_id = $4
-            AND claimed_at IS NULL
-            AND claimed_by IS NULL
-            AND completed_at IS NULL
-            AND failed_at IS NULL
-            AND cancelled_at IS NULL
+          WHERE session_id = $1 AND task_id = $2
           RETURNING ${taskReturningColumns}
         `,
-        [input.participantId, input.claimLeaseTtlMs, input.sessionId, input.taskId, claimId],
+        [input.sessionId, input.taskId, previousClaimedBy],
       );
-      return rows.rows[0] ? toTaskRecord(rows.rows[0]) : null;
-    },
-    buildEvent: (task) =>
-      buildTaskClaimedEventInput({
-        participantId: input.participantId,
-        sessionId: input.sessionId,
-        task,
-      }),
-  });
+      const expiredTask = toTaskRecord(expiredRows.rows[0]);
+      events.push(
+        await appendEventWithClient(
+          client,
+          buildTaskClaimExpiredEventInput({
+            previousClaimedBy,
+            sessionId: input.sessionId,
+            task: expiredTask,
+          }),
+          input.eventSourceId,
+        ),
+      );
+    }
+    // NORMAL CLAIM (unclaimed) or the second half of a RECLAIM: apply the new
+    // claim generation to the already row-locked task.
+    const claimedRows = await client.query<PgTaskRow>(
+      `
+        UPDATE tasks
+        SET
+          claim_expired_at = NULL,
+          claim_expired_by = NULL,
+          claim_expires_at = now() + ($3::text || ' milliseconds')::interval,
+          claim_id = $4,
+          claimed_at = now(),
+          claimed_by = $5,
+          released_at = NULL,
+          released_by = NULL
+        WHERE session_id = $1 AND task_id = $2
+        RETURNING ${taskReturningColumns}
+      `,
+      [input.sessionId, input.taskId, input.claimLeaseTtlMs, newClaimId, input.participantId],
+    );
+    const claimedTask = toTaskRecord(claimedRows.rows[0]);
+    events.push(
+      await appendEventWithClient(
+        client,
+        buildTaskClaimedEventInput({
+          participantId: input.participantId,
+          sessionId: input.sessionId,
+          task: claimedTask,
+        }),
+        input.eventSourceId,
+      ),
+    );
+    await client.query("COMMIT");
+    return { events, task: claimedTask };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    // A fenced epoch is a caller-facing control outcome, not a transaction
+    // failure; surface it untouched so the service maps it to CONTROL_EPOCH_STALE.
+    if (error instanceof ControlEpochStaleError) {
+      throw error;
+    }
+    throw new TaskEventTransactionRollbackError("claimTask", error);
+  } finally {
+    client.release();
+  }
 }
 
 /**
