@@ -37,7 +37,6 @@ describe("HTTP app server error boundary", () => {
 
   it("projects HTTP session inventory with mandatory Replica Scope metadata", () => {
     const inventory = projectSessionInventory({
-      eventsBySession: new Map(),
       replicaId: "replica_http_1",
       runtime: new HostPresenceRuntime(),
       sessions: [],

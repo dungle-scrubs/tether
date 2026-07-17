@@ -7,7 +7,10 @@ import { approvalTargetKey } from "./approval-target-key.js";
 import { ServerConfigService } from "./config.js";
 import { ControlEpochStaleError, nextControlEpoch, parseControlEpoch } from "./control-epoch.js";
 import { migrateDatabase } from "./database-migration.js";
-import { createSessionProjectionStore } from "./db-session-projections.js";
+import {
+  createSessionProjectionStore,
+  listSessionProjectionInventory,
+} from "./db-session-projections.js";
 import {
   type AppendSessionEventInput,
   type ApprovalDecision,
@@ -30,7 +33,7 @@ import {
   clientSessionBindings,
   participantControlLeases,
   participants,
-  sessionEvents,
+  type sessionEvents,
   sessions,
   taskApprovals,
   tasks,
@@ -45,7 +48,6 @@ import type {
   ParticipantRuntimeSnapshot,
   ParticipantRuntimeSnapshotStatus,
   ScheduledMaintenanceIdentity,
-  SessionBindingSummary,
   SessionDebugSummary,
   SessionEvent,
   SessionEventListOptions,
@@ -1487,83 +1489,7 @@ export async function listControlLeaseSnapshots(
  * stays constant regardless of session count, then are merged in memory.
  */
 export async function listSessions(database: DatabasePool): Promise<SessionListItem[]> {
-  const [sessionRows, participantCounts, taskCounts, eventCounts, bindingRows] = await Promise.all([
-    database.db.select().from(sessions).orderBy(desc(sessions.createdAt)),
-    database.db
-      .select({
-        sessionId: participants.sessionId,
-        total: sql<number>`count(*)::int`,
-      })
-      .from(participants)
-      .groupBy(participants.sessionId),
-    database.db
-      .select({
-        active: sql<number>`(count(*) filter (
-          where ${tasks.cancelledAt} is null
-            and ${tasks.completedAt} is null
-            and ${tasks.failedAt} is null
-        ))::int`,
-        sessionId: tasks.sessionId,
-        total: sql<number>`count(*)::int`,
-      })
-      .from(tasks)
-      .groupBy(tasks.sessionId),
-    database.db
-      .select({
-        lastCreatedAt: sql<Date | null>`max(${sessionEvents.createdAt})`,
-        sessionId: sessionEvents.sessionId,
-        total: sql<number>`count(*)::int`,
-      })
-      .from(sessionEvents)
-      .groupBy(sessionEvents.sessionId),
-    database.db
-      .select({
-        externalId: clientSessionBindings.externalId,
-        provider: clientSessionBindings.provider,
-        sessionId: clientSessionBindings.sessionId,
-      })
-      .from(clientSessionBindings)
-      .where(isNull(clientSessionBindings.archivedAt))
-      .orderBy(clientSessionBindings.provider, clientSessionBindings.externalId),
-  ]);
-
-  const participantBySession = new Map(participantCounts.map((row) => [row.sessionId, row.total]));
-  const taskBySession = new Map(taskCounts.map((row) => [row.sessionId, row]));
-  const eventBySession = new Map(eventCounts.map((row) => [row.sessionId, row]));
-  const bindingsBySession = new Map<string, SessionBindingSummary[]>();
-  for (const row of bindingRows) {
-    const list = bindingsBySession.get(row.sessionId) ?? [];
-    list.push({ externalId: row.externalId, provider: row.provider });
-    bindingsBySession.set(row.sessionId, list);
-  }
-
-  const items = sessionRows.map((row): SessionListItem => {
-    const taskCount = taskBySession.get(row.sessionId);
-    const eventCount = eventBySession.get(row.sessionId);
-    const lastCreatedAt = eventCount?.lastCreatedAt ?? null;
-    return {
-      activeTaskCount: taskCount?.active ?? 0,
-      bindings: bindingsBySession.get(row.sessionId) ?? [],
-      createdAt: row.createdAt.toISOString(),
-      eventCount: eventCount?.total ?? 0,
-      lastEventAt: lastCreatedAt ? new Date(lastCreatedAt).toISOString() : null,
-      participantCount: participantBySession.get(row.sessionId) ?? 0,
-      sessionId: row.sessionId,
-      taskCount: taskCount?.total ?? 0,
-    };
-  });
-
-  return items.sort(compareSessionsByRecentActivity);
-}
-
-/** Orders sessions by most recent event, falling back to creation time. */
-function compareSessionsByRecentActivity(left: SessionListItem, right: SessionListItem): number {
-  const leftActivity = left.lastEventAt ?? left.createdAt;
-  const rightActivity = right.lastEventAt ?? right.createdAt;
-  if (leftActivity === rightActivity) {
-    return left.sessionId < right.sessionId ? -1 : 1;
-  }
-  return leftActivity < rightActivity ? 1 : -1;
+  return listSessionProjectionInventory(database.pool);
 }
 
 /**
@@ -3714,6 +3640,7 @@ async function createSessionWithClient(
   );
   const inserted = insertedRows.rows[0];
   if (inserted) {
+    await sessionProjectionStore.initializeForNewSession(client, sessionId);
     return { created: true, session: toSessionRecord(inserted) };
   }
   const rows = await client.query<Pick<PgSessionRow, "createdAt" | "sessionId">>(

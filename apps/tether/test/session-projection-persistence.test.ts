@@ -11,6 +11,7 @@ import {
 import {
   appendEvent,
   appendEventIdempotent,
+  createSession,
   createTaskWithEvent,
   type DatabasePool,
   heartbeatParticipantWithEvent,
@@ -71,8 +72,8 @@ describe("Session Projection persistence", () => {
   });
 
   it("persists an appended event through the narrow projection store interface", async () => {
-    const client = new RecordingProjectionClient();
     const event = createProjectionEvent(1, "session.title", { title: "Stored projection" });
+    const client = new RecordingProjectionClient([event]);
 
     const projection = await createSessionProjectionStore().updateForAppendedEvent(client, event);
 
@@ -85,6 +86,49 @@ describe("Session Projection persistence", () => {
     expect(client.queries.some((query) => query.includes("INSERT INTO session_projections"))).toBe(
       true,
     );
+  });
+
+  it("never creates apparently complete coverage from only a live tail event", async () => {
+    const history = [
+      createProjectionEvent(1, "user.message", { text: "Complete history" }),
+      createProjectionEvent(2, "task.created", {}),
+      createProjectionEvent(3, "session.archived", { archived: true }),
+    ];
+    const client = new MissingProjectionHistoryClient(history);
+
+    const projection = await createSessionProjectionStore().updateForAppendedEvent(
+      client,
+      history[2] as SessionEvent,
+    );
+
+    expect(projection).toMatchObject({
+      archivedAt: history[2]?.createdAt,
+      coversSeqTo: 3,
+      eventCount: 3,
+      title: "Complete history",
+    });
+  });
+
+  it("rebuilds a stale reducer projection before applying a live append", async () => {
+    const history = [
+      createProjectionEvent(1, "user.message", { text: "Recovered prefix" }),
+      createProjectionEvent(2, "task.created", {}),
+      createProjectionEvent(3, "session.archived", { archived: true }),
+      createProjectionEvent(4, "session.title", { title: "Live head" }),
+    ];
+    const client = new IncompleteProjectionHistoryClient(history);
+
+    const projection = await createSessionProjectionStore().updateForAppendedEvent(
+      client,
+      history[3] as SessionEvent,
+    );
+
+    expect(projection).toMatchObject({
+      archivedAt: history[2]?.createdAt,
+      coversSeqTo: 4,
+      eventCount: 4,
+      title: "Live head",
+    });
   });
 
   it("updates the projection inside the generic event append transaction", async () => {
@@ -102,6 +146,18 @@ describe("Session Projection persistence", () => {
     expect(projectionIndex).toBeGreaterThanOrEqual(0);
     expect(notifyIndex).toBeGreaterThan(projectionIndex);
     expect(commitIndex).toBeGreaterThan(notifyIndex);
+  });
+
+  it("initializes a complete empty projection for a newly created session", async () => {
+    const client = new NewSessionTransactionClient();
+
+    const result = await createSession(client.database, "sess_projection_empty");
+
+    expect(result.created).toBe(true);
+    expect(client.queries.some((query) => query.includes("INSERT INTO session_projections"))).toBe(
+      true,
+    );
+    expect(client.queries.at(-1)).toBe("COMMIT");
   });
 
   it("commits participant registration and heartbeat projections atomically", async () => {
@@ -241,11 +297,75 @@ describe("Session Projection persistence", () => {
 class RecordingProjectionClient implements SessionProjectionTransaction {
   readonly queries: string[] = [];
 
+  constructor(private readonly history: readonly SessionEvent[] = []) {}
+
   async query<TRow extends pg.QueryResultRow = pg.QueryResultRow>(
     sql: string,
   ): Promise<{ readonly rows: TRow[] }> {
     this.queries.push(sql);
+    if (sql.includes("FROM session_events")) {
+      return {
+        rows: this.history.map((event) => ({
+          ...event,
+          createdAt: new Date(event.createdAt),
+          seq: String(event.seq),
+        })) as unknown as TRow[],
+      };
+    }
     return { rows: [] };
+  }
+}
+
+class MissingProjectionHistoryClient implements SessionProjectionTransaction {
+  readonly queries: string[] = [];
+
+  constructor(private readonly history: readonly SessionEvent[]) {}
+
+  async query<TRow extends pg.QueryResultRow = pg.QueryResultRow>(
+    sql: string,
+  ): Promise<{ readonly rows: TRow[] }> {
+    this.queries.push(sql.trim());
+    if (sql.includes("FROM session_events")) {
+      return {
+        rows: this.history.map((event) => ({
+          ...event,
+          createdAt: new Date(event.createdAt),
+          seq: String(event.seq),
+        })) as unknown as TRow[],
+      };
+    }
+    return { rows: [] };
+  }
+}
+
+class IncompleteProjectionHistoryClient extends MissingProjectionHistoryClient {
+  override async query<TRow extends pg.QueryResultRow = pg.QueryResultRow>(
+    sql: string,
+  ): Promise<{ readonly rows: TRow[] }> {
+    if (sql.includes("FROM session_projections")) {
+      return {
+        rows: [
+          {
+            activeRunId: null,
+            activity: "idle",
+            activityChangedAt: null,
+            archivedAt: new Date(3),
+            coversSeqTo: "3",
+            deletedAt: null,
+            eventCount: "1",
+            forkedFrom: null,
+            hostMetadata: null,
+            hostMetadataSourceSeq: null,
+            lastEventAt: new Date(3),
+            reducerVersion: 0,
+            tangentOf: null,
+            title: null,
+            titleSourceSeq: null,
+          },
+        ] as unknown as TRow[],
+      };
+    }
+    return super.query(sql);
   }
 }
 
@@ -278,6 +398,27 @@ class AppendedEventTransactionClient implements SessionProjectionTransaction {
             type: "session.title",
           },
         ] as unknown as TRow[],
+      };
+    }
+    return { rows: [] };
+  }
+
+  release(): void {}
+}
+
+class NewSessionTransactionClient implements SessionProjectionTransaction {
+  readonly database = {
+    pool: { connect: async () => this },
+  } as unknown as DatabasePool;
+  readonly queries: string[] = [];
+
+  async query<TRow extends pg.QueryResultRow = pg.QueryResultRow>(
+    sql: string,
+  ): Promise<{ readonly rows: TRow[] }> {
+    this.queries.push(sql.trim());
+    if (sql.includes("INSERT INTO sessions")) {
+      return {
+        rows: [{ createdAt: new Date(0), sessionId: "sess_projection_empty" }] as unknown as TRow[],
       };
     }
     return { rows: [] };

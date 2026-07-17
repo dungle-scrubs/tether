@@ -42,6 +42,11 @@ import {
   upsertParticipant,
   upsertParticipantWithEvent,
 } from "../src/db.js";
+import {
+  backfillSessionProjection,
+  type SessionProjectionTransaction,
+  verifySessionProjection,
+} from "../src/db-session-projections.js";
 import type { AppServer, AppServerDebugInfo } from "../src/http.js";
 import { createAppServer, createAppServerWithSessionService } from "../src/http.js";
 import type { StructuredLogEntry } from "../src/observability.js";
@@ -62,6 +67,7 @@ import {
 } from "./postgres-concurrency-coordinator.js";
 
 const e2e = process.env.E2E === "true" ? describe : describe.skip;
+const projectionBenchmark = process.env.E2E_PROJECTION_BENCHMARK === "true" ? it : it.skip;
 const adminDatabaseUrl = readRequiredE2eAdminDatabaseUrl();
 const e2eAuthOptions = {
   activeKid: testAuthSigningKid,
@@ -399,6 +405,93 @@ interface PermanentDeleteResponse extends JsonResponse {
     | "presence_scope_insufficient"
     | "protected";
   readonly sessionId?: string;
+}
+
+interface Deferred<TValue> {
+  readonly promise: Promise<TValue>;
+  readonly resolve: (value: TValue | PromiseLike<TValue>) => void;
+}
+
+/** Pauses one production backfill immediately before its PostgreSQL CAS. */
+class PausedProjectionBackfillClient implements SessionProjectionTransaction {
+  readonly candidateReady = createDeferred<void>();
+  private readonly resumeSignal = createDeferred<void>();
+  private resumed = false;
+
+  constructor(private readonly client: pg.PoolClient) {}
+
+  async query<TRow extends pg.QueryResultRow = pg.QueryResultRow>(
+    sql: string,
+    values?: readonly unknown[],
+  ): Promise<{ readonly rows: TRow[] }> {
+    if (sql.includes("INSERT INTO session_projections") && sql.includes("$17::boolean")) {
+      this.candidateReady.resolve();
+      await this.resumeSignal.promise;
+    }
+    const result = await this.client.query<TRow>(sql, values ? [...values] : undefined);
+    return { rows: result.rows };
+  }
+
+  resume(): void {
+    if (!this.resumed) {
+      this.resumed = true;
+      this.resumeSignal.resolve();
+    }
+  }
+}
+
+/** Measures bounded backfill queries and can pause before a chosen CAS. */
+class MeasuredProjectionBackfillClient implements SessionProjectionTransaction {
+  readonly candidateReady = createDeferred<void>();
+  readonly queryDurationsMs: number[] = [];
+  private readonly resumeSignal = createDeferred<void>();
+  private paused = false;
+  private resumed = false;
+
+  constructor(
+    private readonly client: SessionProjectionTransaction,
+    private readonly pauseAtCoverage: number | null = null,
+  ) {}
+
+  async query<TRow extends pg.QueryResultRow = pg.QueryResultRow>(
+    sql: string,
+    values?: readonly unknown[],
+  ): Promise<{ readonly rows: TRow[] }> {
+    const isBackfillCas =
+      sql.includes("INSERT INTO session_projections") && sql.includes("$17::boolean");
+    const candidateCoverage = isBackfillCas ? Number(values?.[4]) : null;
+    if (
+      !this.paused &&
+      this.pauseAtCoverage !== null &&
+      candidateCoverage !== null &&
+      candidateCoverage >= this.pauseAtCoverage
+    ) {
+      this.paused = true;
+      this.candidateReady.resolve();
+      await this.resumeSignal.promise;
+    }
+    const startedAt = performance.now();
+    const result = await this.client.query<TRow>(sql, values);
+    if (sql.includes("FROM session_events") || isBackfillCas) {
+      this.queryDurationsMs.push(performance.now() - startedAt);
+    }
+    return result;
+  }
+
+  resume(): void {
+    if (!this.resumed) {
+      this.resumed = true;
+      this.resumeSignal.resolve();
+    }
+  }
+}
+
+function createDeferred<TValue>(): Deferred<TValue> {
+  let resolve: (value: TValue | PromiseLike<TValue>) => void = () => undefined;
+  const promise = new Promise<TValue>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
 }
 
 e2e("tether e2e", () => {
@@ -1533,6 +1626,256 @@ e2e("tether e2e", () => {
     });
     expect(session?.updatedAt).toEqual(expect.any(String));
   });
+
+  it("keeps a live append when a stale projection backfill compare-and-set races it", async () => {
+    const sessionId = `sess_projection_race_${randomUUID()}`;
+    await createDbSession(currentPool(), sessionId);
+    for (const seq of [1, 2, 3]) {
+      await appendEvent(
+        currentPool(),
+        {
+          eventId: `evt_projection_race_${randomUUID()}`,
+          payload: { text: `prefix-${seq}` },
+          producerId: "projection-race-e2e",
+          sessionId,
+          type: "client.observed",
+        },
+        { sourceId: "src_projection_race_e2e" },
+      );
+    }
+    await currentPool().pool.query(`DELETE FROM session_projections WHERE session_id = $1`, [
+      sessionId,
+    ]);
+
+    const rawClient = await currentPool().pool.connect();
+    const pausedClient = new PausedProjectionBackfillClient(rawClient);
+    try {
+      const backfill = backfillSessionProjection(pausedClient, { batchSize: 2, sessionId });
+      await pausedClient.candidateReady.promise;
+      const live = await appendEvent(
+        currentPool(),
+        {
+          eventId: `evt_projection_race_live_${randomUUID()}`,
+          payload: { title: "Live append wins" },
+          producerId: "projection-race-e2e",
+          sessionId,
+          type: "session.title",
+        },
+        { sourceId: "src_projection_race_e2e" },
+      );
+      pausedClient.resume();
+
+      const result = await backfill;
+      const stored = await currentPool().pool.query<{
+        readonly coversSeqTo: string;
+        readonly eventCount: string;
+        readonly title: string | null;
+      }>(
+        `
+          SELECT
+            covers_seq_to AS "coversSeqTo",
+            event_count AS "eventCount",
+            title
+          FROM session_projections
+          WHERE session_id = $1
+        `,
+        [sessionId],
+      );
+
+      expect(live.seq).toBe(4);
+      expect(result).toMatchObject({
+        coversSeqTo: 2,
+        currentCoversSeqTo: 4,
+        outcome: "stale",
+      });
+      expect(stored.rows[0]).toEqual({
+        coversSeqTo: "4",
+        eventCount: "4",
+        title: "Live append wins",
+      });
+    } finally {
+      pausedClient.resume();
+      rawClient.release();
+    }
+  });
+
+  it("keeps inventory and permanent-delete eligibility correct above 10,000 events", async () => {
+    const sessionId = `sess_projection_long_${randomUUID()}`;
+    await createDbSession(currentPool(), sessionId);
+    await currentPool().pool.query(
+      `
+        INSERT INTO session_events (
+          created_at,
+          event_id,
+          payload,
+          producer_id,
+          seq,
+          session_id,
+          type
+        )
+        SELECT
+          clock_timestamp() + generated.seq * interval '1 millisecond',
+          'evt_projection_long_' || generated.seq || '_' || $1,
+          CASE
+            WHEN generated.seq = 10001 THEN jsonb_build_object(
+              'title',
+              'Title after ten thousand'
+            )
+            WHEN generated.seq = 10002 THEN jsonb_build_object('archived', true)
+            ELSE '{}'::jsonb
+          END,
+          'projection-long-e2e',
+          generated.seq,
+          $1,
+          CASE
+            WHEN generated.seq = 10001 THEN 'session.title'
+            WHEN generated.seq = 10002 THEN 'session.archived'
+            ELSE 'client.observed'
+          END
+        FROM generate_series(1, 10002) AS generated(seq)
+      `,
+      [sessionId],
+    );
+    await currentPool().pool.query(
+      `
+        UPDATE session_event_sequences
+        SET next_seq = 10003
+        WHERE session_id = $1
+      `,
+      [sessionId],
+    );
+
+    const backfilled = await backfillSessionProjection(currentPool().pool, {
+      batchSize: 500,
+      sessionId,
+    });
+    const firstInventory = await request<SessionListResponse>("/sessions");
+    const firstSession = firstInventory.sessions.find(
+      (candidate) => candidate.sessionId === sessionId,
+    );
+    const unchangedBackfill = await backfillSessionProjection(currentPool().pool, {
+      batchSize: 500,
+      sessionId,
+    });
+    const secondInventory = await request<SessionListResponse>("/sessions");
+    const secondSession = secondInventory.sessions.find(
+      (candidate) => candidate.sessionId === sessionId,
+    );
+
+    expect(backfilled).toMatchObject({
+      coversSeqTo: 10_002,
+      eventCount: 10_002,
+      outcome: "written",
+    });
+    expect(firstSession).toMatchObject({
+      archived: true,
+      eventCount: 10_002,
+      sessionId,
+      title: "Title after ten thousand",
+    });
+    expect(unchangedBackfill).toMatchObject({
+      coversSeqTo: 10_002,
+      eventCount: 10_002,
+      outcome: "unchanged",
+    });
+    expect(secondSession?.updatedAt).toBe(firstSession?.updatedAt);
+
+    const deleteAuthToken = mintE2eToken({
+      participantId: "part_projection_long_delete",
+      role: "admin",
+      sessionId: "*",
+    });
+    const deleted = await requestStatus<PermanentDeleteResponse>(`/sessions/${sessionId}/delete`, {
+      authToken: deleteAuthToken,
+      method: "POST",
+    });
+
+    expect(deleted.status).toBe(200);
+    expect(deleted.body).toEqual({ ok: true, sessionId });
+  });
+
+  projectionBenchmark(
+    "meets the bounded online projection backfill performance gate",
+    async () => {
+      const batchSize = 10_000;
+      const measurements: {
+        readonly eventCount: number;
+        readonly maxBatchQueryMs: number;
+        readonly totalMs: number;
+      }[] = [];
+      let millionEventSessionId = "";
+      for (const eventCount of [10_000, 100_000, 1_000_000]) {
+        const sessionId = `sess_projection_benchmark_${eventCount}_${randomUUID()}`;
+        millionEventSessionId = sessionId;
+        await seedProjectionBenchmarkSession(sessionId, eventCount);
+        const measured = new MeasuredProjectionBackfillClient(currentPool().pool);
+        const startedAt = performance.now();
+        const result = await backfillSessionProjection(measured, { batchSize, sessionId });
+        const totalMs = performance.now() - startedAt;
+        const verification = await verifySessionProjection(currentPool().pool, {
+          batchSize,
+          sessionId,
+        });
+        const maxBatchQueryMs = Math.max(...measured.queryDurationsMs);
+
+        expect(result).toMatchObject({ coversSeqTo: eventCount, eventCount, outcome: "written" });
+        expect(verification).toMatchObject({
+          freshCoversSeqTo: eventCount,
+          freshEventCount: eventCount,
+          status: "current",
+        });
+        expect(maxBatchQueryMs).toBeLessThan(500);
+        measurements.push({ eventCount, maxBatchQueryMs, totalMs });
+      }
+
+      const baselineSessionId = `sess_projection_benchmark_baseline_${randomUUID()}`;
+      await createDbSession(currentPool(), baselineSessionId);
+      const baselineLatencies = await measureProjectionAppendLatencies(baselineSessionId, 200);
+
+      await currentPool().pool.query(`DELETE FROM session_projections WHERE session_id = $1`, [
+        millionEventSessionId,
+      ]);
+      const racing = new MeasuredProjectionBackfillClient(currentPool().pool, 900_000);
+      const backfill = backfillSessionProjection(racing, {
+        batchSize,
+        sessionId: millionEventSessionId,
+      });
+      await racing.candidateReady.promise;
+      const activeAppendLatenciesPromise = measureProjectionAppendLatencies(
+        millionEventSessionId,
+        200,
+      );
+      racing.resume();
+      const [raceResult, activeAppendLatencies] = await Promise.all([
+        backfill,
+        activeAppendLatenciesPromise,
+      ]);
+      const finalVerification = await verifySessionProjection(currentPool().pool, {
+        batchSize,
+        sessionId: millionEventSessionId,
+      });
+      const baselineP95Ms = percentile95(baselineLatencies);
+      const activeP95Ms = percentile95(activeAppendLatencies);
+
+      expect(raceResult.currentCoversSeqTo).toBeGreaterThanOrEqual(1_000_000);
+      expect(finalVerification).toMatchObject({
+        freshCoversSeqTo: 1_000_200,
+        freshEventCount: 1_000_200,
+        status: "current",
+      });
+      expect(Math.max(...racing.queryDurationsMs)).toBeLessThan(500);
+      expect(activeP95Ms).toBeLessThanOrEqual(baselineP95Ms * 2);
+      process.stdout.write(
+        `${JSON.stringify({
+          activeP95Ms,
+          baselineP95Ms,
+          measurements,
+          raceOutcome: raceResult.outcome,
+        })}\n`,
+      );
+    },
+    180_000,
+  );
 
   it("permanently deletes only archived inactive Host-presence sessions", async () => {
     const session = await createSession();
@@ -7441,6 +7784,97 @@ e2e("tether e2e", () => {
       },
       taskClaimSweeper: { intervalMs: 0 },
     });
+  }
+
+  /** Seeds a sanitized long event mix without exercising HTTP one row at a time. */
+  async function seedProjectionBenchmarkSession(
+    sessionId: string,
+    eventCount: number,
+  ): Promise<void> {
+    await createDbSession(currentPool(), sessionId);
+    await currentPool().pool.query(
+      `
+        INSERT INTO session_events (
+          created_at,
+          event_id,
+          payload,
+          producer_id,
+          seq,
+          session_id,
+          type
+        )
+        SELECT
+          clock_timestamp() + generated.seq * interval '1 microsecond',
+          'evt_projection_benchmark_' || generated.seq || '_' || $1,
+          CASE generated.seq % 10000
+            WHEN 1 THEN jsonb_build_object('text', 'Sanitized benchmark message')
+            WHEN 2 THEN jsonb_build_object('title', 'Sanitized benchmark title')
+            WHEN 3 THEN jsonb_build_object(
+              'branch',
+              'main',
+              'cwd',
+              '/workspace/tether',
+              'workspace',
+              '/workspace/tether'
+            )
+            WHEN 4 THEN jsonb_build_object('archived', false)
+            ELSE '{}'::jsonb
+          END,
+          'projection-benchmark-e2e',
+          generated.seq,
+          $1,
+          CASE generated.seq % 10000
+            WHEN 1 THEN 'user.message'
+            WHEN 2 THEN 'session.title'
+            WHEN 3 THEN 'host.online'
+            WHEN 4 THEN 'session.archived'
+            ELSE 'client.observed'
+          END
+        FROM generate_series(1, $2::int) AS generated(seq)
+      `,
+      [sessionId, eventCount],
+    );
+    await currentPool().pool.query(
+      `
+        UPDATE session_event_sequences
+        SET next_seq = $2::bigint + 1
+        WHERE session_id = $1
+      `,
+      [sessionId, eventCount],
+    );
+  }
+
+  /** Measures sequential production append latency for one session. */
+  async function measureProjectionAppendLatencies(
+    sessionId: string,
+    count: number,
+  ): Promise<number[]> {
+    const latencies: number[] = [];
+    for (let index = 0; index < count; index += 1) {
+      const startedAt = performance.now();
+      await appendEvent(
+        currentPool(),
+        {
+          eventId: `evt_projection_benchmark_live_${randomUUID()}`,
+          payload: {},
+          producerId: "projection-benchmark-e2e",
+          sessionId,
+          type: "client.observed",
+        },
+        { sourceId: "src_projection_benchmark_e2e" },
+      );
+      latencies.push(performance.now() - startedAt);
+    }
+    return latencies;
+  }
+
+  /** Returns the nearest-rank 95th percentile for a non-empty sample. */
+  function percentile95(values: readonly number[]): number {
+    if (values.length === 0) {
+      throw new Error("Cannot calculate p95 for an empty sample");
+    }
+    const sorted = [...values].sort((left, right) => left - right);
+    return sorted[Math.ceil(sorted.length * 0.95) - 1] ?? 0;
   }
 
   /**

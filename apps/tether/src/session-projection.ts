@@ -10,6 +10,20 @@ import type { SessionEvent } from "./types.js";
 /** Active durable Session Projection reducer contract version. */
 export const SESSION_PROJECTION_REDUCER_VERSION = 1;
 
+/** Event contracts whose semantic fields are owned by the current reducer. */
+export const SESSION_PROJECTION_EVENT_CONTRACTS = [
+  "assistant.completed",
+  "assistant.started",
+  "host.online",
+  "session.archived",
+  "session.deleted",
+  "session.forkedFrom",
+  "session.tangentOf",
+  "session.title",
+  "user.command",
+  "user.message",
+] as const;
+
 /** Stable codes for caller violations of the reducer contract. */
 export type SessionProjectionInvariantCode =
   | "coverage_regression"
@@ -215,6 +229,50 @@ export function reduceSessionProjection(
     }
     default:
       return nextProjection;
+  }
+}
+
+/**
+ * Reports whether a known projection-affecting event has an invalid payload.
+ * The result contains no payload data and follows the same field validators as
+ * {@link reduceSessionProjection}.
+ */
+export function isMalformedSessionProjectionEvent(event: SessionEvent): boolean {
+  switch (event.type) {
+    case "assistant.completed":
+    case "assistant.started":
+      return nonEmptyStringField(event.payload, "runId") === null;
+    case "session.archived":
+      return booleanField(event.payload, "archived") === null;
+    case "session.deleted":
+      return booleanField(event.payload, "deleted") === null;
+    case "session.forkedFrom":
+      return (
+        nonNegativeSafeIntegerField(event.payload, "forkSeq") === null ||
+        nonEmptyStringField(event.payload, "parentSessionId") === null
+      );
+    case "session.tangentOf":
+      return (
+        nonEmptyStringField(event.payload, "parentSessionId") === null ||
+        nonEmptyStringField(event.payload, "quote") === null ||
+        nonEmptyStringField(event.payload, "sourceMessageId") === null
+      );
+    case "session.title":
+      return normalizedTitle(stringField(event.payload, "title")) === null;
+    case "user.command":
+      return event.payload.command !== undefined && stringField(event.payload, "command") === null;
+    case "user.message": {
+      const message = event.payload.message;
+      return (
+        normalizedTitle(
+          stringField(event.payload, "text") ??
+            stringField(event.payload, "message") ??
+            (isRecord(message) ? stringField(message, "text") : null),
+        ) === null
+      );
+    }
+    default:
+      return false;
   }
 }
 
