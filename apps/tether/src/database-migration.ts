@@ -639,6 +639,10 @@ function legacyMigrationProbes(): readonly LegacyMigrationProbe[] {
         (await hasAnyAuthFoundationArtifact(client)) && !(await hasAuthFoundationMigration(client)),
       represented: hasAuthFoundationMigration,
     },
+    {
+      label: "0017 task claim id",
+      represented: async (client) => hasColumn(client, "tasks", "claim_id"),
+    },
   ];
 }
 

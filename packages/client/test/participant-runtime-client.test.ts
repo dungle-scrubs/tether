@@ -219,6 +219,7 @@ const baseTask: TaskRecord = {
   claimExpiredAt: null,
   claimExpiredBy: null,
   claimExpiresAt: null,
+  claimId: "claim_runtime_client",
   claimedAt: null,
   claimedBy: null,
   completedAt: null,
@@ -2982,7 +2983,10 @@ function createRuntimeClientFixture(
   } = {},
 ): RuntimeClientFixture {
   let appendCount = 0;
-  let claimedTask: TaskRecord | null = baseTask;
+  let claimedTask: TaskRecord | null = {
+    ...baseTask,
+    claimExpiresAt: "2099-06-05T00:00:30.000Z",
+  };
   let refreshTaskClaim = async (): Promise<TaskRecord | null> => baseTask;
   const actions: string[] = [];
   const diagnostics: string[] = [];

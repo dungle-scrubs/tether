@@ -17,6 +17,7 @@ export const wsTaskClaimMessageSchema = z.object({
 
 /** WebSocket task claim-refresh command schema. */
 export const wsTaskRefreshMessageSchema = z.object({
+  claimId: z.string().min(1),
   op: z.literal(webSocketOperation.taskRefresh),
   requestId: z.string().min(1).optional(),
   taskId: z.string().min(1),
@@ -32,6 +33,7 @@ export const wsTaskCancelMessageSchema = z.object({
 
 /** WebSocket task-complete command schema. */
 export const wsTaskCompleteMessageSchema = z.object({
+  claimId: z.string().min(1),
   op: z.literal(webSocketOperation.taskComplete),
   requestId: z.string().min(1).optional(),
   result: z.record(z.string(), z.unknown()).default({}),
@@ -40,6 +42,7 @@ export const wsTaskCompleteMessageSchema = z.object({
 
 /** WebSocket task-fail command schema. */
 export const wsTaskFailMessageSchema = z.object({
+  claimId: z.string().min(1),
   failure: z.record(z.string(), z.unknown()).default({}),
   op: z.literal(webSocketOperation.taskFail),
   requestId: z.string().min(1).optional(),
@@ -48,6 +51,7 @@ export const wsTaskFailMessageSchema = z.object({
 
 /** WebSocket task-release command schema. */
 export const wsTaskReleaseMessageSchema = z.object({
+  claimId: z.string().min(1),
   op: z.literal(webSocketOperation.taskRelease),
   requestId: z.string().min(1).optional(),
   taskId: z.string().min(1),
@@ -249,10 +253,12 @@ export function buildWsTaskClaimMessage(input: {
 
 /** Creates a WebSocket task claim-refresh command. */
 export function buildWsTaskRefreshMessage(input: {
+  readonly claimId: string;
   readonly requestId?: string;
   readonly taskId: string;
 }): z.infer<typeof wsTaskRefreshMessageSchema> {
   return {
+    claimId: input.claimId,
     op: webSocketOperation.taskRefresh,
     ...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
     taskId: input.taskId,
@@ -275,11 +281,13 @@ export function buildWsTaskCancelMessage(input: {
 
 /** Creates a WebSocket task-complete command. */
 export function buildWsTaskCompleteMessage(input: {
+  readonly claimId: string;
   readonly requestId?: string;
   readonly result: Record<string, unknown>;
   readonly taskId: string;
 }): z.infer<typeof wsTaskCompleteMessageSchema> {
   return {
+    claimId: input.claimId,
     op: webSocketOperation.taskComplete,
     ...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
     result: input.result,
@@ -289,11 +297,13 @@ export function buildWsTaskCompleteMessage(input: {
 
 /** Creates a WebSocket task-fail command. */
 export function buildWsTaskFailMessage(input: {
+  readonly claimId: string;
   readonly failure: Record<string, unknown>;
   readonly requestId?: string;
   readonly taskId: string;
 }): z.infer<typeof wsTaskFailMessageSchema> {
   return {
+    claimId: input.claimId,
     failure: input.failure,
     op: webSocketOperation.taskFail,
     ...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
@@ -303,10 +313,12 @@ export function buildWsTaskFailMessage(input: {
 
 /** Creates a WebSocket task-release command. */
 export function buildWsTaskReleaseMessage(input: {
+  readonly claimId: string;
   readonly requestId?: string;
   readonly taskId: string;
 }): z.infer<typeof wsTaskReleaseMessageSchema> {
   return {
+    claimId: input.claimId,
     op: webSocketOperation.taskRelease,
     ...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
     taskId: input.taskId,

@@ -379,6 +379,7 @@ export function handleTaskHttpRoute(
           mutate: ({ body, instanceId, participantId, sessionId, taskId }) =>
             service.completeTaskOverRest({
               ...(body.controlEpoch !== undefined ? { controlEpoch: body.controlEpoch } : {}),
+              claimId: body.claimId,
               instanceId,
               participantId,
               result: body.result,
@@ -400,6 +401,7 @@ export function handleTaskHttpRoute(
           mutate: ({ body, instanceId, participantId, sessionId, taskId }) =>
             service.failTaskOverRest({
               ...(body.controlEpoch !== undefined ? { controlEpoch: body.controlEpoch } : {}),
+              claimId: body.claimId,
               failure: body.failure,
               instanceId,
               participantId,
@@ -421,6 +423,7 @@ export function handleTaskHttpRoute(
           mutate: ({ body, instanceId, participantId, sessionId, taskId }) =>
             service.releaseTaskOverRest({
               ...(body.controlEpoch !== undefined ? { controlEpoch: body.controlEpoch } : {}),
+              claimId: body.claimId,
               instanceId,
               participantId,
               sessionId,
@@ -502,6 +505,7 @@ export function handleTaskHttpRoute(
       const participantId = effectiveParticipantId(input.authContext, body.participantId);
       const result = yield* service.refreshTaskClaimOverRest({
         ...(body.controlEpoch !== undefined ? { controlEpoch: body.controlEpoch } : {}),
+        claimId: body.claimId,
         instanceId: body.instanceId ?? participantId,
         participantId,
         sessionId,

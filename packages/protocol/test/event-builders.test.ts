@@ -108,6 +108,7 @@ function createScheduledTaskFixture(): TaskRecord {
     claimExpiredAt: null,
     claimExpiredBy: null,
     claimExpiresAt: null,
+    claimId: null,
     claimedAt: null,
     claimedBy: null,
     completedAt: null,

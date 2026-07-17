@@ -25,12 +25,20 @@ export interface ParticipantTaskClaimFlowClient {
   readonly appendEvent: (input: AppendSessionEventInput) => Promise<void>;
   /** Attempts to claim a task. */
   readonly claimTask: (taskId: string) => Promise<TaskRecord | null>;
-  /** Completes a claimed task. */
-  readonly completeTask: (taskId: string, result: Record<string, unknown>) => Promise<void>;
-  /** Fails a claimed task. */
-  readonly failTask: (taskId: string, failure: Record<string, unknown>) => Promise<void>;
-  /** Refreshes a claimed task lease. */
-  readonly refreshTaskClaim: (taskId: string) => Promise<TaskRecord | null>;
+  /** Completes a claimed task, fenced by the current Claim ID. */
+  readonly completeTask: (
+    taskId: string,
+    result: Record<string, unknown>,
+    claimId: string,
+  ) => Promise<void>;
+  /** Fails a claimed task, fenced by the current Claim ID. */
+  readonly failTask: (
+    taskId: string,
+    failure: Record<string, unknown>,
+    claimId: string,
+  ) => Promise<void>;
+  /** Refreshes a claimed task lease, fenced by the current Claim ID. */
+  readonly refreshTaskClaim: (taskId: string, claimId: string) => Promise<TaskRecord | null>;
 }
 
 /** Runtime identity and event context for one task claim flow. */
@@ -74,6 +82,22 @@ type ExecutorOutcome =
 
 const maxConsecutiveRefreshFailures = 3;
 
+/** RFC 3339 timestamp with a mandatory `Z` or numeric UTC offset. */
+const rfc3339WithOffsetPattern =
+  /^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$/;
+
+/**
+ * Terminal reason surfaced when a freshly claimed task carries a missing or
+ * malformed claim deadline. The flow declines the claim before starting refresh
+ * or the executor so a claim it cannot safely fence never runs.
+ */
+export const invalidClaimDeadlineReason = "task.invalid_claim_deadline";
+
+/** Returns whether a claim deadline is a non-null RFC 3339 timestamp with an offset. */
+function isValidClaimDeadline(value: string | null): value is string {
+  return value !== null && rfc3339WithOffsetPattern.test(value) && !Number.isNaN(Date.parse(value));
+}
+
 /** Runs claim, refresh, execution, output, and completion for one task. */
 export async function runParticipantTaskClaimFlow(
   client: ParticipantTaskClaimFlowClient,
@@ -109,9 +133,28 @@ export function buildParticipantTaskClaimFlow(
         return;
       }
 
+      // Every fenced mutation echoes the Claim ID minted on this claim. A server
+      // that predates Claim IDs returns null here and cannot be fenced, so the
+      // flow declines the claim rather than issue unfenced mutations.
+      const claimId = claimSetup.task.claimId;
+      if (claimId === null) {
+        debugTaskStop("task.claim_missing_claim_id");
+        return;
+      }
+
+      // The claim deadline governs refresh cadence and executor liveness. A
+      // missing or malformed deadline is a terminal server contract violation, so
+      // decline before refresh or the executor rather than run unbounded work.
+      const claimExpiresAt = claimSetup.task.claimExpiresAt;
+      if (!isValidClaimDeadline(claimExpiresAt)) {
+        debugTaskStop(invalidClaimDeadlineReason);
+        return;
+      }
+
       yield* buildTaskClaimRefresh(client, logger, {
         cancellation: input.cancellation,
-        claimExpiresAt: claimSetup.task.claimExpiresAt,
+        claimExpiresAt,
+        claimId,
         intervalMs: input.claimRefreshMs,
         taskId: input.task.taskId,
       }).pipe(Effect.forkScoped);
@@ -162,6 +205,7 @@ export function buildParticipantTaskClaimFlow(
               execution.error instanceof ParticipantTaskExecutionError
                 ? { ...execution.error.failure }
                 : { error: execution.error.message },
+              claimId,
             ),
           );
         }
@@ -192,7 +236,7 @@ export function buildParticipantTaskClaimFlow(
         }
       }
       yield* Effect.tryPromise(() =>
-        client.completeTask(input.task.taskId, execution.execution.result),
+        client.completeTask(input.task.taskId, execution.execution.result, claimId),
       ).pipe(
         Effect.catchAll((error) =>
           Effect.sync(() => {
@@ -308,6 +352,7 @@ function buildTaskClaimRefresh(
   input: {
     readonly cancellation: TaskCancellationContext;
     readonly claimExpiresAt: string | null;
+    readonly claimId: string;
     readonly intervalMs: number;
     readonly taskId: string;
   },
@@ -324,7 +369,7 @@ function buildTaskClaimRefresh(
         return;
       }
       const refreshOutcome = yield* Effect.tryPromise(() =>
-        client.refreshTaskClaim(input.taskId),
+        client.refreshTaskClaim(input.taskId, input.claimId),
       ).pipe(
         Effect.catchAll((error) =>
           Effect.sync(() => {

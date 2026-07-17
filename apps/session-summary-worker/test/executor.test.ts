@@ -76,6 +76,7 @@ const task: TaskRecord = {
   claimExpiredAt: null,
   claimExpiredBy: null,
   claimExpiresAt: "2099-07-17T00:00:00.000Z",
+  claimId: "claim_worker_1",
   claimedAt: "2026-07-17T00:00:00.000Z",
   claimedBy: "worker-1",
   completedAt: null,

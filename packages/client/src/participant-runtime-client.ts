@@ -887,20 +887,30 @@ export class ParticipantRuntimeClient {
   }
 
   /**
-   * Completes the active task claim with a structured result payload.
+   * Completes the active task claim with a structured result payload. The
+   * server-issued Claim ID fences the completion against a superseded claim.
    */
-  async completeTask(taskId: string, result: Record<string, unknown>): Promise<void> {
+  async completeTask(
+    taskId: string,
+    result: Record<string, unknown>,
+    claimId: string,
+  ): Promise<void> {
     await this.observability.traceBoundary("completeTask", { taskId }, () =>
-      this.sendCommand((requestId) => buildWsTaskCompleteMessage({ requestId, result, taskId })),
+      this.sendCommand((requestId) =>
+        buildWsTaskCompleteMessage({ claimId, requestId, result, taskId }),
+      ),
     );
   }
 
   /**
-   * Fails the active task claim with a structured failure payload.
+   * Fails the active task claim with a structured failure payload. The
+   * server-issued Claim ID fences the failure against a superseded claim.
    */
-  async failTask(taskId: string, failure: Record<string, unknown>): Promise<void> {
+  async failTask(taskId: string, failure: Record<string, unknown>, claimId: string): Promise<void> {
     await this.observability.traceBoundary("failTask", { taskId }, () =>
-      this.sendCommand((requestId) => buildWsTaskFailMessage({ failure, requestId, taskId })),
+      this.sendCommand((requestId) =>
+        buildWsTaskFailMessage({ claimId, failure, requestId, taskId }),
+      ),
     );
   }
 
@@ -958,13 +968,13 @@ export class ParticipantRuntimeClient {
    * Refreshes the active task claim lease and returns null if the claim is no
    * longer valid.
    */
-  async refreshTaskClaim(taskId: string): Promise<TaskRecord | null> {
+  async refreshTaskClaim(taskId: string, claimId: string): Promise<TaskRecord | null> {
     return this.observability.traceBoundary(
       "refreshTaskClaim",
       { taskId },
       async () => {
         const result = await this.sendCommand((requestId) =>
-          buildWsTaskRefreshMessage({ requestId, taskId }),
+          buildWsTaskRefreshMessage({ claimId, requestId, taskId }),
         );
         return result.task ?? null;
       },

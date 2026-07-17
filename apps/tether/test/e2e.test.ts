@@ -151,6 +151,7 @@ const generatedMigrationNames = [
   "0014_flippant_caretaker.sql",
   "0015_conscious_toad.sql",
   "0016_daffy_surge.sql",
+  "0017_skinny_lockheed.sql",
 ] as const;
 
 interface JsonResponse {
@@ -261,6 +262,7 @@ interface TaskResponse extends JsonResponse {
     readonly claimExpiredAt: string | null;
     readonly claimExpiredBy: string | null;
     readonly claimExpiresAt: string | null;
+    readonly claimId: string | null;
     readonly claimedAt: string | null;
     readonly claimedBy: string | null;
     readonly completedAt: string | null;
@@ -281,6 +283,14 @@ interface TaskResponse extends JsonResponse {
 interface PublishedEventResponse extends JsonResponse {
   readonly event: SessionEvent;
   readonly status?: "created" | "replayed";
+}
+
+/** Narrows a claimed task's server-issued claim id to a required string. */
+function requireClaimId(task: { readonly claimId: string | null }): string {
+  if (task.claimId === null) {
+    throw new Error("Expected a server-issued claim id on a claimed task");
+  }
+  return task.claimId;
 }
 
 interface TaskApprovalResponse extends JsonResponse {
@@ -1523,7 +1533,7 @@ e2e("tether e2e", () => {
     const database = createPool(buildDatabaseUrl(databaseName));
     try {
       await createDatabase(databaseName);
-      await applyLegacyMigrationPrefix(database, generatedMigrationNames.length - 1);
+      await applyLegacyMigrationPrefix(database, generatedMigrationNames.length - 2);
       await database.pool.query(`
         ALTER TABLE auth_grants DROP CONSTRAINT auth_grants_lifetime_check;
         ALTER TABLE auth_grants ADD CONSTRAINT auth_grants_lifetime_check
@@ -1533,7 +1543,7 @@ e2e("tether e2e", () => {
       await expect(migrate(database)).rejects.toMatchObject({
         name: "DatabaseMigrationError",
         reason: "unsupported_schema",
-        recognizedPrefix: generatedMigrationNames.length - 2,
+        recognizedPrefix: generatedMigrationNames.length - 3,
       });
 
       const journal = await database.pool.query<{ readonly count: number }>(
@@ -1551,13 +1561,13 @@ e2e("tether e2e", () => {
     const database = createPool(buildDatabaseUrl(databaseName));
     try {
       await createDatabase(databaseName);
-      await applyLegacyMigrationPrefix(database, generatedMigrationNames.length - 2);
+      await applyLegacyMigrationPrefix(database, generatedMigrationNames.length - 3);
       await database.pool.query(`CREATE TABLE auth_grants (jti text PRIMARY KEY NOT NULL)`);
 
       await expect(migrate(database)).rejects.toMatchObject({
         name: "DatabaseMigrationError",
         reason: "unsupported_schema",
-        recognizedPrefix: generatedMigrationNames.length - 2,
+        recognizedPrefix: generatedMigrationNames.length - 3,
       });
 
       const journal = await database.pool.query<{ readonly count: number }>(
@@ -1623,13 +1633,13 @@ e2e("tether e2e", () => {
     const database = createPool(buildDatabaseUrl(databaseName));
     try {
       await createDatabase(databaseName);
-      await applyLegacyMigrationPrefix(database, generatedMigrationNames.length - 1);
+      await applyLegacyMigrationPrefix(database, generatedMigrationNames.length - 2);
       await database.pool.query(mutationSql);
 
       await expect(migrate(database)).rejects.toMatchObject({
         name: "DatabaseMigrationError",
         reason: "unsupported_schema",
-        recognizedPrefix: generatedMigrationNames.length - 2,
+        recognizedPrefix: generatedMigrationNames.length - 3,
       });
       const journal = await database.pool.query<{ readonly count: number }>(
         `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
@@ -5153,14 +5163,18 @@ e2e("tether e2e", () => {
       method: "POST",
     });
 
-    await request(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`, {
-      body: { instanceId: "inst_codex_e2e", participantId: "part_codex_e2e" },
-      method: "POST",
-    });
+    const claimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`,
+      {
+        body: { instanceId: "inst_codex_e2e", participantId: "part_codex_e2e" },
+        method: "POST",
+      },
+    );
     const completion = await request<TaskResponse>(
       `/sessions/${session.sessionId}/tasks/${task.task.taskId}/complete`,
       {
         body: {
+          claimId: claimed.task.claimId,
           instanceId: "inst_codex_e2e",
           participantId: "part_codex_e2e",
           result: { summary: "done" },
@@ -5656,7 +5670,7 @@ e2e("tether e2e", () => {
             mutationBaseUrl,
             `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim/refresh`,
             {
-              body: { controlEpoch, instanceId, participantId },
+              body: { claimId: claimed.task.claimId, controlEpoch, instanceId, participantId },
               method: "POST",
             },
           );
@@ -5759,7 +5773,7 @@ e2e("tether e2e", () => {
           mutationBaseUrl,
           `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim/refresh`,
           {
-            body: { controlEpoch, instanceId, participantId },
+            body: { claimId: claimed.task.claimId, controlEpoch, instanceId, participantId },
             method: "POST",
           },
         );
@@ -6294,7 +6308,7 @@ e2e("tether e2e", () => {
     const completion = await request<TaskResponse>(
       `/sessions/${sessionId}/tasks/${completed.task.taskId}/complete`,
       {
-        body: { ...controller, result: { summary: "done" } },
+        body: { ...controller, claimId: completed.task.claimId, result: { summary: "done" } },
         method: "POST",
       },
     );
@@ -6302,7 +6316,7 @@ e2e("tether e2e", () => {
     const failure = await request<TaskResponse>(
       `/sessions/${sessionId}/tasks/${failed.task.taskId}/fail`,
       {
-        body: { ...controller, failure: { reason: "expected" } },
+        body: { ...controller, claimId: failed.task.claimId, failure: { reason: "expected" } },
         method: "POST",
       },
     );
@@ -6310,7 +6324,7 @@ e2e("tether e2e", () => {
     const release = await request<TaskResponse>(
       `/sessions/${sessionId}/tasks/${released.task.taskId}/release`,
       {
-        body: controller,
+        body: { ...controller, claimId: released.task.claimId },
         method: "POST",
       },
     );
@@ -6413,7 +6427,7 @@ e2e("tether e2e", () => {
       await request<TaskResponse>(
         `/sessions/${session.sessionId}/tasks/${claimed.task.taskId}/release`,
         {
-          body: controller,
+          body: { ...controller, claimId: claimed.task.claimId },
           method: "POST",
         },
       );
@@ -6481,14 +6495,18 @@ e2e("tether e2e", () => {
       sessionId: session.sessionId,
       taskId,
     });
-    await request(`/sessions/${session.sessionId}/tasks/${taskId}/claim`, {
-      body: { instanceId: "inst_retryable", participantId: "part_retryable" },
-      method: "POST",
-    });
+    const claimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${taskId}/claim`,
+      {
+        body: { instanceId: "inst_retryable", participantId: "part_retryable" },
+        method: "POST",
+      },
+    );
     const failingDatabase = await createEventInsertFailingDatabase(currentPool());
 
     await expect(
       completeTaskWithEvent(failingDatabase, {
+        claimId: requireClaimId(claimed.task),
         eventSourceId: "src_e2e_atomicity",
         participantId: "part_retryable",
         result: { summary: "rolled back" },
@@ -6505,6 +6523,7 @@ e2e("tether e2e", () => {
     await expect(
       request<TaskResponse>(`/sessions/${session.sessionId}/tasks/${taskId}/complete`, {
         body: {
+          claimId: claimed.task.claimId,
           instanceId: "inst_retryable",
           participantId: "part_retryable",
           result: { summary: "retried" },
@@ -6526,14 +6545,21 @@ e2e("tether e2e", () => {
       body: { kind: "software_dev", objective: "race terminal transitions" },
       method: "POST",
     });
-    await request(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`, {
-      body: controller,
-      method: "POST",
-    });
+    const claimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`,
+      {
+        body: controller,
+        method: "POST",
+      },
+    );
 
     const [completeResult, cancelResult] = await Promise.allSettled([
       request<TaskResponse>(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/complete`, {
-        body: { ...controller, result: { summary: "completed first" } },
+        body: {
+          ...controller,
+          claimId: claimed.task.claimId,
+          result: { summary: "completed first" },
+        },
         method: "POST",
       }),
       request<TaskResponse>(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/cancel`, {
@@ -6597,17 +6623,21 @@ e2e("tether e2e", () => {
       },
       method: "POST",
     });
-    await request(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`, {
-      body: {
-        instanceId: "inst_generic_agent_e2e",
-        participantId: "part_generic_agent_e2e",
+    const claimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`,
+      {
+        body: {
+          instanceId: "inst_generic_agent_e2e",
+          participantId: "part_generic_agent_e2e",
+        },
+        method: "POST",
       },
-      method: "POST",
-    });
+    );
     await request<TaskResponse>(
       `/sessions/${session.sessionId}/tasks/${task.task.taskId}/complete`,
       {
         body: {
+          claimId: claimed.task.claimId,
           instanceId: "inst_generic_agent_e2e",
           participantId: "part_generic_agent_e2e",
           result: createGenericApprovalResult(),
@@ -6701,17 +6731,21 @@ e2e("tether e2e", () => {
       },
       method: "POST",
     });
-    await request(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`, {
-      body: {
-        instanceId: "inst_generic_agent_e2e",
-        participantId: "part_generic_agent_e2e",
+    const claimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`,
+      {
+        body: {
+          instanceId: "inst_generic_agent_e2e",
+          participantId: "part_generic_agent_e2e",
+        },
+        method: "POST",
       },
-      method: "POST",
-    });
+    );
     await request<TaskResponse>(
       `/sessions/${session.sessionId}/tasks/${task.task.taskId}/complete`,
       {
         body: {
+          claimId: claimed.task.claimId,
           instanceId: "inst_generic_agent_e2e",
           participantId: "part_generic_agent_e2e",
           result: {
@@ -6954,17 +6988,21 @@ e2e("tether e2e", () => {
       },
       method: "POST",
     });
-    await request(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`, {
-      body: {
-        instanceId: "inst_approval_target_e2e",
-        participantId: "part_approval_target_e2e",
+    const claimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`,
+      {
+        body: {
+          instanceId: "inst_approval_target_e2e",
+          participantId: "part_approval_target_e2e",
+        },
+        method: "POST",
       },
-      method: "POST",
-    });
+    );
     await request<TaskResponse>(
       `/sessions/${session.sessionId}/tasks/${task.task.taskId}/complete`,
       {
         body: {
+          claimId: claimed.task.claimId,
           instanceId: "inst_approval_target_e2e",
           participantId: "part_approval_target_e2e",
           result: {
@@ -7074,17 +7112,21 @@ e2e("tether e2e", () => {
       body: { kind: "software_dev", objective: "generic approval" },
       method: "POST",
     });
-    await request(`/sessions/${session.sessionId}/tasks/${unsupportedTask.task.taskId}/claim`, {
-      body: {
-        instanceId: "inst_software_invalid_e2e",
-        participantId: "part_software_invalid_e2e",
+    const unsupportedClaimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${unsupportedTask.task.taskId}/claim`,
+      {
+        body: {
+          instanceId: "inst_software_invalid_e2e",
+          participantId: "part_software_invalid_e2e",
+        },
+        method: "POST",
       },
-      method: "POST",
-    });
+    );
     await request<TaskResponse>(
       `/sessions/${session.sessionId}/tasks/${unsupportedTask.task.taskId}/complete`,
       {
         body: {
+          claimId: unsupportedClaimed.task.claimId,
           instanceId: "inst_software_invalid_e2e",
           participantId: "part_software_invalid_e2e",
           result: { dryRun: true, organizationRecommendations: [] },
@@ -7099,17 +7141,21 @@ e2e("tether e2e", () => {
       },
       method: "POST",
     });
-    await request(`/sessions/${session.sessionId}/tasks/${invalidPlanTask.task.taskId}/claim`, {
-      body: {
-        instanceId: "inst_email_invalid_e2e",
-        participantId: "part_email_invalid_e2e",
+    const invalidPlanClaimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${invalidPlanTask.task.taskId}/claim`,
+      {
+        body: {
+          instanceId: "inst_email_invalid_e2e",
+          participantId: "part_email_invalid_e2e",
+        },
+        method: "POST",
       },
-      method: "POST",
-    });
+    );
     await request<TaskResponse>(
       `/sessions/${session.sessionId}/tasks/${invalidPlanTask.task.taskId}/complete`,
       {
         body: {
+          claimId: invalidPlanClaimed.task.claimId,
           instanceId: "inst_email_invalid_e2e",
           participantId: "part_email_invalid_e2e",
           result: { dryRun: true, organizationRecommendations: [] },
@@ -7180,7 +7226,7 @@ e2e("tether e2e", () => {
           method: "POST",
         },
       );
-      await requestFrom(
+      const claimed = await requestFrom<TaskResponse>(
         unvalidatedOrigin,
         `/sessions/${sessionId}/tasks/${task.task.taskId}/claim`,
         {
@@ -7196,6 +7242,7 @@ e2e("tether e2e", () => {
         `/sessions/${sessionId}/tasks/${task.task.taskId}/complete`,
         {
           body: {
+            claimId: claimed.task.claimId,
             instanceId: "inst_email_unvalidated_e2e",
             participantId: "part_email_unvalidated_e2e",
             result: {
@@ -7255,15 +7302,19 @@ e2e("tether e2e", () => {
       method: "POST",
     });
 
-    await request(`/sessions/${session.sessionId}/tasks/${completedTask.task.taskId}/claim`, {
-      body: {
-        instanceId: "inst_codex_filter_e2e",
-        participantId: "part_codex_filter_e2e",
+    const filterClaimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${completedTask.task.taskId}/claim`,
+      {
+        body: {
+          instanceId: "inst_codex_filter_e2e",
+          participantId: "part_codex_filter_e2e",
+        },
+        method: "POST",
       },
-      method: "POST",
-    });
+    );
     await request(`/sessions/${session.sessionId}/tasks/${completedTask.task.taskId}/complete`, {
       body: {
+        claimId: filterClaimed.task.claimId,
         instanceId: "inst_codex_filter_e2e",
         participantId: "part_codex_filter_e2e",
         result: { summary: "done" },
@@ -7668,15 +7719,19 @@ e2e("tether e2e", () => {
       body: { kind: "generic_status", objective: "status" },
       method: "POST",
     });
-    await request(`/sessions/${session.sessionId}/tasks/${terminalTask.task.taskId}/claim`, {
-      body: {
-        instanceId: "inst_context_generic_e2e",
-        participantId: "part_context_generic_e2e",
+    const terminalClaimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${terminalTask.task.taskId}/claim`,
+      {
+        body: {
+          instanceId: "inst_context_generic_e2e",
+          participantId: "part_context_generic_e2e",
+        },
+        method: "POST",
       },
-      method: "POST",
-    });
+    );
     await request(`/sessions/${session.sessionId}/tasks/${terminalTask.task.taskId}/complete`, {
       body: {
+        claimId: terminalClaimed.task.claimId,
         instanceId: "inst_context_generic_e2e",
         participantId: "part_context_generic_e2e",
         result: { kind: "generic_status", readOnly: true },
@@ -8582,19 +8637,23 @@ e2e("tether e2e", () => {
     expect(unclaimedSnapshot?.status).toBe("unclaimed");
     expect(eventsAfterDebug.events).toHaveLength(eventsBeforeDebug.events.length);
 
-    await request(`/sessions/${session.sessionId}/tasks/${releasedTask.task.taskId}/claim`, {
-      body: {
-        instanceId: "inst_task_snapshot",
-        participantId: "part_task_snapshot",
+    const releasedClaimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${releasedTask.task.taskId}/claim`,
+      {
+        body: {
+          instanceId: "inst_task_snapshot",
+          participantId: "part_task_snapshot",
+        },
+        method: "POST",
       },
-      method: "POST",
-    });
+    );
     snapshots = await request<TaskSnapshotsResponse>(`/sessions/${session.sessionId}/debug/tasks`);
     const activeSnapshot = snapshots.tasks.find((task) => task.taskId === releasedTask.task.taskId);
     expect(activeSnapshot?.status).toBe("claim_active");
 
     await request(`/sessions/${session.sessionId}/tasks/${releasedTask.task.taskId}/release`, {
       body: {
+        claimId: releasedClaimed.task.claimId,
         instanceId: "inst_task_snapshot",
         participantId: "part_task_snapshot",
       },
@@ -8611,15 +8670,19 @@ e2e("tether e2e", () => {
       body: { kind: "software_dev", objective: "Complete this task" },
       method: "POST",
     });
-    await request(`/sessions/${session.sessionId}/tasks/${completedTask.task.taskId}/claim`, {
-      body: {
-        instanceId: "inst_task_snapshot",
-        participantId: "part_task_snapshot",
+    const completedClaimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${completedTask.task.taskId}/claim`,
+      {
+        body: {
+          instanceId: "inst_task_snapshot",
+          participantId: "part_task_snapshot",
+        },
+        method: "POST",
       },
-      method: "POST",
-    });
+    );
     await request(`/sessions/${session.sessionId}/tasks/${completedTask.task.taskId}/complete`, {
       body: {
+        claimId: completedClaimed.task.claimId,
         instanceId: "inst_task_snapshot",
         participantId: "part_task_snapshot",
         result: { summary: "complete" },
@@ -8683,20 +8746,27 @@ e2e("tether e2e", () => {
       body: { kind: "software_dev", objective: "Keep this task claimed" },
       method: "POST",
     });
-    await request(`/sessions/${session.sessionId}/tasks/${activeTask.task.taskId}/claim`, {
-      body: { instanceId: "inst_summary", participantId: "part_summary" },
-      method: "POST",
-    });
+    const activeClaimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${activeTask.task.taskId}/claim`,
+      {
+        body: { instanceId: "inst_summary", participantId: "part_summary" },
+        method: "POST",
+      },
+    );
     const completedTask = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
       body: { kind: "software_dev", objective: "Complete this summary task" },
       method: "POST",
     });
-    await request(`/sessions/${session.sessionId}/tasks/${completedTask.task.taskId}/claim`, {
-      body: { instanceId: "inst_summary", participantId: "part_summary" },
-      method: "POST",
-    });
+    const summaryCompletedClaimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${completedTask.task.taskId}/claim`,
+      {
+        body: { instanceId: "inst_summary", participantId: "part_summary" },
+        method: "POST",
+      },
+    );
     await request(`/sessions/${session.sessionId}/tasks/${completedTask.task.taskId}/complete`, {
       body: {
+        claimId: summaryCompletedClaimed.task.claimId,
         instanceId: "inst_summary",
         participantId: "part_summary",
         result: { summary: "complete" },
@@ -8704,7 +8774,11 @@ e2e("tether e2e", () => {
       method: "POST",
     });
     await request(`/sessions/${session.sessionId}/tasks/${activeTask.task.taskId}/claim/refresh`, {
-      body: { instanceId: "inst_summary", participantId: "part_summary" },
+      body: {
+        claimId: activeClaimed.task.claimId,
+        instanceId: "inst_summary",
+        participantId: "part_summary",
+      },
       method: "POST",
     });
     const eventsBeforeDebug = await request<EventsResponse>(
@@ -8891,6 +8965,7 @@ e2e("tether e2e", () => {
     await expect(
       request(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/complete`, {
         body: {
+          claimId: firstClaim.task.claimId,
           instanceId: "inst_first_claimant",
           participantId: "part_first_claimant",
           result: { summary: "too late" },
@@ -9042,6 +9117,7 @@ e2e("tether e2e", () => {
     const completed = await withSkewedAppClock(-10_000, () =>
       request<TaskResponse>(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/complete`, {
         body: {
+          claimId: claimed.task.claimId,
           instanceId: "inst_skewed_claim",
           participantId: "part_skewed_claim",
           result: { summary: "completed before DB TTL elapsed" },
@@ -9061,19 +9137,23 @@ e2e("tether e2e", () => {
       body: { kind: "software_dev", objective: "Refresh under skew" },
       method: "POST",
     });
-    await request(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`, {
-      body: {
-        instanceId: "inst_skewed_refresh",
-        participantId: "part_skewed_refresh",
+    const claimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`,
+      {
+        body: {
+          instanceId: "inst_skewed_refresh",
+          participantId: "part_skewed_refresh",
+        },
+        method: "POST",
       },
-      method: "POST",
-    });
+    );
 
     const refreshed = await withSkewedAppClock(-10_000, () =>
       request<TaskResponse>(
         `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim/refresh`,
         {
           body: {
+            claimId: claimed.task.claimId,
             instanceId: "inst_skewed_refresh",
             participantId: "part_skewed_refresh",
           },
@@ -9085,6 +9165,7 @@ e2e("tether e2e", () => {
     const completed = await withSkewedAppClock(-10_000, () =>
       request<TaskResponse>(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/complete`, {
         body: {
+          claimId: refreshed.task.claimId,
           instanceId: "inst_skewed_refresh",
           participantId: "part_skewed_refresh",
           result: { summary: "refreshed before DB TTL elapsed" },
@@ -10185,11 +10266,10 @@ e2e("tether e2e", () => {
       body: { kind: "software_dev", objective },
       method: "POST",
     });
-    await request(`/sessions/${sessionId}/tasks/${task.task.taskId}/claim`, {
+    return request<TaskResponse>(`/sessions/${sessionId}/tasks/${task.task.taskId}/claim`, {
       body: controller,
       method: "POST",
     });
-    return task;
   }
 
   /** Creates a completed email task that can receive approval decisions. */
@@ -10208,13 +10288,17 @@ e2e("tether e2e", () => {
       instanceId: `inst_email_${idSuffix.replaceAll("-", "_")}_e2e`,
       participantId: `part_email_${idSuffix.replaceAll("-", "_")}_e2e`,
     };
-    await request(`/sessions/${sessionId}/tasks/${task.task.taskId}/claim`, {
-      body: controller,
-      method: "POST",
-    });
+    const claimed = await request<TaskResponse>(
+      `/sessions/${sessionId}/tasks/${task.task.taskId}/claim`,
+      {
+        body: controller,
+        method: "POST",
+      },
+    );
     await request<TaskResponse>(`/sessions/${sessionId}/tasks/${task.task.taskId}/complete`, {
       body: {
         ...controller,
+        claimId: claimed.task.claimId,
         result: createGenericApprovalResult(),
       },
       method: "POST",
@@ -11204,6 +11288,7 @@ function createGenericApprovalTaskRecord(sessionId: string, taskId: string): Tas
     claimExpiredAt: null,
     claimExpiredBy: null,
     claimExpiresAt: null,
+    claimId: null,
     claimedAt: null,
     claimedBy: null,
     completedAt: now,

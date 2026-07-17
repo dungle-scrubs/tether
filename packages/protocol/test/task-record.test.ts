@@ -34,6 +34,27 @@ describe("taskRecordSchema", () => {
     expect(parsed).not.toHaveProperty("schedule");
   });
 
+  it("round-trips a claimed record with an offset deadline and a claim id", () => {
+    const task: TaskRecord = {
+      ...createTaskFixture(),
+      claimExpiresAt: "2026-01-01T00:00:30+00:00",
+      claimId: "claim_a1b2c3",
+      claimedAt: "2026-01-01T00:00:00.000Z",
+      claimedBy: "participant_1",
+    };
+
+    expect(taskRecordSchema.parse(task)).toEqual(task);
+  });
+
+  it("rejects a non-null claim deadline without an RFC 3339 offset", () => {
+    expect(
+      taskRecordSchema.safeParse({
+        ...createTaskFixture(),
+        claimExpiresAt: "2026-01-01T00:00:30",
+      }).success,
+    ).toBe(false);
+  });
+
   it("preserves structured task input when present", () => {
     const task = createTaskFixture({
       input: {
@@ -303,6 +324,7 @@ function createTaskFixture(
     claimExpiredAt: null,
     claimExpiredBy: null,
     claimExpiresAt: null,
+    claimId: null,
     claimedAt: null,
     claimedBy: null,
     completedAt: null,

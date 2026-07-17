@@ -41,6 +41,7 @@ const baseTask: TaskRecord = {
   claimExpiredAt: null,
   claimExpiredBy: null,
   claimExpiresAt: null,
+  claimId: null,
   claimedAt: null,
   claimedBy: null,
   completedAt: null,
@@ -119,18 +120,28 @@ describe("participant schemas", () => {
 describe("task lifecycle schemas", () => {
   it("defaults cancellation, completion, and failure payloads to empty records", () => {
     expect(cancelTaskSchema.parse({ participantId: "part_codex" }).reason).toEqual({});
-    expect(completeTaskSchema.parse({ participantId: "part_codex" }).result).toEqual({});
-    expect(failTaskSchema.parse({ participantId: "part_codex" }).failure).toEqual({});
+    expect(
+      completeTaskSchema.parse({ claimId: "claim_test_1", participantId: "part_codex" }).result,
+    ).toEqual({});
+    expect(
+      failTaskSchema.parse({ claimId: "claim_test_1", participantId: "part_codex" }).failure,
+    ).toEqual({});
   });
 
   it("requires a participant to refresh a task claim", () => {
-    expect(refreshTaskClaimSchema.parse({ participantId: "part_codex" })).toEqual({
+    expect(
+      refreshTaskClaimSchema.parse({ claimId: "claim_test_1", participantId: "part_codex" }),
+    ).toEqual({
+      claimId: "claim_test_1",
       participantId: "part_codex",
     });
   });
 
   it("requires a participant to release a task", () => {
-    expect(releaseTaskSchema.parse({ participantId: "part_codex" })).toEqual({
+    expect(
+      releaseTaskSchema.parse({ claimId: "claim_test_1", participantId: "part_codex" }),
+    ).toEqual({
+      claimId: "claim_test_1",
       participantId: "part_codex",
     });
   });
@@ -142,7 +153,14 @@ describe("websocket task command schemas", () => {
       op: "task.claim",
       taskId: "task_1",
     });
-    expect(wsTaskRefreshMessageSchema.parse({ op: "task.refresh", taskId: "task_1" })).toEqual({
+    expect(
+      wsTaskRefreshMessageSchema.parse({
+        claimId: "claim_test_1",
+        op: "task.refresh",
+        taskId: "task_1",
+      }),
+    ).toEqual({
+      claimId: "claim_test_1",
       op: "task.refresh",
       taskId: "task_1",
     });
@@ -153,6 +171,7 @@ describe("websocket task command schemas", () => {
     });
     expect(
       wsTaskCompleteMessageSchema.parse({
+        claimId: "claim_test_1",
         op: "task.complete",
         result: { output: "done" },
         taskId: "task_1",
@@ -166,7 +185,10 @@ describe("websocket task command schemas", () => {
       requestId: "req_1",
       taskId: "task_1",
     });
-    expect(buildWsTaskRefreshMessage({ requestId: "req_2", taskId: "task_1" })).toEqual({
+    expect(
+      buildWsTaskRefreshMessage({ claimId: "claim_test_1", requestId: "req_2", taskId: "task_1" }),
+    ).toEqual({
+      claimId: "claim_test_1",
       op: "task.refresh",
       requestId: "req_2",
       taskId: "task_1",

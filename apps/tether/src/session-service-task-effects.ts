@@ -16,6 +16,7 @@ import {
   type AppliedTaskClaimRefreshResult,
   type AppliedTaskMutationResult,
   type CancelTaskInput,
+  type ClaimOwnedTaskInput,
   type CompleteTaskInput,
   type CreateTaskInput,
   type EnsureScheduledRunRequest,
@@ -108,10 +109,10 @@ export interface SessionTaskEffects {
     operation?: string,
   ) => Effect.Effect<RecordedTaskApprovalResult, SessionServiceFailure>;
   readonly refreshTaskClaimEffect: (
-    input: TaskParticipantInput,
+    input: ClaimOwnedTaskInput,
   ) => Effect.Effect<AppliedTaskClaimRefreshResult, SessionServiceFailure>;
   readonly releaseTaskEffect: (
-    input: TaskParticipantInput,
+    input: ClaimOwnedTaskInput,
   ) => Effect.Effect<AppliedTaskMutationResult, SessionServiceFailure>;
   readonly supersedeScheduledRunsEffect: (
     input: SupersedeScheduledRunsRequest,

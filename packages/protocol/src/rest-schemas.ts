@@ -191,6 +191,7 @@ export const claimTaskSchema = z.object({
 
 /** HTTP body schema for task claim refresh. */
 export const refreshTaskClaimSchema = z.object({
+  claimId: z.string().min(1),
   controlEpoch: controlEpochSchema.optional(),
   instanceId: z.string().min(1).optional(),
   participantId: z.string().min(1),
@@ -206,6 +207,7 @@ export const cancelTaskSchema = z.object({
 
 /** HTTP body schema for task completion. */
 export const completeTaskSchema = z.object({
+  claimId: z.string().min(1),
   controlEpoch: controlEpochSchema.optional(),
   instanceId: z.string().min(1).optional(),
   participantId: z.string().min(1),
@@ -214,6 +216,7 @@ export const completeTaskSchema = z.object({
 
 /** HTTP body schema for task failure. */
 export const failTaskSchema = z.object({
+  claimId: z.string().min(1),
   controlEpoch: controlEpochSchema.optional(),
   failure: z.record(z.string(), z.unknown()).default({}),
   instanceId: z.string().min(1).optional(),
@@ -222,6 +225,7 @@ export const failTaskSchema = z.object({
 
 /** HTTP body schema for task claim release. */
 export const releaseTaskSchema = z.object({
+  claimId: z.string().min(1),
   controlEpoch: controlEpochSchema.optional(),
   instanceId: z.string().min(1).optional(),
   participantId: z.string().min(1),

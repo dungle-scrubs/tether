@@ -1041,6 +1041,7 @@ function handleParsedWebSocketMessage(
     if (op === webSocketOperation.taskRefresh) {
       const parsed = yield* parseWebSocketMessage(raw, wsTaskRefreshMessageSchema);
       const result = yield* service.refreshTaskClaim({
+        claimId: parsed.claimId,
         controlGuard: wsControlGuard(context, sessionId),
         participantId: context.participantId,
         sessionId,
@@ -1061,6 +1062,7 @@ function handleParsedWebSocketMessage(
         hub,
         mutate: ({ body, participantId }) =>
           service.completeTask({
+            claimId: body.claimId,
             controlGuard: wsControlGuard(context, sessionId),
             participantId,
             result: body.result,
@@ -1081,6 +1083,7 @@ function handleParsedWebSocketMessage(
         hub,
         mutate: ({ body, participantId }) =>
           service.failTask({
+            claimId: body.claimId,
             controlGuard: wsControlGuard(context, sessionId),
             failure: body.failure,
             participantId,
@@ -1101,6 +1104,7 @@ function handleParsedWebSocketMessage(
         hub,
         mutate: ({ body, participantId }) =>
           service.releaseTask({
+            claimId: body.claimId,
             controlGuard: wsControlGuard(context, sessionId),
             participantId,
             sessionId,
