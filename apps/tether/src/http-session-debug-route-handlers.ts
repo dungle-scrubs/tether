@@ -42,7 +42,13 @@ export function handleSessionDebugHttpRoute(
     if (!route) {
       return false;
     }
-    const denied = authorize({ action: "admin", context: input.authContext });
+    // Session debug data is confined to the grant's session scope, so a
+    // session-scoped admin reads only its own session's debug resources.
+    const denied = authorize({
+      action: "admin",
+      context: input.authContext,
+      sessionId: route.sessionId,
+    });
     if (denied) {
       sendAuthError(response, denied);
       return true;

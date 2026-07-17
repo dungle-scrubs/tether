@@ -274,6 +274,9 @@ async function startObserverApp(
   const app = createAppServerWithSessionService(createUnusedDatabasePool(), service, {
     auth: {
       activeKid: testAuthSigningKid,
+      // These fixtures authenticate with legacy stateless test tokens, which
+      // required mode rejects unless the migration escape hatch is enabled.
+      allowLegacyTokens: true,
       mode: "required",
       secrets: { [testAuthSigningKid]: testAuthSigningSecret },
     },

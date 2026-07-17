@@ -10,6 +10,7 @@ export const AuthError = {
   ClaimInvalid: "auth_claim_invalid",
   GrantExpired: "auth_grant_expired",
   GrantRevoked: "auth_grant_revoked",
+  LegacyTokenRejected: "auth_legacy_token_rejected",
   StoreUnavailable: "auth_store_unavailable",
   TicketConsumed: "auth_ticket_consumed",
   TicketExpired: "auth_ticket_expired",

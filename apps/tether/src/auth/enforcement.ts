@@ -31,6 +31,8 @@ export interface AuthRuntimeDebugInfo {
   readonly authMode: AuthMode;
   /** Provisional pre-enforcement tgr2 issuance gate, replaced by M7 rollout readiness. */
   readonly grantIssuanceEnabled: boolean;
+  /** Whether revocation-blind legacy stateless tokens are accepted in required mode. */
+  readonly legacyTokensAllowed: boolean;
   /** Current bounded durable-grant denial cache size. */
   readonly negativeGrantCacheEntries: number;
   /** Hard cap for the durable-grant denial cache. */
@@ -40,6 +42,12 @@ export interface AuthRuntimeDebugInfo {
 export interface AuthRuntimeOptions {
   /** Active signing key id used for diagnostics. */
   readonly activeKid: string;
+  /**
+   * Migration escape hatch that accepts legacy stateless tokens in required
+   * mode. Legacy tokens carry no durable grant row and cannot be revoked, so
+   * the default rejects them; enable only while rotating a fleet onto tgr2.
+   */
+  readonly allowLegacyTokens?: boolean;
   /** Durable grant issuer used by lifecycle operations, when configured. */
   readonly issuer?: string | null;
   /** PostgreSQL grant reader required for tgr2 acceptance. */
@@ -99,12 +107,14 @@ export function createAuthRuntime(options: AuthRuntimeOptions): AuthRuntime {
   const disabledWarning = options.mode === "disabled" ? startDisabledModeWarning(logger) : null;
   const authority = createConfiguredGrantAuthority(options);
   const ticketAuthority = createConfiguredTicketAuthority(options, authority);
+  const allowLegacyTokens = options.allowLegacyTokens ?? false;
   return {
     authenticateHttpRequest: async (request, url) => {
       if (options.mode === "disabled") {
         return null;
       }
       return authenticateBearerToken({
+        allowLegacyTokens,
         authority,
         method: request.method,
         now: options.now,
@@ -129,6 +139,7 @@ export function createAuthRuntime(options: AuthRuntimeOptions): AuthRuntime {
       ).length;
       if (credentialCount !== 1) {
         const rejected = {
+          allowLegacyTokens,
           authority,
           logger,
           method: request.method,
@@ -152,6 +163,7 @@ export function createAuthRuntime(options: AuthRuntimeOptions): AuthRuntime {
       }
       const token = headerToken ?? queryToken;
       const context = await authenticateBearerToken({
+        allowLegacyTokens,
         authority,
         method: request.method,
         now: options.now,
@@ -164,6 +176,7 @@ export function createAuthRuntime(options: AuthRuntimeOptions): AuthRuntime {
       return {
         authorizeCommand: async () => {
           await authenticateBearerToken({
+            allowLegacyTokens,
             authority,
             logger,
             method: "COMMAND",
@@ -187,6 +200,7 @@ export function createAuthRuntime(options: AuthRuntimeOptions): AuthRuntime {
         activeKid: options.activeKid,
         authMode: options.mode,
         grantIssuanceEnabled: options.preEnforcementGrantIssuanceEnabled ?? false,
+        legacyTokensAllowed: allowLegacyTokens,
         negativeGrantCacheEntries: authorityDebug?.negativeCacheEntries ?? 0,
         negativeGrantCacheMaximumEntries: authorityDebug?.negativeCacheMaximumEntries ?? 0,
       };
@@ -198,6 +212,7 @@ export function createAuthRuntime(options: AuthRuntimeOptions): AuthRuntime {
 export function authRuntimeOptionsFromConfig(config: ServerConfig): AuthRuntimeOptions {
   return {
     activeKid: config.authSigningKid,
+    allowLegacyTokens: config.authAllowLegacyTokens,
     issuer: config.authIssuer,
     mode: config.authMode,
     secrets: buildSigningSecrets(config),
@@ -232,6 +247,7 @@ export function authErrorFromUnknown(error: unknown): AuthError {
 }
 
 interface AuthenticateBearerTokenInput {
+  readonly allowLegacyTokens: boolean;
   readonly authority: AuthGrantAuthority | null;
   readonly logger: AuthRuntimeLogger;
   readonly method: string | undefined;
@@ -256,6 +272,12 @@ async function authenticateBearerToken(input: AuthenticateBearerTokenInput): Pro
     if (input.token.startsWith("tgr2.")) {
       if (!input.authority) throw new AuthGrantAuthorityError("auth_claim_invalid");
       return await input.authority.authenticateRestBearer(input.token);
+    }
+    if (!input.allowLegacyTokens) {
+      // Legacy stateless tokens carry no durable grant row, so revocation
+      // cannot reach them. Required enforcement rejects them unless the
+      // explicit migration escape hatch is enabled.
+      throw new Error(AuthError.LegacyTokenRejected);
     }
     return createAuthContext(
       verifyLegacyAuthToken(input.token, {

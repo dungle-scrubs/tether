@@ -25,7 +25,15 @@ export function authorize(input: AuthorizeInput): AuthError | null {
     return null;
   }
   if (action === "admin") {
-    return context.role === "admin" ? null : AuthError.RoleDenied;
+    // Admin authority is confined by the grant's session scope. Session debug
+    // routes pass their sessionId, so a session-scoped admin grant reads only
+    // its own session. Global admin surfaces (grant lifecycle, /debug/server,
+    // /ui) pass no sessionId and therefore require a service-scoped (`*`)
+    // admin grant; a session-scoped admin receives the typed scope denial.
+    if (context.role !== "admin") {
+      return AuthError.RoleDenied;
+    }
+    return authorizeSessionScope(context, sessionId);
   }
   if (action === "scheduled-supersede") {
     // Scheduled-run supersession is operator backlog reconciliation, not a
