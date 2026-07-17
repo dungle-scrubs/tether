@@ -8,6 +8,11 @@ export { readServiceAuthToken, resolveServiceAuthToken } from "./auth-token.js";
 export { ClientBridgeSessionEventClient } from "./session-event-client.js";
 export { ClientBridgeSessionResolver } from "./session-resolver.js";
 export { ClientBridgeTaskClient } from "./task-client.js";
+export { SessionEventStreamClient, SessionEventStreamError } from "@dungle-scrubs/tether-client";
+export type {
+  SessionEventStreamClientConfig,
+  SessionEventStreamClientDebugInfo,
+} from "@dungle-scrubs/tether-client";
 export { taskResponseSchema } from "./schemas.js";
 export {
   classifyScheduledSupersession,

@@ -3,11 +3,21 @@ import { describe, expect, it } from "vitest";
 import {
   ClientBridgeSessionEventClient,
   clientBridgeRoutes,
+  SessionEventStreamClient,
+  SessionEventStreamError,
   type ClientBridgeFetch,
   type ClientBridgeRequestError,
 } from "../src/index.js";
 
 describe("ClientBridgeSessionEventClient", () => {
+  it("re-exports the typed observer transport used by streaming bridges", () => {
+    expect(SessionEventStreamClient).toBeTypeOf("function");
+    expect(new SessionEventStreamError({ message: "Replay failed" })).toMatchObject({
+      reason: null,
+      safeDetails: {},
+    });
+  });
+
   it("builds encoded session event routes", () => {
     expect(clientBridgeRoutes.sessionEvents("sess/with space", 42)).toBe(
       "/sessions/sess%2Fwith%20space/events?after=42",

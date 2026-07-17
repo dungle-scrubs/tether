@@ -10,6 +10,7 @@ import {
   readModuleObservabilityOptions,
 } from "./observability.js";
 import { SESSION_PROJECTION_REDUCER_VERSION } from "./session-projection.js";
+import { sessionEventRetentionConfiguration } from "./session-event-retention.js";
 import { sessionSummaryPublicationBaseline } from "./session-summary-publication-config.js";
 import {
   type SessionScalabilityRuntimeState,
@@ -226,6 +227,7 @@ export class SessionScalabilityDiagnostics {
             latestVerification: runtime.latestVerification,
             staleCount: current ? 0 : 1,
           },
+          retention: sessionEventRetentionConfiguration,
           sessionId,
           summary: {
             active,

@@ -24,6 +24,7 @@ import {
   buildWsTaskRefreshMessage,
   type CommandResultEnvelope,
   parseWebSocketServerEnvelope,
+  parseWebSocketRecoveryCondition,
   type WebSocketCommandMessage,
   webSocketOperation,
 } from "./protocol.js";
@@ -1214,7 +1215,13 @@ export class ParticipantRuntimeClient {
           envelope.reason === "replay_window_exceeded" ||
           envelope.reason === "replay_gap_unrepaired"
         ) {
-          this.enterPausedState(envelope.reason, error, {}, generation);
+          const recovery = parseWebSocketRecoveryCondition(envelope);
+          this.enterPausedState(
+            envelope.reason,
+            error,
+            recovery?.limit === undefined ? {} : { limit: recovery.limit },
+            generation,
+          );
           return;
         }
         this.settleReplayCompleteError(error);

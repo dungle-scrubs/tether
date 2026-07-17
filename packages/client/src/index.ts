@@ -37,6 +37,7 @@ export {
   buildSessionEventStreamUrl,
   sessionEventObserverRuntimeKind,
   SessionEventStreamClient,
+  SessionEventStreamError,
 } from "./session-event-stream-client.js";
 export type {
   ParticipantRuntimeClientConfig,

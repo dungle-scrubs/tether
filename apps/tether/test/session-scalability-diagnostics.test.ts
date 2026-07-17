@@ -59,6 +59,19 @@ describe("Session scalability diagnostics", () => {
         latestVerification: { status: "not_observed" },
         staleCount: 0,
       },
+      retention: {
+        boundaryAdvancementEnabled: false,
+        deletionEnabled: false,
+        reason: "future_safety_gates_unmet",
+        status: "disabled",
+        unmetGates: [
+          "consumer_cursor_coverage",
+          "atomic_boundary_advance",
+          "replica_convergence",
+          "backup_restore_validation",
+          "recovery_contract",
+        ],
+      },
       summary: {
         active: [{ budgetClass: "8k", coversSeqTo: 40, summaryId: "summary_1" }],
         activeCandidate: null,

@@ -1,11 +1,13 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 
 import {
+  parseWebSocketRecoveryCondition,
   parseWebSocketServerEnvelope,
   serializePresenceEnvelope,
   serializeReplayCompleteEnvelope,
   webSocketErrorEnvelopeSchema,
   webSocketPresenceEnvelopeSchema,
+  webSocketRecoveryReason,
 } from "../src/index.js";
 
 describe("WebSocket error envelopes", () => {
@@ -64,12 +66,33 @@ describe("WebSocket error envelopes", () => {
   it("preserves replay_window_exceeded as a typed safe reason", () => {
     const envelope = webSocketErrorEnvelopeSchema.parse({
       error: "Replay window exceeded",
+      limit: 2_000,
       op: "error",
       reason: "replay_window_exceeded",
     });
 
-    expectTypeOf(envelope.reason).toEqualTypeOf<string | undefined>();
-    expect(envelope.reason).toBe("replay_window_exceeded");
+    expect(parseWebSocketRecoveryCondition(envelope)).toEqual({
+      limit: 2_000,
+      reason: webSocketRecoveryReason.replayWindowExceeded,
+    });
+  });
+
+  it("reserves recovery_required without treating unknown server fields as recovery", () => {
+    const reserved = webSocketErrorEnvelopeSchema.parse({
+      error: "Recovery required",
+      op: "error",
+      reason: webSocketRecoveryReason.recoveryRequired,
+    });
+    const future = webSocketErrorEnvelopeSchema.parse({
+      error: "Future condition",
+      op: "error",
+      reason: "future_condition",
+    });
+
+    expect(parseWebSocketRecoveryCondition(reserved)).toEqual({
+      reason: webSocketRecoveryReason.recoveryRequired,
+    });
+    expect(parseWebSocketRecoveryCondition(future)).toBeNull();
   });
 
   it("preserves replay_gap_unrepaired as a typed safe reason", () => {

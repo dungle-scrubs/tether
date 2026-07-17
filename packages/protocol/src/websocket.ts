@@ -134,6 +134,54 @@ export type WebSocketPresenceEnvelope = z.infer<typeof webSocketPresenceEnvelope
 /** Parsed server-to-client WebSocket envelope. */
 export type WebSocketServerEnvelope = z.infer<typeof webSocketServerEnvelopeSchema>;
 
+/** Stable recovery vocabulary shared by transport producers and consumers. */
+export const webSocketRecoveryReason = {
+  recoveryRequired: "recovery_required",
+  replayWindowExceeded: "replay_window_exceeded",
+} as const;
+
+/** Recovery reason currently emitted or reserved by the protocol. */
+export type WebSocketRecoveryReason =
+  (typeof webSocketRecoveryReason)[keyof typeof webSocketRecoveryReason];
+
+/** Safe, bounded recovery metadata preserved across client boundaries. */
+export interface WebSocketRecoveryCondition {
+  readonly limit?: number;
+  readonly reason: WebSocketRecoveryReason;
+}
+
+/**
+ * Projects only protocol-owned recovery fields from an error envelope. Unknown
+ * passthrough fields are deliberately excluded from the returned condition.
+ */
+export function parseWebSocketRecoveryCondition(
+  envelope: WebSocketServerEnvelope,
+): WebSocketRecoveryCondition | null {
+  if (envelope.op !== webSocketOperation.error) {
+    return null;
+  }
+  const reason = parseWebSocketRecoveryReason(envelope.reason);
+  if (reason === null) {
+    return null;
+  }
+  const limit = envelope.limit;
+  return {
+    ...(typeof limit === "number" && Number.isSafeInteger(limit) && limit > 0 ? { limit } : {}),
+    reason,
+  };
+}
+
+/** Narrows arbitrary server reason strings to the owned recovery taxonomy. */
+function parseWebSocketRecoveryReason(value: unknown): WebSocketRecoveryReason | null {
+  switch (value) {
+    case webSocketRecoveryReason.recoveryRequired:
+    case webSocketRecoveryReason.replayWindowExceeded:
+      return value;
+    default:
+      return null;
+  }
+}
+
 /** Parsed WebSocket task command message. */
 export type WebSocketTaskCommandMessage =
   | z.infer<typeof wsTaskCancelMessageSchema>

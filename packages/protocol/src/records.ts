@@ -380,6 +380,23 @@ export interface SessionScalabilitySummaryHead {
   readonly summaryId: string;
 }
 
+/** Future safety gates that must pass before raw event retention may exist. */
+export type SessionEventRetentionGate =
+  | "atomic_boundary_advance"
+  | "backup_restore_validation"
+  | "consumer_cursor_coverage"
+  | "recovery_contract"
+  | "replica_convergence";
+
+/** Explicitly disabled retention state exposed to operators in this cutoff. */
+export interface SessionEventRetentionStatus {
+  readonly boundaryAdvancementEnabled: false;
+  readonly deletionEnabled: false;
+  readonly reason: "future_safety_gates_unmet";
+  readonly status: "disabled";
+  readonly unmetGates: readonly SessionEventRetentionGate[];
+}
+
 /** Protocol-owned safe diagnostics for projections, summaries, and context. */
 export interface SessionScalabilityDebugRecord {
   readonly context: {
@@ -397,6 +414,7 @@ export interface SessionScalabilityDebugRecord {
     readonly latestVerification: SessionScalabilityVerificationOutcome;
     readonly staleCount: number;
   };
+  readonly retention: SessionEventRetentionStatus;
   readonly sessionId: string;
   readonly summary: {
     readonly active: readonly SessionScalabilitySummaryHead[];

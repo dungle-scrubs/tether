@@ -1965,12 +1965,17 @@ describe("ParticipantRuntimeClient reconnect scheduling", () => {
       "message",
       JSON.stringify({
         error: "unsafe server detail",
+        limit: 2_000,
         op: "error",
         reason: "replay_window_exceeded",
+        secret: "must-not-cross-client-boundary",
       }),
     );
 
-    await expect(replay).rejects.toMatchObject({ reason: "replay_window_exceeded" });
+    await expect(replay).rejects.toMatchObject({
+      reason: "replay_window_exceeded",
+      safeDetails: { limit: 2_000 },
+    });
     await flushMicrotasks();
     expect(sockets).toHaveLength(1);
     expect(client.debugInfo().pausedReason).toBe("replay_window_exceeded");

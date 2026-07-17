@@ -2452,10 +2452,16 @@ e2e("tether e2e", () => {
       expect(messages.filter(isEventEnvelope)).toHaveLength(0);
       expect(messages).toContainEqual(
         expect.objectContaining({
+          limit: 1,
           op: "error",
           reason: "replay_window_exceeded",
         }),
       );
+      const rawEvents = await requestFrom<EventsResponse>(
+        limitedUrl,
+        `/sessions/${session.sessionId}/events?after=0`,
+      );
+      expect(rawEvents.events).toHaveLength(2);
     } finally {
       if (socket && socket.readyState !== WebSocket.CLOSED) {
         socket.close();

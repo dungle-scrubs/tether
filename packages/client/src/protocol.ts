@@ -11,6 +11,7 @@ export {
   buildWsTaskRefreshMessage,
   buildWsTaskReleaseMessage,
   parseAfterSeq,
+  parseWebSocketRecoveryCondition,
   parseWebSocketServerEnvelope,
   participantRuntimeKindSchema,
   registerParticipantSchema,
@@ -26,6 +27,7 @@ export {
   taskIdFromCancelledEvent,
   taskRecordSchema,
   webSocketOperation,
+  webSocketRecoveryReason,
   webSocketServerEnvelopeSchema,
   wsPublishMessageSchema,
   wsTaskCancelMessageSchema,
@@ -41,5 +43,7 @@ export type {
   CommandResultEnvelope,
   WebSocketCommandMessage,
   WebSocketServerEnvelope,
+  WebSocketRecoveryCondition,
+  WebSocketRecoveryReason,
   WebSocketTaskCommandMessage,
 } from "@dungle-scrubs/tether-protocol";

@@ -4,7 +4,12 @@ import WebSocket from "ws";
 import { resolveServiceAuthToken } from "./auth-token.js";
 import { sleepUnrefEffect } from "./effect-timing.js";
 import { ModuleObservability, readModuleObservabilityOptions } from "./observability.js";
-import { parseWebSocketServerEnvelope, webSocketOperation } from "./protocol.js";
+import {
+  parseWebSocketRecoveryCondition,
+  parseWebSocketServerEnvelope,
+  type WebSocketRecoveryReason,
+  webSocketOperation,
+} from "./protocol.js";
 import { SerialEventDelivery, type SerialEventDeliveryOutcome } from "./serial-event-delivery.js";
 import type { SessionEvent } from "./types.js";
 
@@ -57,6 +62,23 @@ export interface SessionEventStreamClientDebugInfo {
   readonly socketReadyState: number;
   /** Whether the client has been intentionally closed. */
   readonly stopped: boolean;
+}
+
+/** Typed connection error surfaced by passive event-stream clients. */
+export class SessionEventStreamError extends Error {
+  readonly reason: WebSocketRecoveryReason | null;
+  readonly safeDetails: Readonly<Record<string, number>>;
+
+  constructor(input: {
+    readonly message: string;
+    readonly reason?: WebSocketRecoveryReason | null;
+    readonly safeDetails?: Readonly<Record<string, number>>;
+  }) {
+    super(input.message);
+    this.name = "SessionEventStreamError";
+    this.reason = input.reason ?? null;
+    this.safeDetails = input.safeDetails ?? {};
+  }
 }
 
 /**
@@ -292,7 +314,12 @@ export class SessionEventStreamClient {
         return;
       }
       if (envelope.op === webSocketOperation.error) {
-        const error = new Error(envelope.error);
+        const recovery = parseWebSocketRecoveryCondition(envelope);
+        const error = new SessionEventStreamError({
+          message: envelope.error,
+          ...(recovery === null ? {} : { reason: recovery.reason }),
+          ...(recovery?.limit === undefined ? {} : { safeDetails: { limit: recovery.limit } }),
+        });
         this.settleReplayCompleteError(error);
         this.emitError(error);
       }
