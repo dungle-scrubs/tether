@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { hostPresenceInventorySchema } from "../src/index.js";
 import type {
   ClientSessionBindingRecord,
   ControlLeaseSnapshot,
@@ -10,6 +11,21 @@ import type {
 } from "../src/index.js";
 
 describe("diagnostic record ownership", () => {
+  it("requires Replica Scope metadata on Host Presence inventories", () => {
+    expect(hostPresenceInventorySchema.safeParse({ sessions: [] }).success).toBe(false);
+    expect(
+      hostPresenceInventorySchema.parse({
+        replicaId: "replica_opaque_1",
+        scope: "replica",
+        sessions: [{ sessionId: "sess_1" }],
+      }),
+    ).toEqual({
+      replicaId: "replica_opaque_1",
+      scope: "replica",
+      sessions: [{ sessionId: "sess_1" }],
+    });
+  });
+
   it("exports shared session and diagnostic records from protocol", () => {
     const session = {
       createdAt: "2026-07-08T00:00:00.000Z",

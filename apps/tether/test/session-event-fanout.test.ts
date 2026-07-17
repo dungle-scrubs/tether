@@ -6,6 +6,7 @@ import { Effect } from "effect";
 import { SessionEventFanout } from "../src/session-event-fanout.js";
 import { sessionEventNotificationChannel, type DatabasePool } from "../src/db.js";
 import type { SubscriptionHub } from "../src/hub.js";
+import type { StructuredLogEntry } from "../src/observability.js";
 import type { SessionEvent } from "../src/types.js";
 
 describe("SessionEventFanout", () => {
@@ -15,12 +16,15 @@ describe("SessionEventFanout", () => {
 
   it("waits for an in-flight catch-up poll before stop resolves", async () => {
     vi.useFakeTimers();
+    let now = 100;
     const catchUp = createDeferred<SessionEvent[]>();
     const fanout = new SessionEventFanout({
       catchUpPollIntervalMs: 10,
       database: createDatabasePoolFixture(),
+      eventBatchLimit: 1,
       hub: createHubFixture(),
       listenEnabled: false,
+      now: () => now,
       service: {
         debugInfo: () => ({ eventSourceId: "src_test" }),
         listEvents: () => Effect.promise(() => catchUp.promise),
@@ -29,6 +33,10 @@ describe("SessionEventFanout", () => {
 
     await fanout.start();
     await vi.advanceTimersByTimeAsync(10);
+    now = 160;
+    expect(fanout.debugInfo().sessionLag).toMatchObject([
+      { lagAgeMs: 60, outcome: "events_pending" },
+    ]);
     const stopped = fanout.stop();
     let resolved = false;
     stopped.then(() => {
@@ -46,7 +54,10 @@ describe("SessionEventFanout", () => {
 
   it("catches up durable events in configured batches", async () => {
     vi.useFakeTimers();
-    const calls: Array<{ readonly afterSeq: number; readonly limit: number | undefined }> = [];
+    const calls: Array<{
+      readonly afterSeq: number;
+      readonly limit: number | undefined;
+    }> = [];
     const broadcasted: number[] = [];
     const fanout = new SessionEventFanout({
       catchUpPollIntervalMs: 10,
@@ -64,7 +75,7 @@ describe("SessionEventFanout", () => {
     });
 
     await fanout.start();
-    await vi.advanceTimersByTimeAsync(10);
+    await vi.advanceTimersByTimeAsync(20);
     await flushPromises();
     await fanout.stop();
 
@@ -84,6 +95,126 @@ describe("SessionEventFanout", () => {
         .filter((event) => event.seq > afterSeq)
         .slice(0, limit);
     }
+  });
+
+  it("gives every subscribed session one bounded batch and rotates the next round", async () => {
+    vi.useFakeTimers();
+    const calls: string[] = [];
+    const broadcasted: string[] = [];
+    const fanout = new SessionEventFanout({
+      catchUpPollIntervalMs: 10,
+      database: createDatabasePoolFixture(),
+      eventBatchLimit: 1,
+      hub: createHubFixture(
+        (event) => {
+          broadcasted.push(`${event.sessionId}:${event.seq}`);
+        },
+        [
+          { lastDeliveredSeq: 0, sessionId: "sess_hot" },
+          { lastDeliveredSeq: 0, sessionId: "sess_later" },
+        ],
+      ),
+      listenEnabled: false,
+      service: {
+        debugInfo: () => ({ eventSourceId: "src_test" }),
+        listEvents: (sessionId, afterSeq) => {
+          calls.push(sessionId);
+          return Effect.succeed([createSessionEvent(afterSeq + 1, sessionId)]);
+        },
+      },
+    });
+
+    await fanout.start();
+    await vi.advanceTimersByTimeAsync(10);
+    await flushPromises();
+
+    expect(calls).toEqual(["sess_hot", "sess_later"]);
+    expect(broadcasted).toEqual(["sess_hot:1", "sess_later:1"]);
+
+    await vi.advanceTimersByTimeAsync(10);
+    await flushPromises();
+    await fanout.stop();
+
+    expect(calls).toEqual(["sess_hot", "sess_later", "sess_later", "sess_hot"]);
+    expect(fanout.debugInfo().catchUpBatchCount).toBe(4);
+  });
+
+  it("reports bounded hashed lag, failure recovery, and payload-free batch traces", async () => {
+    vi.useFakeTimers();
+    let now = 100;
+    let attempt = 0;
+    const logs: StructuredLogEntry[] = [];
+    const fanout = new SessionEventFanout({
+      catchUpPollIntervalMs: 10,
+      database: createDatabasePoolFixture(),
+      eventBatchLimit: 1,
+      hub: createHubFixture(),
+      listenEnabled: false,
+      now: () => now,
+      observability: {
+        boundaryLogsEnabled: true,
+        logger: { log: (entry) => logs.push(entry) },
+      },
+      service: {
+        debugInfo: () => ({ eventSourceId: "src_trace" }),
+        listEvents: () => {
+          attempt += 1;
+          if (attempt === 1) {
+            return Effect.fail(new Error("temporary database failure"));
+          }
+          return Effect.succeed(attempt === 2 ? [createSessionEvent(1)] : []);
+        },
+      },
+    });
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await fanout.start();
+    await vi.advanceTimersByTimeAsync(10);
+    await flushPromises();
+    now = 160;
+
+    expect(fanout.debugInfo()).toMatchObject({
+      catchUpFailureCount: 1,
+      lastCatchUpOutcome: "failed",
+      sessionLag: [
+        {
+          lagAgeMs: 60,
+          outcome: "failed",
+        },
+      ],
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+    await flushPromises();
+
+    expect(fanout.debugInfo()).toMatchObject({
+      catchUpRecoveryCount: 1,
+      lastCatchUpOutcome: "events_pending",
+      sessionLag: [{ outcome: "events_pending" }],
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+    await flushPromises();
+    await fanout.stop();
+
+    expect(fanout.debugInfo()).toMatchObject({
+      catchUpRecoveryCount: 1,
+      lastCatchUpOutcome: "caught_up",
+      sessionLag: [{ lagAgeMs: 0, outcome: "caught_up" }],
+    });
+    const exitLogs = logs.filter(
+      (entry) => entry.message === "boundary.exit" && entry.operation === "catchUpBatch",
+    );
+    const exitLog = exitLogs[exitLogs.length - 1];
+    expect(exitLog?.data).toMatchObject({
+      batchSize: 0,
+      durationMs: expect.any(Number),
+      outcome: "caught_up",
+      sequenceEnd: 1,
+      sequenceStart: 1,
+    });
+    expect(JSON.stringify(logs)).not.toContain("payload");
+    expect(JSON.stringify(logs)).not.toContain("sess_fanout");
   });
 
   it("does not discard a lower catch-up event after a higher event was broadcast", async () => {
@@ -371,9 +502,20 @@ function createHubFixture(
     { lastDeliveredSeq: 0, sessionId: "sess_fanout" },
   ],
 ): SubscriptionHub {
+  const mutableCursors = cursors.map((cursor) => ({ ...cursor }));
   return {
-    broadcast: onBroadcast,
-    sessionCursors: () => cursors,
+    broadcast: (event: SessionEvent) => {
+      const index = mutableCursors.findIndex((cursor) => cursor.sessionId === event.sessionId);
+      const cursor = mutableCursors[index];
+      if (cursor && event.seq > cursor.lastDeliveredSeq) {
+        mutableCursors[index] = {
+          lastDeliveredSeq: event.seq,
+          sessionId: cursor.sessionId,
+        };
+      }
+      onBroadcast(event);
+    },
+    sessionCursors: () => mutableCursors,
   } as unknown as SubscriptionHub;
 }
 
@@ -446,10 +588,14 @@ class FakeListenClient extends EventEmitter {
     return [...this.detached].sort();
   }
 
-  asPoolClient(): DatabasePool["pool"] extends { connect: () => Promise<infer TClient> }
+  asPoolClient(): DatabasePool["pool"] extends {
+    connect: () => Promise<infer TClient>;
+  }
     ? TClient
     : never {
-    return this as DatabasePool["pool"] extends { connect: () => Promise<infer TClient> }
+    return this as DatabasePool["pool"] extends {
+      connect: () => Promise<infer TClient>;
+    }
       ? TClient
       : never;
   }

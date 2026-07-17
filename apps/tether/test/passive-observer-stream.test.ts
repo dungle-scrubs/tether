@@ -10,7 +10,9 @@ import {
   testAuthSigningSecret,
 } from "../src/auth/test-tokens.js";
 import type { DatabasePool } from "../src/db.js";
+import { HostPresenceRuntime, projectWebSocketPresenceEnvelope } from "../src/host-presence.js";
 import { createAppServerWithSessionService, type AppServer } from "../src/http.js";
+import { webSocketPresenceEnvelopeSchema } from "../src/protocol.js";
 import type { SessionEvent } from "../src/types.js";
 import type {
   SessionServiceDebugInfo,
@@ -25,6 +27,36 @@ describe("passive full-event observer stream", () => {
   afterEach(async () => {
     const apps = openApps.splice(0);
     await Promise.all(apps.map((app) => app.close()));
+  });
+
+  it("projects protocol-owned Replica Scope WebSocket presence envelopes", () => {
+    const runtime = new HostPresenceRuntime();
+    runtime.upsertHost(observerSessionId, {
+      displayName: "Host One",
+      instanceId: "inst_1",
+      participantId: "part_1",
+    });
+
+    expect(
+      webSocketPresenceEnvelopeSchema.parse(
+        projectWebSocketPresenceEnvelope({
+          replicaId: "replica_ws_1",
+          runtime,
+          sessionId: observerSessionId,
+        }),
+      ),
+    ).toEqual({
+      hosts: [
+        {
+          displayName: "Host One",
+          instanceId: "inst_1",
+          participantId: "part_1",
+        },
+      ],
+      op: "presence",
+      replicaId: "replica_ws_1",
+      scope: "replica",
+    });
   });
 
   it("replays and follows durable events without acquiring a control lease", async () => {

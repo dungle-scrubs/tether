@@ -118,6 +118,43 @@ export interface SessionRecord {
   readonly sessionId: string;
 }
 
+/** Scope marker for process-local Host Presence responses. */
+export const replicaPresenceScope = "replica" as const;
+
+/** Live host metadata carried by Replica Scope presence responses. */
+export interface LiveHostPresence {
+  readonly displayName: string;
+  readonly instanceId: string;
+  readonly participantId: string;
+}
+
+/** Runtime validator for one live host in a presence response. */
+export const liveHostPresenceSchema: z.ZodType<LiveHostPresence> = z.object({
+  displayName: z.string(),
+  instanceId: z.string().min(1),
+  participantId: z.string().min(1),
+});
+
+/**
+ * Host Presence session inventory whose contents are complete only for the
+ * replica identified by {@link replicaId}.
+ */
+export interface HostPresenceInventory<TSession = unknown> {
+  /** Opaque identity stable for the lifetime of the serving app process. */
+  readonly replicaId: string;
+  /** Declares that the inventory is process-local rather than cluster-complete. */
+  readonly scope: typeof replicaPresenceScope;
+  /** Existing session inventory payload. */
+  readonly sessions: readonly TSession[];
+}
+
+/** Runtime validator for Replica Scope Host Presence inventory responses. */
+export const hostPresenceInventorySchema: z.ZodType<HostPresenceInventory> = z.object({
+  replicaId: z.string().min(1),
+  scope: z.literal(replicaPresenceScope),
+  sessions: z.array(z.unknown()),
+});
+
 /**
  * Durable association between an external client conversation and one Tether
  * session.
@@ -332,6 +369,7 @@ export const webSocketOperation = {
   commandResult: "command.result",
   error: "error",
   event: "event",
+  presence: "presence",
   publish: "publish",
   replayComplete: "replay.complete",
   taskCancel: "task.cancel",

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type pg from "pg";
 
 import { Effect, Fiber } from "effect";
@@ -10,6 +11,8 @@ import {
 } from "./db.js";
 import { sleepUnrefEffect } from "./effect-runtime.js";
 import type { SubscriptionHub } from "./hub.js";
+import { ModuleObservability } from "./observability.js";
+import type { ModuleObservabilityOptions } from "./observability.js";
 import type { SessionServiceDebugInfo } from "./session-service.js";
 import type { SessionEvent } from "./types.js";
 
@@ -37,6 +40,8 @@ export interface SessionEventFanoutDebugInfo {
   readonly broadcastCount: number;
   readonly catchUpBatchCount: number;
   readonly catchUpEventCount: number;
+  readonly catchUpFailureCount: number;
+  readonly catchUpRecoveryCount: number;
   readonly catchUpPollCount: number;
   readonly catchUpPollIntervalMs: number;
   readonly connected: boolean;
@@ -49,11 +54,23 @@ export interface SessionEventFanoutDebugInfo {
   readonly lastReconnectDelayMs: number | null;
   readonly listenerErrorCount: number;
   readonly listenerState: SessionEventFanoutListenerState;
+  readonly lastCatchUpOutcome: SessionEventFanoutCatchUpOutcome;
   readonly notificationCount: number;
   readonly reconnectAttemptCount: number;
   readonly reconnectSuccessCount: number;
   readonly sessionCursorCount: number;
   readonly scheduled: boolean;
+  readonly sessionLag: readonly SessionEventFanoutSessionLagInfo[];
+}
+
+/** Bounded outcome values for catch-up diagnostics and readiness. */
+export type SessionEventFanoutCatchUpOutcome = "caught_up" | "events_pending" | "failed" | "idle";
+
+/** Per-session durable catch-up lag without exposing raw session identifiers. */
+export interface SessionEventFanoutSessionLagInfo {
+  readonly lagAgeMs: number;
+  readonly outcome: SessionEventFanoutCatchUpOutcome;
+  readonly sessionHash: string;
 }
 
 /**
@@ -65,9 +82,18 @@ interface SessionEventFanoutOptions {
   readonly database: DatabasePool;
   readonly hub: SubscriptionHub;
   readonly listenEnabled?: boolean;
+  readonly now?: () => number;
+  readonly observability?: Omit<ModuleObservabilityOptions, "moduleName">;
   readonly reconnectBaseDelayMs?: number;
   readonly reconnectMaxDelayMs?: number;
   readonly service: SessionEventFanoutSessionService;
+}
+
+interface SessionCatchUpState {
+  lagStartedAt: number | null;
+  outcome: SessionEventFanoutCatchUpOutcome;
+  recoveringFromFailure: boolean;
+  sessionHash: string;
 }
 
 /**
@@ -89,6 +115,7 @@ export interface SessionEventFanoutSessionService {
  * LISTEN/NOTIFY.
  */
 export const defaultEventFanoutCatchUpPollMs = 1_000;
+export const defaultEventFanoutCatchUpStaleMs = 30_000;
 export const defaultEventFanoutBatchLimit = 500;
 const defaultListenerReconnectBaseDelayMs = 100;
 const defaultListenerReconnectMaxDelayMs = 5_000;
@@ -101,7 +128,9 @@ export class SessionEventFanout {
   private broadcastCount = 0;
   private catchUpBatchCount = 0;
   private catchUpEventCount = 0;
+  private catchUpFailureCount = 0;
   private catchUpPollCount = 0;
+  private catchUpRecoveryCount = 0;
   private readonly catchUpPollIntervalMs: number;
   private readonly eventBatchLimit: number;
   private client: pg.PoolClient | null = null;
@@ -120,6 +149,11 @@ export class SessionEventFanout {
   private ignoredSelfNotificationCount = 0;
   private invalidNotificationCount = 0;
   private notificationCount = 0;
+  private readonly now: () => number;
+  private readonly observability: ModuleObservability;
+  private nextRoundStartIndex = 0;
+  private lastCatchUpOutcome: SessionEventFanoutCatchUpOutcome = "idle";
+  private readonly sessionCatchUp = new Map<string, SessionCatchUpState>();
   private runningCatchUp: Promise<void> | null = null;
   private processing: Promise<void> = Promise.resolve();
   private catchUpFiber: Fiber.RuntimeFiber<void, never> | null = null;
@@ -132,6 +166,11 @@ export class SessionEventFanout {
   constructor(private readonly options: SessionEventFanoutOptions) {
     this.catchUpPollIntervalMs = options.catchUpPollIntervalMs ?? defaultEventFanoutCatchUpPollMs;
     this.eventBatchLimit = options.eventBatchLimit ?? defaultEventFanoutBatchLimit;
+    this.now = options.now ?? Date.now;
+    this.observability = new ModuleObservability({
+      ...options.observability,
+      moduleName: "SessionEventFanout",
+    });
     this.reconnectBaseDelayMs = options.reconnectBaseDelayMs ?? defaultListenerReconnectBaseDelayMs;
     this.reconnectMaxDelayMs = options.reconnectMaxDelayMs ?? defaultListenerReconnectMaxDelayMs;
   }
@@ -144,8 +183,10 @@ export class SessionEventFanout {
       broadcastCount: this.broadcastCount,
       catchUpBatchCount: this.catchUpBatchCount,
       catchUpEventCount: this.catchUpEventCount,
+      catchUpFailureCount: this.catchUpFailureCount,
       catchUpPollCount: this.catchUpPollCount,
       catchUpPollIntervalMs: this.catchUpPollIntervalMs,
+      catchUpRecoveryCount: this.catchUpRecoveryCount,
       connected: this.listenerState === sessionEventFanoutListenerState.connected,
       fanoutCursorSessionCount: 0,
       ignoredSelfNotificationCount: this.ignoredSelfNotificationCount,
@@ -156,11 +197,13 @@ export class SessionEventFanout {
       lastReconnectDelayMs: this.lastReconnectDelayMs,
       listenerErrorCount: this.listenerErrorCount,
       listenerState: this.listenerState,
+      lastCatchUpOutcome: this.lastCatchUpOutcome,
       notificationCount: this.notificationCount,
       reconnectAttemptCount: this.reconnectAttemptCount,
       reconnectSuccessCount: this.reconnectSuccessCount,
       sessionCursorCount: this.options.hub.sessionCursors().length,
       scheduled: this.catchUpFiber !== null,
+      sessionLag: this.readSessionLag(),
     };
   }
 
@@ -293,33 +336,121 @@ export class SessionEventFanout {
    * Fetches missed durable events for sessions with local sockets.
    */
   private async catchUp(): Promise<void> {
+    this.catchUpPollCount += 1;
+    const cursors = this.options.hub.sessionCursors();
+    this.synchronizeSessionCatchUpState(cursors.map((cursor) => cursor.sessionId));
+    if (cursors.length === 0) {
+      this.nextRoundStartIndex = 0;
+      this.lastCatchUpOutcome = "idle";
+      return;
+    }
+    const startIndex = this.nextRoundStartIndex % cursors.length;
+    this.nextRoundStartIndex = (startIndex + 1) % cursors.length;
+    const orderedCursors = [...cursors.slice(startIndex), ...cursors.slice(0, startIndex)];
+    for (const cursor of orderedCursors) {
+      if (this.hasLocalSocket(cursor.sessionId)) {
+        await this.catchUpSession(cursor.sessionId, cursor.lastDeliveredSeq);
+      }
+    }
+  }
+
+  /** Processes at most one bounded batch for one subscribed session. */
+  private async catchUpSession(sessionId: string, afterSeq: number): Promise<void> {
+    const state = this.sessionCatchUp.get(sessionId);
+    if (!state) {
+      return;
+    }
+    if (state.lagStartedAt === null) {
+      state.lagStartedAt = this.now();
+    }
+    state.outcome = "events_pending";
+    this.lastCatchUpOutcome = "events_pending";
     try {
-      this.catchUpPollCount += 1;
-      for (const cursor of this.options.hub.sessionCursors()) {
-        let afterSeq = cursor.lastDeliveredSeq;
-        while (this.hasLocalSocket(cursor.sessionId)) {
-          const events = await Effect.runPromise(
-            this.options.service.listEvents(cursor.sessionId, afterSeq, {
+      const events = await this.observability.traceBoundary(
+        "catchUpBatch",
+        {
+          afterSeq,
+          batchLimit: this.eventBatchLimit,
+          replicaId: this.options.service.debugInfo().eventSourceId,
+          sessionHash: state.sessionHash,
+        },
+        () =>
+          Effect.runPromise(
+            this.options.service.listEvents(sessionId, afterSeq, {
               limit: this.eventBatchLimit,
             }),
-          );
-          if (events.length === 0) {
-            break;
-          }
-          this.catchUpBatchCount += 1;
-          this.catchUpEventCount += events.length;
-          for (const event of events) {
-            this.broadcastEvent(event);
-            afterSeq = event.seq;
-          }
-          if (events.length < this.eventBatchLimit) {
-            break;
-          }
+          ),
+        (batch) => ({
+          batchSize: batch.length,
+          outcome: batch.length < this.eventBatchLimit ? "caught_up" : "events_pending",
+          sequenceEnd: batch.at(-1)?.seq ?? afterSeq,
+          sequenceStart: batch[0]?.seq ?? afterSeq,
+        }),
+        () => ({ outcome: "failed" }),
+      );
+      if (events.length > 0) {
+        this.catchUpBatchCount += 1;
+        this.catchUpEventCount += events.length;
+        for (const event of events) {
+          this.broadcastEvent(event);
         }
       }
+      const outcome = events.length < this.eventBatchLimit ? "caught_up" : "events_pending";
+      if (state.recoveringFromFailure) {
+        this.catchUpRecoveryCount += 1;
+        state.recoveringFromFailure = false;
+      }
+      if (outcome === "caught_up") {
+        state.lagStartedAt = null;
+      }
+      state.outcome = outcome;
+      this.lastCatchUpOutcome = outcome;
     } catch (error) {
+      this.catchUpFailureCount += 1;
+      if (state.lagStartedAt === null) {
+        state.lagStartedAt = this.now();
+      }
+      state.outcome = "failed";
+      state.recoveringFromFailure = true;
+      this.lastCatchUpOutcome = "failed";
       console.error(error);
     }
+  }
+
+  /** Keeps lag state aligned with the current local subscription set. */
+  private synchronizeSessionCatchUpState(sessionIds: readonly string[]): void {
+    const subscribed = new Set(sessionIds);
+    for (const sessionId of this.sessionCatchUp.keys()) {
+      if (!subscribed.has(sessionId)) {
+        this.sessionCatchUp.delete(sessionId);
+      }
+    }
+    for (const sessionId of sessionIds) {
+      if (!this.sessionCatchUp.has(sessionId)) {
+        this.sessionCatchUp.set(sessionId, {
+          lagStartedAt: null,
+          outcome: "idle",
+          recoveringFromFailure: false,
+          sessionHash: hashSessionId(sessionId),
+        });
+      }
+    }
+  }
+
+  /** Projects bounded, payload-free per-session lag diagnostics. */
+  private readSessionLag(): readonly SessionEventFanoutSessionLagInfo[] {
+    this.synchronizeSessionCatchUpState(
+      this.options.hub.sessionCursors().map((cursor) => cursor.sessionId),
+    );
+    const now = this.now();
+    return [...this.sessionCatchUp.values()].map((state) => ({
+      lagAgeMs:
+        state.lagStartedAt === null
+          ? 0
+          : Math.min(Math.max(0, now - state.lagStartedAt), Number.MAX_SAFE_INTEGER),
+      outcome: state.outcome,
+      sessionHash: state.sessionHash,
+    }));
   }
 
   /**
@@ -469,6 +600,11 @@ export class SessionEventFanout {
     clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
   }
+}
+
+/** Hashes a session identifier for correlation without exposing its raw value. */
+function hashSessionId(sessionId: string): string {
+  return createHash("sha256").update(sessionId).digest("hex").slice(0, 16);
 }
 
 /** Converts unknown listener failures into stable diagnostics. */

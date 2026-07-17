@@ -9,6 +9,7 @@ import {
   effectiveParticipantId,
 } from "./auth/authorize.js";
 import type { AuthContext } from "./auth/token.js";
+import type { RuntimeTopology } from "./config.js";
 import {
   findProjectedSession,
   type HostPresenceRuntime,
@@ -43,12 +44,14 @@ import type { SessionEvent } from "./types.js";
 
 interface SessionHttpRouteHandlerInput {
   readonly authContext: AuthContext | null;
+  readonly hostPresence: HostPresenceRuntime;
   readonly hub: SubscriptionHub;
+  readonly replicaId: string;
   readonly request: IncomingMessage;
   readonly resourceLimits: ResourceLimits;
   readonly response: ServerResponse;
+  readonly runtimeTopology: RuntimeTopology;
   readonly service: SessionServiceEffect;
-  readonly hostPresence: HostPresenceRuntime;
   readonly url: URL;
 }
 
@@ -167,8 +170,9 @@ export function handleSessionHttpRoute(
         sessions.map((session) => session.sessionId),
       );
       sendJson(response, 200, {
-        sessions: projectSessionInventory({
+        ...projectSessionInventory({
           eventsBySession,
+          replicaId: input.replicaId,
           runtime: input.hostPresence,
           sessions,
         }),
@@ -192,6 +196,14 @@ export function handleSessionHttpRoute(
     const route = matchSessionResourceRoute(request.method, url.pathname);
     if (route?.resource === "delete") {
       if (!authorizeRoute(input, "session-create", route.sessionId)) {
+        return true;
+      }
+      if (input.runtimeTopology === "multi") {
+        sendJson(response, 409, {
+          detail: "permanent delete requires cluster-complete Host Presence",
+          ok: false,
+          reason: "presence_scope_insufficient",
+        });
         return true;
       }
       const sessions = yield* service.listSessions();

@@ -32,6 +32,7 @@ import {
   wsTaskRefreshMessageSchema,
   wsTaskReleaseMessageSchema,
 } from "./protocol.js";
+import type { LiveHostPresence, WebSocketPresenceEnvelope } from "./protocol.js";
 import {
   createWebSocketMessageRateLimiter,
   resourceLimitReason,
@@ -48,18 +49,19 @@ import type {
 import {
   classifyHostPresenceStream,
   type HostPresenceRuntime,
-  type LiveHostPresence,
   type HostPresenceStreamKind,
+  projectWebSocketPresenceEnvelope,
 } from "./host-presence.js";
 import { findClientWebSocketCommandSpec } from "./websocket-command-spec.js";
 
 interface ParticipantWebSocketGatewayInput {
   readonly auth: AuthRuntime;
+  readonly hostPresence: HostPresenceRuntime;
   readonly hub: SubscriptionHub;
+  readonly replicaId: string;
   readonly resourceLimitRuntime: ResourceLimitRuntime;
   readonly server: Server;
   readonly service: SessionServiceEffect;
-  readonly hostPresence: HostPresenceRuntime;
 }
 
 interface WebSocketControlLeaseRefreshInput {
@@ -94,14 +96,15 @@ interface WebSocketCommandContext {
 }
 
 interface HostPresenceWebSocketInput {
+  readonly hostPresence: HostPresenceRuntime;
   readonly hub: SubscriptionHub;
+  readonly replicaId: string;
   readonly resourceLimitRuntime: ResourceLimitRuntime;
   readonly searchParams: URLSearchParams;
   readonly service: SessionServiceEffect;
   readonly sessionId: string;
   readonly socket: WebSocket;
   readonly streamKind: HostPresenceStreamKind;
-  readonly hostPresence: HostPresenceRuntime;
 }
 
 /**
@@ -187,11 +190,12 @@ export function createParticipantWebSocketGateway(
       auth: input.auth,
       controlSocketRegistry,
       hub: input.hub,
+      hostPresence: input.hostPresence,
+      replicaId: input.replicaId,
       resourceLimitRuntime: input.resourceLimitRuntime,
       request,
       service: input.service,
       socket,
-      hostPresence: input.hostPresence,
       wsServer,
     });
   });
@@ -207,12 +211,13 @@ interface ParticipantWebSocketUpgradeInput {
   readonly auth: AuthRuntime;
   readonly controlSocketRegistry: ControlSocketRegistry;
   readonly head: Buffer;
+  readonly hostPresence: HostPresenceRuntime;
   readonly hub: SubscriptionHub;
+  readonly replicaId: string;
   readonly resourceLimitRuntime: ResourceLimitRuntime;
   readonly request: IncomingMessage;
   readonly service: SessionServiceEffect;
   readonly socket: Duplex;
-  readonly hostPresence: HostPresenceRuntime;
   readonly wsServer: WebSocketServer;
 }
 
@@ -249,6 +254,7 @@ function handleParticipantWebSocketUpgrade(input: ParticipantWebSocketUpgradeInp
         input.service,
         input.hub,
         input.resourceLimitRuntime,
+        input.replicaId,
         authContext,
         sessionId,
         url.searchParams,
@@ -268,6 +274,7 @@ function handleWebSocket(
   service: SessionServiceEffect,
   hub: SubscriptionHub,
   resourceLimitRuntime: ResourceLimitRuntime,
+  replicaId: string,
   authContext: AuthContext | null,
   sessionId: string,
   searchParams: URLSearchParams,
@@ -291,13 +298,14 @@ function handleWebSocket(
     if (hostPresenceStream) {
       yield* handleHostPresenceWebSocket({
         hub,
+        hostPresence,
+        replicaId,
         resourceLimitRuntime,
         searchParams,
         service,
         sessionId,
         socket,
         streamKind: hostPresenceStream,
-        hostPresence,
       });
       return;
     }
@@ -445,7 +453,14 @@ function handleHostPresenceWebSocket(
     const deliversPresence = input.streamKind !== "observer";
     const host = input.streamKind === "host" ? hostFromSearchParams(input.searchParams) : null;
     const sendPresence = (): void => {
-      safeSendPresenceEnvelope(input.socket, input.hostPresence.hosts(input.sessionId));
+      safeSendPresenceEnvelope(
+        input.socket,
+        projectWebSocketPresenceEnvelope({
+          replicaId: input.replicaId,
+          runtime: input.hostPresence,
+          sessionId: input.sessionId,
+        }),
+      );
     };
     const unsubscribePresence = deliversPresence
       ? input.hostPresence.subscribePresence(input.sessionId, sendPresence)
@@ -1262,12 +1277,12 @@ function safeSendWebSocketEnvelope(
 }
 
 /** Sends a Host-presence process-local presence frame. */
-function safeSendPresenceEnvelope(socket: WebSocket, hosts: readonly LiveHostPresence[]): void {
+function safeSendPresenceEnvelope(socket: WebSocket, envelope: WebSocketPresenceEnvelope): void {
   if (socket.readyState !== socket.OPEN) {
     return;
   }
   try {
-    socket.send(JSON.stringify({ hosts, op: "presence" }));
+    socket.send(JSON.stringify(envelope));
   } catch (error) {
     console.error(error);
   }
