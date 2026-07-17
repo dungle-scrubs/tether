@@ -1,11 +1,13 @@
 import { createServer } from "node:net";
 
 import { Effect } from "effect";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 
 import type { DatabasePool } from "../src/db.js";
+import { HostPresenceRuntime, projectSessionInventory } from "../src/host-presence.js";
 import { createAppServerWithSessionService, type AppServer } from "../src/http.js";
+import { hostPresenceInventorySchema } from "../src/protocol.js";
 import type { SessionEvent } from "../src/types.js";
 import type {
   SessionServiceDebugInfo,
@@ -18,6 +20,122 @@ describe("HTTP app server error boundary", () => {
   afterEach(async () => {
     const apps = openApps.splice(0);
     await Promise.all(apps.map((app) => app.close()));
+  });
+
+  it("exposes runtime topology and the service event source as replica identity", () => {
+    const app = createAppServerWithSessionService(
+      createUnusedDatabasePool(),
+      createReplayInterleavingSessionService(createDeferred(), createDeferred()),
+      { runtimeTopology: "multi" },
+    );
+
+    expect(app.debugInfo()).toMatchObject({
+      replicaId: "test-replay-interleaving",
+      runtimeTopology: "multi",
+    });
+  });
+
+  it("projects HTTP session inventory with mandatory Replica Scope metadata", () => {
+    const inventory = projectSessionInventory({
+      eventsBySession: new Map(),
+      replicaId: "replica_http_1",
+      runtime: new HostPresenceRuntime(),
+      sessions: [],
+    });
+
+    expect(hostPresenceInventorySchema.parse(inventory)).toEqual({
+      replicaId: "replica_http_1",
+      scope: "replica",
+      sessions: [],
+    });
+  });
+
+  it("rejects multi-topology permanent delete before consulting local presence state", async () => {
+    const listSessions = vi.fn(() => Effect.die(new Error("local presence consulted")));
+    const app = createAppServerWithSessionService(
+      createUnusedDatabasePool(),
+      createPermanentDeleteSessionService(listSessions),
+      {
+        auth: { activeKid: "disabled", mode: "disabled", secrets: {} },
+        eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+        runtimeTopology: "multi",
+        taskClaimSweeper: { intervalMs: 0 },
+      },
+    );
+    openApps.push(app);
+    const port = await findOpenPort();
+    await app.listen(port);
+
+    const response = await fetch(`http://127.0.0.1:${port}/sessions/sess_remote_host/delete`, {
+      method: "POST",
+    });
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      detail: "permanent delete requires cluster-complete Host Presence",
+      ok: false,
+      reason: "presence_scope_insufficient",
+    });
+    expect(listSessions).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "multi",
+    "single",
+  ] as const)("keeps %s-topology inventory readable and replica-scoped", async (runtimeTopology) => {
+    const app = createAppServerWithSessionService(
+      createUnusedDatabasePool(),
+      createPermanentDeleteSessionService(() => Effect.succeed([])),
+      {
+        auth: { activeKid: "disabled", mode: "disabled", secrets: {} },
+        eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+        runtimeTopology,
+        taskClaimSweeper: { intervalMs: 0 },
+      },
+    );
+    openApps.push(app);
+    const port = await findOpenPort();
+    await app.listen(port);
+
+    const response = await fetch(`http://127.0.0.1:${port}/sessions`);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      replicaId: "test-permanent-delete",
+      scope: "replica",
+      sessions: [],
+    });
+  });
+
+  it("serves readiness without authentication while keeping health as independent liveness", async () => {
+    const app = createAppServerWithSessionService(
+      {
+        pool: { query: () => Promise.resolve({ rows: [] }) },
+      } as unknown as DatabasePool,
+      createPermanentDeleteSessionService(() => Effect.succeed([])),
+      {
+        auth: { activeKid: "test", mode: "required", secrets: { test: "secret" } },
+        eventFanout: { catchUpPollIntervalMs: 10, listenEnabled: false },
+        runtimeTopology: "multi",
+        taskClaimSweeper: { intervalMs: 0 },
+      },
+    );
+    openApps.push(app);
+    const port = await findOpenPort();
+    await app.listen(port);
+
+    const readiness = await fetch(`http://127.0.0.1:${port}/ready`);
+    const health = await fetch(`http://127.0.0.1:${port}/health`);
+    const protectedSessions = await fetch(`http://127.0.0.1:${port}/sessions`);
+
+    expect(readiness.status).toBe(200);
+    expect(await readiness.json()).toEqual({
+      ready: true,
+      replicaId: "test-permanent-delete",
+      runtimeTopology: "multi",
+    });
+    expect(health.status).toBe(200);
+    expect(protectedSessions.status).toBe(401);
   });
 
   it("redacts service failures that travel through the app-server catch boundary", async () => {
@@ -183,6 +301,21 @@ function createReplayInterleavingSessionService(
         ],
         status: "created",
       }),
+  } as unknown as SessionServiceEffect;
+}
+
+/** Builds the minimal service surface used by topology-gated delete tests. */
+function createPermanentDeleteSessionService(
+  listSessions: SessionServiceEffect["listSessions"],
+): SessionServiceEffect {
+  return {
+    debugInfo: () => ({
+      ...createSessionServiceDebugInfo(),
+      eventSourceId: "test-permanent-delete",
+    }),
+    expireTaskClaims: () => Effect.succeed({ events: [], expiredCount: 0 }),
+    listEvents: () => Effect.succeed([]),
+    listSessions,
   } as unknown as SessionServiceEffect;
 }
 

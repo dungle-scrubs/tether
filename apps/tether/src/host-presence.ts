@@ -1,3 +1,13 @@
+import {
+  buildWebSocketPresenceEnvelope,
+  replicaPresenceScope,
+} from "@dungle-scrubs/tether-protocol";
+import type {
+  HostPresenceInventory,
+  LiveHostPresence,
+  WebSocketPresenceEnvelope,
+} from "@dungle-scrubs/tether-protocol";
+
 import type { SessionEvent, SessionLineage, SessionListItem, TangentAnchor } from "./types.js";
 
 /**
@@ -8,13 +18,6 @@ import type { SessionEvent, SessionLineage, SessionListItem, TangentAnchor } fro
 
 export type HostPresenceState = "live" | "none" | "stale";
 export type HostSessionActivity = "idle" | "queued" | "running" | "settled";
-
-/** Live host metadata emitted in Host-presence presence frames. */
-export interface LiveHostPresence {
-  readonly displayName: string;
-  readonly instanceId: string;
-  readonly participantId: string;
-}
 
 /** Process-local diagnostics for Host-presence stream classification. */
 export interface HostPresenceDebugInfo {
@@ -118,16 +121,33 @@ export class HostPresenceRuntime {
 /** Projects Tether operator inventory into the Host-presence superset. */
 export function projectSessionInventory(input: {
   readonly eventsBySession: ReadonlyMap<string, readonly SessionEvent[]>;
+  readonly replicaId: string;
   readonly runtime: HostPresenceRuntime;
   readonly sessions: readonly SessionListItem[];
-}): readonly SessionListItem[] {
-  return input.sessions.map((session) =>
-    projectSession({
-      events: input.eventsBySession.get(session.sessionId) ?? [],
-      liveHosts: input.runtime.hosts(session.sessionId),
-      session,
-    }),
-  );
+}): HostPresenceInventory<SessionListItem> {
+  return {
+    replicaId: input.replicaId,
+    scope: replicaPresenceScope,
+    sessions: input.sessions.map((session) =>
+      projectSession({
+        events: input.eventsBySession.get(session.sessionId) ?? [],
+        liveHosts: input.runtime.hosts(session.sessionId),
+        session,
+      }),
+    ),
+  };
+}
+
+/** Projects local host state into the protocol-owned WebSocket envelope. */
+export function projectWebSocketPresenceEnvelope(input: {
+  readonly replicaId: string;
+  readonly runtime: HostPresenceRuntime;
+  readonly sessionId: string;
+}): WebSocketPresenceEnvelope {
+  return buildWebSocketPresenceEnvelope({
+    hosts: input.runtime.hosts(input.sessionId),
+    replicaId: input.replicaId,
+  });
 }
 
 /** Finds one projected session summary by id for delete eligibility checks. */

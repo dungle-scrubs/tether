@@ -1,8 +1,46 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 
-import { webSocketErrorEnvelopeSchema } from "../src/index.js";
+import {
+  parseWebSocketServerEnvelope,
+  serializePresenceEnvelope,
+  webSocketErrorEnvelopeSchema,
+  webSocketPresenceEnvelopeSchema,
+} from "../src/index.js";
 
 describe("WebSocket error envelopes", () => {
+  it("serializes and parses Replica Scope Host Presence envelopes", () => {
+    const envelope = parseWebSocketServerEnvelope(
+      JSON.parse(
+        serializePresenceEnvelope({
+          hosts: [
+            {
+              displayName: "Host One",
+              instanceId: "inst_1",
+              participantId: "part_1",
+            },
+          ],
+          replicaId: "replica_opaque_1",
+        }),
+      ) as unknown,
+    );
+
+    expect(envelope).toEqual({
+      hosts: [
+        {
+          displayName: "Host One",
+          instanceId: "inst_1",
+          participantId: "part_1",
+        },
+      ],
+      op: "presence",
+      replicaId: "replica_opaque_1",
+      scope: "replica",
+    });
+    expect(webSocketPresenceEnvelopeSchema.safeParse({ hosts: [], op: "presence" }).success).toBe(
+      false,
+    );
+  });
+
   it("preserves replay_window_exceeded as a typed safe reason", () => {
     const envelope = webSocketErrorEnvelopeSchema.parse({
       error: "Replay window exceeded",

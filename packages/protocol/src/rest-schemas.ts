@@ -3,6 +3,33 @@ import { z } from "zod";
 import { sessionEventSchema } from "./event-builders.js";
 import { controlChannelSchema, participantRuntimeKindSchema } from "./records.js";
 
+/** Bounded readiness failure reasons safe for unauthenticated responses. */
+export const readinessFailureReason = {
+  databaseUnavailable: "database_unavailable",
+  fanoutCatchUpStale: "fanout_catchup_stale",
+} as const;
+
+/** Protocol-owned readiness response schema. */
+export const readinessResponseSchema = z.discriminatedUnion("ready", [
+  z.object({
+    ready: z.literal(true),
+    replicaId: z.string().min(1),
+    runtimeTopology: z.union([z.literal("single"), z.literal("multi")]),
+  }),
+  z.object({
+    ready: z.literal(false),
+    reason: z.union([
+      z.literal(readinessFailureReason.databaseUnavailable),
+      z.literal(readinessFailureReason.fanoutCatchUpStale),
+    ]),
+    replicaId: z.string().min(1),
+    runtimeTopology: z.union([z.literal("single"), z.literal("multi")]),
+  }),
+]);
+
+/** Parsed bounded readiness response. */
+export type ReadinessResponse = z.infer<typeof readinessResponseSchema>;
+
 /**
  * Server-issued Control Epoch carried by control-protected REST requests. It is
  * a positive safe integer; the server validates it against the current durable

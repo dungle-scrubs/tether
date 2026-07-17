@@ -64,6 +64,8 @@ autonomy, and composability where one agent's output is another's input.
 - [REST Control Epoch migration](apps/tether/docs/rest-control-migration.md):
   deployment order, direct lifecycle examples, bridge upgrade, rollback
   constraints, and compatibility diagnostics.
+- [Multi-replica runtime contract](apps/tether/docs/multi-replica-runtime.md):
+  durable guarantees, Replica Scope limits, readiness, and the support matrix.
 - `packages/protocol`: shared protocol records, validators, and event builders.
 - `packages/client`: participant runtime client for REST and WebSocket
   integration.

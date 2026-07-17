@@ -43,6 +43,12 @@ and role they need.
   participant control leases when a participant identity is supplied.
 - Host-presence streams use `runtimeKind=host` and `runtimeKind=viewer` for
   passive, process-local presence without durable participant rows.
+- `RUNTIME_TOPOLOGY` is required and accepts only `single` or `multi`.
+  Host-presence HTTP inventories and WebSocket frames always identify their
+  process-local boundary with `scope: "replica"` and the serving `replicaId`.
+  They are not cluster-complete inventories in multi-replica deployments.
+- See the [multi-replica runtime contract](docs/multi-replica-runtime.md) for
+  supported durable guarantees, readiness behavior, and process-local limits.
 - Client binding APIs let provider-neutral bridges bind external conversations
   to durable Tether sessions.
 

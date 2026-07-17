@@ -14,6 +14,7 @@ import {
 } from "./auth/enforcement.js";
 import type { AuthContext } from "./auth/token.js";
 import { ServerConfigService } from "./config.js";
+import type { RuntimeTopology } from "./config.js";
 import { type DatabasePool, DatabaseService } from "./db.js";
 import { HostPresenceRuntime } from "./host-presence.js";
 import { handleClientBindingHttpRoute } from "./http-client-binding-route-handlers.js";
@@ -41,8 +42,13 @@ import {
   ResourceLimitRuntime,
   type ResourceLimits,
 } from "./resource-limits.js";
+import { projectReadiness, type ReadinessProjection } from "./readiness.js";
 import type { RestControlPolicyDebugInfo } from "./rest-control-policy.js";
-import { SessionEventFanout, type SessionEventFanoutDebugInfo } from "./session-event-fanout.js";
+import {
+  defaultEventFanoutCatchUpStaleMs,
+  SessionEventFanout,
+  type SessionEventFanoutDebugInfo,
+} from "./session-event-fanout.js";
 import {
   createSessionServiceEffect,
   type SessionServiceDebugInfo,
@@ -85,16 +91,20 @@ export interface AppServerDebugInfo {
   readonly auth: AuthRuntimeDebugInfo;
   /** Cross-replica event fanout listener and catch-up diagnostics. */
   readonly eventFanout: SessionEventFanoutDebugInfo;
+  /** Process-local Host-presence stream diagnostics. */
+  readonly hostPresence: ReturnType<HostPresenceRuntime["debugInfo"]>;
   /** Local WebSocket subscription hub diagnostics. */
   readonly hub: SubscriptionHubDebugInfo;
+  /** Opaque app-lifetime identity reused from the session service event source. */
+  readonly replicaId: string;
   /** Process-local resource limit configuration and hit counters. */
   readonly resourceLimits: ResourceLimitDebugInfo;
+  /** Explicit deployment topology used for Replica Scope safety decisions. */
+  readonly runtimeTopology: RuntimeTopology;
   /** Durable session service boundary diagnostics and configured TTLs. */
   readonly service: SessionServiceDebugInfo;
   /** Task claim expiration scheduler diagnostics. */
   readonly taskClaimSweeper: TaskClaimSweeperDebugInfo;
-  /** Process-local Host-presence stream diagnostics. */
-  readonly hostPresence: ReturnType<HostPresenceRuntime["debugInfo"]>;
 }
 
 /**
@@ -114,6 +124,12 @@ export interface AppServerOptions {
   readonly httpRouteErrors?: HttpRouteErrorOptions;
   /** Process-local resource limits for transports, replay, fanout, and hub sends. */
   readonly resourceLimits?: ResourceLimits;
+  /** Process readiness thresholds. */
+  readonly readiness?: {
+    readonly fanoutStaleAfterMs?: number;
+  };
+  /** Declared deployment topology; direct programmatic construction defaults to single. */
+  readonly runtimeTopology?: RuntimeTopology;
   /** Structured logger for one compatibility-mode startup warning. */
   readonly restControlLogger?: {
     readonly warn: (
@@ -150,6 +166,8 @@ export const AppServerLive = Layer.scoped(
         catchUpPollIntervalMs: config.eventFanoutCatchUpPollMs,
       },
       resourceLimits: config.resourceLimits,
+      readiness: { fanoutStaleAfterMs: config.eventFanoutCatchUpStaleMs },
+      runtimeTopology: config.runtimeTopology,
       taskClaimSweeper: {
         batchSize: config.taskClaimSweepBatchSize,
         intervalMs: config.taskClaimSweepMs,
@@ -172,6 +190,7 @@ export const AppServerLive = Layer.scoped(
 );
 
 type ReadAppServerDebugInfo = () => AppServerDebugInfo;
+type ReadAppReadiness = () => Promise<ReadinessProjection>;
 
 /**
  * Creates the HTTP and WebSocket server boundary around the durable session
@@ -203,6 +222,10 @@ export function createAppServerWithSessionService(
   });
   const corsOptions = options.cors ?? readCorsOptionsFromEnv();
   const hostPresence = new HostPresenceRuntime();
+  const replicaId = service.debugInfo().eventSourceId;
+  const runtimeTopology = options.runtimeTopology ?? "single";
+  const fanoutStaleAfterMs =
+    options.readiness?.fanoutStaleAfterMs ?? defaultEventFanoutCatchUpStaleMs;
   const eventFanout = new SessionEventFanout({
     ...(options.eventFanout ?? {}),
     database: pool,
@@ -228,12 +251,22 @@ export function createAppServerWithSessionService(
   const readDebugInfo = (): AppServerDebugInfo => ({
     auth: auth.debugInfo(),
     eventFanout: eventFanout.debugInfo(),
+    hostPresence: hostPresence.debugInfo(),
     hub: hub.debugInfo(),
+    replicaId,
     resourceLimits: resourceLimitRuntime.debugInfo(),
+    runtimeTopology,
     service: service.debugInfo(),
     taskClaimSweeper: taskClaimSweeper.debugInfo(),
-    hostPresence: hostPresence.debugInfo(),
   });
+  const readReadiness: ReadAppReadiness = () =>
+    projectReadiness({
+      database: pool,
+      fanout: eventFanout,
+      fanoutStaleAfterMs,
+      replicaId,
+      runtimeTopology,
+    });
   if (service.debugInfo().restControl?.mode === "compatibility") {
     (options.restControlLogger ?? defaultRestControlLogger).warn(
       "rest_control.compatibility_enabled",
@@ -253,8 +286,11 @@ export function createAppServerWithSessionService(
           auth,
           resourceLimitRuntime,
           readDebugInfo,
+          readReadiness,
           corsOptions,
           hostPresence,
+          replicaId,
+          runtimeTopology,
           request,
           response,
           options.httpRouteErrors,
@@ -264,11 +300,12 @@ export function createAppServerWithSessionService(
   );
   const wsServer = createParticipantWebSocketGateway({
     auth,
+    hostPresence,
     hub,
+    replicaId,
     resourceLimitRuntime,
     server,
     service,
-    hostPresence,
   });
 
   return {
@@ -323,8 +360,11 @@ function handleHttp(
   auth: AuthRuntime,
   resourceLimitRuntime: ResourceLimitRuntime,
   readAppServerDebugInfo: ReadAppServerDebugInfo,
+  readAppReadiness: ReadAppReadiness,
   corsOptions: CorsOptions,
   hostPresence: HostPresenceRuntime,
+  replicaId: string,
+  runtimeTopology: RuntimeTopology,
   request: IncomingMessage,
   response: ServerResponse,
   errorOptions: HttpRouteErrorOptions = {},
@@ -335,8 +375,11 @@ function handleHttp(
     auth,
     resourceLimitRuntime,
     readAppServerDebugInfo,
+    readAppReadiness,
     corsOptions,
     hostPresence,
+    replicaId,
+    runtimeTopology,
     request,
     response,
   ).pipe(
@@ -361,8 +404,11 @@ function handleHttpRequest(
   auth: AuthRuntime,
   resourceLimitRuntime: ResourceLimitRuntime,
   readAppServerDebugInfo: ReadAppServerDebugInfo,
+  readAppReadiness: ReadAppReadiness,
   corsOptions: CorsOptions,
   hostPresence: HostPresenceRuntime,
+  replicaId: string,
+  runtimeTopology: RuntimeTopology,
   request: IncomingMessage,
   response: ServerResponse,
 ): Effect.Effect<void, unknown> {
@@ -379,6 +425,11 @@ function handleHttpRequest(
     if (matchHttpRoute(directHttpRoutes.health, request.method, url.pathname)) {
       const restControl = readAppServerDebugInfo().service.restControl;
       sendJson(response, 200, projectHealthResponse(restControl));
+      return;
+    }
+    if (matchHttpRoute(directHttpRoutes.readiness, request.method, url.pathname)) {
+      const readiness = yield* Effect.promise(readAppReadiness);
+      sendJson(response, readiness.status, { ...readiness.body });
       return;
     }
     const authContext = authenticateHttpRequest(auth, request, response, url);
@@ -430,11 +481,13 @@ function handleHttpRequest(
       yield* handleSessionHttpRoute({
         authContext,
         hub,
+        hostPresence,
+        replicaId,
         request,
         resourceLimits: resourceLimitRuntime.limits,
         response,
+        runtimeTopology,
         service,
-        hostPresence,
         url,
       })
     ) {

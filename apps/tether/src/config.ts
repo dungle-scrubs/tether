@@ -5,15 +5,20 @@ import {
   parsePositiveResourceLimit,
   type ResourceLimits,
 } from "./resource-limits.js";
-import { defaultEventFanoutCatchUpPollMs } from "./session-event-fanout.js";
+import {
+  defaultEventFanoutCatchUpPollMs,
+  defaultEventFanoutCatchUpStaleMs,
+} from "./session-event-fanout.js";
 import { defaultTaskClaimSweepBatchSize, defaultTaskClaimSweepMs } from "./task-claim-sweeper.js";
 
 const defaultDatabasePoolMax = 10;
 const defaultPort = 3025;
 const defaultAuthMode = "required";
 const defaultAuthSigningKid = "default";
+const runtimeTopologyConfigError = "RUNTIME_TOPOLOGY must be single or multi";
 
 export type AuthMode = "disabled" | "required";
+export type RuntimeTopology = "multi" | "single";
 
 export interface ServerConfig {
   /** Additional accepted verification secrets keyed by signing key id. */
@@ -34,8 +39,11 @@ export interface ServerConfig {
   readonly databasePoolMax: number;
   readonly databaseUrl: string;
   readonly eventFanoutCatchUpPollMs: number;
+  readonly eventFanoutCatchUpStaleMs: number;
   readonly port: number;
   readonly resourceLimits: ResourceLimits;
+  /** Declared deployment topology used for replica-scope safety policy. */
+  readonly runtimeTopology: RuntimeTopology;
   readonly taskClaimSweepBatchSize: number;
   readonly taskClaimSweepMs: number;
 }
@@ -78,6 +86,10 @@ export const serverConfigDescriptor = Config.all({
     "EVENT_FANOUT_CATCH_UP_MS",
     defaultEventFanoutCatchUpPollMs,
   ),
+  eventFanoutCatchUpStaleMs: positiveIntegerConfig(
+    "EVENT_FANOUT_CATCH_UP_STALE_MS",
+    defaultEventFanoutCatchUpStaleMs,
+  ),
   port: Config.integer("PORT").pipe(Config.orElse(() => Config.succeed(defaultPort))),
   resourceLimits: Config.all({
     eventFanoutBatchLimit: positiveIntegerConfig(
@@ -117,6 +129,10 @@ export const serverConfigDescriptor = Config.all({
       defaultResourceLimits.wsReplayMaxEvents,
     ),
   }),
+  runtimeTopology: Config.string("RUNTIME_TOPOLOGY").pipe(
+    Config.orElse(() => Config.succeed("")),
+    Config.mapAttempt(parseRequiredRuntimeTopology),
+  ),
   taskClaimSweepBatchSize: positiveIntegerConfig(
     "TASK_CLAIM_SWEEP_BATCH_SIZE",
     defaultTaskClaimSweepBatchSize,
@@ -170,6 +186,10 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       env.EVENT_FANOUT_CATCH_UP_MS,
       defaultEventFanoutCatchUpPollMs,
     ),
+    eventFanoutCatchUpStaleMs: parsePositiveInteger(
+      env.EVENT_FANOUT_CATCH_UP_STALE_MS,
+      defaultEventFanoutCatchUpStaleMs,
+    ),
     port: Number.parseInt(env.PORT ?? String(defaultPort), 10),
     resourceLimits: {
       eventFanoutBatchLimit: parsePositiveResourceLimit(
@@ -209,6 +229,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
         defaultResourceLimits.wsReplayMaxEvents,
       ),
     },
+    runtimeTopology: parseRequiredRuntimeTopology(env.RUNTIME_TOPOLOGY),
     taskClaimSweepBatchSize: parsePositiveInteger(
       env.TASK_CLAIM_SWEEP_BATCH_SIZE,
       defaultTaskClaimSweepBatchSize,
@@ -226,8 +247,10 @@ interface RawServerConfig {
   readonly databasePoolMax: number;
   readonly databaseUrl: string;
   readonly eventFanoutCatchUpPollMs: number;
+  readonly eventFanoutCatchUpStaleMs: number;
   readonly port: number;
   readonly resourceLimits: ResourceLimits;
+  readonly runtimeTopology: RuntimeTopology;
   readonly taskClaimSweepBatchSize: number;
   readonly taskClaimSweepMs: number;
 }
@@ -270,6 +293,14 @@ function parseAuthMode(value: string | undefined): AuthMode {
     return value;
   }
   throw new Error("AUTH_MODE must be required or disabled");
+}
+
+/** Requires an explicit deployment topology at the process startup seam. */
+function parseRequiredRuntimeTopology(value: string | undefined): RuntimeTopology {
+  if (value === "multi" || value === "single") {
+    return value;
+  }
+  throw new Error(runtimeTopologyConfigError);
 }
 
 /** Parses a JSON object containing accepted signing secrets keyed by kid. */

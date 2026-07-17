@@ -1,7 +1,12 @@
 import { z } from "zod";
 import { sessionEventSchema } from "./event-builders.js";
-import type { SessionEvent } from "./records.js";
-import { taskRecordSchema, webSocketOperation } from "./records.js";
+import type { LiveHostPresence, SessionEvent } from "./records.js";
+import {
+  liveHostPresenceSchema,
+  replicaPresenceScope,
+  taskRecordSchema,
+  webSocketOperation,
+} from "./records.js";
 
 /** WebSocket task-claim command schema. */
 export const wsTaskClaimMessageSchema = z.object({
@@ -69,6 +74,14 @@ export const webSocketReplayCompleteEnvelopeSchema = z.object({
   op: z.literal(webSocketOperation.replayComplete),
 });
 
+/** WebSocket Replica Scope Host Presence envelope schema. */
+export const webSocketPresenceEnvelopeSchema = z.object({
+  hosts: z.array(liveHostPresenceSchema),
+  op: z.literal(webSocketOperation.presence),
+  replicaId: z.string().min(1),
+  scope: z.literal(replicaPresenceScope),
+});
+
 /** WebSocket command-result envelope schema. */
 export const webSocketCommandResultEnvelopeSchema = z
   .object({
@@ -94,11 +107,15 @@ export const webSocketServerEnvelopeSchema = z.union([
   webSocketCommandResultEnvelopeSchema,
   webSocketErrorEnvelopeSchema,
   webSocketEventEnvelopeSchema,
+  webSocketPresenceEnvelopeSchema,
   webSocketReplayCompleteEnvelopeSchema,
 ]);
 
 /** Parsed WebSocket command-result envelope. */
 export type CommandResultEnvelope = z.infer<typeof webSocketCommandResultEnvelopeSchema>;
+
+/** Parsed Replica Scope Host Presence envelope. */
+export type WebSocketPresenceEnvelope = z.infer<typeof webSocketPresenceEnvelopeSchema>;
 
 /** Parsed server-to-client WebSocket envelope. */
 export type WebSocketServerEnvelope = z.infer<typeof webSocketServerEnvelopeSchema>;
@@ -130,6 +147,12 @@ interface SerializeErrorEnvelopeInput {
   readonly details?: Record<string, unknown>;
   readonly error: string;
   readonly requestId?: string;
+}
+
+/** Inputs required to serialize a Replica Scope presence envelope. */
+export interface SerializePresenceEnvelopeInput {
+  readonly hosts: readonly LiveHostPresence[];
+  readonly replicaId: string;
 }
 
 /** Creates a WebSocket publish message for participant-originated events. */
@@ -228,6 +251,18 @@ export function buildWsTaskReleaseMessage(input: {
   };
 }
 
+/** Builds a mandatory Replica Scope Host Presence envelope. */
+export function buildWebSocketPresenceEnvelope(
+  input: SerializePresenceEnvelopeInput,
+): WebSocketPresenceEnvelope {
+  return {
+    hosts: [...input.hosts],
+    op: webSocketOperation.presence,
+    replicaId: input.replicaId,
+    scope: replicaPresenceScope,
+  };
+}
+
 /** Parses server-to-client WebSocket envelopes into the known protocol union. */
 export function parseWebSocketServerEnvelope(value: unknown): WebSocketServerEnvelope | null {
   const parsed = webSocketServerEnvelopeSchema.safeParse(value);
@@ -242,6 +277,11 @@ export function serializeEventEnvelope(event: SessionEvent): string {
 /** Serializes the replay-complete marker sent after historical events. */
 export function serializeReplayCompleteEnvelope(): string {
   return JSON.stringify({ op: webSocketOperation.replayComplete });
+}
+
+/** Serializes a mandatory Replica Scope Host Presence envelope. */
+export function serializePresenceEnvelope(input: SerializePresenceEnvelopeInput): string {
+  return JSON.stringify(buildWebSocketPresenceEnvelope(input));
 }
 
 /** Serializes a command result envelope while preserving command-specific fields. */

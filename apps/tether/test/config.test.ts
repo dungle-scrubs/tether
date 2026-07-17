@@ -1,10 +1,57 @@
 import { Effect } from "effect";
 import { describe, expect, it } from "vitest";
 
-import { readConfig, ServerConfigService, serverConfigLayerFromEnv } from "../src/config.js";
+import {
+  readConfig,
+  readConfigEffectFromEnv,
+  ServerConfigService,
+  serverConfigLayerFromEnv,
+} from "../src/config.js";
 import { defaultResourceLimits } from "../src/resource-limits.js";
 
 describe("server config", () => {
+  it("fails closed when runtime topology is missing", () => {
+    expect(() =>
+      readConfig({
+        AUTH_SIGNING_SECRET: "test-secret",
+        DATABASE_URL: "postgres://example.test/tether",
+      }),
+    ).toThrow("RUNTIME_TOPOLOGY must be single or multi");
+  });
+
+  it("rejects unsupported runtime topology without echoing its value", () => {
+    expect(() =>
+      readConfig({
+        AUTH_SIGNING_SECRET: "test-secret",
+        DATABASE_URL: "postgres://example.test/tether",
+        RUNTIME_TOPOLOGY: "secret-unsupported-topology",
+      }),
+    ).toThrowError(new Error("RUNTIME_TOPOLOGY must be single or multi"));
+  });
+
+  it("fails closed through Effect when runtime topology is missing", async () => {
+    await expect(
+      Effect.runPromise(
+        readConfigEffectFromEnv({
+          AUTH_SIGNING_SECRET: "test-secret",
+          DATABASE_URL: "postgres://example.test/tether",
+        }),
+      ),
+    ).rejects.toThrow("RUNTIME_TOPOLOGY must be single or multi");
+  });
+
+  it("rejects unsupported runtime topology through Effect", async () => {
+    await expect(
+      Effect.runPromise(
+        readConfigEffectFromEnv({
+          AUTH_SIGNING_SECRET: "test-secret",
+          DATABASE_URL: "postgres://example.test/tether",
+          RUNTIME_TOPOLOGY: "cluster",
+        }),
+      ),
+    ).rejects.toThrow("RUNTIME_TOPOLOGY must be single or multi");
+  });
+
   it("reads current scheduler environment names", () => {
     expect(
       readConfig({
@@ -12,11 +59,13 @@ describe("server config", () => {
         DATABASE_POOL_MAX: "20",
         DATABASE_URL: "postgres://example.test/tether",
         EVENT_FANOUT_CATCH_UP_MS: "500",
+        EVENT_FANOUT_CATCH_UP_STALE_MS: "1500",
         EVENT_FANOUT_BATCH_LIMIT: "11",
         EVENT_LIST_DEFAULT_LIMIT: "12",
         EVENT_LIST_MAX_LIMIT: "13",
         HTTP_MAX_BODY_BYTES: "14",
         PORT: "4100",
+        RUNTIME_TOPOLOGY: "single",
         TASK_CLAIM_SWEEP_BATCH_SIZE: "7",
         TASK_CLAIM_SWEEP_MS: "250",
         WS_BACKPRESSURE_BUFFERED_BYTES: "15",
@@ -34,6 +83,7 @@ describe("server config", () => {
       databasePoolMax: 20,
       databaseUrl: "postgres://example.test/tether",
       eventFanoutCatchUpPollMs: 500,
+      eventFanoutCatchUpStaleMs: 1500,
       port: 4100,
       resourceLimits: {
         eventFanoutBatchLimit: 11,
@@ -46,6 +96,7 @@ describe("server config", () => {
         wsMessageRateWindowMs: 18,
         wsReplayMaxEvents: 19,
       },
+      runtimeTopology: "single",
       taskClaimSweepBatchSize: 7,
       taskClaimSweepMs: 250,
     });
@@ -56,10 +107,12 @@ describe("server config", () => {
       AUTH_SIGNING_SECRET: "test-secret",
       DATABASE_URL: "postgres://example.test/tether",
       EVENT_FANOUT_CATCH_UP_MS: "-1",
+      EVENT_FANOUT_CATCH_UP_STALE_MS: "0",
       EVENT_FANOUT_BATCH_LIMIT: "0",
       EVENT_LIST_DEFAULT_LIMIT: "-1",
       EVENT_LIST_MAX_LIMIT: "not-a-number",
       HTTP_MAX_BODY_BYTES: "0",
+      RUNTIME_TOPOLOGY: "single",
       TASK_CLAIM_SWEEP_BATCH_SIZE: "0",
       TASK_CLAIM_SWEEP_MS: "-1",
       WS_BACKPRESSURE_BUFFERED_BYTES: "0",
@@ -70,6 +123,7 @@ describe("server config", () => {
     });
 
     expect(config.eventFanoutCatchUpPollMs).toBe(1_000);
+    expect(config.eventFanoutCatchUpStaleMs).toBe(30_000);
     expect(config.resourceLimits).toEqual(defaultResourceLimits);
     expect(config.taskClaimSweepBatchSize).toBe(50);
     expect(config.taskClaimSweepMs).toBe(1_000);
@@ -83,6 +137,7 @@ describe("server config", () => {
             AUTH_SIGNING_SECRET: "test-secret",
             DATABASE_URL: "postgres://example.test/effect",
             PORT: "4101",
+            RUNTIME_TOPOLOGY: "single",
           }),
         ),
       ),
@@ -96,20 +151,27 @@ describe("server config", () => {
   });
 
   it("defaults auth mode to required and fails without a signing secret", () => {
-    expect(() => readConfig({})).toThrow("AUTH_SIGNING_SECRET is required");
+    expect(() => readConfig({ RUNTIME_TOPOLOGY: "single" })).toThrow(
+      "AUTH_SIGNING_SECRET is required",
+    );
   });
 
   it("fails closed when DATABASE_URL is missing", () => {
-    expect(() => readConfig({ AUTH_SIGNING_SECRET: "test-secret" })).toThrow(
-      "DATABASE_URL is required",
-    );
+    expect(() =>
+      readConfig({ AUTH_SIGNING_SECRET: "test-secret", RUNTIME_TOPOLOGY: "single" }),
+    ).toThrow("DATABASE_URL is required");
   });
 
   it("fails closed through Effect config when DATABASE_URL is missing", async () => {
     await expect(
       Effect.runPromise(
         ServerConfigService.pipe(
-          Effect.provide(serverConfigLayerFromEnv({ AUTH_SIGNING_SECRET: "test-secret" })),
+          Effect.provide(
+            serverConfigLayerFromEnv({
+              AUTH_SIGNING_SECRET: "test-secret",
+              RUNTIME_TOPOLOGY: "single",
+            }),
+          ),
         ),
       ),
     ).rejects.toThrow("DATABASE_URL is required");
@@ -120,6 +182,7 @@ describe("server config", () => {
       readConfig({
         AUTH_MODE: "disabled",
         DATABASE_URL: "postgres://example.test/tether",
+        RUNTIME_TOPOLOGY: "single",
       }),
     ).toMatchObject({
       authMode: "disabled",
@@ -133,6 +196,7 @@ describe("server config", () => {
             serverConfigLayerFromEnv({
               AUTH_MODE: "disabled",
               DATABASE_URL: "postgres://example.test/tether",
+              RUNTIME_TOPOLOGY: "single",
             }),
           ),
         ),
@@ -152,6 +216,7 @@ describe("server config", () => {
         AUTH_SIGNING_KID: "current",
         AUTH_SIGNING_SECRET: "new-secret",
         DATABASE_URL: "postgres://example.test/tether",
+        RUNTIME_TOPOLOGY: "single",
       }),
     ).toMatchObject({
       authAcceptedSigningSecrets: { previous: "old-secret" },
@@ -166,6 +231,7 @@ describe("server config", () => {
       readConfig({
         AUTH_SIGNING_SECRET: "test-secret",
         DATABASE_URL: "postgres://example.test/tether",
+        RUNTIME_TOPOLOGY: "single",
       }).controlEpochEnforcement,
     ).toBe(true);
     expect(
@@ -173,6 +239,7 @@ describe("server config", () => {
         AUTH_SIGNING_SECRET: "test-secret",
         CONTROL_EPOCH_ENFORCEMENT: "true",
         DATABASE_URL: "postgres://example.test/tether",
+        RUNTIME_TOPOLOGY: "single",
       }).controlEpochEnforcement,
     ).toBe(true);
     expect(
@@ -180,6 +247,7 @@ describe("server config", () => {
         AUTH_SIGNING_SECRET: "test-secret",
         CONTROL_EPOCH_ENFORCEMENT: "false",
         DATABASE_URL: "postgres://example.test/tether",
+        RUNTIME_TOPOLOGY: "single",
       }).controlEpochEnforcement,
     ).toBe(false);
     expect(() =>
@@ -187,6 +255,7 @@ describe("server config", () => {
         AUTH_SIGNING_SECRET: "test-secret",
         CONTROL_EPOCH_ENFORCEMENT: "nonsense",
         DATABASE_URL: "postgres://example.test/tether",
+        RUNTIME_TOPOLOGY: "single",
       }),
     ).toThrow("CONTROL_EPOCH_ENFORCEMENT must be a documented boolean");
   });
@@ -200,6 +269,7 @@ describe("server config", () => {
               AUTH_SIGNING_SECRET: "test-secret",
               CONTROL_EPOCH_ENFORCEMENT: "nonsense",
               DATABASE_URL: "postgres://example.test/tether",
+              RUNTIME_TOPOLOGY: "single",
             }),
           ),
         ),
@@ -213,6 +283,7 @@ describe("server config", () => {
         AUTH_SIGNING_KID: " ",
         AUTH_SIGNING_SECRET: "test-secret",
         DATABASE_URL: "postgres://example.test/tether",
+        RUNTIME_TOPOLOGY: "single",
       }),
     ).toMatchObject({
       authSigningKid: "default",

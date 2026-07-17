@@ -8,6 +8,12 @@ export const directHttpRoutes = {
     name: "server.health",
     pattern: /^\/health$/u,
   }),
+  readiness: defineHttpRoute({
+    control: "not-applicable",
+    method: "GET",
+    name: "server.readiness",
+    pattern: /^\/ready$/u,
+  }),
   serverDebug: defineHttpRoute({
     control: "not-applicable",
     method: "GET",

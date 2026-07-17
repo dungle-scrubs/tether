@@ -392,7 +392,12 @@ interface SessionListResponse extends JsonResponse {
 interface PermanentDeleteResponse extends JsonResponse {
   readonly detail?: string;
   readonly ok: boolean;
-  readonly reason?: "failed" | "not-archived" | "not-found" | "protected";
+  readonly reason?:
+    | "failed"
+    | "not-archived"
+    | "not-found"
+    | "presence_scope_insufficient"
+    | "protected";
   readonly sessionId?: string;
 }
 
@@ -6948,6 +6953,88 @@ e2e("tether e2e", () => {
     await taskLoop;
   });
 
+  it("rejects permanent delete when remote Host Presence is outside replica scope", async () => {
+    const replicaA = createAppServer(currentPool(), {
+      auth: e2eAuthOptions,
+      eventFanout: { catchUpPollIntervalMs: 0 },
+      runtimeTopology: "multi",
+      sessionService: { controlEpochEnforcement: false },
+      taskClaimSweeper: { intervalMs: 0 },
+    });
+    const replicaB = createAppServer(currentPool(), {
+      auth: e2eAuthOptions,
+      eventFanout: { catchUpPollIntervalMs: 0 },
+      runtimeTopology: "multi",
+      sessionService: { controlEpochEnforcement: false },
+      taskClaimSweeper: { intervalMs: 0 },
+    });
+    let replicaAStarted = false;
+    let replicaBStarted = false;
+    let host: WebSocket | null = null;
+    try {
+      const portA = await findOpenPort();
+      const portB = await findOpenPort();
+      await replicaA.listen(portA);
+      replicaAStarted = true;
+      await replicaB.listen(portB);
+      replicaBStarted = true;
+      const replicaAUrl = `http://127.0.0.1:${portA}`;
+      const replicaBUrl = `http://127.0.0.1:${portB}`;
+      const session = (
+        await requestFrom<SessionResponse>(replicaBUrl, "/sessions", {
+          body: {},
+          method: "POST",
+        })
+      ).session;
+      await requestFrom(replicaBUrl, `/sessions/${session.sessionId}/events`, {
+        body: {
+          payload: { archived: true },
+          producerId: "replica-delete-e2e",
+          type: "session.archived",
+        },
+        method: "POST",
+      });
+      host = new WebSocket(
+        authenticatedWebSocketUrl(
+          `${replicaAUrl.replace("http:", "ws:")}/sessions/${session.sessionId}/stream?after=0&runtimeKind=host&participantId=part_remote_host&instanceId=inst_remote_host&displayName=Remote%20Host`,
+        ),
+      );
+      await waitForSocketOpen(host);
+      await waitFor(() => replicaA.debugInfo().hostPresence.passiveSocketCount === 1);
+
+      const response = await requestStatusFrom<PermanentDeleteResponse>(
+        replicaBUrl,
+        `/sessions/${session.sessionId}/delete`,
+        {
+          authToken: mintE2eToken({
+            participantId: "part_replica_delete_admin",
+            role: "admin",
+            sessionId: "*",
+          }),
+          method: "POST",
+        },
+      );
+
+      expect(replicaB.debugInfo().hostPresence.passiveSocketCount).toBe(0);
+      expect(response.status).toBe(409);
+      expect(response.body).toMatchObject({
+        ok: false,
+        reason: "presence_scope_insufficient",
+      });
+    } finally {
+      if (host && host.readyState !== WebSocket.CLOSED) {
+        host.close();
+        await waitForSocketClose(host);
+      }
+      if (replicaBStarted) {
+        await replicaB.close();
+      }
+      if (replicaAStarted) {
+        await replicaA.close();
+      }
+    }
+  });
+
   it("fans out committed events across app replicas", async () => {
     const replicaA = createAppServer(currentPool(), {
       auth: e2eAuthOptions,
@@ -6969,7 +7056,8 @@ e2e("tether e2e", () => {
     });
     let replicaAStarted = false;
     let replicaBStarted = false;
-    let socket: WebSocket | null = null;
+    let socketA: WebSocket | null = null;
+    let socketB: WebSocket | null = null;
     try {
       const portA = await findOpenPort();
       const portB = await findOpenPort();
@@ -6993,17 +7081,28 @@ e2e("tether e2e", () => {
         `,
         [2_147_483_648, session.sessionId],
       );
-      socket = new WebSocket(
+      socketA = new WebSocket(
         authenticatedWebSocketUrl(
           `${replicaAUrl.replace("http:", "ws:")}/sessions/${session.sessionId}/stream?after=2147483647`,
         ),
       );
-      const messages: unknown[] = [];
-      socket.on("message", (data) => {
-        messages.push(JSON.parse(String(data)) as unknown);
+      socketB = new WebSocket(
+        authenticatedWebSocketUrl(
+          `${replicaBUrl.replace("http:", "ws:")}/sessions/${session.sessionId}/stream?after=2147483647&runtimeKind=observer`,
+        ),
+      );
+      const messagesA: unknown[] = [];
+      const messagesB: unknown[] = [];
+      socketA.on("message", (data) => {
+        messagesA.push(JSON.parse(String(data)) as unknown);
       });
-      await waitForSocketOpen(socket);
-      await waitFor(() => messages.some(isReplayCompleteEnvelope));
+      socketB.on("message", (data) => {
+        messagesB.push(JSON.parse(String(data)) as unknown);
+      });
+      await Promise.all([waitForSocketOpen(socketA), waitForSocketOpen(socketB)]);
+      await waitFor(
+        () => messagesA.some(isReplayCompleteEnvelope) && messagesB.some(isReplayCompleteEnvelope),
+      );
 
       await requestFrom(replicaBUrl, `/sessions/${session.sessionId}/events`, {
         body: {
@@ -7015,18 +7114,22 @@ e2e("tether e2e", () => {
       });
 
       await waitFor(() =>
-        messages.some(
-          (message) =>
-            isEventEnvelope(message) &&
-            message.event.type === "user.message" &&
-            message.event.producerId === "replica-b" &&
-            message.event.seq === 2_147_483_648,
+        [messagesA, messagesB].every((messages) =>
+          messages.some(
+            (message) =>
+              isEventEnvelope(message) &&
+              message.event.type === "user.message" &&
+              message.event.producerId === "replica-b" &&
+              message.event.seq === 2_147_483_648,
+          ),
         ),
       );
     } finally {
-      if (socket && socket.readyState !== WebSocket.CLOSED) {
-        socket.close();
-        await waitForSocketClose(socket);
+      for (const socket of [socketA, socketB]) {
+        if (socket && socket.readyState !== WebSocket.CLOSED) {
+          socket.close();
+          await waitForSocketClose(socket);
+        }
       }
       if (replicaBStarted) {
         await replicaB.close();
@@ -7106,6 +7209,99 @@ e2e("tether e2e", () => {
         ),
       );
       expect(replicaA.debugInfo().eventFanout.catchUpPollCount).toBeGreaterThan(0);
+    } finally {
+      if (socket && socket.readyState !== WebSocket.CLOSED) {
+        socket.close();
+        await waitForSocketClose(socket);
+      }
+      if (replicaBStarted) {
+        await replicaB.close();
+      }
+      if (replicaAStarted) {
+        await replicaA.close();
+      }
+    }
+  });
+
+  it("fails readiness on fanout catch-up failure and recovers after durable repair", async () => {
+    let failCatchUp = false;
+    const durableService = createSessionServiceEffect(currentPool(), {
+      controlEpochEnforcement: false,
+      taskClaimLeaseTtlMs: 200,
+      wsControlLeaseTtlMs: 200,
+    });
+    const replicaA = createAppServerWithSessionService(
+      currentPool(),
+      {
+        ...durableService,
+        listEvents: (sessionId, afterSeq, options) =>
+          failCatchUp
+            ? Effect.die(new Error("simulated fanout catch-up failure"))
+            : durableService.listEvents(sessionId, afterSeq, options),
+      },
+      {
+        auth: e2eAuthOptions,
+        eventFanout: { catchUpPollIntervalMs: 10, listenEnabled: false },
+        readiness: { fanoutStaleAfterMs: 1 },
+        runtimeTopology: "multi",
+        taskClaimSweeper: { intervalMs: 0 },
+      },
+    );
+    const replicaB = createAppServer(currentPool(), {
+      auth: e2eAuthOptions,
+      eventFanout: { catchUpPollIntervalMs: 0 },
+      runtimeTopology: "multi",
+      sessionService: { controlEpochEnforcement: false },
+      taskClaimSweeper: { intervalMs: 0 },
+    });
+    let replicaAStarted = false;
+    let replicaBStarted = false;
+    let socket: WebSocket | null = null;
+    try {
+      const portA = await findOpenPort();
+      const portB = await findOpenPort();
+      await replicaA.listen(portA);
+      replicaAStarted = true;
+      await replicaB.listen(portB);
+      replicaBStarted = true;
+      const replicaAUrl = `http://127.0.0.1:${portA}`;
+      const replicaBUrl = `http://127.0.0.1:${portB}`;
+      const session = (
+        await requestFrom<SessionResponse>(replicaBUrl, "/sessions", {
+          body: {},
+          method: "POST",
+        })
+      ).session;
+      socket = new WebSocket(
+        authenticatedWebSocketUrl(
+          `${replicaAUrl.replace("http:", "ws:")}/sessions/${session.sessionId}/stream?after=0&runtimeKind=observer`,
+        ),
+      );
+      const messages: unknown[] = [];
+      socket.on("message", (data) => messages.push(JSON.parse(String(data)) as unknown));
+      await waitForSocketOpen(socket);
+      await waitFor(() => messages.some(isReplayCompleteEnvelope));
+
+      failCatchUp = true;
+      await waitFor(
+        () =>
+          replicaA.debugInfo().eventFanout.catchUpFailureCount > 0 &&
+          (replicaA.debugInfo().eventFanout.sessionLag[0]?.lagAgeMs ?? 0) > 1,
+      );
+      const failedReadiness = await fetch(`${replicaAUrl}/ready`);
+
+      expect(failedReadiness.status).toBe(503);
+      expect(await failedReadiness.json()).toMatchObject({
+        ready: false,
+        reason: "fanout_catchup_stale",
+      });
+
+      failCatchUp = false;
+      await waitFor(() => replicaA.debugInfo().eventFanout.catchUpRecoveryCount > 0);
+      const recoveredReadiness = await fetch(`${replicaAUrl}/ready`);
+
+      expect(recoveredReadiness.status).toBe(200);
+      expect(await recoveredReadiness.json()).toMatchObject({ ready: true });
     } finally {
       if (socket && socket.readyState !== WebSocket.CLOSED) {
         socket.close();
@@ -7546,6 +7742,7 @@ e2e("tether e2e", () => {
         AUTH_MODE: "disabled",
         DATABASE_URL: databaseUrl,
         PORT: "0",
+        RUNTIME_TOPOLOGY: "single",
         ...options.env,
       },
       stdio: ["ignore", "pipe", "pipe"],
