@@ -75,7 +75,7 @@ describe("observeTaskApprovals", () => {
     expect(processed).toEqual(["evt_new", "evt_live"]);
   });
 
-  it("keeps a rejected replayed approval retryable for a later duplicate delivery", async () => {
+  it("retries a rejected replayed approval with bounded backoff until it succeeds", async () => {
     const fixture = createApprovalObserverFixture();
     const failure = new Error("append failed");
     const errors: unknown[] = [];
@@ -93,61 +93,144 @@ describe("observeTaskApprovals", () => {
         }
       },
       processedApprovalIdFromEvent,
+      retry: { attempts: 3, baseDelayMs: 1, maxDelayMs: 5 },
     });
 
     fixture.emit(createEvent("approval.recorded", "evt_retry"));
     fixture.replayComplete.resolve();
-    await waitFor(() => errors.length === 1);
+    await waitFor(() => observer.debugInfo().processedApprovalIds.length === 1);
 
-    expect(errors).toHaveLength(1);
-    expect(errors[0]).toBeInstanceOf(TaskApprovalProcessingError);
-    expect(errors[0]).toMatchObject({
-      approvalId: "evt_retry",
-      cause: failure,
-      operation: "processApproval",
-    });
+    expect(errors).toEqual([]);
+    expect(attempts).toEqual(["evt_retry", "evt_retry"]);
     expect(observer.debugInfo()).toMatchObject({
       activeProcessingCount: 0,
       inFlightApprovalIds: [],
-      lastError: { approvalId: "evt_retry", message: "append failed" },
-      processedApprovalIds: [],
+      lastError: { approvalId: "evt_retry", attempts: 1, message: "append failed" },
+      processedApprovalIds: ["evt_retry"],
     });
-
-    fixture.emit(createEvent("approval.recorded", "evt_retry"));
-    await waitFor(() => attempts.length === 2);
-    await waitFor(() => observer.debugInfo().processedApprovalIds.length === 1);
-
-    expect(attempts).toEqual(["evt_retry", "evt_retry"]);
-    expect(observer.debugInfo().processedApprovalIds).toEqual(["evt_retry"]);
   });
 
-  it("keeps a rejected live approval retryable for a later duplicate delivery", async () => {
+  it("retries a rejected live approval without needing a duplicate delivery", async () => {
     const fixture = createApprovalObserverFixture();
+    const errors: unknown[] = [];
     const attempts: string[] = [];
+    const processed: string[] = [];
 
     observeTaskApprovals({
       approvalId: (approval) => approval.id,
       client: fixture.client,
-      onError: () => undefined,
+      onError: (error) => errors.push(error),
       parseApproval: parseTestApproval,
       processApproval: async (approval) => {
         attempts.push(approval.id);
         if (attempts.length === 1) {
           throw new Error("live append failed");
         }
+        processed.push(approval.id);
       },
       processedApprovalIdFromEvent,
+      retry: { attempts: 3, baseDelayMs: 1, maxDelayMs: 5 },
     });
 
     fixture.replayComplete.resolve();
     await Promise.resolve();
     fixture.emit(createEvent("approval.recorded", "evt_live_retry"));
-    await waitFor(() => attempts.length === 1);
+    await waitFor(() => processed.length === 1);
 
-    fixture.emit(createEvent("approval.recorded", "evt_live_retry"));
-    await waitFor(() => attempts.length === 2);
-
+    expect(errors).toEqual([]);
     expect(attempts).toEqual(["evt_live_retry", "evt_live_retry"]);
+    expect(processed).toEqual(["evt_live_retry"]);
+  });
+
+  it("stops retrying when a processed-output event arrives during the backoff window", async () => {
+    const fixture = createApprovalObserverFixture();
+    const errors: unknown[] = [];
+    const attempts: string[] = [];
+
+    const observer = observeTaskApprovals({
+      approvalId: (approval) => approval.id,
+      client: fixture.client,
+      onError: (error) => errors.push(error),
+      parseApproval: parseTestApproval,
+      processApproval: async (approval) => {
+        attempts.push(approval.id);
+        if (attempts.length === 1) {
+          // Attempt 1's side effect commits server-side, but the ack is lost so
+          // the call rejects. During the backoff the approval's own committed
+          // output event is broadcast back, marking it processed.
+          fixture.emit(createEvent("agent.output", "evt_output", { approvalId: approval.id }));
+          throw new Error("append committed but ack lost");
+        }
+      },
+      processedApprovalIdFromEvent,
+      retry: { attempts: 3, baseDelayMs: 1, maxDelayMs: 5 },
+    });
+
+    fixture.replayComplete.resolve();
+    await Promise.resolve();
+    fixture.emit(createEvent("approval.recorded", "evt_double"));
+    await waitFor(
+      () =>
+        observer.debugInfo().processedApprovalIds.includes("evt_double") &&
+        observer.debugInfo().activeProcessingCount === 0,
+    );
+
+    expect(attempts).toEqual(["evt_double"]);
+    expect(errors).toEqual([]);
+    expect(observer.debugInfo()).toMatchObject({
+      activeProcessingCount: 0,
+      inFlightApprovalIds: [],
+      processedApprovalIds: ["evt_double"],
+    });
+  });
+
+  it("surfaces a persistent failure after exhausting retries and keeps the approval retryable", async () => {
+    const fixture = createApprovalObserverFixture();
+    const failure = new Error("append keeps failing");
+    const errors: unknown[] = [];
+    const attempts: string[] = [];
+
+    const observer = observeTaskApprovals({
+      approvalId: (approval) => approval.id,
+      client: fixture.client,
+      onError: (error) => errors.push(error),
+      parseApproval: parseTestApproval,
+      processApproval: async (approval) => {
+        attempts.push(approval.id);
+        if (attempts.length <= 2) {
+          throw failure;
+        }
+      },
+      processedApprovalIdFromEvent,
+      retry: { attempts: 2, baseDelayMs: 1, maxDelayMs: 5 },
+    });
+
+    fixture.replayComplete.resolve();
+    await Promise.resolve();
+    fixture.emit(createEvent("approval.recorded", "evt_exhausted"));
+    await waitFor(() => errors.length === 1);
+
+    expect(attempts).toEqual(["evt_exhausted", "evt_exhausted"]);
+    expect(errors[0]).toBeInstanceOf(TaskApprovalProcessingError);
+    expect(errors[0]).toMatchObject({
+      approvalId: "evt_exhausted",
+      attempts: 2,
+      cause: failure,
+      operation: "processApproval",
+    });
+    expect(observer.debugInfo()).toMatchObject({
+      activeProcessingCount: 0,
+      inFlightApprovalIds: [],
+      lastError: { approvalId: "evt_exhausted", attempts: 2, message: "append keeps failing" },
+      processedApprovalIds: [],
+    });
+
+    fixture.emit(createEvent("approval.recorded", "evt_exhausted"));
+    await waitFor(() => observer.debugInfo().processedApprovalIds.length === 1);
+
+    expect(attempts).toEqual(["evt_exhausted", "evt_exhausted", "evt_exhausted"]);
+    expect(errors).toHaveLength(1);
+    expect(observer.debugInfo().processedApprovalIds).toEqual(["evt_exhausted"]);
   });
 
   it("suppresses duplicate deliveries while processing is in flight", async () => {
@@ -205,6 +288,7 @@ describe("observeTaskApprovals", () => {
         }
       },
       processedApprovalIdFromEvent,
+      retry: { attempts: 1 },
     });
 
     fixture.replayComplete.resolve();
@@ -219,6 +303,40 @@ describe("observeTaskApprovals", () => {
     await waitFor(() => attempts.length === 2);
 
     expect(attempts).toEqual(["evt_pending_retry", "evt_pending_retry"]);
+  });
+
+  it("bounds processed approval id retention while preserving live-window dedupe", async () => {
+    const fixture = createApprovalObserverFixture();
+    const retentionLimit = 10_000;
+    const overflow = 50;
+    const attempts: string[] = [];
+
+    const observer = observeTaskApprovals({
+      approvalId: (approval) => approval.id,
+      client: fixture.client,
+      parseApproval: parseTestApproval,
+      processApproval: async (approval) => {
+        attempts.push(approval.id);
+      },
+      processedApprovalIdFromEvent,
+    });
+
+    fixture.replayComplete.resolve();
+    await Promise.resolve();
+    for (let index = 0; index < retentionLimit + overflow; index += 1) {
+      fixture.emit(createEvent("agent.output", `evt_out_${index}`, { approvalId: `apr_${index}` }));
+    }
+
+    const processedIds = observer.debugInfo().processedApprovalIds;
+    expect(processedIds).toHaveLength(retentionLimit);
+    expect(processedIds[0]).toBe(`apr_${overflow}`);
+    expect(processedIds[processedIds.length - 1]).toBe(`apr_${retentionLimit + overflow - 1}`);
+
+    fixture.emit(createEvent("approval.recorded", `apr_${retentionLimit + overflow - 1}`));
+    await Promise.resolve();
+
+    expect(attempts).toEqual([]);
+    expect(observer.debugInfo().processedApprovalIds).toHaveLength(retentionLimit);
   });
 });
 

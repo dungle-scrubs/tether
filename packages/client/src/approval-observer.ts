@@ -1,5 +1,20 @@
+import { Effect } from "effect";
+
+import { sleepUnrefEffect } from "./effect-timing.js";
 import type { SessionEvent } from "./types.js";
 import { ModuleObservability, readModuleObservabilityOptions } from "./observability.js";
+
+const defaultProcessApprovalRetryAttempts = 5;
+const defaultProcessApprovalRetryBaseDelayMs = 100;
+const defaultProcessApprovalRetryMaxDelayMs = 2_000;
+/**
+ * Upper bound on retained processed approval ids. Duplicates of one approval
+ * can only recur near its original delivery: reconnects resume after the last
+ * handled sequence, and a fresh replay re-suppresses old approvals through
+ * their processed-output events, so ids evicted after this many newer
+ * approvals no longer need live dedupe.
+ */
+const maxProcessedApprovalIds = 10_000;
 
 type ApprovalEventPhase = "live" | "processed-output" | "replay";
 
@@ -7,6 +22,8 @@ type ApprovalEventPhase = "live" | "processed-output" | "replay";
 export interface TaskApprovalObserverFailureInfo {
   /** Approval id whose processing failed. */
   readonly approvalId: string;
+  /** Processing attempts made when the failure was captured. */
+  readonly attempts: number;
   /** Original or wrapped error message. */
   readonly message: string;
   /** Original or wrapped error name. */
@@ -43,12 +60,15 @@ export interface TaskApprovalObserver {
 export class TaskApprovalProcessingError extends Error {
   /** Approval id that failed processing. */
   readonly approvalId: string;
+  /** Processing attempts made in the exhausted bounded retry cycle. */
+  readonly attempts: number;
   /** Observer operation that failed. */
   readonly operation: string;
 
   /** Captures approval processing context while preserving the original cause. */
   constructor(input: {
     readonly approvalId: string;
+    readonly attempts?: number;
     readonly cause: unknown;
     readonly operation: string;
   }) {
@@ -56,6 +76,7 @@ export class TaskApprovalProcessingError extends Error {
       cause: input.cause,
     });
     this.approvalId = input.approvalId;
+    this.attempts = input.attempts ?? 1;
     this.name = "TaskApprovalProcessingError";
     this.operation = input.operation;
   }
@@ -83,6 +104,15 @@ export interface ObserveTaskApprovalsOptions<TApproval> {
   readonly processApproval: (approval: TApproval) => Promise<void>;
   /** Extracts already-processed approval ids from prior output events. */
   readonly processedApprovalIdFromEvent: (event: SessionEvent) => string | null;
+  /** Bounded retry policy for approval processing failures. */
+  readonly retry?: {
+    /** Maximum processing attempts in one bounded retry cycle. */
+    readonly attempts?: number;
+    /** Initial delay before the second processing attempt. */
+    readonly baseDelayMs?: number;
+    /** Maximum delay between processing attempts after repeated failures. */
+    readonly maxDelayMs?: number;
+  };
 }
 
 /**
@@ -99,6 +129,11 @@ export function observeTaskApprovals<TApproval>(
   const inFlightApprovalIds = new Set<string>();
   const replayedApprovals = new Map<string, TApproval>();
   const onError = options.onError ?? console.error;
+  const retryPolicy = {
+    attempts: options.retry?.attempts ?? defaultProcessApprovalRetryAttempts,
+    baseDelayMs: options.retry?.baseDelayMs ?? defaultProcessApprovalRetryBaseDelayMs,
+    maxDelayMs: options.retry?.maxDelayMs ?? defaultProcessApprovalRetryMaxDelayMs,
+  };
   let activeProcessingCount = 0;
   let lastError: TaskApprovalObserverFailureInfo | null = null;
   let replayComplete = false;
@@ -148,26 +183,63 @@ export function observeTaskApprovals<TApproval>(
         "processApproval",
         { approvalId, eventPhase },
         async () => {
-          try {
-            await options.processApproval(approval);
-          } catch (cause) {
-            const error = new TaskApprovalProcessingError({
-              approvalId,
-              cause,
-              operation: "processApproval",
-            });
-            lastError = {
-              approvalId,
-              message: cause instanceof Error ? cause.message : String(cause),
-              name: cause instanceof Error ? cause.name : "UnknownError",
-              operation: "processApproval",
-            };
-            throw error;
+          for (let attempt = 1; ; attempt += 1) {
+            try {
+              await options.processApproval(approval);
+              return;
+            } catch (cause) {
+              lastError = {
+                approvalId,
+                attempts: attempt,
+                message: cause instanceof Error ? cause.message : String(cause),
+                name: cause instanceof Error ? cause.name : "UnknownError",
+                operation: "processApproval",
+              };
+              if (attempt >= retryPolicy.attempts || stopped) {
+                throw new TaskApprovalProcessingError({
+                  approvalId,
+                  attempts: attempt,
+                  cause,
+                  operation: "processApproval",
+                });
+              }
+              const delayMs = Math.min(
+                retryPolicy.maxDelayMs,
+                retryPolicy.baseDelayMs * 2 ** (attempt - 1),
+              );
+              observability.debug("processApproval", "approval.retry_scheduled", {
+                approvalId,
+                attempt,
+                delayMs,
+                eventPhase,
+                outcome: "retry_scheduled",
+                ...stateCounts(),
+              });
+              await Effect.runPromise(sleepUnrefEffect(delayMs));
+              if (processedApprovalIds.has(approvalId)) {
+                observability.debug("processApproval", "approval.skipped_processed", {
+                  approvalId,
+                  attempt,
+                  eventPhase,
+                  outcome: "skipped_processed",
+                  ...stateCounts(),
+                });
+                return;
+              }
+              if (stopped) {
+                throw new TaskApprovalProcessingError({
+                  approvalId,
+                  attempts: attempt,
+                  cause,
+                  operation: "processApproval",
+                });
+              }
+            }
           }
         },
         () => ({ approvalId, outcome: "processed" }),
       );
-      processedApprovalIds.add(approvalId);
+      rememberProcessedApprovalId(approvalId);
       observability.debug("processApproval", "approval.processed", {
         approvalId,
         eventPhase,
@@ -183,7 +255,7 @@ export function observeTaskApprovals<TApproval>(
   const unsubscribe = options.client.onEvent((event) => {
     const processedApprovalId = options.processedApprovalIdFromEvent(event);
     if (processedApprovalId) {
-      processedApprovalIds.add(processedApprovalId);
+      rememberProcessedApprovalId(processedApprovalId);
       replayedApprovals.delete(processedApprovalId);
       observability.debug("onEvent", "approval.processed_output_seen", {
         approvalId: processedApprovalId,
@@ -239,6 +311,19 @@ export function observeTaskApprovals<TApproval>(
   );
 
   return stop;
+
+  /** Records one processed approval id inside the bounded dedupe window. */
+  function rememberProcessedApprovalId(approvalId: string): void {
+    processedApprovalIds.delete(approvalId);
+    processedApprovalIds.add(approvalId);
+    while (processedApprovalIds.size > maxProcessedApprovalIds) {
+      const oldest = processedApprovalIds.values().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      processedApprovalIds.delete(oldest);
+    }
+  }
 
   /** Returns local state counts for structured logs. */
   function stateCounts(): Record<string, number> {
