@@ -1198,8 +1198,7 @@ export class ParticipantRuntimeClient {
     }
     let parsed: unknown;
     try {
-      const frameByteLength =
-        typeof data === "string" ? Buffer.byteLength(data) : Buffer.byteLength(String(data));
+      const frameByteLength = Buffer.byteLength(String(data));
       parsed = JSON.parse(String(data)) as unknown;
       const envelope = parseWebSocketServerEnvelope(parsed);
       if (!envelope) {

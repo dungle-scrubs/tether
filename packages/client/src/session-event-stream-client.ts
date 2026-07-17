@@ -315,8 +315,7 @@ export class SessionEventStreamClient {
       return;
     }
     try {
-      const frameByteLength =
-        typeof data === "string" ? Buffer.byteLength(data) : Buffer.byteLength(String(data));
+      const frameByteLength = Buffer.byteLength(String(data));
       const envelope = parseWebSocketServerEnvelope(JSON.parse(String(data)) as unknown);
       if (!envelope) {
         this.delivery.rejectInvalidEnvelope();

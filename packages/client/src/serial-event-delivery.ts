@@ -294,7 +294,6 @@ export class SerialEventDelivery<TEvent extends SequencedDeliveryEvent> {
         this.activeDeliverySeq = item.event.seq;
         this.assertInternalInvariants();
         const controller = new AbortController();
-        let paused = false;
         for (const [handlerIndex, handler] of handlers.entries()) {
           const invocation = this.invokeHandler(handler, item.event, controller.signal);
           const result = await invocation.result;
@@ -307,8 +306,7 @@ export class SerialEventDelivery<TEvent extends SequencedDeliveryEvent> {
               handlerIndex,
               kind: "handler-failed",
             });
-            paused = true;
-            break;
+            return;
           }
           if (result.kind === "timeout") {
             controller.abort();
@@ -321,12 +319,8 @@ export class SerialEventDelivery<TEvent extends SequencedDeliveryEvent> {
               kind: "handler-timeout",
               timeoutMs: this.options.handlerTimeoutMs,
             });
-            paused = true;
-            break;
+            return;
           }
-        }
-        if (paused) {
-          return;
         }
         this.shiftHead();
         this.activeDeliverySeq = null;
@@ -445,10 +439,9 @@ export class SerialEventDelivery<TEvent extends SequencedDeliveryEvent> {
       clock.clearTimeout(timeoutHandle);
       return raced;
     });
-    const settled = invocation.then(
-      () => undefined,
-      () => undefined,
-    );
+    // `invocation` maps its own rejection to a failed result, so it never
+    // rejects; one continuation is enough to expose its settlement.
+    const settled = invocation.then(() => undefined);
     return { result, settled };
   }
 }
