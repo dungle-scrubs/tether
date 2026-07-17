@@ -44,7 +44,9 @@ export interface SessionEventFanoutDebugInfo {
   readonly catchUpRecoveryCount: number;
   readonly catchUpPollCount: number;
   readonly catchUpPollIntervalMs: number;
+  readonly coalescedNotificationCount: number;
   readonly connected: boolean;
+  readonly droppedNotificationCount: number;
   readonly fanoutCursorSessionCount: number;
   readonly ignoredSelfNotificationCount: number;
   readonly invalidNotificationCount: number;
@@ -56,6 +58,7 @@ export interface SessionEventFanoutDebugInfo {
   readonly listenerState: SessionEventFanoutListenerState;
   readonly lastCatchUpOutcome: SessionEventFanoutCatchUpOutcome;
   readonly notificationCount: number;
+  readonly pendingNotificationSessionCount: number;
   readonly reconnectAttemptCount: number;
   readonly reconnectSuccessCount: number;
   readonly sessionCursorCount: number;
@@ -82,6 +85,8 @@ interface SessionEventFanoutOptions {
   readonly database: DatabasePool;
   readonly hub: SubscriptionHub;
   readonly listenEnabled?: boolean;
+  /** Maximum sessions with one pending cross-replica notification marker. */
+  readonly notificationQueueLimit?: number;
   readonly now?: () => number;
   readonly observability?: Omit<ModuleObservabilityOptions, "moduleName">;
   readonly reconnectBaseDelayMs?: number;
@@ -117,6 +122,7 @@ export interface SessionEventFanoutSessionService {
 export const defaultEventFanoutCatchUpPollMs = 1_000;
 export const defaultEventFanoutCatchUpStaleMs = 30_000;
 export const defaultEventFanoutBatchLimit = 500;
+export const defaultEventFanoutNotificationQueueLimit = 1_000;
 const defaultListenerReconnectBaseDelayMs = 100;
 const defaultListenerReconnectMaxDelayMs = 5_000;
 
@@ -146,10 +152,16 @@ export class SessionEventFanout {
   private lastDisconnectedAt: string | null = null;
   private lastListenerError: SessionEventFanoutListenerErrorInfo | null = null;
   private lastReconnectDelayMs: number | null = null;
+  private coalescedNotificationCount = 0;
+  private droppedNotificationCount = 0;
   private ignoredSelfNotificationCount = 0;
   private invalidNotificationCount = 0;
   private notificationCount = 0;
+  private readonly notificationQueueLimit: number;
+  private notificationQueueSaturated = false;
   private readonly now: () => number;
+  /** Lowest pending notified seq per session awaiting one coalesced fetch. */
+  private readonly pendingNotificationSeqs = new Map<string, number>();
   private readonly observability: ModuleObservability;
   private nextRoundStartIndex = 0;
   private lastCatchUpOutcome: SessionEventFanoutCatchUpOutcome = "idle";
@@ -166,6 +178,8 @@ export class SessionEventFanout {
   constructor(private readonly options: SessionEventFanoutOptions) {
     this.catchUpPollIntervalMs = options.catchUpPollIntervalMs ?? defaultEventFanoutCatchUpPollMs;
     this.eventBatchLimit = options.eventBatchLimit ?? defaultEventFanoutBatchLimit;
+    this.notificationQueueLimit =
+      options.notificationQueueLimit ?? defaultEventFanoutNotificationQueueLimit;
     this.now = options.now ?? Date.now;
     this.observability = new ModuleObservability({
       ...options.observability,
@@ -187,7 +201,9 @@ export class SessionEventFanout {
       catchUpPollCount: this.catchUpPollCount,
       catchUpPollIntervalMs: this.catchUpPollIntervalMs,
       catchUpRecoveryCount: this.catchUpRecoveryCount,
+      coalescedNotificationCount: this.coalescedNotificationCount,
       connected: this.listenerState === sessionEventFanoutListenerState.connected,
+      droppedNotificationCount: this.droppedNotificationCount,
       fanoutCursorSessionCount: 0,
       ignoredSelfNotificationCount: this.ignoredSelfNotificationCount,
       invalidNotificationCount: this.invalidNotificationCount,
@@ -199,6 +215,7 @@ export class SessionEventFanout {
       listenerState: this.listenerState,
       lastCatchUpOutcome: this.lastCatchUpOutcome,
       notificationCount: this.notificationCount,
+      pendingNotificationSessionCount: this.pendingNotificationSeqs.size,
       reconnectAttemptCount: this.reconnectAttemptCount,
       reconnectSuccessCount: this.reconnectSuccessCount,
       sessionCursorCount: this.options.hub.sessionCursors().length,
@@ -288,11 +305,52 @@ export class SessionEventFanout {
 
   /**
    * Serializes notification processing so session event order is preserved per
-   * process.
+   * process, while coalescing pending notifications per session: one queued
+   * marker fetches every committed event a burst of notifications covered, so
+   * queue depth is bounded by subscribed sessions instead of event rate. The
+   * durable catch-up poll backstops anything a saturated queue drops.
    */
   private enqueueNotification(notification: SessionEventNotification): void {
+    if (!this.hasLocalSocket(notification.sessionId)) {
+      return;
+    }
+    const pendingSeq = this.pendingNotificationSeqs.get(notification.sessionId);
+    if (pendingSeq !== undefined) {
+      if (notification.seq < pendingSeq) {
+        this.pendingNotificationSeqs.set(notification.sessionId, notification.seq);
+      }
+      this.coalescedNotificationCount += 1;
+      return;
+    }
+    if (this.pendingNotificationSeqs.size >= this.notificationQueueLimit) {
+      this.droppedNotificationCount += 1;
+      if (!this.notificationQueueSaturated) {
+        this.notificationQueueSaturated = true;
+        logNotificationQueueSaturated({
+          pendingSessionCount: this.pendingNotificationSeqs.size,
+          queueLimit: this.notificationQueueLimit,
+        });
+      }
+      return;
+    }
+    this.pendingNotificationSeqs.set(notification.sessionId, notification.seq);
     this.processing = this.processing
-      .then(() => this.broadcastNotification(notification))
+      .then(() => {
+        const fromSeq = this.pendingNotificationSeqs.get(notification.sessionId);
+        this.pendingNotificationSeqs.delete(notification.sessionId);
+        if (
+          this.notificationQueueSaturated &&
+          this.pendingNotificationSeqs.size <= this.notificationQueueLimit / 2
+        ) {
+          // Hysteresis: one saturation log per episode, re-armed only after
+          // the queue has drained back to half its capacity.
+          this.notificationQueueSaturated = false;
+        }
+        if (fromSeq === undefined) {
+          return;
+        }
+        return this.broadcastNotifiedSession(notification.sessionId, fromSeq);
+      })
       .catch((error: unknown) => {
         console.error(error);
       });
@@ -454,19 +512,19 @@ export class SessionEventFanout {
   }
 
   /**
-   * Fetches the notified committed event from the shared database and forwards
-   * it to the local hub. The hub owns per-socket delivery dedupe and cursor
-   * completeness.
+   * Fetches the committed events one coalesced notification marker covers and
+   * forwards them to the local hub in one bounded batch. The hub owns
+   * per-socket delivery dedupe and cursor completeness; events beyond the
+   * batch limit are picked up by the durable catch-up poll.
    */
-  private async broadcastNotification(notification: SessionEventNotification): Promise<void> {
-    if (!this.hasLocalSocket(notification.sessionId)) {
+  private async broadcastNotifiedSession(sessionId: string, fromSeq: number): Promise<void> {
+    if (!this.hasLocalSocket(sessionId)) {
       return;
     }
     const events = await Effect.runPromise(
-      this.options.service.listEvents(notification.sessionId, notification.seq - 1, { limit: 1 }),
+      this.options.service.listEvents(sessionId, fromSeq - 1, { limit: this.eventBatchLimit }),
     );
-    const event = events.find((candidate) => candidate.seq === notification.seq);
-    if (event) {
+    for (const event of events) {
       this.broadcastEvent(event);
     }
   }
@@ -605,6 +663,19 @@ export class SessionEventFanout {
 /** Hashes a session identifier for correlation without exposing its raw value. */
 function hashSessionId(sessionId: string): string {
   return createHash("sha256").update(sessionId).digest("hex").slice(0, 16);
+}
+
+/** Emits one structured, payload-free saturation log line per episode. */
+function logNotificationQueueSaturated(details: {
+  readonly pendingSessionCount: number;
+  readonly queueLimit: number;
+}): void {
+  process.stderr.write(
+    `${JSON.stringify({
+      details,
+      event: "session_event_fanout.notification_queue_saturated",
+    })}\n`,
+  );
 }
 
 /** Converts unknown listener failures into stable diagnostics. */

@@ -23,6 +23,12 @@ export type RuntimeTopology = "multi" | "single";
 export interface ServerConfig {
   /** Additional accepted verification secrets keyed by signing key id. */
   readonly authAcceptedSigningSecrets: Readonly<Record<string, string>>;
+  /**
+   * Whether required enforcement accepts revocation-blind legacy stateless
+   * tokens. Rejection is the safe default; explicit true selects the
+   * temporary tgr2 migration compatibility mode.
+   */
+  readonly authAllowLegacyTokens: boolean;
   /** Token issuer required for durable grant issuance and verification. */
   readonly authIssuer: string | null;
   /** Whether HTTP and WebSocket auth enforcement is active. */
@@ -68,6 +74,10 @@ export const serverConfigDescriptor = Config.all({
     Config.orElse(() => Config.succeed("{}")),
     Config.mapAttempt(parseAuthAcceptedSigningSecrets),
   ),
+  authAllowLegacyTokens: Config.string("AUTH_ALLOW_LEGACY_TOKENS").pipe(
+    Config.orElse(() => Config.succeed("")),
+    Config.mapAttempt(parseAuthAllowLegacyTokens),
+  ),
   authIssuer: Config.string("AUTH_ISSUER").pipe(Config.orElse(() => Config.succeed(""))),
   authMode: Config.literal(
     "required",
@@ -111,9 +121,17 @@ export const serverConfigDescriptor = Config.all({
       "HTTP_MAX_BODY_BYTES",
       defaultResourceLimits.httpMaxBodyBytes,
     ),
+    restEventListMaxBytes: positiveIntegerConfig(
+      "REST_EVENT_LIST_MAX_BYTES",
+      defaultResourceLimits.restEventListMaxBytes,
+    ),
     wsBackpressureBufferedBytes: positiveIntegerConfig(
       "WS_BACKPRESSURE_BUFFERED_BYTES",
       defaultResourceLimits.wsBackpressureBufferedBytes,
+    ),
+    wsGapRepairGraceMs: positiveIntegerConfig(
+      "WS_GAP_REPAIR_GRACE_MS",
+      defaultResourceLimits.wsGapRepairGraceMs,
     ),
     wsMaxPayloadBytes: positiveIntegerConfig(
       "WS_MAX_PAYLOAD_BYTES",
@@ -126,6 +144,10 @@ export const serverConfigDescriptor = Config.all({
     wsMessageRateWindowMs: positiveIntegerConfig(
       "WS_MESSAGE_RATE_WINDOW_MS",
       defaultResourceLimits.wsMessageRateWindowMs,
+    ),
+    wsReplayMaxBytes: positiveIntegerConfig(
+      "WS_REPLAY_MAX_BYTES",
+      defaultResourceLimits.wsReplayMaxBytes,
     ),
     wsReplayMaxEvents: positiveIntegerConfig(
       "WS_REPLAY_MAX_EVENTS",
@@ -179,6 +201,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     authAcceptedSigningSecrets: parseAuthAcceptedSigningSecrets(
       env.AUTH_ACCEPTED_SIGNING_SECRETS ?? "{}",
     ),
+    authAllowLegacyTokens: parseAuthAllowLegacyTokens(env.AUTH_ALLOW_LEGACY_TOKENS),
     authIssuer: env.AUTH_ISSUER ?? "",
     authMode: parseAuthMode(env.AUTH_MODE),
     authSigningKid: env.AUTH_SIGNING_KID ?? defaultAuthSigningKid,
@@ -212,9 +235,17 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
         env.HTTP_MAX_BODY_BYTES,
         defaultResourceLimits.httpMaxBodyBytes,
       ),
+      restEventListMaxBytes: parsePositiveResourceLimit(
+        env.REST_EVENT_LIST_MAX_BYTES,
+        defaultResourceLimits.restEventListMaxBytes,
+      ),
       wsBackpressureBufferedBytes: parsePositiveResourceLimit(
         env.WS_BACKPRESSURE_BUFFERED_BYTES,
         defaultResourceLimits.wsBackpressureBufferedBytes,
+      ),
+      wsGapRepairGraceMs: parsePositiveResourceLimit(
+        env.WS_GAP_REPAIR_GRACE_MS,
+        defaultResourceLimits.wsGapRepairGraceMs,
       ),
       wsMaxPayloadBytes: parsePositiveResourceLimit(
         env.WS_MAX_PAYLOAD_BYTES,
@@ -227,6 +258,10 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       wsMessageRateWindowMs: parsePositiveResourceLimit(
         env.WS_MESSAGE_RATE_WINDOW_MS,
         defaultResourceLimits.wsMessageRateWindowMs,
+      ),
+      wsReplayMaxBytes: parsePositiveResourceLimit(
+        env.WS_REPLAY_MAX_BYTES,
+        defaultResourceLimits.wsReplayMaxBytes,
       ),
       wsReplayMaxEvents: parsePositiveResourceLimit(
         env.WS_REPLAY_MAX_EVENTS,
@@ -244,6 +279,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
 
 interface RawServerConfig {
   readonly authAcceptedSigningSecrets: Readonly<Record<string, string>>;
+  readonly authAllowLegacyTokens: boolean;
   readonly authIssuer: string;
   readonly authMode: AuthMode;
   readonly authSigningKid: string;
@@ -381,8 +417,25 @@ function toConfigMap(env: NodeJS.ProcessEnv): Map<string, string> {
  * Absence selects enforced mode; an explicit invalid value fails startup.
  */
 function parseBooleanFlag(value: string | undefined): boolean {
+  return parseDocumentedBooleanFlag(value, "CONTROL_EPOCH_ENFORCEMENT", true);
+}
+
+/**
+ * Parses the legacy stateless-token migration escape hatch. Absence selects
+ * rejection; an explicit invalid value fails startup.
+ */
+function parseAuthAllowLegacyTokens(value: string | undefined): boolean {
+  return parseDocumentedBooleanFlag(value, "AUTH_ALLOW_LEGACY_TOKENS", false);
+}
+
+/** Parses one documented boolean token with an explicit absence default. */
+function parseDocumentedBooleanFlag(
+  value: string | undefined,
+  name: string,
+  absentValue: boolean,
+): boolean {
   if (value === undefined || value.trim() === "") {
-    return true;
+    return absentValue;
   }
   const normalized = value.trim().toLowerCase();
   if (normalized === "true" || normalized === "1" || normalized === "yes" || normalized === "on") {
@@ -391,7 +444,7 @@ function parseBooleanFlag(value: string | undefined): boolean {
   if (normalized === "false" || normalized === "0" || normalized === "no" || normalized === "off") {
     return false;
   }
-  throw new Error("CONTROL_EPOCH_ENFORCEMENT must be a documented boolean");
+  throw new Error(`${name} must be a documented boolean`);
 }
 
 /**

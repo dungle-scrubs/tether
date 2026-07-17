@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createAuthRuntime, type AuthRuntimeLogger } from "../src/auth/enforcement.js";
 import type { AuthGrantRecord, AuthGrantStore } from "../src/auth/grant-stores.js";
 import { mintAuthGrantToken } from "../src/auth/grant-token.js";
-import { AuthError } from "../src/auth/token.js";
+import { AuthError, mintAuthToken } from "../src/auth/token.js";
 
 describe("auth enforcement runtime", () => {
   it("authenticates tgr2 through PostgreSQL and retains a private command revalidator", async () => {
@@ -248,6 +248,96 @@ describe("auth enforcement runtime", () => {
     ]);
   });
 
+  it("rejects legacy stateless tokens in required mode by default", async () => {
+    const warnings: AuthWarning[] = [];
+    const runtime = createAuthRuntime({
+      activeKid: "default",
+      logger: collectWarnings(warnings),
+      mode: "required",
+      secrets: { default: "secret" },
+    });
+    const bearer = mintLegacyBearer();
+
+    await expect(
+      runtime.authenticateHttpRequest(
+        {
+          headers: { authorization: `Bearer ${bearer}` },
+          method: "GET",
+        } as IncomingMessage,
+        new URL("http://localhost/sessions"),
+      ),
+    ).rejects.toThrowError(new Error(AuthError.LegacyTokenRejected));
+
+    expect(warnings).toEqual([
+      {
+        details: {
+          method: "GET",
+          reason: AuthError.LegacyTokenRejected,
+          route: "/sessions",
+          transport: "http",
+        },
+        event: "auth.reject",
+      },
+    ]);
+    expect(JSON.stringify({ debug: runtime.debugInfo(), warnings })).not.toContain(bearer);
+  });
+
+  it("rejects legacy stateless tokens on WebSocket upgrades in required mode by default", async () => {
+    const runtime = createAuthRuntime({
+      activeKid: "default",
+      mode: "required",
+      secrets: { default: "secret" },
+    });
+    const bearer = mintLegacyBearer();
+    const url = new URL(`http://localhost/sessions/sess_legacy/stream?access_token=${bearer}`);
+
+    await expect(
+      runtime.authenticateWebSocketUpgrade(
+        {
+          headers: {},
+          method: "GET",
+          url: `${url.pathname}${url.search}`,
+        } as IncomingMessage,
+        url,
+      ),
+    ).rejects.toThrowError(new Error(AuthError.LegacyTokenRejected));
+  });
+
+  it("accepts legacy stateless tokens only with the explicit migration escape hatch", async () => {
+    const runtime = createAuthRuntime({
+      activeKid: "default",
+      allowLegacyTokens: true,
+      mode: "required",
+      secrets: { default: "secret" },
+    });
+
+    const context = await runtime.authenticateHttpRequest(
+      {
+        headers: { authorization: `Bearer ${mintLegacyBearer()}` },
+        method: "GET",
+      } as IncomingMessage,
+      new URL("http://localhost/sessions"),
+    );
+
+    expect(context).toMatchObject({
+      grantJti: null,
+      participantId: "part_legacy",
+      role: "participant",
+      sessionScope: "sess_legacy",
+    });
+    expect(runtime.debugInfo().legacyTokensAllowed).toBe(true);
+  });
+
+  it("reports the legacy escape hatch as disabled by default", () => {
+    const runtime = createAuthRuntime({
+      activeKid: "default",
+      mode: "required",
+      secrets: { default: "secret" },
+    });
+
+    expect(runtime.debugInfo().legacyTokensAllowed).toBe(false);
+  });
+
   it("rejects tgr2 through the legacy runtime without exposing credential material", async () => {
     const warnings: AuthWarning[] = [];
     const runtime = createAuthRuntime({
@@ -278,6 +368,20 @@ describe("auth enforcement runtime", () => {
 interface AuthWarning {
   readonly details: Record<string, unknown>;
   readonly event: string;
+}
+
+/** Mints a compatibility legacy stateless bearer for escape-hatch tests. */
+function mintLegacyBearer(): string {
+  return mintAuthToken(
+    {
+      exp: 4_102_444_800,
+      kid: "default",
+      participantId: "part_legacy",
+      role: "participant",
+      sessionId: "sess_legacy",
+    },
+    { default: "secret" },
+  );
 }
 
 function collectWarnings(warnings: AuthWarning[]): AuthRuntimeLogger {

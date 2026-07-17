@@ -113,6 +113,16 @@ export class TetherApiClient {
       signal,
     });
     if (!response.ok) {
+      // Tether reports publication conflicts as 4xx; throttling and server
+      // unavailability are transient and stay retryable so the claim flow can
+      // treat them as such instead of recording a durable false conflict.
+      if (response.status === 429 || response.status >= 500) {
+        throw new SessionSummaryWorkerError(
+          "generation_unavailable",
+          `Session Summary candidate submission failed with HTTP ${response.status}`,
+          { retryable: true },
+        );
+      }
       throw new SessionSummaryWorkerError(
         "publication_conflict",
         `Session Summary candidate submission failed with HTTP ${response.status}`,

@@ -158,6 +158,16 @@ interface CandidateRow {
   readonly validatedAt: Date | null;
 }
 
+interface PendingReservationRow {
+  readonly cancelledAt: Date | null;
+  readonly completedAt: Date | null;
+  readonly failedAt: Date | null;
+  readonly summaryId: string;
+  readonly taskFailure: unknown;
+  readonly taskId: string | null;
+  readonly taskInput: unknown;
+}
+
 interface SummaryTaskFenceRow {
   readonly cancelledAt: Date | null;
   readonly claimActive: boolean;
@@ -776,31 +786,39 @@ async function quarantineCandidate(
   pool: SessionSummaryStorePool,
   input: { readonly failure: SessionSummaryFailure; readonly summaryId: string },
 ): Promise<{ readonly status: "quarantined"; readonly summaryId: string }> {
-  const failure = sessionSummaryFailureSchema.parse(input.failure);
   const client = await pool.connect();
   try {
-    const result = await client.query<{ readonly summaryId: string }>(
-      `
-        UPDATE session_summaries
-        SET failure = $2::jsonb, quarantined_at = clock_timestamp()
-        WHERE summary_id = $1
-          AND published_at IS NULL
-          AND quarantined_at IS NULL
-          AND superseded_at IS NULL
-        RETURNING summary_id AS "summaryId"
-      `,
-      [input.summaryId, JSON.stringify(failure)],
-    );
-    if (!result.rows[0]) {
-      throw new SessionSummaryStoreError(
-        "invalid_state",
-        "Session Summary candidate cannot transition to quarantined",
-      );
-    }
-    return { status: "quarantined", summaryId: input.summaryId };
+    return await quarantineCandidateOnClient(client, input);
   } finally {
     client.release();
   }
+}
+
+/** Quarantines one candidate on the caller's client without owning a transaction. */
+async function quarantineCandidateOnClient(
+  client: SessionSummaryStoreClient,
+  input: { readonly failure: SessionSummaryFailure; readonly summaryId: string },
+): Promise<{ readonly status: "quarantined"; readonly summaryId: string }> {
+  const failure = sessionSummaryFailureSchema.parse(input.failure);
+  const result = await client.query<{ readonly summaryId: string }>(
+    `
+      UPDATE session_summaries
+      SET failure = $2::jsonb, quarantined_at = clock_timestamp()
+      WHERE summary_id = $1
+        AND published_at IS NULL
+        AND quarantined_at IS NULL
+        AND superseded_at IS NULL
+      RETURNING summary_id AS "summaryId"
+    `,
+    [input.summaryId, JSON.stringify(failure)],
+  );
+  if (!result.rows[0]) {
+    throw new SessionSummaryStoreError(
+      "invalid_state",
+      "Session Summary candidate cannot transition to quarantined",
+    );
+  }
+  return { status: "quarantined", summaryId: input.summaryId };
 }
 
 /** Timestamps structural validation without coupling it to publication. */
@@ -1125,23 +1143,48 @@ async function selectAndReserveGeneration(
   try {
     await client.query("BEGIN");
     await lockSessionBudgetClass(client, input.sessionId, input.budgetClass);
-    const pending = await client.query<{ readonly summaryId: string }>(
+    // The backing task is read without FOR UPDATE: candidate submission locks
+    // the task row before this advisory lock, so locking it here would invert
+    // that order. Terminal task states and elapsed deadlines never revert, so
+    // a stale read only defers reclamation to the next reservation attempt.
+    const pending = await client.query<PendingReservationRow>(
       `
-        SELECT summary_id AS "summaryId"
-        FROM session_summaries
-        WHERE session_id = $1
-          AND budget_class = $2
-          AND published_at IS NULL
-          AND quarantined_at IS NULL
-          AND superseded_at IS NULL
-        ORDER BY created_at, summary_id
-        LIMIT 1
+        SELECT
+          s.summary_id AS "summaryId",
+          t.cancelled_at AS "cancelledAt",
+          t.completed_at AS "completedAt",
+          t.failed_at AS "failedAt",
+          t.failure AS "taskFailure",
+          t.input AS "taskInput",
+          t.task_id AS "taskId"
+        FROM session_summaries s
+        LEFT JOIN tasks t
+          ON t.session_id = s.session_id AND t.task_id = s.generation_task_id
+        WHERE s.session_id = $1
+          AND s.budget_class = $2
+          AND s.published_at IS NULL
+          AND s.quarantined_at IS NULL
+          AND s.superseded_at IS NULL
+        ORDER BY s.created_at, s.summary_id
+        FOR UPDATE OF s
       `,
       [input.sessionId, input.budgetClass],
     );
     if (pending.rows.length > 0) {
-      await client.query("COMMIT");
-      return { status: "in_progress" };
+      const databaseNow = await readDatabaseNow(client);
+      let inProgress = false;
+      for (const row of pending.rows) {
+        const failure = classifyDeadPendingReservation(row, databaseNow);
+        if (failure === null) {
+          inProgress = true;
+          continue;
+        }
+        await quarantineCandidateOnClient(client, { failure, summaryId: row.summaryId });
+      }
+      if (inProgress) {
+        await client.query("COMMIT");
+        return { status: "in_progress" };
+      }
     }
     const publishedHead = await readPublishedHead(client, input.sessionId, input.budgetClass);
     const bounds = await client.query<StreamBoundsRow>(
@@ -1227,6 +1270,67 @@ async function selectAndReserveGeneration(
   } finally {
     client.release();
   }
+}
+
+/**
+ * Decides whether one pending reservation can still publish its candidate.
+ *
+ * Every candidate write path requires a live claim on a nonterminal task
+ * before an unelapsed job deadline, so a pending row whose backing task is
+ * missing, terminal, malformed, or past its immutable deadline can never
+ * advance. Returning its bounded failure quarantines it in the reservation
+ * transaction so a fresh generation can be reserved.
+ */
+function classifyDeadPendingReservation(
+  row: PendingReservationRow,
+  databaseNow: Date,
+): SessionSummaryFailure | null {
+  if (row.taskId === null) {
+    return deadReservationFailure("stale_job", "Session Summary generation task no longer exists");
+  }
+  if (row.cancelledAt !== null) {
+    return deadReservationFailure(
+      "cancelled",
+      "Session Summary generation task was cancelled before publication",
+    );
+  }
+  if (row.failedAt !== null) {
+    const taskFailure = sessionSummaryFailureSchema.safeParse(row.taskFailure);
+    return taskFailure.success
+      ? taskFailure.data
+      : deadReservationFailure(
+          "generation_unavailable",
+          "Session Summary generation task failed before publication",
+        );
+  }
+  if (row.completedAt !== null) {
+    return deadReservationFailure(
+      "publication_conflict",
+      "Session Summary generation task completed without publishing its candidate",
+    );
+  }
+  const job = sessionSummaryGenerationJobSchema.safeParse(row.taskInput);
+  if (!job.success) {
+    return deadReservationFailure(
+      "stale_job",
+      "Session Summary task input does not match the protocol generation contract",
+    );
+  }
+  if (Date.parse(job.data.deadlineAt) <= databaseNow.getTime()) {
+    return deadReservationFailure(
+      "deadline_exceeded",
+      "Session Summary generation job deadline elapsed before publication",
+    );
+  }
+  return null;
+}
+
+/** Builds one bounded nonretryable failure for a dead pending reservation. */
+function deadReservationFailure(
+  code: SessionSummaryFailure["code"],
+  message: string,
+): SessionSummaryFailure {
+  return { attempt: 1, code, message, retryable: false };
 }
 
 async function traceSummaryStoreOperation<TValue>(

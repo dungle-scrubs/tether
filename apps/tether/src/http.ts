@@ -364,27 +364,15 @@ export function createAppServerWithSessionService(
   });
 
   return {
-    close: async () => {
-      await taskClaimSweeper.stop();
-      await eventFanout.stop();
-      await authRevocation.stop();
-      auth.close();
-      await new Promise<void>((resolve, reject) => {
-        wsServer.close((wsError) => {
-          if (wsError) {
-            reject(wsError);
-            return;
-          }
-          server.close((serverError) => {
-            if (serverError) {
-              reject(serverError);
-              return;
-            }
-            resolve();
-          });
-        });
-      });
-    },
+    close: () =>
+      closeAppServerResources({
+        auth,
+        authRevocation,
+        eventFanout,
+        server,
+        taskClaimSweeper,
+        wsServer,
+      }),
     debugInfo: readDebugInfo,
     listen: async (port) => {
       await authRevocation.start();
@@ -395,6 +383,74 @@ export function createAppServerWithSessionService(
       taskClaimSweeper.start();
     },
   };
+}
+
+/**
+ * Structural resource seam for ordered app-server shutdown, so the ordering
+ * contract below is unit-testable with recording fakes.
+ */
+export interface AppServerCloseResources {
+  readonly auth: { readonly close: () => void };
+  readonly authRevocation: { readonly stop: () => Promise<void> };
+  readonly eventFanout: { readonly stop: () => Promise<void> };
+  readonly server: {
+    readonly close: (callback: (error?: Error) => void) => unknown;
+    readonly closeIdleConnections: () => void;
+  };
+  readonly taskClaimSweeper: { readonly stop: () => Promise<void> };
+  readonly wsServer: {
+    readonly clients: Iterable<{ readonly close: (code: number, reason: string) => void }>;
+    readonly close: (callback?: (error?: Error) => void) => void;
+  };
+}
+
+/**
+ * Closes app-server resources in intake-first order. New HTTP connections and
+ * WebSocket upgrades stop first, in-flight responses and socket close
+ * handshakes drain while the fanout and claim sweeper are still delivering,
+ * and only then do the background modules stop. Stopping fanout or the sweeper
+ * before intake would leave this replica accepting REST writes and holding
+ * open subscriber sockets that silently miss committed remote-origin events
+ * for the whole drain window. Live sockets receive a going-away close so their
+ * clients reconnect to another replica and resume from their durable cursors.
+ */
+export async function closeAppServerResources(resources: AppServerCloseResources): Promise<void> {
+  // Initiate both listener closes before any teardown: the HTTP close stops
+  // new connections (and therefore new WS upgrades, which arrive on the same
+  // listener), and the WS close stops the gateway accepting handled upgrades.
+  const serverClosed = new Promise<void>((resolve, reject) => {
+    resources.server.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
+  const wsServerClosed = new Promise<void>((resolve, reject) => {
+    resources.wsServer.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
+  // Idle keep-alive sockets would otherwise hold the listener open forever;
+  // in-flight responses still complete before their sockets close.
+  resources.server.closeIdleConnections();
+  // End live subscriptions with a going-away close while the fanout is still
+  // running, so close handshakes and reconnect signals are delivered rather
+  // than sockets lingering to silently miss events after fanout stops.
+  for (const client of resources.wsServer.clients) {
+    client.close(1001, "server shutting down");
+  }
+  await Promise.all([wsServerClosed, serverClosed]);
+  // Intake is closed and sockets are drained; now stop background delivery.
+  await resources.taskClaimSweeper.stop();
+  await resources.eventFanout.stop();
+  await resources.authRevocation.stop();
+  resources.auth.close();
 }
 
 /** Builds the default Effect session service used by the HTTP app boundary. */

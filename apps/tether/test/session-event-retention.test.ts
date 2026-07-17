@@ -50,6 +50,11 @@ describe("session event retention cutoff", () => {
       "apps/tether/src/auth/socket-registry.ts:entry.grantJti",
       "apps/tether/src/auth/socket-registry.ts:socket",
       "apps/tether/src/auth/socket-registry.ts:socket",
+      // Reviewed: bounded fenced-generation history prune; never touches
+      // session_events, and the current lease row is excluded by predicate.
+      "apps/tether/src/db.ts:participantControlLeases",
+      // Reviewed: fenced permanent session delete; cascades session-owned rows
+      // but session_events removal happens only through this reviewed cascade.
       "apps/tether/src/db.ts:sessions",
       "apps/tether/src/host-presence.ts:instanceId",
       "apps/tether/src/host-presence.ts:listener",
@@ -58,10 +63,11 @@ describe("session event retention cutoff", () => {
       "apps/tether/src/hub.ts:nextSeq",
       "apps/tether/src/hub.ts:sessionId",
       "apps/tether/src/hub.ts:socket",
+      "apps/tether/src/session-event-fanout.ts:notification.sessionId",
       "apps/tether/src/session-event-fanout.ts:sessionId",
       "apps/tether/src/session-scalability-runtime-state.ts:key",
       "apps/tether/src/session-scalability-runtime-state.ts:oldest",
-      "apps/tether/src/session-service-core-effects.ts:deleteInput.sessionId",
+      "apps/tether/src/session-service-core-effects.ts:sessionId, { hasLiveHost }",
       'apps/tether/src/websocket-participant-gateway.ts:"access_token"',
       'apps/tether/src/websocket-participant-gateway.ts:"ticket"',
       "apps/tether/src/websocket-participant-gateway.ts:key",

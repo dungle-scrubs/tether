@@ -1,10 +1,19 @@
 import { describe, expect, it } from "vitest";
 
-import { claimControlLease, type DatabasePool } from "../src/db.js";
+import {
+  claimControlLease,
+  controlLeaseGenerationHistoryLimit,
+  type DatabasePool,
+} from "../src/db.js";
 
 interface CapturedQuery {
   readonly params: readonly unknown[] | undefined;
   readonly sql: string;
+}
+
+/** Drizzle issues query-config objects; raw transaction statements are strings. */
+function queryText(sql: string | { readonly text: string }): string {
+  return typeof sql === "string" ? sql : sql.text;
 }
 
 /** A durable participant_control_leases row as returned by the RETURNING columns. */
@@ -56,7 +65,11 @@ class ScriptedLeaseClient {
 
   constructor(private readonly currentEpoch: number) {}
 
-  async query<TRow>(sql: string, params?: readonly unknown[]): Promise<{ readonly rows: TRow[] }> {
+  async query<TRow>(
+    rawSql: string | { readonly text: string },
+    params?: readonly unknown[],
+  ): Promise<{ readonly rows: TRow[] }> {
+    const sql = queryText(rawSql);
     this.queries.push({ params, sql });
     if (isDatabaseClockSelect(sql)) {
       return {
@@ -141,9 +154,10 @@ describe("claimControlLease generation history", () => {
     // No current row: the active-lease SELECT returns empty, MAX(epoch) is null.
     const client = new (class extends ScriptedLeaseClient {
       async query<TRow>(
-        sql: string,
+        rawSql: string | { readonly text: string },
         params?: readonly unknown[],
       ): Promise<{ readonly rows: TRow[] }> {
+        const sql = queryText(rawSql);
         this.queries.push({ params, sql });
         if (isDatabaseClockSelect(sql)) {
           return {
@@ -176,5 +190,63 @@ describe("claimControlLease generation history", () => {
     }
     expect(claim.status).toBe("claimed");
     expect(claim.lease.epoch).toBe(1);
+  });
+});
+
+function isHistoryPruneDelete(sql: string): boolean {
+  return sql.includes('delete from "participant_control_leases"');
+}
+
+describe("claimControlLease bounded generation-history pruning", () => {
+  it("prunes fenced history beyond the bounded tail inside the acquisition transaction", async () => {
+    const client = new ScriptedLeaseClient(7);
+
+    const claim = await claimControlLease(scriptedDatabase(client), {
+      controlChannel: "ws",
+      instanceId: "inst_a",
+      leaseTtlMs: 60_000,
+      participantId: "part_1",
+      sessionId: "sess_1",
+    });
+    if (claim.status === "conflict") {
+      throw new Error("unexpected conflict");
+    }
+
+    const prune = client.queries.find((query) => isHistoryPruneDelete(query.sql));
+    expect(prune).toBeDefined();
+    const pruneSql = prune?.sql ?? "";
+    // Only fenced generations are prunable: the current row (neither released
+    // nor superseded) is excluded by predicate and can never be deleted.
+    expect(pruneSql).toContain(
+      '"participant_control_leases"."released_at" is not null or "participant_control_leases"."superseded_at" is not null',
+    );
+    // The newest generations ordered by epoch are always retained, so
+    // MAX(epoch) can never regress for allocateNextControlEpoch and recent
+    // acquisition-id rows stay resolvable for retry classification.
+    expect(pruneSql).toContain('not in (select "epoch" from "participant_control_leases"');
+    expect(pruneSql).toContain('order by "participant_control_leases"."epoch" desc');
+    expect(prune?.params).toEqual([
+      "sess_1",
+      "part_1",
+      "sess_1",
+      "part_1",
+      controlLeaseGenerationHistoryLimit,
+    ]);
+
+    // Pruning runs inside the same transaction as the generation change, after
+    // the new generation row is inserted and before the commit, under the same
+    // participant advisory lock.
+    const insertIndex = client.queries.findIndex((query) =>
+      query.sql.includes("INSERT INTO participant_control_leases"),
+    );
+    const pruneIndex = client.queries.findIndex((query) => isHistoryPruneDelete(query.sql));
+    expect(pruneIndex).toBeGreaterThan(insertIndex);
+    expect(client.queries.at(-1)?.sql).toBe("COMMIT");
+  });
+
+  it("keeps a bounded multi-generation tail rather than pruning to the current row", () => {
+    // The retention tail must stay comfortably above one row so operator
+    // history and REST acquisition-id replay both keep working.
+    expect(controlLeaseGenerationHistoryLimit).toBeGreaterThanOrEqual(5);
   });
 });

@@ -5,8 +5,8 @@ import { resolveServiceAuthToken } from "./auth-token.js";
 import { sleepUnrefEffect } from "./effect-timing.js";
 import { ModuleObservability, readModuleObservabilityOptions } from "./observability.js";
 import {
+  classifyWebSocketServerEnvelope,
   parseWebSocketRecoveryCondition,
-  parseWebSocketServerEnvelope,
   type WebSocketRecoveryReason,
   webSocketOperation,
 } from "./protocol.js";
@@ -191,8 +191,22 @@ export class SessionEventStreamClient {
     };
   }
 
-  /** Reopens the stream from the highest observed event sequence. */
+  /**
+   * Reopens the stream from the highest observed event sequence. This is the
+   * documented Paused State remediation: it clears the paused reason and
+   * bounded recovery counters before reconnecting. Reconnecting an
+   * intentionally closed client rejects with a typed error instead of
+   * reporting success on a dead stream.
+   */
   async reconnect(): Promise<SessionEventStreamClient> {
+    if (this.stopped) {
+      throw new SessionEventStreamError({
+        message: "Cannot reconnect an intentionally closed session event stream client",
+      });
+    }
+    this.pausedReason = null;
+    this.deliveryRecoveryAttempts = 0;
+    this.deliveryRecoverySeq = null;
     this.socket?.close();
     await this.waitForClose().catch(() => undefined);
     await this.requestReconnect(0);
@@ -233,11 +247,23 @@ export class SessionEventStreamClient {
         );
         this.socket = socket;
         this.connectCount += 1;
+        // Set once open() resolves for this socket. A close before the socket
+        // established (a failed open, including the retries inside the backoff
+        // loop) must not schedule its own reconnect: the initial connect()
+        // rejects to a caller holding no client reference, and the backoff loop
+        // already owns its own retries.
+        let established = false;
         this.closePromise = new Promise((resolve) => {
           socket.once("close", () => {
+            // Recovery and pause paths null the socket before closing it, so
+            // this branch only runs for closes the client did not orchestrate:
+            // network blips, server restarts, and intentional close().
             if (this.connectionGeneration === generation && this.socket === socket) {
               this.socket = null;
               this.settleReplayCompleteError(new Error("WebSocket closed before replay completed"));
+              if (established) {
+                this.scheduleReconnectAfterUnexpectedClose();
+              }
             }
             resolve();
           });
@@ -252,7 +278,10 @@ export class SessionEventStreamClient {
           this.handleMessage(data, generation);
         });
         await new Promise<void>((resolve, reject) => {
-          socket.once("open", resolve);
+          socket.once("open", () => {
+            established = true;
+            resolve();
+          });
           socket.once("error", reject);
         });
       },
@@ -279,6 +308,34 @@ export class SessionEventStreamClient {
     return reconnect;
   }
 
+  /**
+   * Recovers from an unexpected transport close with the documented reconnect
+   * backoff. Intentional close() and Paused State never reconnect. Before
+   * reopening, it awaits the delivery settlement barrier so an in-flight
+   * handler cannot overlap its own replayed invocation.
+   */
+  private scheduleReconnectAfterUnexpectedClose(): void {
+    if (this.stopped || this.pausedReason !== null) {
+      return;
+    }
+    const generationAtSchedule = this.connectionGeneration;
+    const settlingDelivery = this.delivery;
+    void settlingDelivery.waitForSettlement().then(() => {
+      // A concurrent manual reconnect() can open a newer generation while this
+      // handler's settlement is still pending. Re-check terminal state and the
+      // generation so a stale continuation never overwrites a live socket.
+      if (
+        this.stopped ||
+        this.pausedReason !== null ||
+        this.connectionGeneration !== generationAtSchedule ||
+        this.socket !== null
+      ) {
+        return;
+      }
+      void this.requestReconnect();
+    });
+  }
+
   /** Builds the bounded reconnect loop as an Effect program. */
   private buildReconnectWithBackoff(
     initialDelayMs: number | null = null,
@@ -286,7 +343,7 @@ export class SessionEventStreamClient {
     return Effect.gen(this, function* () {
       let attempt = 0;
       let delayMs = initialDelayMs ?? observerReconnectDelayMs(attempt, this.config);
-      while (!this.stopped) {
+      while (!this.stopped && this.pausedReason === null) {
         if (delayMs > 0) {
           yield* sleepUnrefEffect(delayMs);
         }
@@ -316,11 +373,22 @@ export class SessionEventStreamClient {
     }
     try {
       const frameByteLength = Buffer.byteLength(String(data));
-      const envelope = parseWebSocketServerEnvelope(JSON.parse(String(data)) as unknown);
-      if (!envelope) {
+      const classified = classifyWebSocketServerEnvelope(JSON.parse(String(data)) as unknown);
+      if (classified.kind === "unknown-op") {
+        // Forward compatibility: a newer server operation carries no event
+        // delivery in the owned protocol, so skipping it preserves seq
+        // contiguity; a future delivery-bearing op would surface as a
+        // non-contiguous event and halt through the typed outcome.
+        this.observability.debug("handleMessage", "observer_stream.unknown_envelope_op_skipped", {
+          op: classified.op.slice(0, 64),
+        });
+        return;
+      }
+      if (classified.kind === "malformed") {
         this.delivery.rejectInvalidEnvelope();
         return;
       }
+      const envelope = classified.envelope;
       if (envelope.op === webSocketOperation.event) {
         this.eventCount += 1;
         this.delivery.enqueueEvent(envelope.event, frameByteLength);
@@ -338,6 +406,15 @@ export class SessionEventStreamClient {
           ...(recovery === null ? {} : { reason: recovery.reason }),
           ...(recovery?.limit === undefined ? {} : { safeDetails: { limit: recovery.limit } }),
         });
+        // Terminal replay conditions require caller remediation; pausing here
+        // keeps the ensuing server close from starting a futile reconnect
+        // loop against the same unrepairable cursor.
+        if (
+          envelope.reason === "replay_window_exceeded" ||
+          envelope.reason === "replay_gap_unrepaired"
+        ) {
+          this.pausedReason = envelope.reason;
+        }
         this.settleReplayCompleteError(error);
         this.emitError(error);
       }
@@ -433,7 +510,7 @@ export class SessionEventStreamClient {
    * settlement barrier so a timed-out handler cannot overlap its own replay.
    */
   private recoverFromDeliveryFailure(generation: number): void {
-    if (this.stopped || generation !== this.connectionGeneration) {
+    if (this.stopped || this.pausedReason !== null || generation !== this.connectionGeneration) {
       return;
     }
     const targetSeq = this.lastObservedSeq + 1;
@@ -444,8 +521,9 @@ export class SessionEventStreamClient {
     this.deliveryRecoveryAttempts += 1;
     const socket = this.socket;
     if (this.deliveryRecoveryAttempts >= observerMaxRecoveryAttempts) {
+      // Paused State suppresses automatic reconnects but keeps the client
+      // remediable: an explicit reconnect() clears the pause and resumes.
       this.pausedReason = "delivery_recovery_exhausted";
-      this.stopped = true;
       this.settleReplayCompleteError(new Error("Observer delivery failed before replay completed"));
       this.emitError(
         new SessionEventStreamError({

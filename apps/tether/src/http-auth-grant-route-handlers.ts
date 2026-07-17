@@ -76,6 +76,9 @@ export function handleAuthGrantHttpRoute(input: Input): Effect.Effect<boolean, u
   return Effect.gen(function* () {
     const route = matchRoute(input.request.method, input.url.pathname);
     if (route === null) return false;
+    // Grant lifecycle is a global admin surface: omitting sessionId means
+    // authorize accepts only a service-scoped (`*`) admin grant, so a
+    // session-scoped admin cannot mint, list, inspect, or revoke grants.
     const denied = authorize({ action: "admin", context: input.authContext });
     if (denied) {
       sendAuthError(input.response, denied);

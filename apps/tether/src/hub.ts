@@ -5,6 +5,7 @@ import {
   defaultResourceLimits,
   resourceLimitReason,
   type ResourceLimits,
+  sessionEventByteLength,
 } from "./resource-limits.js";
 import type { SessionEvent } from "./types.js";
 
@@ -14,7 +15,9 @@ import type { SessionEvent } from "./types.js";
 export interface SubscriptionHubDebugInfo {
   readonly backpressureCloseCount: number;
   readonly duplicateEventSkipCount: number;
+  readonly gapBufferDropCount: number;
   readonly outOfOrderLiveEventCount: number;
+  readonly pendingEventByteLength: number;
   readonly pendingEventCount: number;
   readonly replayBufferedEventCount: number;
   readonly replayGapRepairCount: number;
@@ -58,16 +61,39 @@ interface ReplayGapUnrepairedLogDetails {
   readonly sessionId: string;
 }
 
+/** Structured diagnostics for one dropped pending gap buffer. */
+interface GapBufferDroppedLogDetails {
+  readonly contiguousDeliveredSeq: number;
+  readonly droppedByteLength: number;
+  readonly droppedEventCount: number;
+  readonly sessionId: string;
+}
+
+/** One buffered future event and its measured serialized size. */
+interface BufferedSessionEvent {
+  readonly byteLength: number;
+  readonly event: SessionEvent;
+}
+
 interface SocketSubscriptionState {
   readonly afterSeq: number;
   contiguousDeliveredSeq: number;
-  readonly pendingBySeq: Map<number, SessionEvent>;
+  /** Wall-clock start of the current gap-repair grace window, if one is open. */
+  gapRepairStartedAt: number | null;
+  readonly pendingBySeq: Map<number, BufferedSessionEvent>;
+  /** Total serialized bytes currently held in pendingBySeq. */
+  pendingByteLength: number;
   replaying: boolean;
 }
 
 /** Process-local options for the WebSocket subscription hub. */
 export interface SubscriptionHubOptions {
-  readonly limits: Pick<ResourceLimits, "wsBackpressureBufferedBytes" | "wsReplayMaxEvents">;
+  readonly limits: Pick<
+    ResourceLimits,
+    "wsBackpressureBufferedBytes" | "wsGapRepairGraceMs" | "wsReplayMaxBytes" | "wsReplayMaxEvents"
+  >;
+  /** Clock override so gap-repair grace windows are testable. */
+  readonly now?: (() => number) | undefined;
 }
 
 /** Options for adding a subscribed WebSocket to the hub. */
@@ -80,6 +106,8 @@ export class SubscriptionHub {
   private readonly socketsBySession = new Map<string, Map<WebSocket, SocketSubscriptionState>>();
   private backpressureCloseCount = 0;
   private duplicateEventSkipCount = 0;
+  private gapBufferDropCount = 0;
+  private readonly now: () => number;
   private outOfOrderLiveEventCount = 0;
   private replayGapRepairCount = 0;
   private replayGapRepairEventCount = 0;
@@ -88,22 +116,28 @@ export class SubscriptionHub {
     private readonly options: SubscriptionHubOptions = {
       limits: {
         wsBackpressureBufferedBytes: defaultResourceLimits.wsBackpressureBufferedBytes,
+        wsGapRepairGraceMs: defaultResourceLimits.wsGapRepairGraceMs,
+        wsReplayMaxBytes: defaultResourceLimits.wsReplayMaxBytes,
         wsReplayMaxEvents: defaultResourceLimits.wsReplayMaxEvents,
       },
     },
-  ) {}
+  ) {
+    this.now = options.now ?? Date.now;
+  }
 
   /**
    * Returns a snapshot of session and socket fan-out state.
    */
   debugInfo(): SubscriptionHubDebugInfo {
     let socketCount = 0;
+    let pendingEventByteLength = 0;
     let pendingEventCount = 0;
     let replayBufferedEventCount = 0;
     let replayingSocketCount = 0;
     for (const sockets of this.socketsBySession.values()) {
       socketCount += sockets.size;
       for (const state of sockets.values()) {
+        pendingEventByteLength += state.pendingByteLength;
         pendingEventCount += state.pendingBySeq.size;
         if (state.replaying) {
           replayingSocketCount += 1;
@@ -114,7 +148,9 @@ export class SubscriptionHub {
     return {
       backpressureCloseCount: this.backpressureCloseCount,
       duplicateEventSkipCount: this.duplicateEventSkipCount,
+      gapBufferDropCount: this.gapBufferDropCount,
       outOfOrderLiveEventCount: this.outOfOrderLiveEventCount,
+      pendingEventByteLength,
       pendingEventCount,
       replayBufferedEventCount,
       replayGapRepairCount: this.replayGapRepairCount,
@@ -157,7 +193,9 @@ export class SubscriptionHub {
     sockets.set(socket, {
       afterSeq: normalizedOptions.afterSeq,
       contiguousDeliveredSeq: normalizedOptions.afterSeq,
+      gapRepairStartedAt: null,
       pendingBySeq: new Map(),
+      pendingByteLength: 0,
       replaying: normalizedOptions.replaying ?? false,
     });
     this.socketsBySession.set(sessionId, sockets);
@@ -263,11 +301,47 @@ export class SubscriptionHub {
     if (source === "live") {
       this.outOfOrderLiveEventCount += 1;
     }
-    if (state.pendingBySeq.size >= this.options.limits.wsReplayMaxEvents) {
-      this.closeUnrepairedGapSocket(sessionId, socket, state, event.seq);
-      return;
+    const saturated =
+      state.pendingBySeq.size >= this.options.limits.wsReplayMaxEvents ||
+      state.pendingByteLength >= this.options.limits.wsReplayMaxBytes;
+    if (saturated) {
+      // During replay the gateway repair loop owns gap recovery, so a saturated
+      // buffer is closed with the typed repair failure exactly as before. For a
+      // live socket the buffer is only an optimization: the durable catch-up
+      // poll re-reads everything after the contiguous cursor, so the buffer is
+      // dropped and the poll gets a bounded grace window to repair the gap
+      // before the socket is closed as genuinely unrepairable.
+      if (state.replaying) {
+        this.closeUnrepairedGapSocket(sessionId, socket, state, event.seq);
+        return;
+      }
+      const now = this.now();
+      if (
+        state.gapRepairStartedAt !== null &&
+        now - state.gapRepairStartedAt >= this.options.limits.wsGapRepairGraceMs
+      ) {
+        this.closeUnrepairedGapSocket(sessionId, socket, state, event.seq);
+        return;
+      }
+      state.gapRepairStartedAt = state.gapRepairStartedAt ?? now;
+      this.dropPendingGapBuffer(sessionId, state);
     }
-    state.pendingBySeq.set(event.seq, event);
+    const byteLength = sessionEventByteLength(event);
+    state.pendingBySeq.set(event.seq, { byteLength, event });
+    state.pendingByteLength += byteLength;
+  }
+
+  /** Drops a saturated pending buffer that the durable catch-up poll re-reads. */
+  private dropPendingGapBuffer(sessionId: string, state: SocketSubscriptionState): void {
+    this.gapBufferDropCount += 1;
+    logGapBufferDropped({
+      contiguousDeliveredSeq: state.contiguousDeliveredSeq,
+      droppedByteLength: state.pendingByteLength,
+      droppedEventCount: state.pendingBySeq.size,
+      sessionId,
+    });
+    state.pendingBySeq.clear();
+    state.pendingByteLength = 0;
   }
 
   /** Sends an event that is exactly the next contiguous sequence. */
@@ -280,12 +354,20 @@ export class SubscriptionHub {
     if (socket.readyState !== socket.OPEN) {
       return;
     }
-    if (socket.bufferedAmount > this.options.limits.wsBackpressureBufferedBytes) {
+    // Buffered future events are bytes this socket has not consumed yet, so
+    // they count toward the slow-consumer budget alongside the ws send buffer.
+    if (
+      socket.bufferedAmount + state.pendingByteLength >
+      this.options.limits.wsBackpressureBufferedBytes
+    ) {
       this.closeBackpressuredSocket(sessionId, socket);
       return;
     }
     socket.send(serializeEventEnvelope(event));
     state.contiguousDeliveredSeq = event.seq;
+    // The contiguous cursor advanced, so any open gap-repair grace window has
+    // made progress and restarts from the next saturation.
+    state.gapRepairStartedAt = null;
   }
 
   /** Drains any buffered future events that now extend the contiguous prefix. */
@@ -296,12 +378,13 @@ export class SubscriptionHub {
   ): void {
     while (socket.readyState === socket.OPEN) {
       const nextSeq = state.contiguousDeliveredSeq + 1;
-      const nextEvent = state.pendingBySeq.get(nextSeq);
-      if (!nextEvent) {
+      const buffered = state.pendingBySeq.get(nextSeq);
+      if (!buffered) {
         return;
       }
       state.pendingBySeq.delete(nextSeq);
-      this.sendContiguousEvent(sessionId, socket, state, nextEvent);
+      state.pendingByteLength = Math.max(0, state.pendingByteLength - buffered.byteLength);
+      this.sendContiguousEvent(sessionId, socket, state, buffered.event);
     }
   }
 
@@ -405,6 +488,16 @@ function logReplayGapUnrepaired(details: ReplayGapUnrepairedLogDetails): void {
     `${JSON.stringify({
       details,
       event: "websocket.replay_gap_unrepaired",
+    })}\n`,
+  );
+}
+
+/** Emits one structured gap-buffer drop log line without using console APIs. */
+function logGapBufferDropped(details: GapBufferDroppedLogDetails): void {
+  process.stderr.write(
+    `${JSON.stringify({
+      details,
+      event: "websocket.replay_gap_buffer_dropped",
     })}\n`,
   );
 }

@@ -10,6 +10,7 @@ import type {
   PersistedEventAppendResult,
   PersistedParticipantRegistrationResult,
   PersistedTaskApprovalResult,
+  PermanentSessionDeleteResult,
   PersistedTaskClaimResult,
   PersistedTaskCreateResult,
   PersistedTaskEventResult,
@@ -219,7 +220,17 @@ export interface ParticipantStore {
 /** Persistence for session records and aggregate diagnostics. */
 export interface SessionStore {
   readonly create: (sessionId: string) => Promise<CreateSessionResult>;
-  readonly delete: (sessionId: string) => Promise<boolean>;
+  /**
+   * Permanently deletes one session with the eligibility re-check fenced
+   * inside the delete transaction. The optional `hasLiveHost` probe re-checks
+   * process-local Host Presence between the row locks and the delete.
+   */
+  readonly delete: (
+    sessionId: string,
+    options?: {
+      readonly hasLiveHost?: (() => boolean) | undefined;
+    },
+  ) => Promise<PermanentSessionDeleteResult>;
   readonly list: () => Promise<SessionListItem[]>;
   readonly read: (sessionId: string) => Promise<SessionRecord>;
   readonly readDebugSummary: (sessionId: string) => Promise<SessionDebugSummary>;

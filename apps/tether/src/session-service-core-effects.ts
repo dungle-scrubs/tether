@@ -1,5 +1,6 @@
 import { Effect } from "effect";
 
+import type { PermanentSessionDeleteResult } from "./db.js";
 import type { SessionPersistenceStores } from "./db-store-contracts.js";
 import {
   type AppendSessionEventInput,
@@ -66,8 +67,10 @@ export interface SessionCoreEffects {
     readonly sessionId: string | undefined;
   }) => Effect.Effect<SessionCreatedResult, SessionServiceFailure>;
   readonly deleteSessionEffect: (input: {
+    /** Re-checks process-local Host Presence inside the delete transaction. */
+    readonly hasLiveHost?: (() => boolean) | undefined;
     readonly sessionId: string;
-  }) => Effect.Effect<boolean, SessionServiceFailure>;
+  }) => Effect.Effect<PermanentSessionDeleteResult, SessionServiceFailure>;
   readonly ensurePublicSessionEffect: (input: {
     readonly sessionId: string | undefined;
   }) => Effect.Effect<
@@ -167,7 +170,12 @@ export function createSessionCoreEffects(input: SessionCoreEffectsInput): Sessio
       trySessionPromise(() => input.stores.clientBindings.archive(bindingInput)),
     createSessionEffect,
     deleteSessionEffect: (deleteInput) =>
-      trySessionPromise(() => input.stores.sessions.delete(deleteInput.sessionId)),
+      trySessionPromise(() => {
+        // Single-expression call so the reviewed delete-call inventory keeps
+        // matching this store delete.
+        const { hasLiveHost, sessionId } = deleteInput;
+        return input.stores.sessions.delete(sessionId, { hasLiveHost });
+      }),
     ensurePublicSessionEffect: (ensureInput) =>
       Effect.gen(function* () {
         const result = yield* trySessionPromise(() =>

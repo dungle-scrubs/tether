@@ -54,6 +54,41 @@ describe("ClientBridgeSessionResolver", () => {
     });
   });
 
+  it("accepts a server session record that carries only createdAt and sessionId", async () => {
+    const requests: CapturedRequest[] = [];
+    const fetch = createJsonFetch(requests, [
+      {
+        body: {
+          binding: createBindingFixture({ externalId: "chat_real", sessionId: "sess_real" }),
+          created: true,
+          // Inline literal mirroring toSessionRecord on the server: the sessions
+          // table has no archive column, so archivedAt is never emitted.
+          session: {
+            createdAt: "2026-01-01T00:00:00.000Z",
+            sessionId: "sess_real",
+          },
+        },
+        status: 200,
+      },
+    ]);
+    const resolver = new ClientBridgeSessionResolver(
+      {
+        provider: "external-chat",
+        serviceUrl: "http://tether.test",
+      },
+      { fetch },
+    );
+
+    await expect(resolver.resolveSession("chat_real")).resolves.toEqual({
+      binding: createBindingFixture({ externalId: "chat_real", sessionId: "sess_real" }),
+      created: true,
+      session: {
+        createdAt: "2026-01-01T00:00:00.000Z",
+        sessionId: "sess_real",
+      },
+    });
+  });
+
   it("passes a default session id when a bridge is configured with one", async () => {
     const requests: CapturedRequest[] = [];
     const fetch = createJsonFetch(requests, [
@@ -554,15 +589,14 @@ function createBindingFixture(input: {
 }
 
 /**
- * Builds a session fixture returned by Tether.
+ * Builds a session fixture mirroring the server's real emission, which contains
+ * only createdAt and sessionId.
  */
 function createSessionFixture(input: { readonly sessionId: string }): {
-  readonly archivedAt: string | null;
   readonly createdAt: string;
   readonly sessionId: string;
 } {
   return {
-    archivedAt: null,
     createdAt: "2026-01-01T00:00:00.000Z",
     sessionId: input.sessionId,
   };

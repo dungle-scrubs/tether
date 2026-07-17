@@ -16,8 +16,6 @@ import type { ClientBridgeFetch } from "./transport.js";
 
 /** Durable Tether session selected by a client bridge. */
 export interface ClientBridgeSession {
-  /** Nullable archive timestamp returned by Tether. */
-  readonly archivedAt: string | null;
   /** Creation timestamp returned by Tether. */
   readonly createdAt: string;
   /** Durable Tether session id. */

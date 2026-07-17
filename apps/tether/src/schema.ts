@@ -207,6 +207,22 @@ export const sessions = pgTable("sessions", {
 });
 
 /**
+ * Permanent tombstones for permanently deleted sessions. A tombstone fences a
+ * deleted session id forever: sanctioned creator paths refuse to recreate the
+ * id, so a durable client cursor held against the dropped event log can never
+ * silently resume against a restarted sequence that reuses the same id. The
+ * tombstone row commits in the same transaction that deletes the session row
+ * and cascades the event log and sequence allocator. No foreign key exists by
+ * design; the session row is gone once the tombstone is durable.
+ */
+export const sessionTombstones = pgTable("session_tombstones", {
+  deletedAt: timestamp("deleted_at", { withTimezone: true }).notNull().defaultNow(),
+  /** Last event sequence allocated before the log was dropped, for diagnostics. */
+  lastSeq: bigint("last_seq", { mode: "number" }).notNull().default(0),
+  sessionId: text("session_id").primaryKey(),
+});
+
+/**
  * Durable mapping between an external client conversation and the Tether
  * session it controls. Client bridges use this so external chats, Slack
  * threads, or other integration conversations survive bridge restarts.

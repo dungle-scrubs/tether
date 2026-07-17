@@ -99,6 +99,9 @@ const projectionBenchmark = process.env.E2E_PROJECTION_BENCHMARK === "true" ? it
 const adminDatabaseUrl = readRequiredE2eAdminDatabaseUrl();
 const e2eAuthOptions = {
   activeKid: testAuthSigningKid,
+  // E2e fixtures authenticate with legacy stateless test tokens, which
+  // required mode rejects unless the migration escape hatch is enabled.
+  allowLegacyTokens: true,
   issuer: "https://auth.e2e.tether.local",
   mode: "required",
   preEnforcementGrantIssuanceEnabled: true,

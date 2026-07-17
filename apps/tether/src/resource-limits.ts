@@ -2,6 +2,8 @@
 
 import { webSocketRecoveryReason } from "@dungle-scrubs/tether-protocol";
 
+import type { SessionEvent } from "./types.js";
+
 export const resourceLimitReason = {
   backpressure: "backpressure",
   bodyTooLarge: "body_too_large",
@@ -19,10 +21,13 @@ export interface ResourceLimits {
   readonly eventListDefaultLimit: number;
   readonly eventListMaxLimit: number;
   readonly httpMaxBodyBytes: number;
+  readonly restEventListMaxBytes: number;
   readonly wsBackpressureBufferedBytes: number;
+  readonly wsGapRepairGraceMs: number;
   readonly wsMaxPayloadBytes: number;
   readonly wsMessageRateLimit: number;
   readonly wsMessageRateWindowMs: number;
+  readonly wsReplayMaxBytes: number;
   readonly wsReplayMaxEvents: number;
 }
 
@@ -68,12 +73,24 @@ export const defaultResourceLimits: ResourceLimits = {
   eventListDefaultLimit: 500,
   eventListMaxLimit: 1_000,
   httpMaxBodyBytes: 2 * 1024 * 1024,
+  restEventListMaxBytes: 16 * 1024 * 1024,
   wsBackpressureBufferedBytes: 4 * 1024 * 1024,
+  wsGapRepairGraceMs: 10_000,
   wsMaxPayloadBytes: 2 * 1024 * 1024,
   wsMessageRateLimit: 60,
   wsMessageRateWindowMs: 10_000,
+  wsReplayMaxBytes: 64 * 1024 * 1024,
   wsReplayMaxEvents: 2_000,
 };
+
+/**
+ * Approximates one durable session event's serialized fan-out size in bytes.
+ * The envelope framing adds a small constant on top, so this is the load-bearing
+ * measure for replay-window and pending-buffer byte budgets.
+ */
+export function sessionEventByteLength(event: SessionEvent): number {
+  return Buffer.byteLength(JSON.stringify(event));
+}
 
 /** Mutable per-process limit counters shared by app-server modules. */
 export class ResourceLimitRuntime {

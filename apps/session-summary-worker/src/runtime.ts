@@ -92,7 +92,12 @@ export class SessionSummaryWorkerRuntime {
       runtimeKind: "generic_agent",
       serviceUrl: this.#config.serviceUrl,
       sessionId: this.#config.sessionId,
-      shouldClaimTask: (task) => sessionSummaryGenerationJobSchema.safeParse(task.input).success,
+      // Pool capacity is reserved before the shared client initiates a claim,
+      // so a full pool declines the task and leaves it claimable elsewhere
+      // instead of claiming work that local backpressure would fail terminally.
+      shouldClaimTask: (task) =>
+        sessionSummaryGenerationJobSchema.safeParse(task.input).success &&
+        this.#pool.tryReserve(task.taskId),
       workKinds: ["session_summary_generation"],
     });
     return { status: "stopped" };
@@ -136,7 +141,11 @@ export class SessionSummaryWorkerRuntime {
         const startedAt = performance.now();
         this.#started += 1;
         try {
-          const result = await this.#pool.run(() => this.#executor(context), context.signal);
+          const result = await this.#pool.runReserved(
+            context.task.taskId,
+            () => this.#executor(context),
+            context.signal,
+          );
           this.#succeeded += 1;
           span.setStatus({ code: SpanStatusCode.OK });
           return result;

@@ -453,6 +453,7 @@ describe("SessionEventFanout", () => {
     const fanout = new SessionEventFanout({
       catchUpPollIntervalMs: 0,
       database: createListenDatabaseFixture([client]),
+      eventBatchLimit: 5,
       hub: createHubFixture((event) => {
         broadcasted.push(event.seq);
       }),
@@ -475,7 +476,7 @@ describe("SessionEventFanout", () => {
     await flushPromises();
     await flushPromises();
 
-    expect(listEvents).toHaveBeenCalledWith("sess_fanout", 0, { limit: 1 });
+    expect(listEvents).toHaveBeenCalledWith("sess_fanout", 0, { limit: 5 });
     expect(broadcasted).toEqual([1]);
     expect(fanout.debugInfo()).toMatchObject({
       fanoutCursorSessionCount: 0,
@@ -483,6 +484,130 @@ describe("SessionEventFanout", () => {
     });
 
     await fanout.stop();
+  });
+
+  it("coalesces bursts of notifications into one pending marker per session", async () => {
+    const client = new FakeListenClient();
+    const broadcasted: number[] = [];
+    const firstFetch = createDeferred<SessionEvent[]>();
+    let call = 0;
+    const listEvents = vi.fn((_sessionId: string, afterSeq: number) => {
+      call += 1;
+      if (call === 1) {
+        return Effect.promise(() => firstFetch.promise);
+      }
+      return Effect.succeed([
+        createSessionEvent(afterSeq + 1),
+        createSessionEvent(afterSeq + 2),
+        createSessionEvent(afterSeq + 3),
+      ]);
+    });
+    const fanout = new SessionEventFanout({
+      catchUpPollIntervalMs: 0,
+      database: createListenDatabaseFixture([client]),
+      eventBatchLimit: 10,
+      hub: createHubFixture((event) => {
+        broadcasted.push(event.seq);
+      }),
+      service: {
+        debugInfo: () => ({ eventSourceId: "src_test" }),
+        listEvents,
+      },
+    });
+
+    await fanout.start();
+    const notify = (seq: number): void => {
+      client.emitNotification({
+        channel: sessionEventNotificationChannel,
+        payload: JSON.stringify({
+          eventId: `evt_remote_${seq}`,
+          seq,
+          sessionId: "sess_fanout",
+          sourceId: "src_remote",
+        }),
+      });
+    };
+    // The first notification opens a pending marker whose fetch stays in
+    // flight while a burst of further notifications arrives.
+    notify(1);
+    await flushPromises();
+    notify(2);
+    notify(3);
+    notify(4);
+    await flushPromises();
+
+    // Notification 2 opens the one follow-up marker; 3 and 4 coalesce onto it
+    // instead of appending chain links or DB roundtrips.
+    expect(fanout.debugInfo()).toMatchObject({
+      coalescedNotificationCount: 2,
+      droppedNotificationCount: 0,
+    });
+    firstFetch.resolve([createSessionEvent(1)]);
+    await flushPromises();
+    await flushPromises();
+    await flushPromises();
+    await fanout.stop();
+
+    // Two DB roundtrips serve four notifications, and the coalesced batch
+    // fetch delivers the burst's events contiguously.
+    expect(listEvents).toHaveBeenCalledTimes(2);
+    expect(broadcasted).toEqual([1, 2, 3, 4]);
+  });
+
+  it("drops notifications with a diagnostic when the pending queue is saturated", async () => {
+    const client = new FakeListenClient();
+    const fetches: Array<ReturnType<typeof createDeferred<SessionEvent[]>>> = [];
+    const listEvents = vi.fn(() => {
+      const deferred = createDeferred<SessionEvent[]>();
+      fetches.push(deferred);
+      return Effect.promise(() => deferred.promise);
+    });
+    const fanout = new SessionEventFanout({
+      catchUpPollIntervalMs: 0,
+      database: createListenDatabaseFixture([client]),
+      hub: createHubFixture(undefined, [
+        { lastDeliveredSeq: 0, sessionId: "sess_a" },
+        { lastDeliveredSeq: 0, sessionId: "sess_b" },
+        { lastDeliveredSeq: 0, sessionId: "sess_c" },
+      ]),
+      notificationQueueLimit: 2,
+      service: {
+        debugInfo: () => ({ eventSourceId: "src_test" }),
+        listEvents,
+      },
+    });
+
+    await fanout.start();
+    for (const sessionId of ["sess_a", "sess_b", "sess_c"]) {
+      client.emitNotification({
+        channel: sessionEventNotificationChannel,
+        payload: JSON.stringify({
+          eventId: `evt_${sessionId}`,
+          seq: 1,
+          sessionId,
+          sourceId: "src_remote",
+        }),
+      });
+    }
+
+    // The notifications arrive in one tick: the third session's marker is
+    // dropped at the depth cap, and the durable catch-up poll remains its
+    // delivery path.
+    expect(fanout.debugInfo()).toMatchObject({
+      droppedNotificationCount: 1,
+      pendingNotificationSessionCount: 2,
+    });
+
+    for (let round = 0; round < 6; round += 1) {
+      for (const fetch of fetches) {
+        fetch.resolve([]);
+      }
+      await flushPromises();
+    }
+    await fanout.stop();
+
+    expect(fanout.debugInfo().pendingNotificationSessionCount).toBe(0);
+    expect(listEvents).toHaveBeenCalledTimes(2);
   });
 });
 

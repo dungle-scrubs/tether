@@ -8,6 +8,7 @@ import { authErrorPayload, authErrorStatus } from "./auth/enforcement.js";
 import type { AuthError } from "./auth/token.js";
 import {
   type ControlLeaseClaim,
+  SessionDeletedError,
   SessionEventSequenceRangeError,
   SessionNotFoundError,
 } from "./db.js";
@@ -160,6 +161,17 @@ export function handleHttpRouteError(
     });
     return;
   }
+  const sessionDeletedError = sessionDeletedErrorFromUnknown(error);
+  if (sessionDeletedError) {
+    sendJson(response, 410, {
+      deletedAt: sessionDeletedError.deletedAt,
+      error: "Session was permanently deleted and its id cannot be reused",
+      operation: sessionDeletedError.operation,
+      reason: "session_deleted",
+      sessionId: sessionDeletedError.sessionId,
+    });
+    return;
+  }
   const requestId = options.requestIdFactory?.() ?? createRouteErrorRequestId();
   const normalizedError = normalizeRouteError(error);
   (options.logger ?? defaultHttpRouteErrorLogger).error("http.route_error", {
@@ -201,6 +213,26 @@ function sessionNotFoundErrorFromUnknown(error: unknown, depth = 0): SessionNotF
     const nested = readNestedError(error, "originalError") ?? readNestedError(error, "cause");
     if (nested !== null) {
       return sessionNotFoundErrorFromUnknown(nested, depth + 1);
+    }
+  }
+  return null;
+}
+
+/** Extracts typed deleted-session-id failures from direct or service-wrapped errors. */
+function sessionDeletedErrorFromUnknown(error: unknown, depth = 0): SessionDeletedError | null {
+  if (depth > 5) {
+    return null;
+  }
+  if (error instanceof SessionDeletedError) {
+    return error;
+  }
+  if (error instanceof SessionServicePersistenceError) {
+    return sessionDeletedErrorFromUnknown(error.cause, depth + 1);
+  }
+  if (typeof error === "object" && error !== null) {
+    const nested = readNestedError(error, "originalError") ?? readNestedError(error, "cause");
+    if (nested !== null) {
+      return sessionDeletedErrorFromUnknown(nested, depth + 1);
     }
   }
   return null;

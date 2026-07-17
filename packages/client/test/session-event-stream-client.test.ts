@@ -135,7 +135,7 @@ describe("SessionEventStreamClient", () => {
     client.close();
   });
 
-  it("closes an invalid observer stream and replays from the handled cursor", async () => {
+  it("closes the stream on a malformed known-op frame and replays from the handled cursor", async () => {
     const sockets: FakeWebSocket[] = [];
     const client = await SessionEventStreamClient.connect({
       afterSeq: 0,
@@ -152,7 +152,7 @@ describe("SessionEventStreamClient", () => {
     firstSocket.emitServerEvent(createEvent({ eventId: "evt_1", seq: 1 }));
     await waitFor(() => client.debugInfo().lastObservedSeq === 1);
 
-    firstSocket.emit("message", JSON.stringify({ op: "unsupported" }));
+    firstSocket.emit("message", JSON.stringify({ op: "event" }));
     await waitFor(() => sockets.length === 2);
     const replacementSocket = sockets[1];
     if (!replacementSocket) {
@@ -161,6 +161,41 @@ describe("SessionEventStreamClient", () => {
 
     expect(firstSocket.readyState).toBe(WebSocket.CLOSED);
     expect(new URL(replacementSocket.url).searchParams.get("after")).toBe("1");
+    client.close();
+  });
+
+  it("skips unknown-op server frames without recovery or event loss", async () => {
+    const sockets: FakeWebSocket[] = [];
+    const client = await SessionEventStreamClient.connect({
+      afterSeq: 0,
+      reconnect: { baseDelayMs: 0, maxDelayMs: 0 },
+      serviceUrl: "http://tether.test",
+      sessionId: "sess_stream",
+      webSocketFactory: createFakeWebSocketFactory(sockets),
+    });
+    const socket = sockets[0];
+    if (!socket) {
+      throw new Error("Missing fake socket");
+    }
+    const errors: Error[] = [];
+    client.onError((error) => {
+      errors.push(error);
+    });
+    const observed: number[] = [];
+    client.onEvent((event) => {
+      observed.push(event.seq);
+    });
+
+    socket.emit("message", JSON.stringify({ op: "presence.v2", payload: { future: true } }));
+    socket.emitServerEvent(createEvent({ eventId: "evt_1", seq: 1 }));
+    socket.emitReplayComplete();
+    await client.waitForReplayComplete();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(observed).toEqual([1]);
+    expect(errors).toEqual([]);
+    expect(sockets).toHaveLength(1);
+    expect(client.debugInfo().pausedReason).toBeNull();
     client.close();
   });
 
@@ -382,6 +417,298 @@ describe("SessionEventStreamClient", () => {
     client.close();
   });
 
+  it("automatically reconnects after an unexpected close and resumes from the handled cursor", async () => {
+    const sockets: FakeWebSocket[] = [];
+    const client = await SessionEventStreamClient.connect({
+      afterSeq: 0,
+      reconnect: { baseDelayMs: 0, maxDelayMs: 0 },
+      serviceUrl: "http://tether.test",
+      sessionId: "sess_stream",
+      webSocketFactory: createFakeWebSocketFactory(sockets),
+    });
+    const firstSocket = sockets[0];
+    if (!firstSocket) {
+      throw new Error("Missing first fake socket");
+    }
+    const observed: number[] = [];
+    client.onEvent((event) => {
+      observed.push(event.seq);
+    });
+    firstSocket.emitServerEvent(createEvent({ eventId: "evt_1", seq: 1 }));
+    await waitFor(() => client.debugInfo().lastObservedSeq === 1);
+
+    firstSocket.emitClose();
+    await waitFor(() => sockets.length === 2);
+    const replacementSocket = sockets[1];
+    if (!replacementSocket) {
+      throw new Error("Missing replacement fake socket");
+    }
+    expect(new URL(replacementSocket.url).searchParams.get("after")).toBe("1");
+    replacementSocket.emitServerEvent(createEvent({ eventId: "evt_2", seq: 2 }));
+    replacementSocket.emitReplayComplete();
+    await client.waitForReplayComplete();
+
+    expect(observed).toEqual([1, 2]);
+    expect(client.debugInfo()).toMatchObject({
+      connectCount: 2,
+      lastObservedSeq: 2,
+      reconnectSuccessCount: 1,
+    });
+    client.close();
+  });
+
+  it("waits for an in-flight handler to settle before reconnecting after a close", async () => {
+    const sockets: FakeWebSocket[] = [];
+    const client = await SessionEventStreamClient.connect({
+      afterSeq: 0,
+      reconnect: { baseDelayMs: 0, maxDelayMs: 0 },
+      serviceUrl: "http://tether.test",
+      sessionId: "sess_stream",
+      webSocketFactory: createFakeWebSocketFactory(sockets),
+    });
+    const firstSocket = sockets[0];
+    if (!firstSocket) {
+      throw new Error("Missing first fake socket");
+    }
+    let releaseHandler: (() => void) | undefined;
+    const handlerBlocked = new Promise<void>((resolve) => {
+      releaseHandler = resolve;
+    });
+    const entered: number[] = [];
+    client.onEvent(async (event) => {
+      entered.push(event.seq);
+      await handlerBlocked;
+    });
+    firstSocket.emitServerEvent(createEvent({ eventId: "evt_1", seq: 1 }));
+    await waitFor(() => entered.length === 1);
+
+    firstSocket.emitClose();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(sockets).toHaveLength(1);
+
+    releaseHandler?.();
+    await waitFor(() => sockets.length === 2);
+    const replacementSocket = sockets[1];
+    if (!replacementSocket) {
+      throw new Error("Missing replacement fake socket");
+    }
+    expect(new URL(replacementSocket.url).searchParams.get("after")).toBe("1");
+    client.close();
+  });
+
+  it("leaves no background reconnect activity after a failed initial connect", async () => {
+    const sockets: FakeWebSocket[] = [];
+    const factory: SessionEventStreamWebSocketFactory = (url) => {
+      const socket = new FakeWebSocket(url);
+      socket.failOpen = true;
+      sockets.push(socket);
+      return socket as unknown as WebSocket;
+    };
+
+    await expect(
+      SessionEventStreamClient.connect({
+        afterSeq: 0,
+        reconnect: { baseDelayMs: 0, maxDelayMs: 0 },
+        serviceUrl: "http://tether.test",
+        sessionId: "sess_stream",
+        webSocketFactory: factory,
+      }),
+    ).rejects.toBeTruthy();
+
+    expect(sockets).toHaveLength(1);
+    // A failed connect() rejects to a caller holding no client reference. The
+    // close that follows the failed open must not spawn a zombie reconnect
+    // loop, so no further open attempts may occur.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(sockets).toHaveLength(1);
+  });
+
+  it("does not stack a second reconnect when reconnect() runs during pending settlement", async () => {
+    const sockets: FakeWebSocket[] = [];
+    const client = await SessionEventStreamClient.connect({
+      afterSeq: 0,
+      reconnect: { baseDelayMs: 0, maxDelayMs: 0 },
+      serviceUrl: "http://tether.test",
+      sessionId: "sess_stream",
+      webSocketFactory: createFakeWebSocketFactory(sockets),
+    });
+    const firstSocket = sockets[0];
+    if (!firstSocket) {
+      throw new Error("Missing first fake socket");
+    }
+    let releaseHandler: (() => void) | undefined;
+    const handlerBlocked = new Promise<void>((resolve) => {
+      releaseHandler = resolve;
+    });
+    const entered: number[] = [];
+    client.onEvent(async (event) => {
+      entered.push(event.seq);
+      await handlerBlocked;
+    });
+
+    firstSocket.emitServerEvent(createEvent({ eventId: "evt_1", seq: 1 }));
+    await waitFor(() => entered.length === 1);
+
+    // Unexpected close of the established gen-1 socket while its handler is
+    // still in flight: this schedules a reconnect gated on delivery settlement.
+    firstSocket.emitClose();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(sockets).toHaveLength(1);
+
+    // A concurrent manual reconnect() opens gen 2 before settlement resolves.
+    await client.reconnect();
+    expect(sockets).toHaveLength(2);
+    const secondSocket = sockets[1];
+    if (!secondSocket) {
+      throw new Error("Missing replacement fake socket");
+    }
+
+    // Releasing the blocked gen-1 handler resolves the stale settlement waiter.
+    // Its continuation must observe the newer generation and do nothing rather
+    // than opening gen 3 and orphaning the live gen-2 socket.
+    releaseHandler?.();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(sockets).toHaveLength(2);
+    expect(secondSocket.readyState).toBe(WebSocket.OPEN);
+    expect(client.debugInfo().connectCount).toBe(2);
+    client.close();
+  });
+
+  it("does not reconnect after an intentional close", async () => {
+    const sockets: FakeWebSocket[] = [];
+    const client = await SessionEventStreamClient.connect({
+      afterSeq: 0,
+      reconnect: { baseDelayMs: 0, maxDelayMs: 0 },
+      serviceUrl: "http://tether.test",
+      sessionId: "sess_stream",
+      webSocketFactory: createFakeWebSocketFactory(sockets),
+    });
+
+    client.close();
+    await client.waitForClose();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(sockets).toHaveLength(1);
+    expect(client.debugInfo().stopped).toBe(true);
+  });
+
+  it("rejects reconnect on an intentionally closed observer with a typed error", async () => {
+    const sockets: FakeWebSocket[] = [];
+    const client = await SessionEventStreamClient.connect({
+      afterSeq: 0,
+      serviceUrl: "http://tether.test",
+      sessionId: "sess_stream",
+      webSocketFactory: createFakeWebSocketFactory(sockets),
+    });
+
+    client.close();
+
+    await expect(client.reconnect()).rejects.toBeInstanceOf(SessionEventStreamError);
+    expect(sockets).toHaveLength(1);
+  });
+
+  it("explicit reconnect clears observer Paused State after handler remediation", async () => {
+    const sockets: FakeWebSocket[] = [];
+    const errors: Error[] = [];
+    let failDelivery = true;
+    const client = await SessionEventStreamClient.connect({
+      afterSeq: 0,
+      reconnect: { baseDelayMs: 0, maxDelayMs: 0 },
+      serviceUrl: "http://tether.test",
+      sessionId: "sess_stream",
+      webSocketFactory: createFakeWebSocketFactory(sockets),
+    });
+    client.onError((error) => {
+      errors.push(error);
+    });
+    const observed: number[] = [];
+    client.onEvent((event) => {
+      observed.push(event.seq);
+      if (failDelivery) {
+        throw new Error("observer handler requires remediation");
+      }
+    });
+
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      const socket = sockets[attempt - 1];
+      if (!socket) {
+        throw new Error(`Missing observer socket for attempt ${attempt}`);
+      }
+      socket.emitServerEvent(createEvent({ eventId: "evt_1", seq: 1 }));
+      if (attempt < 5) {
+        await waitFor(() => sockets.length === attempt + 1);
+      } else {
+        await waitFor(() => client.debugInfo().pausedReason !== null);
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(sockets).toHaveLength(5);
+    expect(client.debugInfo()).toMatchObject({
+      pausedReason: "delivery_recovery_exhausted",
+      stopped: false,
+    });
+
+    failDelivery = false;
+    await client.reconnect();
+    const remediatedSocket = sockets[5];
+    if (!remediatedSocket) {
+      throw new Error("Missing remediated fake socket");
+    }
+    const replay = client.waitForReplayComplete();
+    remediatedSocket.emitServerEvent(createEvent({ eventId: "evt_1", seq: 1 }));
+    remediatedSocket.emitReplayComplete();
+    await replay;
+
+    expect(client.debugInfo()).toMatchObject({
+      lastObservedSeq: 1,
+      pausedReason: null,
+    });
+    client.close();
+  });
+
+  it("pauses on a typed terminal replay reason instead of reconnect-looping", async () => {
+    const sockets: FakeWebSocket[] = [];
+    const errors: Error[] = [];
+    const client = await SessionEventStreamClient.connect({
+      afterSeq: 12,
+      reconnect: { baseDelayMs: 0, maxDelayMs: 0 },
+      serviceUrl: "http://tether.test",
+      sessionId: "sess_stream",
+      webSocketFactory: createFakeWebSocketFactory(sockets),
+    });
+    const socket = sockets[0];
+    if (!socket) {
+      throw new Error("Missing fake socket");
+    }
+    client.onError((error) => {
+      errors.push(error);
+    });
+    const replay = client.waitForReplayComplete();
+
+    socket.emit(
+      "message",
+      JSON.stringify({
+        error: "Replay window exceeded",
+        limit: 2_000,
+        op: "error",
+        reason: "replay_window_exceeded",
+      }),
+    );
+    await expect(replay).rejects.toBeInstanceOf(SessionEventStreamError);
+    socket.emitClose();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(sockets).toHaveLength(1);
+    expect(client.debugInfo().pausedReason).toBe("replay_window_exceeded");
+
+    await client.reconnect();
+
+    expect(sockets).toHaveLength(2);
+    expect(client.debugInfo().pausedReason).toBeNull();
+    client.close();
+  });
+
   it("does not expose task command methods on observer stream instances", async () => {
     const sockets: FakeWebSocket[] = [];
     const client = await SessionEventStreamClient.connect({
@@ -403,12 +730,21 @@ describe("SessionEventStreamClient", () => {
 /** Minimal in-memory WebSocket implementation for observer client tests. */
 class FakeWebSocket extends EventEmitter {
   deferClose = false;
+  failOpen = false;
   readyState = WebSocket.CONNECTING;
   readonly sent: string[] = [];
 
   constructor(readonly url: string) {
     super();
     queueMicrotask(() => {
+      if (this.failOpen) {
+        // Model a server that is down at connect time: the socket surfaces an
+        // error and closes without ever establishing.
+        this.readyState = WebSocket.CLOSED;
+        this.emit("error", new Error("connection refused"));
+        this.emit("close");
+        return;
+      }
       this.readyState = WebSocket.OPEN;
       this.emit("open");
     });

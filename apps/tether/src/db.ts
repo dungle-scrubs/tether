@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { and, desc, eq, isNotNull, isNull, or, type SQL, sql } from "drizzle-orm";
+import { and, desc, eq, isNotNull, isNull, notInArray, or, type SQL, sql } from "drizzle-orm";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { Context, Effect, Layer } from "effect";
 import pg from "pg";
@@ -433,6 +433,46 @@ export class SessionNotFoundError extends Error {
     this.sessionId = input.sessionId;
   }
 }
+
+/**
+ * Error raised when a creator path targets a permanently deleted session id.
+ * The tombstone fences the id forever: recreating it would restart the event
+ * sequence at 1 and silently strand any consumer holding a durable cursor
+ * against the dropped log, so recreation is refused with this typed failure.
+ */
+export class SessionDeletedError extends Error {
+  /** ISO timestamp recorded when the session was permanently deleted. */
+  readonly deletedAt: string;
+  readonly operation: string;
+  readonly sessionId: string;
+
+  constructor(input: {
+    readonly deletedAt: string;
+    readonly operation: string;
+    readonly sessionId: string;
+  }) {
+    super(
+      `Session ${input.sessionId} was permanently deleted at ${input.deletedAt} and its id cannot be reused (${input.operation})`,
+    );
+    this.name = "SessionDeletedError";
+    this.deletedAt = input.deletedAt;
+    this.operation = input.operation;
+    this.sessionId = input.sessionId;
+  }
+}
+
+/**
+ * Typed outcome of one fenced permanent session delete. Refusals reuse the
+ * route-level eligibility reasons so both checks speak the same vocabulary.
+ */
+export type PermanentSessionDeleteResult =
+  | { readonly status: "deleted" }
+  | { readonly status: "not_found" }
+  | {
+      readonly detail: string;
+      readonly reason: "not-archived" | "protected";
+      readonly status: "refused";
+    };
 
 const clientSessionBindingReturningColumns = `
   archived_at AS "archivedAt",
@@ -990,6 +1030,13 @@ export async function claimControlLease(
         input.sessionId,
       ],
     );
+    // Bounded history maintenance for this participant, under the same
+    // participant advisory lock as the generation change above.
+    await pruneControlLeaseGenerationHistoryWithClient(
+      client,
+      input.sessionId,
+      input.participantId,
+    );
     const lease = toControlLease(leasedRows.rows[0]);
     await client.query("COMMIT");
     return { lease, status: activeLease ? "superseded" : "claimed" };
@@ -1145,6 +1192,13 @@ export async function acquireRestParticipantControl(
         input.participantId,
         input.sessionId,
       ],
+    );
+    // Bounded history maintenance for this participant, under the same
+    // participant advisory lock as the generation change above.
+    await pruneControlLeaseGenerationHistoryWithClient(
+      client,
+      input.sessionId,
+      input.participantId,
     );
     const registration = await upsertParticipantWithEventWithClient(client, input);
     const lease = toControlLease(insertedRows.rows[0]);
@@ -1344,6 +1398,57 @@ async function assertControlEpochCurrentWithClient(
       sessionId: guard.sessionId,
     });
   }
+}
+
+/**
+ * Fenced generation rows retained per participant, including the current row.
+ * The tail keeps recent superseded rows available for operator diagnostics and
+ * keeps recent REST acquisition-id rows resolvable for retry classification,
+ * while bounding history growth for reconnect-flapping participants.
+ */
+export const controlLeaseGenerationHistoryLimit = 20;
+
+/**
+ * Opportunistically prunes fenced (superseded or released) generation rows for
+ * one participant beyond the bounded recent tail. Callers run this inside an
+ * acquisition transaction that already holds the participant advisory lock, so
+ * pruning never races epoch allocation: the newest rows ordered by epoch are
+ * always retained, including whichever row carries MAX(epoch), so
+ * `allocateNextControlEpoch` can never observe a regressed maximum. The current
+ * row is excluded by predicate and is never deleted.
+ */
+async function pruneControlLeaseGenerationHistoryWithClient(
+  client: pg.PoolClient,
+  sessionId: string,
+  participantId: string,
+): Promise<void> {
+  // Method-form Drizzle delete on the checked-out transaction client, so the
+  // reviewed delete-call inventory covers this bounded history prune.
+  const transactionDb = drizzle(client);
+  const retainedEpochs = transactionDb
+    .select({ epoch: participantControlLeases.epoch })
+    .from(participantControlLeases)
+    .where(
+      and(
+        eq(participantControlLeases.sessionId, sessionId),
+        eq(participantControlLeases.participantId, participantId),
+      ),
+    )
+    .orderBy(desc(participantControlLeases.epoch))
+    .limit(controlLeaseGenerationHistoryLimit);
+  await transactionDb
+    .delete(participantControlLeases)
+    .where(
+      and(
+        eq(participantControlLeases.sessionId, sessionId),
+        eq(participantControlLeases.participantId, participantId),
+        or(
+          isNotNull(participantControlLeases.releasedAt),
+          isNotNull(participantControlLeases.supersededAt),
+        ),
+        notInArray(participantControlLeases.epoch, retainedEpochs),
+      ),
+    );
 }
 
 /** Allocates the next strictly-monotonic Control Epoch for a participant. */
@@ -1548,13 +1653,136 @@ export async function createSession(
   }
 }
 
-/** Permanently deletes one durable session and all session-owned rows. */
-export async function deleteSession(database: DatabasePool, sessionId: string): Promise<boolean> {
-  const deleted = await database.db
-    .delete(sessions)
-    .where(eq(sessions.sessionId, sessionId))
-    .returning({ sessionId: sessions.sessionId });
-  return deleted.length > 0;
+/**
+ * Permanently deletes one durable session and all session-owned rows, with the
+ * eligibility re-check fenced inside the delete transaction.
+ *
+ * The transaction locks session-owned rows in the mandatory D-009 order (lease
+ * rows, then task rows, then the event sequence row, then the projection row -
+ * the same order every event-append and claim transaction uses), so the
+ * archived/settled re-check below cannot race a concurrent claim or append:
+ * either their transaction committed first and the re-check observes it, or
+ * they block on these row locks and observe the cascade after commit as a typed
+ * rejection. Process-local Host Presence cannot be fenced durably, so the
+ * optional `hasLiveHost` probe re-runs inside the transaction to shrink that
+ * remaining window to the final microtask before the delete statement.
+ *
+ * A tombstone row commits in the same transaction that drops the event log and
+ * sequence allocator, permanently fencing the session id against recreation so
+ * resuming consumers with durable cursors observe a missing session instead of
+ * a silently restarted event sequence.
+ */
+export async function deleteSession(
+  database: DatabasePool,
+  sessionId: string,
+  options: {
+    /** Re-checks process-local Host Presence inside the delete transaction. */
+    readonly hasLiveHost?: (() => boolean) | undefined;
+  } = {},
+): Promise<PermanentSessionDeleteResult> {
+  const client = await database.pool.connect();
+  try {
+    await client.query("BEGIN");
+    const sessionRows = await client.query<{ readonly sessionId: string }>(
+      `SELECT session_id AS "sessionId" FROM sessions WHERE session_id = $1 FOR UPDATE`,
+      [sessionId],
+    );
+    if (!sessionRows.rows[0]) {
+      await client.query("ROLLBACK");
+      return { status: "not_found" };
+    }
+    // D-009 lock order: lease rows first, ordered per participant the same way
+    // the control-lease transactions order their current-row scans.
+    await client.query(
+      `
+        SELECT 1
+        FROM participant_control_leases
+        WHERE session_id = $1
+        ORDER BY participant_id, lease_expires_at DESC, claimed_at DESC, instance_id
+        FOR UPDATE
+      `,
+      [sessionId],
+    );
+    // Then task rows, so an in-flight claim either committed before this lock
+    // (and the projection re-check sees its activity) or blocks here and finds
+    // the task cascade-deleted after commit.
+    await client.query(
+      `
+        SELECT 1
+        FROM tasks
+        WHERE session_id = $1
+        ORDER BY task_id
+        FOR UPDATE
+      `,
+      [sessionId],
+    );
+    // Then the sequence row, which also captures the last allocated sequence
+    // for the tombstone before the cascade drops the allocator.
+    const seqRows = await client.query<SequenceRow>(
+      `
+        SELECT next_seq AS "seq"
+        FROM session_event_sequences
+        WHERE session_id = $1
+        FOR UPDATE
+      `,
+      [sessionId],
+    );
+    // Finally the projection row: the durable, lock-fenced eligibility re-check.
+    const projectionRows = await client.query<{
+      readonly activity: string;
+      readonly archivedAt: Date | null;
+    }>(
+      `
+        SELECT activity, archived_at AS "archivedAt"
+        FROM session_projections
+        WHERE session_id = $1
+        FOR UPDATE
+      `,
+      [sessionId],
+    );
+    const projection = projectionRows.rows[0] ?? null;
+    if (!projection || projection.archivedAt === null) {
+      await client.query("ROLLBACK");
+      return {
+        detail: projection
+          ? "only archived sessions can be permanently deleted"
+          : "session projection is missing",
+        reason: "not-archived",
+        status: "refused",
+      };
+    }
+    if (projection.activity === "running" || projection.activity === "queued") {
+      await client.query("ROLLBACK");
+      return { detail: "a turn is active on this session", reason: "protected", status: "refused" };
+    }
+    if (options.hasLiveHost?.() === true) {
+      await client.query("ROLLBACK");
+      return { detail: "a host is live on this session", reason: "protected", status: "refused" };
+    }
+    const rawNextSeq = seqRows.rows[0]?.seq;
+    const nextSeq =
+      typeof rawNextSeq === "number" || typeof rawNextSeq === "string" ? Number(rawNextSeq) : 1;
+    const lastSeq = Number.isSafeInteger(nextSeq) && nextSeq > 1 ? nextSeq - 1 : 0;
+    await client.query(
+      `
+        INSERT INTO session_tombstones (last_seq, session_id)
+        VALUES ($1, $2)
+        ON CONFLICT (session_id) DO UPDATE
+        SET deleted_at = now(), last_seq = EXCLUDED.last_seq
+      `,
+      [lastSeq, sessionId],
+    );
+    // Method-form Drizzle delete on the checked-out transaction client, so the
+    // reviewed delete-call inventory covers this cascade entry point.
+    await drizzle(client).delete(sessions).where(eq(sessions.sessionId, sessionId));
+    await client.query("COMMIT");
+    return { status: "deleted" };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 /**
@@ -2348,6 +2576,32 @@ export async function createTaskWithEventIdempotent(
     return { event, events: [event], status: "created", task };
   } catch (error) {
     await client.query("ROLLBACK");
+    // A residual duplicate-id race that slipped past the advisory lock (for
+    // example a concurrent generated-id insert choosing the same id) surfaces
+    // as the task primary-key unique violation. Map it to the same idempotent
+    // replay/conflict outcome the pre-insert existence check produces instead
+    // of bubbling an opaque transaction rollback out as an HTTP 500. A 23505
+    // only fires after the conflicting inserter committed, so the winner's row
+    // is committed and visible; re-read it on the SAME client (usable for
+    // autocommit queries after ROLLBACK) rather than acquiring a second pool
+    // connection, which would self-deadlock the pool at max=1 or under a
+    // concurrent burst that has every connection parked on this same path.
+    if (isPgUniqueViolation(error, "tasks_session_id_task_id_pk")) {
+      const existing = await readTaskWithClient(client, input.sessionId, input.taskId);
+      if (existing) {
+        const conflictingFields = compareTaskCreateInput(existing, input);
+        if (conflictingFields.length === 0) {
+          return { events: [], status: "replayed", task: existing };
+        }
+        return {
+          conflictingFields,
+          events: [],
+          status: "conflict",
+          task: null,
+          taskId: input.taskId,
+        };
+      }
+    }
     throw new TaskEventTransactionRollbackError("createTask", error);
   } finally {
     client.release();
@@ -2988,6 +3242,33 @@ export class ScheduledTaskIdentityMismatchError extends Error {
   }
 }
 
+/**
+ * Error raised when the task row occupying a derived scheduled-run id does not
+ * carry the expected kind and schedule identity. Task ids are caller-chosen
+ * opaque strings, so a generic schedule-less create may legally insert a row at
+ * the deterministic id; replaying such a squatter as the scheduled run would
+ * silently suppress the window's maintenance work behind a success response.
+ */
+export class ScheduledRunIdentityConflictError extends Error {
+  readonly conflictingFields: readonly string[];
+  readonly sessionId: string;
+  readonly taskId: string;
+
+  constructor(input: {
+    readonly conflictingFields: readonly string[];
+    readonly sessionId: string;
+    readonly taskId: string;
+  }) {
+    super(
+      `Task ${input.taskId} in session ${input.sessionId} occupies the derived scheduled-run id but does not match the schedule identity: ${input.conflictingFields.join(", ")}`,
+    );
+    this.name = "ScheduledRunIdentityConflictError";
+    this.conflictingFields = input.conflictingFields;
+    this.sessionId = input.sessionId;
+    this.taskId = input.taskId;
+  }
+}
+
 /** Caller-owned inputs for one atomic ensure-scheduled-run operation. */
 export interface EnsureScheduledRunInput {
   readonly eventSourceId: string;
@@ -3151,6 +3432,14 @@ export async function ensureScheduledRunWithEvents(
     // windows so an older-window and a newer-window ensure cannot interleave and
     // both insert. The lock key deliberately excludes the window start.
     await acquireTransactionAdvisoryLock(client, input.sessionId, scheduleIdentityLockKey(input));
+    // Also serialize on the derived task id itself: the idempotent caller-id
+    // create path (createTaskWithEventIdempotent) locks on (sessionId, taskId),
+    // so without this second lock a schedule-less create carrying the derived
+    // id could interleave its existence check with this ensure and lose the
+    // insert race as a raw unique violation. The identity lock above is always
+    // taken first and the create path takes only the task-id lock, so the
+    // two-lock ordering cannot deadlock.
+    await acquireTransactionAdvisoryLock(client, input.sessionId, taskId);
     const supersededRows = await client.query<PgTaskRow>(
       `
         UPDATE tasks
@@ -3203,6 +3492,31 @@ export async function ensureScheduledRunWithEvents(
     const existing = await readTaskWithClient(client, input.sessionId, taskId);
     let current: EnsureScheduledRunCurrent;
     if (existing) {
+      // Replay is legitimate only when the occupant of the deterministic id
+      // actually IS this schedule's run. Task ids are caller-chosen opaque
+      // strings, so a schedule-less generic create may occupy the derived id;
+      // its schedule columns are NULL, it is invisible to supersession, and
+      // silently replaying it would skip the window's maintenance work behind
+      // a success response. Kind and the full schedule identity are verified;
+      // objective and input remain replay-compatible, matching the caller-id
+      // create replay semantics for scheduler retries.
+      const conflictingFields = [
+        ...(existing.kind === input.kind ? [] : ["kind"]),
+        ...compareScheduleIdentity(existing.schedule ?? null, {
+          mailboxAccountId: input.mailboxAccountId,
+          mailboxProvider: input.mailboxProvider,
+          scheduleAlgorithmVersion: input.scheduleAlgorithmVersion,
+          scheduleIntervalMs: input.scheduleIntervalMs,
+          scheduleWindowStart: input.scheduleWindowStart,
+        }),
+      ];
+      if (conflictingFields.length > 0) {
+        throw new ScheduledRunIdentityConflictError({
+          conflictingFields,
+          sessionId: input.sessionId,
+          taskId,
+        });
+      }
       current = { status: "replayed", task: existing };
     } else {
       // Only the newest window is ensured. If a strictly-newer window run already
@@ -3245,7 +3559,10 @@ export async function ensureScheduledRunWithEvents(
     };
   } catch (error) {
     await client.query("ROLLBACK");
-    if (error instanceof ScheduledTaskIdentityMismatchError) {
+    if (
+      error instanceof ScheduledTaskIdentityMismatchError ||
+      error instanceof ScheduledRunIdentityConflictError
+    ) {
       throw error;
     }
     throw new TaskEventTransactionRollbackError("ensureScheduledRun", error);
@@ -3705,7 +4022,11 @@ async function appendEventWithClient(
   );
   const rawSeq = seqRows.rows[0]?.seq;
   if (rawSeq === undefined) {
-    throw new Error(`Failed to allocate sequence for ${input.sessionId}`);
+    // The sequence row is created with the session and removed only by the
+    // session-delete cascade, so a missing row here means the session was
+    // permanently deleted after the existence check above. Surface the typed
+    // missing-session failure instead of an opaque allocation error.
+    throw new SessionNotFoundError({ operation: "appendEvent", sessionId: input.sessionId });
   }
   const seq = parseEventSequence(rawSeq, input.sessionId);
   const eventRows = await client.query<PgSessionEventRow>(
@@ -3873,6 +4194,28 @@ async function createSessionWithClient(
     `,
     [sessionId],
   );
+  // The tombstone read deliberately runs AFTER the insert attempt. A concurrent
+  // permanent delete commits its tombstone atomically with the session-row
+  // delete, and a conflicting insert waits on the deleted row; the statement
+  // snapshot taken here therefore observes any tombstone committed either
+  // before this transaction or while the insert waited, and the throw rolls
+  // back the recreation. A permanently deleted session id is never reusable.
+  const tombstoneRows = await client.query<{ readonly deletedAt: Date }>(
+    `
+      SELECT deleted_at AS "deletedAt"
+      FROM session_tombstones
+      WHERE session_id = $1
+    `,
+    [sessionId],
+  );
+  const tombstone = tombstoneRows.rows[0];
+  if (tombstone) {
+    throw new SessionDeletedError({
+      deletedAt: tombstone.deletedAt.toISOString(),
+      operation: "createSession",
+      sessionId,
+    });
+  }
   await client.query(
     `
       INSERT INTO session_event_sequences (session_id)

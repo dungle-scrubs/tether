@@ -188,7 +188,7 @@ function createApprovalStores(
           sessionId: task.sessionId,
         },
       }),
-      delete: async () => true,
+      delete: async () => ({ status: "deleted" }) as const,
       list: async () => [],
       read: async () => ({
         createdAt: new Date().toISOString(),

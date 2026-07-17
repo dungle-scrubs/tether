@@ -377,7 +377,7 @@ function makeSessionServiceEffect(
         "deleteSession",
         { sessionId: input.sessionId },
         deleteSessionEffect(input),
-        (deleted) => ({ deleted }),
+        (result) => ({ status: result.status }),
       ),
     ensurePublicSession: (input) =>
       traceEffect(

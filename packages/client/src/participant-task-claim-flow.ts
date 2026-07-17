@@ -1,9 +1,10 @@
 import { Effect } from "effect";
 import { sleepUnrefEffect } from "./effect-timing.js";
 import type { TaskCancellationContext } from "./participant-claimable-task-runner.js";
-import type {
-  ParticipantTaskExecutor,
-  ParticipantTaskExecutorContext,
+import {
+  ParticipantRuntimeCommandError,
+  type ParticipantTaskExecutor,
+  type ParticipantTaskExecutorContext,
 } from "./participant-runtime-client.js";
 import { ParticipantTaskExecutionError } from "./participant-task-execution-error.js";
 import {
@@ -39,6 +40,37 @@ export interface ParticipantTaskClaimFlowClient {
   ) => Promise<void>;
   /** Refreshes a claimed task lease, fenced by the current Claim ID. */
   readonly refreshTaskClaim: (taskId: string, claimId: string) => Promise<TaskRecord | null>;
+  /** Releases a claimed task back to the claimable pool, fenced by the current Claim ID. */
+  readonly releaseTask: (taskId: string, claimId: string) => Promise<void>;
+}
+
+/**
+ * Error raised when the server rejects the task claim command itself, for
+ * example with a participant-required or authorization failure. Unlike a
+ * transport blip, a command rejection means this runner cannot claim work, so
+ * the flow propagates it to the runtime error boundary instead of leaving the
+ * runner looking healthy behind a debug-only diagnostic.
+ */
+export class ParticipantTaskClaimRejectedError extends Error {
+  /** Stable participant identity whose claim command was rejected. */
+  readonly participantId: string;
+  /** Durable session that owns the task. */
+  readonly sessionId: string;
+  /** Task whose claim command was rejected. */
+  readonly taskId: string;
+
+  constructor(input: {
+    readonly cause: Error;
+    readonly participantId: string;
+    readonly sessionId: string;
+    readonly taskId: string;
+  }) {
+    super(`Task claim command rejected: ${input.cause.message}`, { cause: input.cause });
+    this.name = "ParticipantTaskClaimRejectedError";
+    this.participantId = input.participantId;
+    this.sessionId = input.sessionId;
+    this.taskId = input.taskId;
+  }
 }
 
 /** Runtime identity and event context for one task claim flow. */
@@ -70,6 +102,7 @@ export interface ParticipantTaskClaimFlowInput {
 }
 
 type ClaimSetupOutcome =
+  | { readonly error: ParticipantTaskClaimRejectedError; readonly type: "claim_rejected" }
   | { readonly type: "claimed"; readonly task: TaskRecord }
   | { readonly type: "cancelled" | "claim_not_won" | "claim_transport_unknown" | "setup_failed" };
 
@@ -81,6 +114,16 @@ type ExecutorOutcome =
     };
 
 const maxConsecutiveRefreshFailures = 3;
+
+/**
+ * Fraction of the remaining claim lease that may elapse before the next
+ * refresh attempt. Refreshing at half the lease keeps a full missed attempt of
+ * headroom before the sweeper can expire the claim and re-dispatch the task.
+ */
+const claimRefreshLeaseFraction = 0.5;
+
+/** Floor for lease-derived refresh delays so a nearly elapsed lease cannot busy-loop. */
+const minClaimRefreshDelayMs = 50;
 
 /** RFC 3339 timestamp with a mandatory `Z` or numeric UTC offset. */
 const rfc3339WithOffsetPattern =
@@ -127,6 +170,9 @@ export function buildParticipantTaskClaimFlow(
     Effect.gen(function* () {
       const claimSetup = yield* claimAndPublishInitialProgress(client, context, logger, input);
       if (claimSetup.type !== "claimed") {
+        if (claimSetup.type === "claim_rejected") {
+          return yield* Effect.fail(claimSetup.error);
+        }
         if (claimSetup.type === "cancelled") {
           debugTaskStop("task.cancelled_before_executor");
         }
@@ -198,17 +244,31 @@ export function buildParticipantTaskClaimFlow(
       };
       const execution = yield* runExecutor(input.executor, executorContext);
       if (execution.type === "executor_failed") {
-        if (!shouldStop()) {
-          yield* Effect.tryPromise(() =>
-            client.failTask(
-              input.task.taskId,
-              execution.error instanceof ParticipantTaskExecutionError
-                ? { ...execution.error.failure }
-                : { error: execution.error.message },
-              claimId,
-            ),
-          );
+        if (shouldStop()) {
+          return;
         }
+        // A retryable executor failure is transient, so release the claim back
+        // to the claimable pool for another attempt instead of failing the
+        // task terminally, which no worker could ever pick up again.
+        if (execution.error instanceof ParticipantTaskExecutionError && execution.error.retryable) {
+          logger.debug("runTaskClaimFlow", "task.released_for_retry", {
+            error: execution.error.message,
+            participantId: context.participantId,
+            sessionId: context.sessionId,
+            taskId: input.task.taskId,
+          });
+          yield* Effect.tryPromise(() => client.releaseTask(input.task.taskId, claimId));
+          return;
+        }
+        yield* Effect.tryPromise(() =>
+          client.failTask(
+            input.task.taskId,
+            execution.error instanceof ParticipantTaskExecutionError
+              ? { ...execution.error.failure }
+              : { error: execution.error.message },
+            claimId,
+          ),
+        );
         return;
       }
       if (shouldStop()) {
@@ -258,9 +318,26 @@ function claimAndPublishInitialProgress(
     return Effect.succeed({ type: "cancelled" });
   }
   return Effect.gen(function* () {
-    const claimOutcome = yield* Effect.tryPromise(() => client.claimTask(input.task.taskId)).pipe(
+    const claimOutcome = yield* Effect.tryPromise({
+      catch: (error) => error,
+      try: () => client.claimTask(input.task.taskId),
+    }).pipe(
       Effect.match({
         onFailure: (error): ClaimSetupOutcome => {
+          // A correlated command rejection means the server refused this
+          // runner's claim, not that the transport hiccuped. Escalate it so a
+          // runner that cannot claim is visible instead of debug-only quiet.
+          if (error instanceof ParticipantRuntimeCommandError) {
+            return {
+              error: new ParticipantTaskClaimRejectedError({
+                cause: error,
+                participantId: context.participantId,
+                sessionId: context.sessionId,
+                taskId: input.task.taskId,
+              }),
+              type: "claim_rejected",
+            };
+          }
           logger.debug("runTaskClaimFlow", "task.claim_transport_unknown", {
             error: error instanceof Error ? error.message : "Unknown claim error",
             participantId: context.participantId,
@@ -274,7 +351,7 @@ function claimAndPublishInitialProgress(
           task ? { task, type: "claimed" } : { type: "claim_not_won" },
       }),
     );
-    if (claimOutcome.type === "claim_transport_unknown") {
+    if (claimOutcome.type === "claim_rejected" || claimOutcome.type === "claim_transport_unknown") {
       return claimOutcome;
     }
     if (claimOutcome.type === "claim_not_won") {
@@ -363,8 +440,22 @@ function buildTaskClaimRefresh(
   return Effect.gen(function* () {
     let consecutiveFailures = 0;
     let currentClaimExpiresAt = input.claimExpiresAt;
+    let clampReported = false;
     while (!isTaskStopped(input.cancellation)) {
-      yield* sleepUnrefEffect(input.intervalMs);
+      // The configured interval is clamped against the server lease deadline
+      // so a claimRefreshMs at or above the lease TTL cannot silently open a
+      // duplicate-execution window between refresh ticks.
+      const delayMs = nextClaimRefreshDelayMs(input.intervalMs, currentClaimExpiresAt);
+      if (delayMs < input.intervalMs && !clampReported) {
+        clampReported = true;
+        logger.debug("runTaskClaimFlow", "task.claim_refresh_interval_clamped", {
+          claimExpiresAt: currentClaimExpiresAt,
+          clampedDelayMs: delayMs,
+          configuredIntervalMs: input.intervalMs,
+          taskId: input.taskId,
+        });
+      }
+      yield* sleepUnrefEffect(delayMs);
       if (isTaskStopped(input.cancellation)) {
         return;
       }
@@ -416,6 +507,28 @@ function buildTaskClaimRefresh(
       }
     }
   });
+}
+
+/**
+ * Derives the next claim refresh delay from the configured interval and the
+ * current server lease deadline. The delay never exceeds a safe fraction of
+ * the remaining lease, so a configured interval at or above the lease TTL is
+ * clamped instead of guaranteeing that every lease elapses between ticks.
+ */
+export function nextClaimRefreshDelayMs(
+  intervalMs: number,
+  claimExpiresAt: string | null,
+  now: number = Date.now(),
+): number {
+  if (claimExpiresAt === null) {
+    return intervalMs;
+  }
+  const claimExpiresAtMs = Date.parse(claimExpiresAt);
+  if (!Number.isFinite(claimExpiresAtMs)) {
+    return intervalMs;
+  }
+  const safeDelayMs = Math.floor((claimExpiresAtMs - now) * claimRefreshLeaseFraction);
+  return Math.min(intervalMs, Math.max(minClaimRefreshDelayMs, safeDelayMs));
 }
 
 /** Preserves executor error messages when Effect wraps rejected promises. */
