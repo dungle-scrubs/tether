@@ -781,7 +781,7 @@ function createControlAcquisitionFixture(acquisitionId = "acq_bridge") {
     acquisitionId,
     acquisitionStatus: "claimed",
     controlEpoch: 1,
-    leaseExpiresAt: "2026-07-16T12:01:00.000Z",
+    leaseExpiresAt: "2099-01-01T00:01:00.000Z",
     participant: { participantId: "part_bridge" },
     registrationStatus: "joined",
     renewAfterMs: 30_000,
