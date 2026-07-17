@@ -3,11 +3,31 @@ import { describe, expect, expectTypeOf, it } from "vitest";
 import {
   parseWebSocketServerEnvelope,
   serializePresenceEnvelope,
+  serializeReplayCompleteEnvelope,
   webSocketErrorEnvelopeSchema,
   webSocketPresenceEnvelopeSchema,
 } from "../src/index.js";
 
 describe("WebSocket error envelopes", () => {
+  it("carries optional fenced participant identity on replay completion", () => {
+    const envelope = parseWebSocketServerEnvelope(
+      JSON.parse(
+        serializeReplayCompleteEnvelope({
+          controlEpoch: 4,
+          instanceId: "instance_summary_worker",
+          participantId: "participant_summary_worker",
+        }),
+      ) as unknown,
+    );
+
+    expect(envelope).toEqual({
+      controlEpoch: 4,
+      instanceId: "instance_summary_worker",
+      op: "replay.complete",
+      participantId: "participant_summary_worker",
+    });
+  });
+
   it("serializes and parses Replica Scope Host Presence envelopes", () => {
     const envelope = parseWebSocketServerEnvelope(
       JSON.parse(

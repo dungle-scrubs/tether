@@ -70,9 +70,23 @@ export const webSocketEventEnvelopeSchema = z.object({
 });
 
 /** WebSocket replay-complete envelope schema. */
-export const webSocketReplayCompleteEnvelopeSchema = z.object({
-  op: z.literal(webSocketOperation.replayComplete),
-});
+export const webSocketReplayCompleteEnvelopeSchema = z
+  .object({
+    controlEpoch: z.number().int().positive().safe().optional(),
+    instanceId: z.string().min(1).optional(),
+    op: z.literal(webSocketOperation.replayComplete),
+    participantId: z.string().min(1).optional(),
+  })
+  .refine(
+    (value) =>
+      [value.controlEpoch, value.instanceId, value.participantId].every(
+        (entry) => entry === undefined,
+      ) ||
+      [value.controlEpoch, value.instanceId, value.participantId].every(
+        (entry) => entry !== undefined,
+      ),
+    { message: "fenced participant identity must be complete" },
+  );
 
 /** WebSocket Replica Scope Host Presence envelope schema. */
 export const webSocketPresenceEnvelopeSchema = z.object({
@@ -274,9 +288,21 @@ export function serializeEventEnvelope(event: SessionEvent): string {
   return JSON.stringify({ event, op: webSocketOperation.event });
 }
 
+/** Fenced participant identity optionally attached to replay completion. */
+export interface ReplayCompleteParticipantContext {
+  readonly controlEpoch: number;
+  readonly instanceId: string;
+  readonly participantId: string;
+}
+
 /** Serializes the replay-complete marker sent after historical events. */
-export function serializeReplayCompleteEnvelope(): string {
-  return JSON.stringify({ op: webSocketOperation.replayComplete });
+export function serializeReplayCompleteEnvelope(
+  participant?: ReplayCompleteParticipantContext,
+): string {
+  return JSON.stringify({
+    ...(participant ?? {}),
+    op: webSocketOperation.replayComplete,
+  });
 }
 
 /** Serializes a mandatory Replica Scope Host Presence envelope. */

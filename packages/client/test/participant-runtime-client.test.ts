@@ -3,31 +3,29 @@ import { EventEmitter } from "node:events";
 import { Effect, Fiber } from "effect";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
-
-import { ParticipantCursorWriter } from "../src/participant-cursor-writer.js";
-
 import {
-  ParticipantRuntimeCursorPersistError,
-  ParticipantRuntimeShutdownError,
   buildParticipantRuntimeStreamUrl,
   ParticipantRuntimeClient,
   type ParticipantRuntimeClientConfig,
   ParticipantRuntimeClientConfigurationError,
   type ParticipantRuntimeCommandError,
   type ParticipantRuntimeCommandTimeoutError,
+  ParticipantRuntimeCursorPersistError,
   type ParticipantRuntimeCursorStore,
+  ParticipantRuntimeShutdownError,
+  type ParticipantRuntimeWebSocketFactory,
   type ParticipantTaskExecutor,
   type RunParticipantRuntimeHooks,
   resolveCommandTimeoutMs,
   resolveResumeSeq,
   resolveServiceAuthToken,
-  type ParticipantRuntimeWebSocketFactory,
   runParticipantRuntime,
   type SessionEvent,
   TaskCancellationRegistry,
   type TaskRecord,
   taskFromClaimableEvent,
 } from "../src/index.js";
+import { ParticipantCursorWriter } from "../src/participant-cursor-writer.js";
 
 type RunTaskClaimFlowInput = Parameters<ParticipantRuntimeClient["runTaskClaimFlow"]>[0];
 
@@ -62,10 +60,12 @@ type PrivateCommandRuntimeClient = ParticipantRuntimeClient & {
 };
 
 type PrivateReplayRuntimeClient = ParticipantRuntimeClient & {
+  readonly currentControlEpoch: number | null;
   handleMessage(data: string): void;
 };
 
 type PrivateCursorRuntimeClient = ParticipantRuntimeClient & {
+  readonly currentControlEpoch: number | null;
   handleMessage(data: string): void;
   readonly recentEvents: readonly SessionEvent[];
   replaceDelivery(afterSeq: number): void;
@@ -690,6 +690,23 @@ describe("ParticipantRuntimeClient.runTaskClaimFlow", () => {
     });
 
     expect(executorSeqs).toEqual([1]);
+  });
+
+  it("passes the connection control epoch to the claimed task executor", async () => {
+    const runtime = createRuntimeClientFixture({ controlEpoch: 7 });
+    let executorControlEpoch: number | undefined;
+
+    await runtime.client.runTaskClaimFlow({
+      cancellation: createCancellationFixture().cancellation,
+      claimRefreshMs: 1_000,
+      executor: async (context) => {
+        executorControlEpoch = context.controlEpoch;
+        return { result: { ok: true } };
+      },
+      task: baseTask,
+    });
+
+    expect(executorControlEpoch).toBe(7);
   });
 
   it("does not claim work that was cancelled before claim", async () => {
@@ -2218,6 +2235,21 @@ describe("ParticipantRuntimeClient replay wait", () => {
 });
 
 describe("ParticipantRuntimeClient durable cursor", () => {
+  it("captures the fenced participant epoch from replay completion", () => {
+    const fixture = createCursorFixture();
+
+    fixture.client.handleMessage(
+      JSON.stringify({
+        controlEpoch: 9,
+        instanceId: baseConfig.instanceId,
+        op: "replay.complete",
+        participantId: baseConfig.participantId,
+      }),
+    );
+
+    expect(fixture.client.currentControlEpoch).toBe(9);
+  });
+
   it("keeps handled progress fixed when a synchronous event handler throws", async () => {
     const delivered: number[] = [];
     const fixture = createCursorFixture({ eventCount: 1, withHandler: false });
@@ -2919,6 +2951,7 @@ function createRuntimeClientFixture(
     readonly appendEvent?: () => Promise<void>;
     readonly claimTask?: () => Promise<TaskRecord | null>;
     readonly completeTask?: () => Promise<void>;
+    readonly controlEpoch?: number;
     readonly lastHandledSeq?: number;
     readonly recentEvents?: readonly SessionEvent[];
   } = {},
@@ -2949,6 +2982,7 @@ function createRuntimeClientFixture(
       await options.completeTask?.();
     },
     config: baseConfig,
+    currentControlEpoch: options.controlEpoch ?? null,
     failTask: async (_taskId: string, failure: Record<string, unknown>) => {
       actions.push("fail");
       failures.push(failure);
@@ -3174,6 +3208,7 @@ function createCursorFixture(
   const client = Object.assign(Object.create(ParticipantRuntimeClient.prototype), {
     config: { ...baseConfig, afterSeq, cursorStore },
     connectionGeneration: 0,
+    currentControlEpoch: null,
     cursorPersistEventCount: options.eventCount ?? 50,
     cursorPersistIntervalMs: options.intervalMs ?? 1_000,
     cursorPersistTimer: null,
