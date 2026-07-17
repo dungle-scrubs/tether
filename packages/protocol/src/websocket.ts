@@ -129,6 +129,21 @@ export const webSocketServerEnvelopeSchema = z.union([
   webSocketReplayCompleteEnvelopeSchema,
 ]);
 
+/** Server-to-client operations covered by the owned envelope union. */
+const knownWebSocketServerEnvelopeOps: ReadonlySet<string> = new Set([
+  webSocketOperation.commandResult,
+  webSocketOperation.error,
+  webSocketOperation.event,
+  webSocketOperation.presence,
+  webSocketOperation.replayComplete,
+]);
+
+/** Classification of one raw server frame against the owned envelope union. */
+export type WebSocketServerEnvelopeClassification =
+  | { readonly envelope: WebSocketServerEnvelope; readonly kind: "envelope" }
+  | { readonly kind: "malformed" }
+  | { readonly kind: "unknown-op"; readonly op: string };
+
 /** Parsed WebSocket command-result envelope. */
 export type CommandResultEnvelope = z.infer<typeof webSocketCommandResultEnvelopeSchema>;
 
@@ -341,6 +356,42 @@ export function buildWebSocketPresenceEnvelope(
 export function parseWebSocketServerEnvelope(value: unknown): WebSocketServerEnvelope | null {
   const parsed = webSocketServerEnvelopeSchema.safeParse(value);
   return parsed.success ? parsed.data : null;
+}
+
+/**
+ * Classifies one raw server frame so clients can skip forward-compatible
+ * unknown operations while keeping strict validation for known ones. A frame
+ * whose `op` is outside the owned server envelope union is `unknown-op`; a
+ * frame carrying a known `op` that fails strict validation is `malformed`.
+ *
+ * Skipping unknown-op frames preserves seq contiguity because event ordering
+ * is carried exclusively by `event` envelopes and their `seq` values. If a
+ * future server ever attached an event delivery to a new operation, the
+ * skipped delivery would surface as a non-contiguous `event` frame and halt
+ * delivery through the existing typed outcome rather than losing the event
+ * silently.
+ */
+export function classifyWebSocketServerEnvelope(
+  value: unknown,
+): WebSocketServerEnvelopeClassification {
+  const parsed = webSocketServerEnvelopeSchema.safeParse(value);
+  if (parsed.success) {
+    return { envelope: parsed.data, kind: "envelope" };
+  }
+  const op = readEnvelopeOp(value);
+  if (op !== null && !knownWebSocketServerEnvelopeOps.has(op)) {
+    return { kind: "unknown-op", op };
+  }
+  return { kind: "malformed" };
+}
+
+/** Reads the operation discriminator from one untrusted frame value. */
+function readEnvelopeOp(value: unknown): string | null {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+  const op = (value as Record<string, unknown>).op;
+  return typeof op === "string" ? op : null;
 }
 
 /** Serializes a session event envelope for WebSocket subscribers. */

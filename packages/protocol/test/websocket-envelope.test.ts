@@ -1,6 +1,7 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 
 import {
+  classifyWebSocketServerEnvelope,
   parseWebSocketRecoveryCondition,
   parseWebSocketServerEnvelope,
   serializePresenceEnvelope,
@@ -118,5 +119,39 @@ describe("WebSocket error envelopes", () => {
       futureDetails: { retryable: false },
       reason: "future_replay_reason",
     });
+  });
+});
+
+describe("WebSocket server envelope classification", () => {
+  it("classifies a valid known-op frame as an envelope", () => {
+    const classified = classifyWebSocketServerEnvelope({ op: "replay.complete" });
+
+    expect(classified).toEqual({
+      envelope: { op: "replay.complete" },
+      kind: "envelope",
+    });
+  });
+
+  it("classifies a future unknown operation without failing strict parsing", () => {
+    const classified = classifyWebSocketServerEnvelope({
+      op: "presence.v2",
+      payload: { future: true },
+    });
+
+    expect(classified).toEqual({ kind: "unknown-op", op: "presence.v2" });
+  });
+
+  it("keeps a known-op frame with an invalid body strictly malformed", () => {
+    expect(classifyWebSocketServerEnvelope({ op: "event" })).toEqual({ kind: "malformed" });
+    expect(
+      classifyWebSocketServerEnvelope({ event: { eventId: "evt_1", seq: 1 }, op: "event" }),
+    ).toEqual({ kind: "malformed" });
+  });
+
+  it("classifies frames without a string op as malformed", () => {
+    expect(classifyWebSocketServerEnvelope(null)).toEqual({ kind: "malformed" });
+    expect(classifyWebSocketServerEnvelope("frame")).toEqual({ kind: "malformed" });
+    expect(classifyWebSocketServerEnvelope({})).toEqual({ kind: "malformed" });
+    expect(classifyWebSocketServerEnvelope({ op: 7 })).toEqual({ kind: "malformed" });
   });
 });
