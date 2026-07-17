@@ -32,6 +32,7 @@ import {
   createTaskWithEvent,
   expireTaskClaims,
   getTask,
+  listContextEventSuffix,
   listEvents,
   listParticipants,
   listTaskApprovals,
@@ -296,7 +297,14 @@ interface SessionContextResponse extends JsonResponse {
     };
     readonly forParticipant: string | null;
     readonly kind: "session_context";
-    readonly latestSummary: null;
+    readonly latestSummary: null | {
+      readonly budgetClass: string;
+      readonly content: { readonly headline: string };
+      readonly coversSeqFrom: number;
+      readonly coversSeqTo: number;
+      readonly summaryId: string;
+    };
+    readonly mode: "raw_only" | "summary_with_raw_tail";
     readonly recentEventRange: {
       readonly endSeq: number | null;
       readonly startSeq: number | null;
@@ -6017,6 +6025,7 @@ e2e("tether e2e", () => {
       forParticipant: "part_coordinator",
       kind: "session_context",
       latestSummary: null,
+      mode: "raw_only",
       recentEventRange: {
         endSeq: expect.any(Number) as number,
         startSeq: expect.any(Number) as number,
@@ -6038,6 +6047,118 @@ e2e("tether e2e", () => {
     expect(context.context.recentEvents.length).toBeGreaterThan(0);
     expect(context.context.recentEvents.at(-1)?.type).toBe("task.completed");
     expect(context.context.budget.estimatedTokens).toBeGreaterThan(0);
+  });
+
+  it("builds context from the active budget-class summary plus its exact raw suffix", async () => {
+    const session = await createSession();
+    for (const text of ["covered one", "covered two", "exact tail"]) {
+      await request(`/sessions/${session.sessionId}/events`, {
+        body: { payload: { text }, producerId: "external-client", type: "user.message" },
+        method: "POST",
+      });
+    }
+    const eventRows = await currentPool().pool.query<{
+      readonly eventId: string;
+      readonly seq: string;
+    }>(
+      `SELECT event_id AS "eventId", seq::text FROM session_events WHERE session_id = $1 ORDER BY seq`,
+      [session.sessionId],
+    );
+    const covered = eventRows.rows.slice(0, -1);
+    const suffix = eventRows.rows.at(-1);
+    if (covered.length === 0 || suffix === undefined) {
+      throw new Error("Expected covered events and one raw suffix event");
+    }
+    const activeSummaryId = `summary_context_active_${randomUUID()}`;
+    await insertPublishedContextSummary({
+      budgetClass: "8k",
+      coversSeqFrom: Number(covered[0]?.seq),
+      coversSeqTo: Number(covered.at(-1)?.seq),
+      headline: "Superseded 8k summary",
+      sessionId: session.sessionId,
+      sourceEventCount: covered.length,
+      sourceFirstEventId: covered[0]?.eventId ?? "missing",
+      sourceLastEventId: covered.at(-1)?.eventId ?? "missing",
+      summaryId: `summary_context_superseded_${randomUUID()}`,
+      superseded: true,
+    });
+    await insertPublishedContextSummary({
+      budgetClass: "8k",
+      coversSeqFrom: Number(covered[0]?.seq),
+      coversSeqTo: Number(covered.at(-1)?.seq),
+      headline: "Selected 8k summary",
+      sessionId: session.sessionId,
+      sourceEventCount: covered.length,
+      sourceFirstEventId: covered[0]?.eventId ?? "missing",
+      sourceLastEventId: covered.at(-1)?.eventId ?? "missing",
+      summaryId: activeSummaryId,
+    });
+    await insertPublishedContextSummary({
+      budgetClass: "16k",
+      coversSeqFrom: Number(covered[0]?.seq),
+      coversSeqTo: Number(covered.at(-1)?.seq),
+      headline: "Wrong budget summary",
+      sessionId: session.sessionId,
+      sourceEventCount: covered.length,
+      sourceFirstEventId: covered[0]?.eventId ?? "missing",
+      sourceLastEventId: covered.at(-1)?.eventId ?? "missing",
+      summaryId: `summary_context_wrong_budget_${randomUUID()}`,
+    });
+
+    const context = await request<SessionContextResponse>(
+      `/sessions/${session.sessionId}/context?budgetTokens=8000`,
+    );
+    const exactEvents = await request<EventsResponse>(`/sessions/${session.sessionId}/events`);
+
+    expect(context.context).toMatchObject({
+      budget: { omittedEventCount: 0, requestedTokens: 8_000 },
+      latestSummary: {
+        budgetClass: "8k",
+        content: { headline: "Selected 8k summary" },
+        coversSeqFrom: Number(covered[0]?.seq),
+        coversSeqTo: Number(covered.at(-1)?.seq),
+        summaryId: activeSummaryId,
+      },
+      mode: "summary_with_raw_tail",
+      recentEventRange: { startSeq: Number(suffix.seq), endSeq: Number(suffix.seq) },
+    });
+    expect(context.context.recentEvents.map((event) => event.seq)).toEqual([Number(suffix.seq)]);
+    expect(exactEvents.events.map((event) => event.seq)).toEqual(
+      eventRows.rows.map((event) => Number(event.seq)),
+    );
+    expect(exactEvents.events.some((event) => event.type.includes("summary"))).toBe(false);
+  });
+
+  it("reads only the bounded newest context tail while retaining exact omitted accounting", async () => {
+    const session = await createSession();
+    const insertedCount = 10_001;
+    await currentPool().pool.query(
+      `
+        INSERT INTO session_events (event_id, payload, producer_id, seq, session_id, type)
+        SELECT $1 || generate_series::text, '{}'::jsonb, 'context-tail-e2e',
+          generate_series + 1, $2, 'context.tail'
+        FROM generate_series(1, $3)
+      `,
+      [`evt_context_tail_${randomUUID()}_`, session.sessionId, insertedCount],
+    );
+    await currentPool().pool.query(
+      `
+        UPDATE session_projections
+        SET covers_seq_to = $2, event_count = $2
+        WHERE session_id = $1
+      `,
+      [session.sessionId, insertedCount + 1],
+    );
+
+    const suffix = await listContextEventSuffix(currentPool(), session.sessionId, 0, 10_000);
+
+    expect(suffix).toMatchObject({
+      eligibleEventCount: insertedCount + 1,
+      truncated: true,
+    });
+    expect(suffix.events).toHaveLength(10_000);
+    expect(suffix.events[0]?.seq).toBe(3);
+    expect(suffix.events.at(-1)?.seq).toBe(insertedCount + 1);
   });
 
   it("lets a new runtime take over a participant after the active control lease expires", async () => {
@@ -7750,6 +7871,63 @@ e2e("tether e2e", () => {
       method: "POST",
     });
     return response.session;
+  }
+
+  /** Inserts one structurally valid active summary for context-read E2E setup. */
+  async function insertPublishedContextSummary(input: {
+    readonly budgetClass: string;
+    readonly coversSeqFrom: number;
+    readonly coversSeqTo: number;
+    readonly headline: string;
+    readonly sessionId: string;
+    readonly sourceEventCount: number;
+    readonly sourceFirstEventId: string;
+    readonly sourceLastEventId: string;
+    readonly summaryId: string;
+    readonly superseded?: boolean;
+  }): Promise<void> {
+    await currentPool().pool.query(
+      `
+        INSERT INTO session_summaries (
+          budget_class, content, covers_seq_from, covers_seq_to,
+          generation_task_id, integrity_algorithm, integrity_hash,
+          ollama_context_size, ollama_model, ollama_quantization,
+          ollama_revision, ollama_thinking_mode, output_schema_version,
+          producer_id, producer_version, prompt_version, published_at,
+          session_id, source_event_count, source_first_event_id,
+          source_last_event_id, source_range_hash, summary_id, superseded_at,
+          validated_at
+        )
+        VALUES (
+          $1, $2::jsonb, $3, $4, $5, 'sha256', $6,
+          32768, 'local-model', 'q4_k_m', 'revision-1', 'low',
+          'summary.v1', 'summary-worker', '1.0.0', 'prompt.v1',
+          clock_timestamp(), $7, $8, $9, $10, $11, $12,
+          CASE WHEN $13 THEN clock_timestamp() ELSE NULL END,
+          clock_timestamp()
+        )
+      `,
+      [
+        input.budgetClass,
+        JSON.stringify({
+          facts: [],
+          headline: input.headline,
+          narrative: "Validated earlier durable context.",
+          openQuestions: [],
+        }),
+        input.coversSeqFrom,
+        input.coversSeqTo,
+        `task_${input.summaryId}`,
+        "a".repeat(64),
+        input.sessionId,
+        input.sourceEventCount,
+        input.sourceFirstEventId,
+        input.sourceLastEventId,
+        "b".repeat(64),
+        input.summaryId,
+        input.superseded ?? false,
+      ],
+    );
   }
 
   /**

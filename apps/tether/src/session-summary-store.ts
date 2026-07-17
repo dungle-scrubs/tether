@@ -9,10 +9,12 @@ import {
   type SessionSummaryInspection,
   type SessionSummaryOllamaIdentity,
   type SessionSummaryProducerIdentity,
+  type SessionSummaryRecord,
   sessionSummaryCandidateSubmissionSchema,
   sessionSummaryFailureSchema,
   sessionSummaryGenerationJobSchema,
   sessionSummaryInspectionSchema,
+  sessionSummaryRecordSchema,
 } from "@dungle-scrubs/tether-protocol";
 import type pg from "pg";
 
@@ -88,6 +90,11 @@ export interface SessionSummaryStore {
     readonly failure: SessionSummaryFailure;
     readonly summaryId: string;
   }) => Promise<{ readonly status: "quarantined"; readonly summaryId: string }>;
+  /** Reads the single active published summary for one context budget class. */
+  readonly readLatestPublished: (
+    sessionId: string,
+    budgetClass: string,
+  ) => Promise<SessionSummaryRecord | null>;
   /** Publishes one validated candidate and supersedes its prior head atomically. */
   readonly publishCandidate: (summaryId: string) => Promise<{
     readonly status: "published";
@@ -191,6 +198,13 @@ interface InspectionRow {
   readonly validatedAt: Date | null;
 }
 
+interface PublishedRecordRow extends InspectionRow {
+  readonly content: SessionSummaryContent | null;
+  readonly createdAt: Date;
+  readonly integrityAlgorithm: string | null;
+  readonly integrityHash: string | null;
+}
+
 /** Expected candidate persistence failure with a stable route-safe reason. */
 export class SessionSummaryStoreError extends Error {
   constructor(
@@ -239,11 +253,105 @@ export function createSessionSummaryStore(
     inspectCandidate: (summaryId) => inspectCandidate(pool, summaryId),
     publishCandidate: (summaryId) => publishCandidate(pool, summaryId),
     quarantineCandidate: (input) => quarantineCandidate(pool, input),
+    readLatestPublished: (sessionId, budgetClass) =>
+      readLatestPublished(pool, sessionId, budgetClass),
     selectAndReserveGeneration: (input) =>
       selectAndReserveGeneration(pool, input, createGenerationTask),
     submitCandidate: (submission) => submitCandidate(pool, submission),
     validateCandidate: (summaryId) => validateCandidate(pool, summaryId),
   };
+}
+
+/** Reads the current published record without selecting superseded candidates. */
+async function readLatestPublished(
+  pool: SessionSummaryStorePool,
+  sessionId: string,
+  budgetClass: string,
+): Promise<SessionSummaryRecord | null> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query<PublishedRecordRow>(
+      `
+        SELECT
+          budget_class AS "budgetClass",
+          content,
+          covers_seq_from AS "coversSeqFrom",
+          covers_seq_to AS "coversSeqTo",
+          created_at AS "createdAt",
+          failure,
+          generation_task_id AS "generationTaskId",
+          integrity_algorithm AS "integrityAlgorithm",
+          integrity_hash AS "integrityHash",
+          ollama_context_size AS "ollamaContextSize",
+          ollama_model AS "ollamaModel",
+          ollama_quantization AS "ollamaQuantization",
+          ollama_revision AS "ollamaRevision",
+          ollama_thinking_mode AS "ollamaThinkingMode",
+          output_schema_version AS "outputSchemaVersion",
+          producer_id AS "producerId",
+          producer_version AS "producerVersion",
+          prompt_version AS "promptVersion",
+          published_at AS "publishedAt",
+          quarantined_at AS "quarantinedAt",
+          session_id AS "sessionId",
+          source_event_count AS "sourceEventCount",
+          source_first_event_id AS "sourceFirstEventId",
+          source_last_event_id AS "sourceLastEventId",
+          source_range_hash AS "sourceRangeHash",
+          summary_id AS "summaryId",
+          superseded_at AS "supersededAt",
+          validated_at AS "validatedAt"
+        FROM session_summaries
+        WHERE session_id = $1
+          AND budget_class = $2
+          AND published_at IS NOT NULL
+          AND superseded_at IS NULL
+        LIMIT 1
+      `,
+      [sessionId, budgetClass],
+    );
+    const row = result.rows[0];
+    if (!row) {
+      return null;
+    }
+    return sessionSummaryRecordSchema.parse({
+      budgetClass: row.budgetClass,
+      content: row.content,
+      coversSeqFrom: parseSafeSequence(row.coversSeqFrom, "coversSeqFrom"),
+      coversSeqTo: parseSafeSequence(row.coversSeqTo, "coversSeqTo"),
+      createdAt: row.createdAt.toISOString(),
+      failure: row.failure,
+      generationTaskId: row.generationTaskId,
+      integrity:
+        row.integrityAlgorithm === null || row.integrityHash === null
+          ? null
+          : { algorithm: row.integrityAlgorithm, hash: row.integrityHash },
+      ollama: {
+        contextSize: row.ollamaContextSize,
+        model: row.ollamaModel,
+        quantization: row.ollamaQuantization,
+        revision: row.ollamaRevision,
+        thinkingMode: row.ollamaThinkingMode,
+      },
+      outputSchemaVersion: row.outputSchemaVersion,
+      producer: { id: row.producerId, version: row.producerVersion },
+      promptVersion: row.promptVersion,
+      publishedAt: row.publishedAt?.toISOString() ?? null,
+      quarantinedAt: row.quarantinedAt?.toISOString() ?? null,
+      sessionId: row.sessionId,
+      source: {
+        eventCount: parseSafeSequence(row.sourceEventCount, "sourceEventCount"),
+        firstEventId: row.sourceFirstEventId,
+        lastEventId: row.sourceLastEventId,
+        rangeHash: row.sourceRangeHash,
+      },
+      summaryId: row.summaryId,
+      supersededAt: row.supersededAt?.toISOString() ?? null,
+      validatedAt: row.validatedAt?.toISOString() ?? null,
+    });
+  } finally {
+    client.release();
+  }
 }
 
 /** Atomically inserts, validates, and publishes one candidate with replay safety. */

@@ -2156,6 +2156,59 @@ export async function listEvents(
   return rows.rows.map(toSessionEvent);
 }
 
+/** Reads only the newest bounded context candidates and aggregate suffix size. */
+export async function listContextEventSuffix(
+  database: DatabasePool,
+  sessionId: string,
+  afterSeq: number,
+  limit: number,
+): Promise<{
+  readonly eligibleEventCount: number;
+  readonly estimatedTokens: number;
+  readonly events: readonly SessionEvent[];
+  readonly truncated: boolean;
+}> {
+  const head = await database.pool.query<{ readonly streamEndSeq: unknown }>(
+    `
+        SELECT covers_seq_to AS "streamEndSeq"
+        FROM session_projections
+        WHERE session_id = $1
+      `,
+    [sessionId],
+  );
+  const streamEndSeq = Number(head.rows[0]?.streamEndSeq ?? afterSeq);
+  if (!Number.isSafeInteger(streamEndSeq) || streamEndSeq < afterSeq) {
+    throw new Error("Invalid Session Context projection head");
+  }
+  const newest = await database.pool.query<PgSessionEventRow>(
+    `
+        SELECT
+          created_at AS "createdAt",
+          event_id AS "eventId",
+          payload,
+          producer_id AS "producerId",
+          seq AS "seq",
+          session_id AS "sessionId",
+          type
+        FROM session_events
+        WHERE session_id = $1
+          AND seq > $2
+          AND seq <= $4
+        ORDER BY seq DESC
+        LIMIT $3
+      `,
+    [sessionId, afterSeq, limit, streamEndSeq],
+  );
+  const eligibleEventCount = streamEndSeq - afterSeq;
+  const events = newest.rows.reverse().map(toSessionEvent);
+  return {
+    eligibleEventCount,
+    estimatedTokens: Math.ceil(JSON.stringify(events).length / 4),
+    events,
+    truncated: eligibleEventCount > events.length,
+  };
+}
+
 /**
  * Creates a durable task and appends its canonical lifecycle event in one
  * database transaction.

@@ -151,6 +151,7 @@ function recordingStore(calls: string[]): SessionSummaryStore {
       status: "quarantined",
       summaryId: input.summaryId,
     }),
+    readLatestPublished: async () => null,
     selectAndReserveGeneration: async () => ({ status: "caught_up" }),
     submitCandidate: async (input) => {
       calls.push("submit");

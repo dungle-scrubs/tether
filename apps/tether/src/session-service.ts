@@ -29,6 +29,7 @@ import {
 import { createSessionControlEffects } from "./session-service-control-effects.js";
 import { createSessionCoreEffects } from "./session-service-core-effects.js";
 import { createSessionReadEffects } from "./session-service-read-effects.js";
+import { createSessionSummaryStore } from "./session-summary-store.js";
 import {
   assertBroadcastEventsWithObservability,
   catchAtomicEpochStale,
@@ -190,6 +191,7 @@ function makeSessionServiceEffect(
   const claimLeaseTtlMs = options.taskClaimLeaseTtlMs ?? taskClaimLeaseTtlMs;
   const wsLeaseTtlMs = options.wsControlLeaseTtlMs ?? wsControlLeaseTtlMs;
   const stores = createSessionPersistenceStores(database);
+  const sessionSummaryStore = createSessionSummaryStore(database.pool);
   const restControlPolicy = new RestControlPolicy(options.controlEpochEnforcement ?? true);
   const appendEventEffect = (
     input: AppendSessionEventInput,
@@ -292,7 +294,7 @@ function makeSessionServiceEffect(
     listTasksEffect,
     listTaskSnapshotsEffect,
     readSessionDebugSummaryEffect,
-  } = createSessionReadEffects({ stores });
+  } = createSessionReadEffects({ sessionSummaryStore, stores });
   const withRestTaskMutationControl = <TInput extends RestControlledInput & TaskParticipantInput>(
     operation: RestTaskOperation,
     input: TInput,

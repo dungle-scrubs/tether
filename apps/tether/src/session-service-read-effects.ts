@@ -4,12 +4,21 @@ import type { SessionPersistenceStores } from "./db-store-contracts.js";
 import {
   buildBoundedSessionContextView,
   buildParticipantTaskContracts,
+  canUseSessionSummaryForContext,
+  classifySessionContextBudget,
 } from "./session-service-context.js";
+import {
+  decideSessionContextMaintenance,
+  enqueueSessionContextMaintenance,
+  type SessionContextBudgetClass,
+  truncatedSessionContextSuffixTokenFloor,
+} from "./session-context-maintenance-policy.js";
 import {
   defaultRecentTerminalTaskLimit,
   type SessionServiceFailure,
 } from "./session-service-contracts.js";
 import { trySessionPromise } from "./session-service-runtime.js";
+import type { SessionSummaryStore } from "./session-summary-store.js";
 import type {
   ControlLeaseSnapshot,
   ParticipantRecord,
@@ -26,8 +35,24 @@ import type {
   TaskSnapshot,
 } from "./types.js";
 
+/** Maximum newest raw events one context read may materialize before packing. */
+export const maxSessionContextCandidateEvents = 10_000;
+
 /** Dependencies for read-only session Effect builders. */
 export interface SessionReadEffectsInput {
+  /** Optional scheduler bundle enabled only after summary publication gates pass. */
+  readonly summaryMaintenance?: {
+    readonly reportFailure: (failure: {
+      readonly budgetClass: SessionContextBudgetClass;
+      readonly code: "schedule_failed";
+    }) => void;
+    readonly schedule: (input: {
+      readonly budgetClass: SessionContextBudgetClass;
+      readonly sessionId: string;
+      readonly unsummarizedTokens: number;
+    }) => Promise<void>;
+  };
+  readonly sessionSummaryStore: Pick<SessionSummaryStore, "readLatestPublished">;
   readonly stores: SessionPersistenceStores;
 }
 
@@ -97,23 +122,60 @@ export function createSessionReadEffects(input: SessionReadEffectsInput): Sessio
   return {
     buildSessionContextViewEffect: (contextInput) =>
       Effect.gen(function* () {
-        const [events, activeTasks, terminalTasks, participants] = yield* trySessionPromise(() =>
+        const budgetClass = classifySessionContextBudget(contextInput.budgetTokens);
+        const publishedSummary = yield* trySessionPromise(() =>
+          input.sessionSummaryStore.readLatestPublished(contextInput.sessionId, budgetClass),
+        );
+        const latestSummary = canUseSessionSummaryForContext({
+          budgetTokens: contextInput.budgetTokens,
+          forParticipant: contextInput.forParticipant,
+          sessionId: contextInput.sessionId,
+          summary: publishedSummary,
+        })
+          ? publishedSummary
+          : null;
+        const [suffix, activeTasks, terminalTasks, participants] = yield* trySessionPromise(() =>
           Promise.all([
-            input.stores.events.list(contextInput.sessionId, 0),
+            input.stores.events.listContextSuffix(
+              contextInput.sessionId,
+              latestSummary?.coversSeqTo ?? 0,
+              maxSessionContextCandidateEvents,
+            ),
             input.stores.tasks.list(contextInput.sessionId, "active"),
             input.stores.tasks.list(contextInput.sessionId, "terminal"),
             input.stores.participants.list(contextInput.sessionId),
           ]),
         );
-        return buildBoundedSessionContextView({
+        const events = suffix.events;
+        const context = buildBoundedSessionContextView({
           activeTasks,
           budgetTokens: contextInput.budgetTokens,
           events,
+          eligibleEventCount: suffix.eligibleEventCount,
           forParticipant: contextInput.forParticipant,
+          latestSummary,
           recentTerminalTasks: terminalTasks.slice(0, defaultRecentTerminalTaskLimit),
           sessionId: contextInput.sessionId,
           taskContracts: buildParticipantTaskContracts(participants),
         });
+        const maintenanceDecision = decideSessionContextMaintenance({
+          budgetClass,
+          unsummarizedTokens: suffix.truncated
+            ? Math.max(suffix.estimatedTokens, truncatedSessionContextSuffixTokenFloor)
+            : suffix.estimatedTokens,
+        });
+        if (input.summaryMaintenance !== undefined) {
+          enqueueSessionContextMaintenance(
+            maintenanceDecision,
+            (maintenance) =>
+              input.summaryMaintenance?.schedule({
+                ...maintenance,
+                sessionId: contextInput.sessionId,
+              }) ?? Promise.resolve(),
+            input.summaryMaintenance.reportFailure,
+          );
+        }
+        return context;
       }),
     findParticipantTaskContractEffect: (contractInput) =>
       Effect.map(

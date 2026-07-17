@@ -139,7 +139,78 @@ describe("Session Summary persistence", () => {
     expect(taskCreateIndex).toBeLessThan(client.queries.length - 1);
     expect(client.queries.at(-1)).toBe("COMMIT");
   });
+
+  it("reads only the active published summary for one session and budget class", async () => {
+    const client = new PublishedSummaryClient();
+    const store = createSessionSummaryStore({ connect: async () => client });
+
+    const summary = await store.readLatestPublished("sess_1", "8k");
+
+    expect(summary).toMatchObject({
+      budgetClass: "8k",
+      content: { headline: "Durable context" },
+      coversSeqFrom: 1,
+      coversSeqTo: 42,
+      integrity: { algorithm: "sha256", hash: "a".repeat(64) },
+      sessionId: "sess_1",
+      summaryId: "summary_active",
+    });
+    expect(client.values).toEqual(["sess_1", "8k"]);
+    expect(client.queryText).toContain("published_at IS NOT NULL");
+    expect(client.queryText).toContain("superseded_at IS NULL");
+  });
 });
+
+class PublishedSummaryClient implements SessionSummaryStoreClient {
+  queryText = "";
+  values: readonly unknown[] = [];
+
+  async query<TRow>(sql: string, values?: readonly unknown[]): Promise<{ readonly rows: TRow[] }> {
+    this.queryText = sql.replaceAll(/\s+/gu, " ").trim();
+    this.values = values ?? [];
+    return {
+      rows: [
+        {
+          budgetClass: "8k",
+          content: {
+            facts: [],
+            headline: "Durable context",
+            narrative: "Earlier exact events.",
+            openQuestions: [],
+          },
+          coversSeqFrom: "1",
+          coversSeqTo: "42",
+          createdAt: new Date("2026-07-17T00:00:00.000Z"),
+          failure: null,
+          generationTaskId: "task_summary",
+          integrityAlgorithm: "sha256",
+          integrityHash: "a".repeat(64),
+          ollamaContextSize: 32_768,
+          ollamaModel: "local-model",
+          ollamaQuantization: "q4_k_m",
+          ollamaRevision: "revision-1",
+          ollamaThinkingMode: "low",
+          outputSchemaVersion: "summary.v1",
+          producerId: "summary-worker",
+          producerVersion: "1.0.0",
+          promptVersion: "prompt.v1",
+          publishedAt: new Date("2026-07-17T00:01:00.000Z"),
+          quarantinedAt: null,
+          sessionId: "sess_1",
+          sourceEventCount: "42",
+          sourceFirstEventId: "evt_1",
+          sourceLastEventId: "evt_42",
+          sourceRangeHash: "b".repeat(64),
+          summaryId: "summary_active",
+          supersededAt: null,
+          validatedAt: new Date("2026-07-17T00:00:59.000Z"),
+        },
+      ] as TRow[],
+    };
+  }
+
+  release(): void {}
+}
 
 class RangeSelectionClient implements SessionSummaryStoreClient {
   readonly queries: string[] = [];
