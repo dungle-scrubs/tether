@@ -8,7 +8,6 @@ import { z } from "zod";
 
 /** Durable client session record returned by Tether bridge endpoints. */
 export const clientSessionRecordSchema = z.object({
-  archivedAt: z.string().nullable(),
   createdAt: z.string(),
   sessionId: z.string().min(1),
 });
