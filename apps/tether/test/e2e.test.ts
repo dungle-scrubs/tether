@@ -16,6 +16,7 @@ import {
 } from "../src/auth/test-tokens.js";
 import type { AuthRole } from "../src/auth/token.js";
 import { createAuthPersistenceStores } from "../src/auth/db-grant-stores.js";
+import { runBootstrapAdminCli } from "../src/auth/bootstrap-cli.js";
 import type {
   AuthGrantAuditMetadata,
   AuthGrantMetadata,
@@ -71,7 +72,9 @@ const e2e = process.env.E2E === "true" ? describe : describe.skip;
 const adminDatabaseUrl = readRequiredE2eAdminDatabaseUrl();
 const e2eAuthOptions = {
   activeKid: testAuthSigningKid,
+  issuer: "https://auth.e2e.tether.local",
   mode: "required",
+  preEnforcementGrantIssuanceEnabled: true,
   secrets: { [testAuthSigningKid]: testAuthSigningSecret },
 } as const;
 
@@ -120,6 +123,32 @@ const generatedMigrationNames = [
 
 interface JsonResponse {
   readonly [key: string]: unknown;
+}
+
+interface AuthGrantPublicResponse {
+  readonly audience: "tether-rest";
+  readonly expiresAt: string;
+  readonly issuedAt: string;
+  readonly issuer: string;
+  readonly jti: string;
+  readonly kid: string;
+  readonly revokedAt: string | null;
+  readonly role: "admin" | "observer" | "participant";
+  readonly sessionScope: string;
+  readonly subject: string;
+}
+
+interface AuthGrantCreateResponse extends JsonResponse {
+  readonly bearer: string;
+  readonly grant: AuthGrantPublicResponse;
+}
+
+interface AuthGrantReadResponse extends JsonResponse {
+  readonly grant: AuthGrantPublicResponse;
+}
+
+interface AuthGrantListResponse extends JsonResponse {
+  readonly grants: readonly AuthGrantPublicResponse[];
 }
 
 interface ServerProcessResult {
@@ -721,7 +750,7 @@ e2e("tether e2e", () => {
         jti,
         revokedAt,
       }),
-    ).resolves.toBe("revoked");
+    ).resolves.toMatchObject({ status: "revoked" });
     await expect(
       stores.revokeGrantWithAudit({
         audit: {
@@ -735,7 +764,7 @@ e2e("tether e2e", () => {
         jti,
         revokedAt,
       }),
-    ).resolves.toBe("already_revoked");
+    ).resolves.toMatchObject({ status: "already_revoked" });
     await expect(stores.audits.listForGrant(jti, 10)).resolves.toHaveLength(2);
 
     const authColumns = await currentPool().pool.query<{ readonly columnName: string }>(`
@@ -1867,6 +1896,202 @@ e2e("tether e2e", () => {
     await expect(
       requestFrom<SessionListResponse>(baseUrl, "/sessions", { authToken }),
     ).resolves.toEqual(expect.objectContaining({ sessions: expect.any(Array) }));
+  });
+
+  it("creates, inspects, lists, and idempotently revokes a durable auth grant", async () => {
+    const created = await requestFrom<AuthGrantCreateResponse>(baseUrl, "/auth/grants", {
+      body: {
+        role: "participant",
+        sessionScope: "sess_auth_lifecycle",
+        subject: "part_auth_lifecycle",
+        ttlSeconds: 3_600,
+      },
+      method: "POST",
+    });
+
+    expect(created.bearer).toMatch(/^tgr2\./u);
+    expect(created.grant).toMatchObject({
+      audience: "tether-rest",
+      revokedAt: null,
+      role: "participant",
+      sessionScope: "sess_auth_lifecycle",
+      subject: "part_auth_lifecycle",
+    });
+    expect(created.grant).not.toHaveProperty("metadata");
+
+    const inspected = await requestFrom<AuthGrantReadResponse>(
+      baseUrl,
+      `/auth/grants/${created.grant.jti}`,
+    );
+    expect(inspected.grant).toEqual(created.grant);
+    expect(JSON.stringify(inspected)).not.toContain(created.bearer);
+    expect(inspected.grant).not.toHaveProperty("signature");
+
+    const listed = await requestFrom<AuthGrantListResponse>(baseUrl, "/auth/grants?limit=1");
+    expect(listed.grants).toHaveLength(1);
+    expect(listed.grants[0]).toEqual(created.grant);
+    expect(JSON.stringify(listed)).not.toContain(created.bearer);
+
+    const revoked = await requestStatusFrom<AuthGrantReadResponse & { readonly status: string }>(
+      baseUrl,
+      `/auth/grants/${created.grant.jti}/revoke`,
+      { body: {}, method: "POST" },
+    );
+    expect(revoked.status).toBe(200);
+    expect(revoked.body.status).toBe("revoked");
+    expect(revoked.body.grant.revokedAt).not.toBeNull();
+
+    const repeated = await requestStatusFrom<AuthGrantReadResponse & { readonly status: string }>(
+      baseUrl,
+      `/auth/grants/${created.grant.jti}/revoke`,
+      { body: {}, method: "POST" },
+    );
+    expect(repeated.status).toBe(200);
+    expect(repeated.body.status).toBe("already_revoked");
+    expect(repeated.body.grant.revokedAt).toBe(revoked.body.grant.revokedAt);
+
+    const audits = await createAuthPersistenceStores(currentPool()).audits.listForGrant(
+      created.grant.jti,
+      10,
+    );
+    expect(audits.map((audit) => audit.action).sort()).toEqual(["grant.created", "grant.revoked"]);
+    expect(JSON.stringify(audits)).not.toContain(created.bearer);
+
+    const missing = await requestStatusFrom(baseUrl, "/auth/grants/grant_missing");
+    expect(missing.status).toBe(404);
+    expect(missing.text).not.toContain(created.bearer);
+
+    const invalidLimit = await requestStatusFrom(baseUrl, "/auth/grants?limit=101");
+    expect(invalidLimit.status).toBe(400);
+    expect(invalidLimit.text).not.toContain(created.bearer);
+
+    const invalidJti = await requestStatusFrom(baseUrl, "/auth/grants/not-a-grant");
+    expect(invalidJti.status).toBe(400);
+    expect(invalidJti.text).not.toContain(created.bearer);
+  });
+
+  it("authorizes grant lifecycle routes before revealing grant existence", async () => {
+    const participant = mintE2eToken({
+      participantId: "part_auth_denied",
+      role: "participant",
+      sessionId: "*",
+    });
+    const paths = [
+      "/auth/grants/grant_known_only_to_admin",
+      "/auth/grants/grant_missing/revoke",
+    ] as const;
+    for (const path of paths) {
+      const response = await requestStatusFrom(baseUrl, path, {
+        authToken: participant,
+        ...(path.endsWith("/revoke") ? { body: {}, method: "POST" } : {}),
+      });
+      expect(response.status).toBe(403);
+      expect(response.body).toEqual({ error: "Forbidden", reason: "role" });
+      expect(response.text).not.toContain("grant_missing");
+      expect(response.text).not.toContain("grant_known_only_to_admin");
+    }
+  });
+
+  it("requires authentication before grant lifecycle routing", async () => {
+    const response = await requestStatusFrom(baseUrl, "/auth/grants/grant_missing", {
+      authToken: null,
+    });
+    expect(response.status).toBe(401);
+    expect(response.body).toEqual({ error: "Unauthorized", reason: "missing" });
+  });
+
+  it("keeps provisional tgr2 issuance observably gated before persistence", async () => {
+    const gatedApp = createAppServer(currentPool(), {
+      auth: {
+        activeKid: testAuthSigningKid,
+        issuer: "https://auth.e2e.tether.local",
+        mode: "required",
+        secrets: { [testAuthSigningKid]: testAuthSigningSecret },
+      },
+    });
+    const port = await findOpenPort();
+    await gatedApp.listen(port);
+    onTestFinished(() => gatedApp.close());
+
+    expect(gatedApp.debugInfo().auth.grantIssuanceEnabled).toBe(false);
+    const subject = `admin_gated_${randomUUID()}`;
+    const response = await requestStatusFrom(`http://127.0.0.1:${port}`, "/auth/grants", {
+      authToken: mintE2eToken({ participantId: "part_gate_admin", role: "admin", sessionId: "*" }),
+      body: { role: "admin", sessionScope: "*", subject },
+      method: "POST",
+    });
+    expect(response.status).toBe(503);
+    expect(response.body).toEqual({
+      error: "Authentication grant issuance unavailable",
+      reason: "auth_grant_issuance_gated",
+    });
+    const persisted = await currentPool().pool.query<{ readonly count: number }>(
+      `SELECT count(*)::int AS count FROM auth_grants WHERE subject = $1`,
+      [subject],
+    );
+    expect(persisted.rows[0]?.count).toBe(0);
+  });
+
+  it("preserves explicit auth-disabled development access to the grant lifecycle", async () => {
+    const disabledApp = createAppServer(currentPool(), {
+      auth: {
+        activeKid: testAuthSigningKid,
+        issuer: "https://auth.e2e.tether.local",
+        mode: "disabled",
+        preEnforcementGrantIssuanceEnabled: true,
+        secrets: { [testAuthSigningKid]: testAuthSigningSecret },
+      },
+    });
+    const port = await findOpenPort();
+    await disabledApp.listen(port);
+    onTestFinished(() => disabledApp.close());
+
+    const response = await requestStatusFrom<AuthGrantCreateResponse>(
+      `http://127.0.0.1:${port}`,
+      "/auth/grants",
+      {
+        authToken: null,
+        body: { role: "admin", sessionScope: "*", subject: "bootstrap_disabled_mode" },
+        method: "POST",
+      },
+    );
+    expect(response.status).toBe(201);
+    expect(response.body.bearer).toMatch(/^tgr2\./u);
+  });
+
+  it("bootstraps one audited administrator and writes its bearer once", async () => {
+    const output: string[] = [];
+    await runBootstrapAdminCli(
+      ["--subject", "admin_bootstrap_e2e", "--ttl", "1h"],
+      {
+        AUTH_ISSUER: "https://auth.e2e.tether.local",
+        AUTH_GRANT_BOOTSTRAP_COMPATIBILITY_CONFIRMED: "true",
+        AUTH_SIGNING_KID: testAuthSigningKid,
+        AUTH_SIGNING_SECRET: testAuthSigningSecret,
+        DATABASE_URL: databaseUrl,
+      },
+      (value) => output.push(value),
+    );
+
+    expect(output).toHaveLength(1);
+    expect(output[0]?.endsWith("\n")).toBe(true);
+    const created = JSON.parse(output[0] ?? "") as AuthGrantCreateResponse;
+    expect(created.bearer).toMatch(/^tgr2\./u);
+    expect(created.grant).toMatchObject({
+      role: "admin",
+      sessionScope: "*",
+      subject: "admin_bootstrap_e2e",
+    });
+    const stores = createAuthPersistenceStores(currentPool());
+    await expect(stores.grants.findByJti(created.grant.jti)).resolves.toMatchObject({
+      metadata: { source: "bootstrap" },
+      subject: "admin_bootstrap_e2e",
+    });
+    const audits = await stores.audits.listForGrant(created.grant.jti, 10);
+    expect(audits).toEqual([
+      expect.objectContaining({ action: "grant.created", reasonCode: "bootstrap" }),
+    ]);
+    expect(JSON.stringify(audits)).not.toContain(created.bearer);
   });
 
   it("enforces REST role and session scope", async () => {

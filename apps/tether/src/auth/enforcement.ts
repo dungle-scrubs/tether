@@ -17,15 +17,21 @@ export interface AuthRuntimeDebugInfo {
   readonly activeKid: string;
   /** Current enforcement mode. */
   readonly authMode: AuthMode;
+  /** Provisional pre-enforcement tgr2 issuance gate, replaced by M7 rollout readiness. */
+  readonly grantIssuanceEnabled: boolean;
 }
 
 export interface AuthRuntimeOptions {
   /** Active signing key id used for diagnostics. */
   readonly activeKid: string;
+  /** Durable grant issuer used by lifecycle operations, when configured. */
+  readonly issuer?: string | null;
   /** Structured warning sink for auth boundary events. */
   readonly logger?: AuthRuntimeLogger;
   /** Auth enforcement mode. */
   readonly mode: AuthMode;
+  /** Provisional test-only issuance gate until M7 supplies mixed-replica readiness. */
+  readonly preEnforcementGrantIssuanceEnabled?: boolean;
   /** Accepted verification secrets keyed by kid. */
   readonly secrets: AuthSigningSecrets;
 }
@@ -90,6 +96,7 @@ export function createAuthRuntime(options: AuthRuntimeOptions): AuthRuntime {
       acceptedKids: sortedKids,
       activeKid: options.activeKid,
       authMode: options.mode,
+      grantIssuanceEnabled: options.preEnforcementGrantIssuanceEnabled ?? false,
     }),
   };
 }
@@ -98,6 +105,7 @@ export function createAuthRuntime(options: AuthRuntimeOptions): AuthRuntime {
 export function authRuntimeOptionsFromConfig(config: ServerConfig): AuthRuntimeOptions {
   return {
     activeKid: config.authSigningKid,
+    issuer: config.authIssuer,
     mode: config.authMode,
     secrets: buildSigningSecrets(config),
   };

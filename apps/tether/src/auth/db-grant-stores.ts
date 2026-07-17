@@ -1,4 +1,4 @@
-import { and, asc, eq, isNull } from "drizzle-orm";
+import { and, asc, desc, eq, isNull } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import type { DatabasePool } from "../db.js";
@@ -27,6 +27,7 @@ import type { AuthRole } from "./token.js";
 type AuthStoreDatabase = Pick<NodePgDatabase<typeof schema>, "insert" | "select" | "update">;
 
 const maximumAuditListLimit = 100;
+const maximumGrantListLimit = 100;
 const opaqueRequestIdPattern = /^req_[A-Za-z0-9_-]{1,120}$/u;
 const replicaIdPattern = /^replica_[A-Za-z0-9_-]{1,120}$/u;
 const sha256HexPattern = /^[0-9a-f]{64}$/u;
@@ -75,20 +76,24 @@ async function revokeGrantWithAudit(
           .update(authGrants)
           .set({ revokedAt: input.revokedAt })
           .where(and(eq(authGrants.jti, input.jti), isNull(authGrants.revokedAt)))
-          .returning({ jti: authGrants.jti });
-        if (revoked[0] !== undefined) {
+          .returning();
+        const revokedGrant = revoked[0];
+        if (revokedGrant !== undefined) {
           await transaction.insert(authGrantAuditEvents).values({
             ...input.audit,
             grantJti: input.jti,
           });
-          return "revoked";
+          return { grant: parseGrantRecord(revokedGrant), status: "revoked" };
         }
         const existing = await transaction
-          .select({ revokedAt: authGrants.revokedAt })
+          .select()
           .from(authGrants)
           .where(eq(authGrants.jti, input.jti))
           .limit(1);
-        return existing[0] === undefined ? "not_found" : "already_revoked";
+        const existingGrant = existing[0];
+        return existingGrant === undefined
+          ? { grant: null, status: "not_found" }
+          : { grant: parseGrantRecord(existingGrant), status: "already_revoked" };
       }),
     "auth_grant_revoke_failed",
   );
@@ -104,6 +109,21 @@ function createGrantStore(database: AuthStoreDatabase): AuthGrantStore {
       );
       const row = rows[0];
       return row === undefined ? null : parseGrantRecord(row);
+    },
+    list: async (limit) => {
+      if (!Number.isSafeInteger(limit) || limit <= 0 || limit > maximumGrantListLimit) {
+        throw new AuthPersistenceError("auth_grant_limit_invalid");
+      }
+      const rows = await runAuthStoreOperation(
+        () =>
+          database
+            .select()
+            .from(authGrants)
+            .orderBy(desc(authGrants.issuedAt), desc(authGrants.jti))
+            .limit(limit),
+        "auth_grant_list_failed",
+      );
+      return rows.map(parseGrantRecord);
     },
   };
 }

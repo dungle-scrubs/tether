@@ -3,6 +3,8 @@ import { URL } from "node:url";
 
 import { Context, Effect, Layer } from "effect";
 import { authorize } from "./auth/authorize.js";
+import { createAuthGrantLifecycle, type AuthGrantLifecycle } from "./auth/grant-lifecycle.js";
+import { createAuthPersistenceStores } from "./auth/db-grant-stores.js";
 import {
   type AuthRuntime,
   type AuthRuntimeDebugInfo,
@@ -18,6 +20,7 @@ import type { RuntimeTopology } from "./config.js";
 import { type DatabasePool, DatabaseService } from "./db.js";
 import { HostPresenceRuntime } from "./host-presence.js";
 import { handleClientBindingHttpRoute } from "./http-client-binding-route-handlers.js";
+import { handleAuthGrantHttpRoute } from "./http-auth-grant-route-handlers.js";
 import { directHttpRoutes } from "./http-direct-routes.js";
 import { matchHttpRoute } from "./http-route-spec.js";
 import {
@@ -238,13 +241,20 @@ export function createAppServerWithSessionService(
     onEvents: (events) => broadcastEvents(hub, events),
     service,
   });
-  const auth = createAuthRuntime(
-    options.auth ?? {
-      activeKid: "disabled",
-      mode: "disabled",
-      secrets: {},
-    },
-  );
+  const authOptions = options.auth ?? {
+    activeKid: "disabled",
+    issuer: null,
+    mode: "disabled",
+    secrets: {},
+  };
+  const auth = createAuthRuntime(authOptions);
+  const authGrantLifecycle = createAuthGrantLifecycle({
+    activeKid: authOptions.activeKid,
+    issuer: authOptions.issuer ?? null,
+    issuanceEnabled: authOptions.preEnforcementGrantIssuanceEnabled ?? false,
+    secrets: authOptions.secrets,
+    stores: createAuthPersistenceStores(pool),
+  });
   /**
    * Reads process-local diagnostics for the app server and its child modules.
    */
@@ -284,6 +294,7 @@ export function createAppServerWithSessionService(
           service,
           hub,
           auth,
+          authGrantLifecycle,
           resourceLimitRuntime,
           readDebugInfo,
           readReadiness,
@@ -358,6 +369,7 @@ function handleHttp(
   service: SessionServiceEffect,
   hub: SubscriptionHub,
   auth: AuthRuntime,
+  authGrantLifecycle: AuthGrantLifecycle,
   resourceLimitRuntime: ResourceLimitRuntime,
   readAppServerDebugInfo: ReadAppServerDebugInfo,
   readAppReadiness: ReadAppReadiness,
@@ -373,6 +385,7 @@ function handleHttp(
     service,
     hub,
     auth,
+    authGrantLifecycle,
     resourceLimitRuntime,
     readAppServerDebugInfo,
     readAppReadiness,
@@ -402,6 +415,7 @@ function handleHttpRequest(
   service: SessionServiceEffect,
   hub: SubscriptionHub,
   auth: AuthRuntime,
+  authGrantLifecycle: AuthGrantLifecycle,
   resourceLimitRuntime: ResourceLimitRuntime,
   readAppServerDebugInfo: ReadAppServerDebugInfo,
   readAppReadiness: ReadAppReadiness,
@@ -434,6 +448,18 @@ function handleHttpRequest(
     }
     const authContext = authenticateHttpRequest(auth, request, response, url);
     if (authContext === undefined) {
+      return;
+    }
+    if (
+      yield* handleAuthGrantHttpRoute({
+        authContext,
+        lifecycle: authGrantLifecycle,
+        maxBodyBytes: resourceLimitRuntime.limits.httpMaxBodyBytes,
+        request,
+        response,
+        url,
+      })
+    ) {
       return;
     }
     if (matchHttpRoute(directHttpRoutes.ui, request.method, url.pathname)) {

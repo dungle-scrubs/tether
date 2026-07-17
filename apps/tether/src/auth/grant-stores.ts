@@ -28,6 +28,8 @@ export type AuthPersistenceErrorCode =
   | "auth_audit_list_failed"
   | "auth_audit_limit_invalid"
   | "auth_grant_create_failed"
+  | "auth_grant_list_failed"
+  | "auth_grant_limit_invalid"
   | "auth_grant_read_failed"
   | "auth_grant_revoke_failed"
   | "auth_metadata_invalid"
@@ -117,13 +119,17 @@ export interface RevokeAuthGrantWithAuditInput {
   readonly revokedAt: Date;
 }
 
-/** Observable result of an idempotent atomic revocation. */
-export type RevokeAuthGrantResult = "already_revoked" | "not_found" | "revoked";
+/** Observable result of an idempotent atomic revocation with its committed row. */
+export type RevokeAuthGrantResult =
+  | { readonly grant: AuthGrantRecord; readonly status: "already_revoked" | "revoked" }
+  | { readonly grant: null; readonly status: "not_found" };
 
 /** Narrow grant reads required by later authorization layers. */
 export interface AuthGrantStore {
   /** Reads one durable grant by its public token id. */
   readonly findByJti: (jti: string) => Promise<AuthGrantRecord | null>;
+  /** Lists a bounded newest-first page of durable grants. */
+  readonly list: (limit: number) => Promise<readonly AuthGrantRecord[]>;
 }
 
 /** Narrow grant-audit reads. Lifecycle writes are transaction-owning operations. */
