@@ -9,7 +9,19 @@ import { Effect } from "effect";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it, onTestFinished } from "vitest";
 import WebSocket from "ws";
-import type { SessionScalabilityDebugRecord } from "@dungle-scrubs/tether-protocol";
+import type { ParticipantTaskExecutorContext } from "@dungle-scrubs/tether-client";
+import {
+  createSessionSummaryExecutor,
+  OllamaClient,
+  TetherApiClient,
+} from "@dungle-scrubs/session-summary-worker";
+import type {
+  SessionScalabilityDebugRecord,
+  SessionSummaryContent,
+  SessionSummaryGenerationJob,
+  SessionSummaryOllamaIdentity,
+  TaskRecord,
+} from "@dungle-scrubs/tether-protocol";
 import {
   mintTestAuthToken,
   testAuthSigningKid,
@@ -56,6 +68,7 @@ import { sessionEventType, systemProducerId, webSocketOperation } from "../src/p
 import { defaultResourceLimits } from "../src/resource-limits.js";
 import { clientPublishDenyReason } from "../src/session-event-publish-policy.js";
 import { createSessionServiceEffect } from "../src/session-service.js";
+import { createSessionSummaryGenerationService } from "../src/session-summary-service.js";
 import { createSessionSummaryStore } from "../src/session-summary-store.js";
 import type {
   ControlLeaseSnapshot,
@@ -77,6 +90,13 @@ const e2eAuthOptions = {
   mode: "required",
   secrets: { [testAuthSigningKid]: testAuthSigningSecret },
 } as const;
+const summaryWorkerOllamaIdentity = {
+  contextSize: 32_768,
+  model: "evaluated-e2e-model",
+  quantization: "Q4_K_M",
+  revision: `sha256:${"a".repeat(64)}`,
+  thinkingMode: "disabled",
+} as const satisfies SessionSummaryOllamaIdentity;
 
 /** Exact final Plan 32 current-lease fence used by protected mutations. */
 const currentControlLeaseFenceQuery = `
@@ -548,6 +568,19 @@ e2e("tether e2e", () => {
     });
 
     expect(response.session.sessionId).toMatch(/^sess_/u);
+    const scalabilityTables = await currentPool().pool.query<{ readonly tableName: string }>(
+      `
+        SELECT table_name AS "tableName"
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name IN ('session_projections', 'session_summaries')
+        ORDER BY table_name
+      `,
+    );
+    expect(scalabilityTables.rows.map((row) => row.tableName)).toEqual([
+      "session_projections",
+      "session_summaries",
+    ]);
   });
 
   it("serializes competing Session Summary publications to exactly one active row", async () => {
@@ -603,11 +636,13 @@ e2e("tether e2e", () => {
         ],
       );
     }
-    const store = createSessionSummaryStore(currentPool().pool);
+    const replicaAStore = createSessionSummaryStore(currentPool().pool);
+    const replicaBStore = createSessionSummaryStore(currentPool().pool);
 
-    const publications = await Promise.allSettled(
-      summaryIds.map((summaryId) => store.publishCandidate(summaryId)),
-    );
+    const publications = await Promise.allSettled([
+      replicaAStore.publishCandidate(summaryIds[0]),
+      replicaBStore.publishCandidate(summaryIds[1]),
+    ]);
     const active = await currentPool().pool.query<{
       readonly count: number;
       readonly summaryId: string;
@@ -758,9 +793,18 @@ e2e("tether e2e", () => {
       const migrationRows = await legacyDatabase.pool.query<{
         readonly count: number;
       }>(`SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`);
+      const scalabilityTables = await legacyDatabase.pool.query<{ readonly count: number }>(
+        `
+          SELECT count(*)::int AS count
+          FROM information_schema.tables
+          WHERE table_schema = 'public'
+            AND table_name IN ('session_projections', 'session_summaries')
+        `,
+      );
 
       expect(columns.rows[0]?.count).toBe(4);
       expect(migrationRows.rows[0]?.count).toBeGreaterThanOrEqual(10);
+      expect(scalabilityTables.rows[0]?.count).toBe(2);
     } finally {
       await legacyDatabase.end();
       await dropDatabase(legacyDatabaseName);
@@ -1796,49 +1840,7 @@ e2e("tether e2e", () => {
 
   it("keeps inventory and permanent-delete eligibility correct above 10,000 events", async () => {
     const sessionId = `sess_projection_long_${randomUUID()}`;
-    await createDbSession(currentPool(), sessionId);
-    await currentPool().pool.query(
-      `
-        INSERT INTO session_events (
-          created_at,
-          event_id,
-          payload,
-          producer_id,
-          seq,
-          session_id,
-          type
-        )
-        SELECT
-          clock_timestamp() + generated.seq * interval '1 millisecond',
-          'evt_projection_long_' || generated.seq || '_' || $1,
-          CASE
-            WHEN generated.seq = 10001 THEN jsonb_build_object(
-              'title',
-              'Title after ten thousand'
-            )
-            WHEN generated.seq = 10002 THEN jsonb_build_object('archived', true)
-            ELSE '{}'::jsonb
-          END,
-          'projection-long-e2e',
-          generated.seq,
-          $1,
-          CASE
-            WHEN generated.seq = 10001 THEN 'session.title'
-            WHEN generated.seq = 10002 THEN 'session.archived'
-            ELSE 'client.observed'
-          END
-        FROM generate_series(1, 10002) AS generated(seq)
-      `,
-      [sessionId],
-    );
-    await currentPool().pool.query(
-      `
-        UPDATE session_event_sequences
-        SET next_seq = 10003
-        WHERE session_id = $1
-      `,
-      [sessionId],
-    );
+    await createLongSessionFixture(currentPool(), sessionId);
 
     const backfilled = await backfillSessionProjection(currentPool().pool, {
       batchSize: 500,
@@ -1874,6 +1876,10 @@ e2e("tether e2e", () => {
       outcome: "unchanged",
     });
     expect(secondSession?.updatedAt).toBe(firstSession?.updatedAt);
+    const verificationFixture = createProjectionVerificationFixture(sessionId);
+    await expect(
+      verifySessionProjection(currentPool().pool, verificationFixture.options),
+    ).resolves.toMatchObject(verificationFixture.expected);
 
     const deleteAuthToken = mintE2eToken({
       participantId: "part_projection_long_delete",
@@ -6060,6 +6066,103 @@ e2e("tether e2e", () => {
     expect(context.context.budget.estimatedTokens).toBeGreaterThan(0);
   });
 
+  it("runs the external worker through fake Ollama and publishes summary-backed context", async () => {
+    const fixture = await createSummaryWorkerJobFixture("success");
+    const executor = createSessionSummaryExecutor({
+      evaluatedSelection: enabledSummaryWorkerSelection(),
+      maxExecutionMs: 60_000,
+      ollama: new OllamaClient({
+        baseUrl: "http://fake-ollama.test",
+        fetch: createFakeOllamaFetch({
+          facts: [],
+          headline: "Integrated worker summary",
+          narrative: "The exact reserved range was summarized.",
+          openQuestions: [],
+        }),
+        maxAttempts: 1,
+        requestTimeoutMs: 1_000,
+        retryBackoffMs: 1,
+      }),
+      tether: new TetherApiClient({
+        authToken: fixture.authToken,
+        baseUrl,
+        pageSize: 100,
+        requestTimeoutMs: 2_000,
+      }),
+    });
+
+    const result = await executor(fixture.context);
+    await backfillSessionProjection(currentPool().pool, {
+      batchSize: 100,
+      sessionId: fixture.job.sessionId,
+    });
+    const context = await request<SessionContextResponse>(
+      `/sessions/${fixture.job.sessionId}/context?budgetTokens=8000`,
+    );
+    const exact = await request<EventsResponse>(
+      `/sessions/${fixture.job.sessionId}/events?after=0&limit=100`,
+    );
+    const exactSuffix = exact.events.filter((event) => event.seq > fixture.job.range.to);
+
+    expect(result.result).toEqual({ status: "candidate_submitted" });
+    expect(context.context).toMatchObject({
+      latestSummary: {
+        content: { headline: "Integrated worker summary" },
+        coversSeqFrom: fixture.job.range.from,
+        coversSeqTo: fixture.job.range.to,
+        summaryId: fixture.job.summaryId,
+      },
+      mode: "summary_with_raw_tail",
+    });
+    expect(context.context.recentEvents.map((event) => event.seq)).toEqual(
+      exactSuffix.map((event) => event.seq),
+    );
+    expect(exactSuffix.some((event) => event.payload.text === "exact raw tail")).toBe(true);
+  });
+
+  it("keeps raw-only context and exact replay unchanged when fake Ollama fails", async () => {
+    const fixture = await createSummaryWorkerJobFixture("failure");
+    const before = await request<EventsResponse>(
+      `/sessions/${fixture.job.sessionId}/events?after=0&limit=100`,
+    );
+    const executor = createSessionSummaryExecutor({
+      evaluatedSelection: enabledSummaryWorkerSelection(),
+      maxExecutionMs: 60_000,
+      ollama: new OllamaClient({
+        baseUrl: "http://fake-ollama.test",
+        fetch: async () => {
+          throw new Error("fake Ollama unavailable");
+        },
+        maxAttempts: 1,
+        requestTimeoutMs: 100,
+        retryBackoffMs: 1,
+      }),
+      tether: new TetherApiClient({
+        authToken: fixture.authToken,
+        baseUrl,
+        pageSize: 100,
+        requestTimeoutMs: 2_000,
+      }),
+    });
+
+    await expect(executor(fixture.context)).rejects.toMatchObject({
+      code: "generation_unavailable",
+    });
+    await backfillSessionProjection(currentPool().pool, {
+      batchSize: 100,
+      sessionId: fixture.job.sessionId,
+    });
+    const context = await request<SessionContextResponse>(
+      `/sessions/${fixture.job.sessionId}/context?budgetTokens=8000`,
+    );
+    const after = await request<EventsResponse>(
+      `/sessions/${fixture.job.sessionId}/events?after=0&limit=100`,
+    );
+
+    expect(context.context).toMatchObject({ latestSummary: null, mode: "raw_only" });
+    expect(after.events).toEqual(before.events);
+  });
+
   it("builds context from the active budget-class summary plus its exact raw suffix", async () => {
     const session = await createSession();
     for (const text of ["covered one", "covered two", "exact tail"]) {
@@ -7971,6 +8074,97 @@ e2e("tether e2e", () => {
     return pool;
   }
 
+  /** Creates a reserved and claimed real-Postgres job for the external worker E2E. */
+  async function createSummaryWorkerJobFixture(label: string): Promise<{
+    readonly authToken: string;
+    readonly context: ParticipantTaskExecutorContext;
+    readonly job: SessionSummaryGenerationJob;
+  }> {
+    const session = await createSession();
+    for (const text of ["covered source one", "covered source two"]) {
+      await appendEvent(
+        currentPool(),
+        {
+          eventId: `evt_summary_worker_${label}_${randomUUID()}`,
+          payload: { text },
+          producerId: "summary-worker-e2e",
+          sessionId: session.sessionId,
+          type: "user.message",
+        },
+        { sourceId: "src_summary_worker_e2e" },
+      );
+    }
+    const generation = createSessionSummaryGenerationService({
+      store: createSessionSummaryStore(currentPool().pool),
+    });
+    const reservation = await generation.requestGeneration(
+      createSummaryRangeFixture(session.sessionId),
+    );
+    if (reservation.status !== "created") {
+      throw new Error(`Expected created Session Summary job, got ${reservation.status}`);
+    }
+    const participantId = `part_summary_worker_${label}_${randomUUID()}`;
+    const instanceId = `inst_summary_worker_${label}_${randomUUID()}`;
+    const acquisition = await acquireRestParticipantControl(currentPool(), {
+      acquisitionId: `acq_summary_worker_${label}_${randomUUID()}`,
+      capabilities: { workKinds: ["session_summary_generation"] },
+      displayName: "Session Summary Worker E2E",
+      eventSourceId: "src_summary_worker_control_e2e",
+      instanceId,
+      leaseTtlMs: 60_000,
+      participantId,
+      runtimeKind: "session_summary_worker",
+      sessionId: session.sessionId,
+    });
+    if (acquisition.status === "conflict" || acquisition.status === "acquisition_stale") {
+      throw new Error(`Failed to acquire worker control: ${acquisition.status}`);
+    }
+    const controlEpoch = acquisition.lease.epoch;
+    const claimed = await claimTaskWithEvent(currentPool(), {
+      claimLeaseTtlMs: 60_000,
+      controlGuard: {
+        controlChannel: "rest",
+        controlEpoch,
+        instanceId,
+        participantId,
+        sessionId: session.sessionId,
+      },
+      eventSourceId: "src_summary_worker_claim_e2e",
+      participantId,
+      sessionId: session.sessionId,
+      taskId: reservation.job.taskId,
+    });
+    if (claimed === null) {
+      throw new Error("Failed to claim reserved Session Summary job");
+    }
+    await appendEvent(
+      currentPool(),
+      {
+        eventId: `evt_summary_worker_tail_${label}_${randomUUID()}`,
+        payload: { text: "exact raw tail" },
+        producerId: "summary-worker-e2e",
+        sessionId: session.sessionId,
+        type: "user.message",
+      },
+      { sourceId: "src_summary_worker_tail_e2e" },
+    );
+    return {
+      authToken: mintE2eToken({ participantId, role: "participant", sessionId: session.sessionId }),
+      context: {
+        controlEpoch,
+        instanceId,
+        participantId,
+        publishOutput: async () => undefined,
+        publishProgress: async () => undefined,
+        recentEvents: [],
+        sessionId: session.sessionId,
+        signal: new AbortController().signal,
+        task: claimed.task satisfies TaskRecord,
+      },
+      job: reservation.job,
+    };
+  }
+
   /** Reads the durable allocator cursor for one session as a safe event sequence. */
   async function readNextEventSequence(database: DatabasePool, sessionId: string): Promise<number> {
     const rows = await database.pool.query<{ readonly nextSeq: string }>(
@@ -8761,6 +8955,99 @@ interface E2eRequestInit {
   readonly authToken?: string | null;
   readonly body?: unknown;
   readonly method?: string;
+}
+
+/** Evaluated worker selection shared by success and failure integration fixtures. */
+function enabledSummaryWorkerSelection() {
+  return {
+    candidate: {
+      identity: summaryWorkerOllamaIdentity,
+      outputSchemaVersion: "session-summary.v1",
+      promptVersion: "session-summary.v1",
+    },
+    status: "enabled",
+  } as const;
+}
+
+/** Creates one fake Ollama transport that returns protocol-valid structured content. */
+function createFakeOllamaFetch(content: SessionSummaryContent): typeof globalThis.fetch {
+  return async () => Response.json({ message: { content: JSON.stringify(content) } });
+}
+
+/** Builds the exact range-selection policy used by integrated worker jobs. */
+function createSummaryRangeFixture(sessionId: string) {
+  return {
+    budgetClass: "8k",
+    deadlineAt: new Date(Date.now() + 60_000),
+    inputLimitBytes: 64_000,
+    maxEventCount: 100,
+    ollama: summaryWorkerOllamaIdentity,
+    outputLimitBytes: 64_000,
+    outputSchemaVersion: "session-summary.v1",
+    producer: { id: "session-summary-worker", version: "e2e" },
+    promptVersion: "session-summary.v1",
+    sessionId,
+  } as const;
+}
+
+/** Seeds a long raw-event session whose final events change inventory eligibility. */
+async function createLongSessionFixture(database: DatabasePool, sessionId: string): Promise<void> {
+  await createDbSession(database, sessionId);
+  await database.pool.query(
+    `
+      INSERT INTO session_events (
+        created_at,
+        event_id,
+        payload,
+        producer_id,
+        seq,
+        session_id,
+        type
+      )
+      SELECT
+        clock_timestamp() + generated.seq * interval '1 millisecond',
+        'evt_projection_long_' || generated.seq || '_' || $1,
+        CASE
+          WHEN generated.seq = 10001 THEN jsonb_build_object(
+            'title',
+            'Title after ten thousand'
+          )
+          WHEN generated.seq = 10002 THEN jsonb_build_object('archived', true)
+          ELSE '{}'::jsonb
+        END,
+        'projection-long-e2e',
+        generated.seq,
+        $1,
+        CASE
+          WHEN generated.seq = 10001 THEN 'session.title'
+          WHEN generated.seq = 10002 THEN 'session.archived'
+          ELSE 'client.observed'
+        END
+      FROM generate_series(1, 10002) AS generated(seq)
+    `,
+    [sessionId],
+  );
+  await database.pool.query(
+    `
+      UPDATE session_event_sequences
+      SET next_seq = 10003
+      WHERE session_id = $1
+    `,
+    [sessionId],
+  );
+}
+
+/** Builds the non-skipped verification contract for a long-session projection. */
+function createProjectionVerificationFixture(sessionId: string) {
+  return {
+    expected: {
+      differenceFields: [],
+      freshCoversSeqTo: 10_002,
+      freshEventCount: 10_002,
+      status: "current",
+    },
+    options: { batchSize: 500, sessionId },
+  } as const;
 }
 
 /** Counts canonical session creation lifecycle events in a fetched event page. */

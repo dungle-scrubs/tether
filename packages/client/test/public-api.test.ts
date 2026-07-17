@@ -199,5 +199,9 @@ describe("@dungle-scrubs/tether-client public API", () => {
     expect(Object.getOwnPropertyNames(Client.SessionEventStreamClient.prototype)).not.toEqual(
       expect.arrayContaining(["appendEvent", "claimTask", "completeTask", "refreshTaskClaim"]),
     );
+    expect(new Client.SessionEventStreamError({ message: "Replay failed" })).toMatchObject({
+      reason: null,
+      safeDetails: {},
+    });
   });
 });
