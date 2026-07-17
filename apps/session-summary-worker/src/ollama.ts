@@ -1,9 +1,13 @@
 import {
+  deriveSessionSummaryCorrelationId,
+  deriveSessionSummaryCandidateConfigurationId,
   type SessionEvent,
   type SessionSummaryContent,
   type SessionSummaryGenerationJob,
   sessionSummaryContentSchema,
+  sessionScalabilitySpanNames,
 } from "@dungle-scrubs/tether-protocol";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
 import { z } from "zod";
 
 import { readBoundedResponseText } from "./bounded-response.js";
@@ -12,6 +16,13 @@ import { SessionSummaryWorkerError } from "./errors.js";
 const ollamaResponseSchema = z.strictObject({
   message: z.strictObject({ content: z.string() }),
 });
+
+interface OllamaGenerateInput {
+  readonly events: readonly SessionEvent[];
+  readonly job: SessionSummaryGenerationJob;
+  readonly outputLimitBytes: number;
+  readonly signal: AbortSignal;
+}
 
 /** Direct Ollama adapter configuration with finite transport behavior. */
 export interface OllamaClientOptions {
@@ -43,12 +54,41 @@ export class OllamaClient {
   }
 
   /** Generates and protocol-validates one bounded structured result. */
-  async generate(input: {
-    readonly events: readonly SessionEvent[];
-    readonly job: SessionSummaryGenerationJob;
-    readonly outputLimitBytes: number;
-    readonly signal: AbortSignal;
-  }): Promise<SessionSummaryContent> {
+  async generate(input: OllamaGenerateInput): Promise<SessionSummaryContent> {
+    return trace.getTracer("session-summary-worker").startActiveSpan(
+      sessionScalabilitySpanNames.ollamaGenerate,
+      {
+        attributes: {
+          "ollama.context_size": input.job.ollama.contextSize,
+          "summary.candidate_configuration_id": deriveSessionSummaryCandidateConfigurationId(
+            input.job.ollama,
+          ),
+          "summary.correlation_id": deriveSessionSummaryCorrelationId(input.job.summaryId),
+          "summary.range_size": input.job.range.to - input.job.range.from + 1,
+        },
+      },
+      async (span) => {
+        try {
+          const content = await this.#generateBounded(input);
+          span.setStatus({ code: SpanStatusCode.OK });
+          return content;
+        } catch (error) {
+          span.setAttribute(
+            "ollama.failure_code",
+            error instanceof SessionSummaryWorkerError ? error.code : "transport_failure",
+          );
+          span.setStatus({ code: SpanStatusCode.ERROR });
+          throw error instanceof SessionSummaryWorkerError
+            ? error.withSummaryCorrelation(input.job.summaryId)
+            : error;
+        } finally {
+          span.end();
+        }
+      },
+    );
+  }
+
+  async #generateBounded(input: OllamaGenerateInput): Promise<SessionSummaryContent> {
     const prompt = JSON.stringify({
       events: input.events,
       previousSummary: input.job.previousSummary,

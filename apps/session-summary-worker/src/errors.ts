@@ -1,5 +1,8 @@
 import { ParticipantTaskExecutionError } from "@dungle-scrubs/tether-client";
-import type { SessionSummaryFailure } from "@dungle-scrubs/tether-protocol";
+import {
+  deriveSessionSummaryCorrelationId,
+  type SessionSummaryFailure,
+} from "@dungle-scrubs/tether-protocol";
 
 /** Stable failure codes emitted by the worker task executor. */
 export type SessionSummaryWorkerErrorCode = SessionSummaryFailure["code"];
@@ -7,6 +10,7 @@ export type SessionSummaryWorkerErrorCode = SessionSummaryFailure["code"];
 /** Bounded typed failure crossing the worker and client-runtime seam. */
 export class SessionSummaryWorkerError extends ParticipantTaskExecutionError {
   readonly code: SessionSummaryWorkerErrorCode;
+  readonly correlationId: string | null;
   readonly retryable: boolean;
 
   constructor(
@@ -15,6 +19,7 @@ export class SessionSummaryWorkerError extends ParticipantTaskExecutionError {
     options: {
       readonly attempt?: number;
       readonly cause?: unknown;
+      readonly correlationId?: string;
       readonly retryable?: boolean;
     } = {},
   ) {
@@ -24,6 +29,7 @@ export class SessionSummaryWorkerError extends ParticipantTaskExecutionError {
       {
         attempt: Math.max(1, Math.min(10, Math.trunc(options.attempt ?? 1))),
         code,
+        ...(options.correlationId === undefined ? {} : { correlationId: options.correlationId }),
         message: boundedMessage,
         retryable: options.retryable ?? false,
       },
@@ -31,7 +37,20 @@ export class SessionSummaryWorkerError extends ParticipantTaskExecutionError {
     );
     this.name = "SessionSummaryWorkerError";
     this.code = code;
+    this.correlationId = options.correlationId ?? null;
     this.retryable = options.retryable ?? false;
+  }
+
+  /** Returns this failure with the bounded diagnostic correlation attached. */
+  withSummaryCorrelation(summaryId: string): SessionSummaryWorkerError {
+    const correlationId = deriveSessionSummaryCorrelationId(summaryId);
+    return this.correlationId === correlationId
+      ? this
+      : new SessionSummaryWorkerError(this.code, this.message, {
+          cause: this.cause,
+          correlationId,
+          retryable: this.retryable,
+        });
   }
 
   /** Returns protocol-bounded task failure metadata. */
@@ -39,6 +58,7 @@ export class SessionSummaryWorkerError extends ParticipantTaskExecutionError {
     return {
       attempt: Math.max(1, Math.min(10, Math.trunc(attempt))),
       code: this.code,
+      ...(this.correlationId === null ? {} : { correlationId: this.correlationId }),
       message: this.message,
       retryable: this.retryable,
     };

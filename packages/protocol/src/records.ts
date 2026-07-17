@@ -342,6 +342,77 @@ export interface SessionDebugSummary {
   readonly tasks: SessionDebugTaskSummary;
 }
 
+/** Stable warning vocabulary for scalability health projection. */
+export type SessionScalabilityHealthWarning =
+  | "ollama_disabled"
+  | "projection_stale"
+  | "retention_disabled"
+  | "summary_invalid"
+  | "summary_publication_disabled"
+  | "summary_worker_disabled";
+
+/** Safe latest backfill state observed by the serving process. */
+export type SessionScalabilityBackfillOutcome =
+  | { readonly status: "not_observed" }
+  | {
+      readonly batchesRead: number;
+      readonly malformedEventCount: number;
+      readonly status: "stale" | "unchanged" | "written";
+    };
+
+/** Safe latest verification state observed by the serving process. */
+export type SessionScalabilityVerificationOutcome =
+  | { readonly status: "not_observed" }
+  | {
+      readonly batchesRead: number;
+      readonly differenceCount: number;
+      readonly malformedEventCount: number;
+      readonly status: "current" | "mismatch" | "missing";
+    };
+
+/** Content-free active summary head exposed to operators. */
+export interface SessionScalabilitySummaryHead {
+  readonly budgetClass: string;
+  readonly coversSeqFrom: number;
+  readonly coversSeqTo: number;
+  readonly producerId: string;
+  readonly producerVersion: string;
+  readonly summaryId: string;
+}
+
+/** Protocol-owned safe diagnostics for projections, summaries, and context. */
+export interface SessionScalabilityDebugRecord {
+  readonly context: {
+    readonly rawOnlyCount: number;
+    readonly summaryBackedCount: number;
+  };
+  readonly healthWarnings: readonly SessionScalabilityHealthWarning[];
+  readonly projection: {
+    readonly activeReducerVersion: number;
+    readonly coverage: { readonly coversSeqTo: number; readonly eventCount: number } | null;
+    readonly current: boolean;
+    readonly currentCount: number;
+    readonly enabled: boolean;
+    readonly latestBackfill: SessionScalabilityBackfillOutcome;
+    readonly latestVerification: SessionScalabilityVerificationOutcome;
+    readonly staleCount: number;
+  };
+  readonly sessionId: string;
+  readonly summary: {
+    readonly active: readonly SessionScalabilitySummaryHead[];
+    readonly activeCandidate: SessionScalabilitySummaryHead | null;
+    readonly disabledReason: string | null;
+    readonly publicationEnabled: boolean;
+    readonly rejectionCode: string | null;
+    readonly retentionEnabled: boolean;
+  };
+  readonly worker: {
+    readonly ollamaStatus: "disabled" | "ready" | "unavailable";
+    readonly reason: string | null;
+    readonly status: "disabled" | "ready" | "unavailable";
+  };
+}
+
 /** Producer id used by Tether-owned system events. */
 export const systemProducerId = "tether";
 

@@ -1,13 +1,75 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  deriveSessionSummaryCorrelationId,
+  deriveSessionSummaryCandidateConfigurationId,
+  sessionScalabilitySpanNames,
   sessionSummaryCandidateSubmissionSchema,
+  sessionSummaryFailureSchema,
   sessionSummaryGenerationJobSchema,
   sessionSummaryInspectionSchema,
   sessionSummaryRecordSchema,
 } from "../src/index.js";
 
 describe("Session Summary protocol", () => {
+  it("derives a stable bounded correlation id without retaining the summary id", () => {
+    const summaryId = "summary_secret_identifier_1";
+    const correlationId = deriveSessionSummaryCorrelationId(summaryId);
+
+    expect(correlationId).toMatch(/^summary_corr_[a-f0-9]{16}$/u);
+    expect(deriveSessionSummaryCorrelationId(summaryId)).toBe(correlationId);
+    expect(deriveSessionSummaryCorrelationId(`${summaryId}_other`)).not.toBe(correlationId);
+    expect(correlationId).not.toContain(summaryId);
+  });
+
+  it("derives a stable bounded candidate configuration id", () => {
+    const identity = {
+      contextSize: 32_768,
+      model: "local-model-sensitive-name",
+      quantization: "Q4_K_M",
+      revision: "revision-sensitive-name",
+      thinkingMode: "disabled" as const,
+    };
+    const configurationId = deriveSessionSummaryCandidateConfigurationId(identity);
+
+    expect(configurationId).toMatch(/^summary_cfg_[a-f0-9]{16}$/u);
+    expect(configurationId).not.toContain(identity.model);
+    expect(
+      deriveSessionSummaryCandidateConfigurationId({ ...identity, contextSize: 65_536 }),
+    ).not.toBe(configurationId);
+  });
+
+  it("owns the complete scalability boundary span vocabulary", () => {
+    expect(Object.values(sessionScalabilitySpanNames)).toEqual([
+      "session_context.build",
+      "ollama.generate",
+      "session_projection.append",
+      "session_projection.backfill_batch",
+      "session_projection.verify",
+      "session_summary.candidate_submit",
+      "session_summary.job_create",
+      "session_summary.publish",
+      "session_summary.range_select",
+      "summary_job.handle",
+    ]);
+  });
+
+  it("validates bounded failure correlation without requiring it on legacy rows", () => {
+    const correlationId = deriveSessionSummaryCorrelationId("summary_1");
+    const failure = {
+      attempt: 1,
+      code: "generation_unavailable" as const,
+      correlationId,
+      message: "Ollama is unavailable",
+      retryable: true,
+    };
+
+    expect(sessionSummaryFailureSchema.parse(failure)).toEqual(failure);
+    expect(
+      sessionSummaryFailureSchema.safeParse({ ...failure, correlationId: "summary_1" }).success,
+    ).toBe(false);
+  });
+
   it("validates a complete durable summary record and rejects an unsafe range", () => {
     const record = {
       budgetClass: "standard",

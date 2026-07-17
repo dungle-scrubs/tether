@@ -36,6 +36,59 @@ export const sessionSummaryFailureCodes = [
   "unsafe_sequence",
 ] as const;
 
+/** Stable span vocabulary shared by service, worker, and model boundaries. */
+export const sessionScalabilitySpanNames = {
+  contextBuild: "session_context.build",
+  ollamaGenerate: "ollama.generate",
+  projectionApply: "session_projection.append",
+  projectionBackfill: "session_projection.backfill_batch",
+  projectionVerify: "session_projection.verify",
+  summaryCandidateSubmit: "session_summary.candidate_submit",
+  summaryJobCreate: "session_summary.job_create",
+  summaryPublish: "session_summary.publish",
+  summaryRangeSelect: "session_summary.range_select",
+  summaryWorkerHandle: "summary_job.handle",
+} as const;
+
+/**
+ * Derives a bounded, content-free correlation value from an existing Summary
+ * identity. It is diagnostic only and must not be used as an authorization or
+ * uniqueness primitive.
+ */
+export function deriveSessionSummaryCorrelationId(summaryId: string): string {
+  return `summary_corr_${diagnosticHash(summaryId)}`;
+}
+
+/** Derives a bounded metrics identity for one complete Ollama configuration. */
+export function deriveSessionSummaryCandidateConfigurationId(
+  identity: SessionSummaryOllamaIdentity,
+): string {
+  return `summary_cfg_${diagnosticHash(
+    [
+      identity.contextSize,
+      identity.model,
+      identity.quantization,
+      identity.revision,
+      identity.thinkingMode,
+    ].join("\u0000"),
+  )}`;
+}
+
+function diagnosticHash(value: string): string {
+  let first = 2_166_136_261;
+  let second = 2_166_136_261 ^ 0x9e37_79b9;
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    first = Math.imul(first ^ codeUnit, 16_777_619);
+    second = Math.imul(second ^ (codeUnit + index), 16_777_619);
+  }
+  return `${hex32(first)}${hex32(second)}`;
+}
+
+function hex32(value: number): string {
+  return (value >>> 0).toString(16).padStart(8, "0");
+}
+
 /** One source-grounded fact in validated structured summary content. */
 export interface SessionSummaryFact {
   readonly category: (typeof sessionSummaryFactCategories)[number];
@@ -85,6 +138,7 @@ export interface SessionSummarySourceMetadata {
 export interface SessionSummaryFailure {
   readonly attempt: number;
   readonly code: (typeof sessionSummaryFailureCodes)[number];
+  readonly correlationId?: string | undefined;
   readonly message: string;
   readonly retryable: boolean;
 }
@@ -256,6 +310,10 @@ export const sessionSummarySourceMetadataSchema = z.strictObject({
 export const sessionSummaryFailureSchema = z.strictObject({
   attempt: z.number().int().positive().max(10),
   code: z.enum(sessionSummaryFailureCodes),
+  correlationId: z
+    .string()
+    .regex(/^summary_corr_[a-f0-9]{16}$/u)
+    .optional(),
   message: z.string().min(1).max(512),
   retryable: z.boolean(),
 });

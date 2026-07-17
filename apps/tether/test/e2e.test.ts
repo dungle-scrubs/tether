@@ -9,6 +9,7 @@ import { Effect } from "effect";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it, onTestFinished } from "vitest";
 import WebSocket from "ws";
+import type { SessionScalabilityDebugRecord } from "@dungle-scrubs/tether-protocol";
 import {
   mintTestAuthToken,
   testAuthSigningKid,
@@ -368,6 +369,10 @@ interface TaskSnapshotsResponse extends JsonResponse {
 
 interface SessionDebugSummaryResponse extends JsonResponse {
   readonly summary: SessionDebugSummary;
+}
+
+interface SessionScalabilityDebugResponse extends JsonResponse {
+  readonly scalability: SessionScalabilityDebugRecord;
 }
 
 interface ServerDebugResponse extends JsonResponse {
@@ -6938,6 +6943,9 @@ e2e("tether e2e", () => {
     const summary = await request<SessionDebugSummaryResponse>(
       `/sessions/${session.sessionId}/debug/summary`,
     );
+    const scalability = await request<SessionScalabilityDebugResponse>(
+      `/sessions/${session.sessionId}/debug/scalability`,
+    );
     const eventsAfterDebug = await request<EventsResponse>(
       `/sessions/${session.sessionId}/events?after=0`,
     );
@@ -6962,6 +6970,23 @@ e2e("tether e2e", () => {
       total: 3,
       unclaimed: 1,
     });
+    expect(scalability.scalability).toMatchObject({
+      context: { rawOnlyCount: expect.any(Number), summaryBackedCount: expect.any(Number) },
+      projection: {
+        activeReducerVersion: 1,
+        coverage: { coversSeqTo: eventsBeforeDebug.events.length },
+        current: true,
+      },
+      summary: {
+        activeCandidate: null,
+        publicationEnabled: false,
+        rejectionCode: null,
+        retentionEnabled: false,
+      },
+      worker: { ollamaStatus: "disabled", status: "disabled" },
+    });
+    expect(JSON.stringify(scalability)).not.toContain("Remain active");
+    expect(JSON.stringify(scalability)).not.toContain("complete");
     expect(eventsAfterDebug.events).toHaveLength(eventsBeforeDebug.events.length);
   });
 

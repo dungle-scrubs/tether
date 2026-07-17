@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { URL } from "node:url";
 
+import type { SessionScalabilityHealthWarning } from "@dungle-scrubs/tether-protocol";
 import { Context, Effect, Layer } from "effect";
 import { authorize } from "./auth/authorize.js";
 import {
@@ -58,6 +59,7 @@ import {
   type SessionServiceOptions,
 } from "./session-service.js";
 import { createSessionSummaryStore, type SessionSummaryStore } from "./session-summary-store.js";
+import { sessionScalabilityBaselineWarnings } from "./session-scalability-diagnostics.js";
 import {
   TaskClaimSweeper,
   type TaskClaimSweeperConfig,
@@ -431,7 +433,11 @@ function handleHttpRequest(
     applyCorsResponseHeaders(request, response, corsOptions);
     if (matchHttpRoute(directHttpRoutes.health, request.method, url.pathname)) {
       const restControl = readAppServerDebugInfo().service.restControl;
-      sendJson(response, 200, projectHealthResponse(restControl));
+      const scalabilityWarnings =
+        typeof service.readScalabilityHealthWarnings === "function"
+          ? yield* service.readScalabilityHealthWarnings()
+          : sessionScalabilityBaselineWarnings;
+      sendJson(response, 200, projectHealthResponse(restControl, scalabilityWarnings));
       return;
     }
     if (matchHttpRoute(directHttpRoutes.readiness, request.method, url.pathname)) {
@@ -535,12 +541,16 @@ function handleHttpRequest(
 /** Projects REST control mode into a ready health response with bounded warnings. */
 export function projectHealthResponse(
   restControl: RestControlPolicyDebugInfo | undefined,
+  scalabilityWarnings: readonly SessionScalabilityHealthWarning[] = sessionScalabilityBaselineWarnings,
 ): Record<string, unknown> {
   return {
     ok: true,
-    ...(restControl?.mode === "compatibility"
-      ? { warnings: ["REST_CONTROL_COMPATIBILITY_ENABLED"] }
-      : {}),
+    warnings: [
+      ...scalabilityWarnings,
+      ...(restControl?.mode === "compatibility"
+        ? (["REST_CONTROL_COMPATIBILITY_ENABLED"] as const)
+        : []),
+    ],
   };
 }
 

@@ -118,6 +118,9 @@ function sessionSummaryFailureResponse(error: unknown): {
   if (!(error instanceof SessionSummaryStoreError)) {
     return null;
   }
+  if (error.code === "persistence_failure") {
+    return null;
+  }
   const status =
     error.code === "summary_not_found" || error.code === "task_not_found"
       ? 404

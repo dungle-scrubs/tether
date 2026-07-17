@@ -11,6 +11,8 @@
 import { isDeepStrictEqual } from "node:util";
 
 import type pg from "pg";
+import { sessionScalabilitySpanNames } from "@dungle-scrubs/tether-protocol";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
 
 import {
   foldSessionProjection,
@@ -23,6 +25,7 @@ import {
   type SessionProjectionTangentLineage,
 } from "./session-projection.js";
 import type { SessionBindingSummary, SessionEvent, SessionListItem } from "./types.js";
+import { sessionScalabilityRuntimeState } from "./session-scalability-runtime-state.js";
 
 /** Minimal transaction Interface required by projection persistence. */
 export interface SessionProjectionTransaction {
@@ -239,6 +242,29 @@ export async function verifySessionProjection(
   client: SessionProjectionTransaction,
   input: SessionProjectionBackfillInput,
 ): Promise<SessionProjectionVerificationReport> {
+  const report = await traceProjectionOperation(
+    sessionScalabilitySpanNames.projectionVerify,
+    { "projection.batch_size": input.batchSize },
+    () => verifySessionProjectionInternal(client, input),
+    (report) => ({
+      "projection.batch_count": report.batchesRead,
+      "projection.difference_count": report.differenceFields.length,
+      "projection.status": report.status,
+    }),
+  );
+  sessionScalabilityRuntimeState.recordVerification(input.sessionId, {
+    batchesRead: report.batchesRead,
+    differenceCount: report.differenceFields.length,
+    malformedEventCount: report.malformedEventCount,
+    status: report.status,
+  });
+  return report;
+}
+
+async function verifySessionProjectionInternal(
+  client: SessionProjectionTransaction,
+  input: SessionProjectionBackfillInput,
+): Promise<SessionProjectionVerificationReport> {
   assertPositiveBatchSize(input.batchSize);
   const stored = await readProjection(client, input.sessionId);
   const fresh = await foldSessionHistoryBatches(
@@ -273,6 +299,31 @@ export async function verifySessionProjection(
  * installs the candidate only if the projection row still matches its start.
  */
 export async function backfillSessionProjection(
+  client: SessionProjectionTransaction,
+  input: SessionProjectionBackfillInput,
+): Promise<SessionProjectionBackfillResult> {
+  const result = await traceProjectionOperation(
+    sessionScalabilitySpanNames.projectionBackfill,
+    {
+      "projection.batch_size": input.batchSize,
+      "projection.rebuild_from_start": input.rebuildFromStart === true,
+    },
+    () => backfillSessionProjectionInternal(client, input),
+    (result) => ({
+      "projection.batch_count": result.batchesRead,
+      "projection.malformed_event_count": result.malformedEventCount,
+      "projection.status": result.outcome,
+    }),
+  );
+  sessionScalabilityRuntimeState.recordBackfill(input.sessionId, {
+    batchesRead: result.batchesRead,
+    malformedEventCount: result.malformedEventCount,
+    status: result.outcome,
+  });
+  return result;
+}
+
+async function backfillSessionProjectionInternal(
   client: SessionProjectionTransaction,
   input: SessionProjectionBackfillInput,
 ): Promise<SessionProjectionBackfillResult> {
@@ -394,6 +445,21 @@ async function updateForAppendedEvent(
   client: SessionProjectionTransaction,
   event: SessionEvent,
 ): Promise<SessionProjection> {
+  return traceProjectionOperation(
+    sessionScalabilitySpanNames.projectionApply,
+    { "projection.event_seq": event.seq },
+    () => updateForAppendedEventInternal(client, event),
+    (projection) => ({
+      "projection.covers_seq_to": projection.coversSeqTo,
+      "projection.reducer_version": projection.reducerVersion,
+    }),
+  );
+}
+
+async function updateForAppendedEventInternal(
+  client: SessionProjectionTransaction,
+  event: SessionEvent,
+): Promise<SessionProjection> {
   const prior = await readProjection(client, event.sessionId);
   const projection =
     prior && isCompletePredecessor(prior, event)
@@ -401,6 +467,30 @@ async function updateForAppendedEvent(
       : await foldCompleteSessionHistory(client, event.sessionId);
   await writeProjection(client, event.sessionId, projection);
   return projection;
+}
+
+async function traceProjectionOperation<TValue>(
+  name: string,
+  attributes: Readonly<Record<string, boolean | number | string>>,
+  action: () => Promise<TValue>,
+  summarize: (value: TValue) => Readonly<Record<string, boolean | number | string>>,
+): Promise<TValue> {
+  return trace
+    .getTracer("tether-session-projection")
+    .startActiveSpan(name, { attributes }, async (span) => {
+      try {
+        const value = await action();
+        span.setAttributes(summarize(value));
+        span.setStatus({ code: SpanStatusCode.OK });
+        return value;
+      } catch (error) {
+        span.setAttribute("projection.failure_code", "projection_operation_failed");
+        span.setStatus({ code: SpanStatusCode.ERROR });
+        throw error;
+      } finally {
+        span.end();
+      }
+    });
 }
 
 function isCompletePredecessor(projection: SessionProjection, event: SessionEvent): boolean {

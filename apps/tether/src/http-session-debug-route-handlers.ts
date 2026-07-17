@@ -17,7 +17,7 @@ interface SessionDebugHttpRouteHandlerInput {
   readonly url: URL;
 }
 
-type SessionDebugResource = "control-leases" | "participants" | "summary" | "tasks";
+type SessionDebugResource = "control-leases" | "participants" | "scalability" | "summary" | "tasks";
 
 interface SessionDebugRouteSpec {
   readonly resource: SessionDebugResource;
@@ -27,6 +27,7 @@ interface SessionDebugRouteSpec {
 export const sessionDebugRoutes = [
   defineSessionDebugRoute("control-leases"),
   defineSessionDebugRoute("participants"),
+  defineSessionDebugRoute("scalability"),
   defineSessionDebugRoute("summary"),
   defineSessionDebugRoute("tasks"),
 ] as const;
@@ -59,6 +60,11 @@ export function handleSessionDebugHttpRoute(
     if (route.resource === "summary") {
       const summary = yield* service.readSessionDebugSummary(route.sessionId);
       sendJson(response, 200, { summary });
+      return true;
+    }
+    if (route.resource === "scalability") {
+      const scalability = yield* service.readSessionScalabilityDebug(route.sessionId);
+      sendJson(response, 200, { scalability });
       return true;
     }
     const tasks = yield* service.listTaskSnapshots(route.sessionId);

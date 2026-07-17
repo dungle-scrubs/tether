@@ -133,9 +133,17 @@ export function createSessionSummaryExecutor(
           "poison_range",
           "Session Summary range produced invalid or oversized work",
           { attempt: 1 },
-        );
+        ).withSummaryCorrelation(job.summaryId);
       }
-      throw error;
+      throw (
+        error instanceof SessionSummaryWorkerError
+          ? error
+          : new SessionSummaryWorkerError(
+              "generation_unavailable",
+              "Session Summary worker boundary failed",
+              { cause: error },
+            )
+      ).withSummaryCorrelation(job.summaryId);
     }
   };
 }

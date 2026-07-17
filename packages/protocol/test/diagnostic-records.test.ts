@@ -6,6 +6,7 @@ import type {
   ControlLeaseSnapshot,
   ParticipantRuntimeSnapshot,
   SessionDebugSummary,
+  SessionScalabilityDebugRecord,
   SessionRecord,
   TaskSnapshot,
 } from "../src/index.js";
@@ -123,5 +124,44 @@ describe("diagnostic record ownership", () => {
       summary: { sessionId: "sess_1" },
       task: { status: "unclaimed" },
     });
+  });
+
+  it("owns a content-free scalability diagnostic record", () => {
+    const diagnostic = {
+      context: { rawOnlyCount: 3, summaryBackedCount: 1 },
+      healthWarnings: [
+        "summary_publication_disabled",
+        "summary_worker_disabled",
+        "ollama_disabled",
+        "retention_disabled",
+      ],
+      projection: {
+        activeReducerVersion: 1,
+        coverage: { coversSeqTo: 42, eventCount: 42 },
+        current: true,
+        currentCount: 1,
+        enabled: true,
+        latestBackfill: { status: "not_observed" },
+        latestVerification: { status: "not_observed" },
+        staleCount: 0,
+      },
+      sessionId: "sess_1",
+      summary: {
+        active: [],
+        activeCandidate: null,
+        disabledReason: "hard_gates_not_passed",
+        publicationEnabled: false,
+        rejectionCode: null,
+        retentionEnabled: false,
+      },
+      worker: {
+        ollamaStatus: "disabled",
+        reason: "hard_gates_not_passed",
+        status: "disabled",
+      },
+    } satisfies SessionScalabilityDebugRecord;
+
+    expect(JSON.stringify(diagnostic)).not.toContain("narrative");
+    expect(diagnostic.projection.current).toBe(true);
   });
 });

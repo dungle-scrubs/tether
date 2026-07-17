@@ -1,6 +1,7 @@
 import { readdir, readFile } from "node:fs/promises";
 
 import { getTableConfig } from "drizzle-orm/pg-core";
+import { deriveSessionSummaryCorrelationId } from "@dungle-scrubs/tether-protocol";
 import { describe, expect, it } from "vitest";
 
 import { sessionSummaries } from "../src/schema.js";
@@ -159,7 +160,25 @@ describe("Session Summary persistence", () => {
     expect(client.queryText).toContain("published_at IS NOT NULL");
     expect(client.queryText).toContain("superseded_at IS NULL");
   });
+
+  it("preserves bounded correlation on typed publication failures", async () => {
+    const summaryId = "summary_sensitive_identifier";
+    const store = createSessionSummaryStore({ connect: async () => new MissingSummaryClient() });
+
+    await expect(store.publishCandidate(summaryId)).rejects.toMatchObject({
+      code: "summary_not_found",
+      correlationId: deriveSessionSummaryCorrelationId(summaryId),
+    });
+  });
 });
+
+class MissingSummaryClient implements SessionSummaryStoreClient {
+  async query<TRow>(): Promise<{ readonly rows: TRow[] }> {
+    return { rows: [] };
+  }
+
+  release(): void {}
+}
 
 class PublishedSummaryClient implements SessionSummaryStoreClient {
   queryText = "";

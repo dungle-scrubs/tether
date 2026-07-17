@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 
 import {
   canonicalizeSessionSummaryContent,
+  deriveSessionSummaryCandidateConfigurationId,
+  deriveSessionSummaryCorrelationId,
   type SessionSummaryCandidateSubmission,
   type SessionSummaryContent,
   type SessionSummaryFailure,
@@ -15,7 +17,9 @@ import {
   sessionSummaryGenerationJobSchema,
   sessionSummaryInspectionSchema,
   sessionSummaryRecordSchema,
+  sessionScalabilitySpanNames,
 } from "@dungle-scrubs/tether-protocol";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type pg from "pg";
 
 import { createTaskWithEventOnClient, type TransactionClient } from "./db.js";
@@ -214,15 +218,24 @@ export class SessionSummaryStoreError extends Error {
       | "duplicate_submission"
       | "integrity_mismatch"
       | "invalid_state"
+      | "persistence_failure"
       | "summary_not_found"
       | "task_not_claimed"
       | "task_not_found"
       | "wrong_claimant"
       | "wrong_task_kind",
     message: string,
+    readonly correlationId: string | null = null,
   ) {
     super(message);
     this.name = "SessionSummaryStoreError";
+  }
+
+  /** Attaches the bounded cross-boundary correlation id without raw identities. */
+  withCorrelationId(correlationId: string): SessionSummaryStoreError {
+    return this.correlationId === correlationId
+      ? this
+      : new SessionSummaryStoreError(this.code, this.message, correlationId);
   }
 }
 
@@ -251,13 +264,50 @@ export function createSessionSummaryStore(
   return {
     insertCandidate: (submission) => insertCandidate(pool, submission),
     inspectCandidate: (summaryId) => inspectCandidate(pool, summaryId),
-    publishCandidate: (summaryId) => publishCandidate(pool, summaryId),
+    publishCandidate: (summaryId) =>
+      traceSummaryStoreOperation(
+        sessionScalabilitySpanNames.summaryPublish,
+        summaryId,
+        {},
+        () => publishCandidate(pool, summaryId),
+        (result) => ({ superseded: result.supersededSummaryId !== null }),
+      ),
     quarantineCandidate: (input) => quarantineCandidate(pool, input),
     readLatestPublished: (sessionId, budgetClass) =>
       readLatestPublished(pool, sessionId, budgetClass),
     selectAndReserveGeneration: (input) =>
-      selectAndReserveGeneration(pool, input, createGenerationTask),
-    submitCandidate: (submission) => submitCandidate(pool, submission),
+      traceSummaryStoreOperation(
+        sessionScalabilitySpanNames.summaryRangeSelect,
+        input.summaryId,
+        {
+          "summary.budget_class": input.budgetClass,
+          "summary.candidate_configuration_id": deriveSessionSummaryCandidateConfigurationId(
+            input.ollama,
+          ),
+        },
+        () => selectAndReserveGeneration(pool, input, createGenerationTask),
+        (result) => ({
+          "summary.range_size":
+            result.status === "reserved" ? result.job.range.to - result.job.range.from + 1 : 0,
+          "summary.status": result.status,
+        }),
+      ),
+    submitCandidate: (submission) =>
+      traceSummaryStoreOperation(
+        sessionScalabilitySpanNames.summaryCandidateSubmit,
+        submission.summaryId,
+        {
+          "summary.candidate_configuration_id": deriveSessionSummaryCandidateConfigurationId(
+            submission.ollama,
+          ),
+          "summary.range_size": submission.range.to - submission.range.from + 1,
+        },
+        () => submitCandidate(pool, submission),
+        (result) => ({
+          "summary.published": true,
+          "summary.superseded": result.supersededSummaryId !== null,
+        }),
+      ),
     validateCandidate: (summaryId) => validateCandidate(pool, summaryId),
   };
 }
@@ -1156,7 +1206,19 @@ async function selectAndReserveGeneration(
       taskId: input.taskId,
     });
     await insertReservedSummary(client, job);
-    await createGenerationTask(client, job);
+    await traceSummaryStoreOperation(
+      sessionScalabilitySpanNames.summaryJobCreate,
+      job.summaryId,
+      {
+        "summary.budget_class": job.budgetClass,
+        "summary.candidate_configuration_id": deriveSessionSummaryCandidateConfigurationId(
+          job.ollama,
+        ),
+        "summary.range_size": job.range.to - job.range.from + 1,
+      },
+      () => createGenerationTask(client, job),
+      () => ({ "summary.created": true }),
+    );
     await client.query("COMMIT");
     return { job, status: "reserved" };
   } catch (error) {
@@ -1165,6 +1227,48 @@ async function selectAndReserveGeneration(
   } finally {
     client.release();
   }
+}
+
+async function traceSummaryStoreOperation<TValue>(
+  name: string,
+  summaryId: string,
+  attributes: Readonly<Record<string, boolean | number | string>>,
+  action: () => Promise<TValue>,
+  summarize: (value: TValue) => Readonly<Record<string, boolean | number | string>>,
+): Promise<TValue> {
+  const correlationId = deriveSessionSummaryCorrelationId(summaryId);
+  return trace.getTracer("tether-session-summary").startActiveSpan(
+    name,
+    {
+      attributes: {
+        ...attributes,
+        "summary.correlation_id": correlationId,
+      },
+    },
+    async (span) => {
+      try {
+        const value = await action();
+        span.setAttributes(summarize(value));
+        span.setStatus({ code: SpanStatusCode.OK });
+        return value;
+      } catch (error) {
+        span.setAttribute(
+          "summary.failure_code",
+          error instanceof SessionSummaryStoreError ? error.code : "persistence_failure",
+        );
+        span.setStatus({ code: SpanStatusCode.ERROR });
+        throw error instanceof SessionSummaryStoreError
+          ? error.withCorrelationId(correlationId)
+          : new SessionSummaryStoreError(
+              "persistence_failure",
+              "Session Summary persistence boundary failed",
+              correlationId,
+            );
+      } finally {
+        span.end();
+      }
+    },
+  );
 }
 
 /** Acquires the canonical transaction lock for one session and budget class. */

@@ -1,4 +1,8 @@
 import type { Effect } from "effect";
+import type {
+  SessionScalabilityDebugRecord,
+  SessionScalabilityHealthWarning,
+} from "@dungle-scrubs/tether-protocol";
 
 import type {
   ControlEpochGuard,
@@ -129,6 +133,11 @@ export interface SessionServiceDebugInfo extends BoundaryDebugInfo {
   /** Process-local identifier used to tag emitted event fanout notifications. */
   readonly eventSourceId: string;
   readonly restControlLeaseTtlMs: number;
+  /** Content-free scalability diagnostic boundary counters and last failure. */
+  readonly scalability?: BoundaryDebugInfo & {
+    readonly rawOnlyCount: number;
+    readonly summaryBackedCount: number;
+  };
   /** Bounded REST participant-control policy state. */
   readonly restControl?: RestControlPolicyDebugInfo;
   readonly taskClaimLeaseTtlMs: number;
@@ -245,6 +254,15 @@ export interface SessionServiceEffect {
   readonly readSessionDebugSummary: (
     sessionId: string,
   ) => Effect.Effect<SessionDebugSummary, SessionServiceFailure>;
+  /** Reads content-free scalability diagnostics for one session. */
+  readonly readSessionScalabilityDebug: (
+    sessionId: string,
+  ) => Effect.Effect<SessionScalabilityDebugRecord, SessionServiceFailure>;
+  /** Reads aggregate scalability warnings for the health projection. */
+  readonly readScalabilityHealthWarnings: () => Effect.Effect<
+    readonly SessionScalabilityHealthWarning[],
+    SessionServiceFailure
+  >;
   /** Lists read-only control-lease diagnostics for one session. */
   readonly listControlLeaseSnapshots: (
     sessionId: string,

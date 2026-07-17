@@ -1,4 +1,7 @@
-import type { SessionSummaryGenerationJob } from "@dungle-scrubs/tether-protocol";
+import {
+  deriveSessionSummaryCorrelationId,
+  type SessionSummaryGenerationJob,
+} from "@dungle-scrubs/tether-protocol";
 import { describe, expect, it } from "vitest";
 
 import type { SessionSummaryWorkerError } from "../src/errors.js";
@@ -34,9 +37,30 @@ describe("OllamaClient", () => {
 
     await expect(generate(client)).rejects.toMatchObject({
       code: "generation_unavailable",
+      correlationId: deriveSessionSummaryCorrelationId(job.summaryId),
       retryable: true,
     } satisfies Partial<SessionSummaryWorkerError>);
     expect(attempts).toBe(2);
+  });
+
+  it("preserves correlation in protocol-safe task failure metadata", async () => {
+    const client = createClient(async () => {
+      throw new TypeError("connection refused with sensitive endpoint details");
+    }, 1);
+
+    try {
+      await generate(client);
+      throw new Error("expected generation to fail");
+    } catch (error) {
+      const failure = error as SessionSummaryWorkerError;
+      expect(failure.toFailure(2)).toEqual({
+        attempt: 2,
+        code: "generation_unavailable",
+        correlationId: deriveSessionSummaryCorrelationId(job.summaryId),
+        message: "Ollama transport retry budget was exhausted",
+        retryable: true,
+      });
+    }
   });
 
   it.each([

@@ -3,7 +3,12 @@ import {
   type RunParticipantRuntimeInput,
   runParticipantRuntime,
 } from "@dungle-scrubs/tether-client";
-import { sessionSummaryGenerationJobSchema } from "@dungle-scrubs/tether-protocol";
+import {
+  deriveSessionSummaryCorrelationId,
+  deriveSessionSummaryCandidateConfigurationId,
+  sessionScalabilitySpanNames,
+  sessionSummaryGenerationJobSchema,
+} from "@dungle-scrubs/tether-protocol";
 import { SpanStatusCode, trace } from "@opentelemetry/api";
 
 import type { EvaluatedSessionSummarySelection } from "./executor.js";
@@ -108,32 +113,46 @@ export class SessionSummaryWorkerRuntime {
   async #execute(
     context: Parameters<ParticipantTaskExecutor>[0],
   ): Promise<Awaited<ReturnType<ParticipantTaskExecutor>>> {
-    return trace
-      .getTracer("session-summary-worker")
-      .startActiveSpan(
-        "session_summary.execute",
-        { attributes: { "worker.queue.bounded": true } },
-        async (span) => {
-          const startedAt = performance.now();
-          this.#started += 1;
-          try {
-            const result = await this.#pool.run(() => this.#executor(context), context.signal);
-            this.#succeeded += 1;
-            span.setStatus({ code: SpanStatusCode.OK });
-            return result;
-          } catch (error) {
-            this.#failed += 1;
-            this.#lastFailureCode =
-              error instanceof SessionSummaryWorkerError ? error.code : "unknown_failure";
-            span.setAttribute("worker.failure.code", this.#lastFailureCode);
-            span.setStatus({ code: SpanStatusCode.ERROR });
-            throw error;
-          } finally {
-            this.#lastDurationMs = Math.round(performance.now() - startedAt);
-            span.end();
-          }
+    const parsedJob = sessionSummaryGenerationJobSchema.safeParse(context.task.input);
+    return trace.getTracer("session-summary-worker").startActiveSpan(
+      sessionScalabilitySpanNames.summaryWorkerHandle,
+      {
+        attributes: {
+          ...(parsedJob.success
+            ? {
+                "summary.correlation_id": deriveSessionSummaryCorrelationId(
+                  parsedJob.data.summaryId,
+                ),
+                "summary.candidate_configuration_id": deriveSessionSummaryCandidateConfigurationId(
+                  parsedJob.data.ollama,
+                ),
+                "summary.range_size": parsedJob.data.range.to - parsedJob.data.range.from + 1,
+              }
+            : {}),
+          "worker.queue.bounded": true,
         },
-      );
+      },
+      async (span) => {
+        const startedAt = performance.now();
+        this.#started += 1;
+        try {
+          const result = await this.#pool.run(() => this.#executor(context), context.signal);
+          this.#succeeded += 1;
+          span.setStatus({ code: SpanStatusCode.OK });
+          return result;
+        } catch (error) {
+          this.#failed += 1;
+          this.#lastFailureCode =
+            error instanceof SessionSummaryWorkerError ? error.code : "unknown_failure";
+          span.setAttribute("worker.failure.code", this.#lastFailureCode);
+          span.setStatus({ code: SpanStatusCode.ERROR });
+          throw error;
+        } finally {
+          this.#lastDurationMs = Math.round(performance.now() - startedAt);
+          span.end();
+        }
+      },
+    );
   }
 }
 

@@ -1,3 +1,9 @@
+import {
+  sessionScalabilitySpanNames,
+  type SessionScalabilityDebugRecord,
+  type SessionScalabilityHealthWarning,
+} from "@dungle-scrubs/tether-protocol";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
 import { Effect } from "effect";
 
 import type { SessionPersistenceStores } from "./db-store-contracts.js";
@@ -19,6 +25,7 @@ import {
 } from "./session-service-contracts.js";
 import { trySessionPromise } from "./session-service-runtime.js";
 import type { SessionSummaryStore } from "./session-summary-store.js";
+import type { SessionScalabilityDiagnostics } from "./session-scalability-diagnostics.js";
 import type {
   ControlLeaseSnapshot,
   ParticipantRecord,
@@ -53,6 +60,7 @@ export interface SessionReadEffectsInput {
     }) => Promise<void>;
   };
   readonly sessionSummaryStore: Pick<SessionSummaryStore, "readLatestPublished">;
+  readonly scalabilityDiagnostics: SessionScalabilityDiagnostics;
   readonly stores: SessionPersistenceStores;
 }
 
@@ -101,6 +109,13 @@ export interface SessionReadEffects {
   readonly readSessionDebugSummaryEffect: (
     sessionId: string,
   ) => Effect.Effect<SessionDebugSummary, SessionServiceFailure>;
+  readonly readSessionScalabilityDebugEffect: (
+    sessionId: string,
+  ) => Effect.Effect<SessionScalabilityDebugRecord, SessionServiceFailure>;
+  readonly readScalabilityHealthWarningsEffect: () => Effect.Effect<
+    readonly SessionScalabilityHealthWarning[],
+    SessionServiceFailure
+  >;
 }
 
 /** Builds read-only effects for one service instance. */
@@ -147,7 +162,7 @@ export function createSessionReadEffects(input: SessionReadEffectsInput): Sessio
           ]),
         );
         const events = suffix.events;
-        const context = buildBoundedSessionContextView({
+        const context = buildTracedSessionContextView({
           activeTasks,
           budgetTokens: contextInput.budgetTokens,
           events,
@@ -158,6 +173,7 @@ export function createSessionReadEffects(input: SessionReadEffectsInput): Sessio
           sessionId: contextInput.sessionId,
           taskContracts: buildParticipantTaskContracts(participants),
         });
+        input.scalabilityDiagnostics.recordContext(context.mode);
         const maintenanceDecision = decideSessionContextMaintenance({
           budgetClass,
           unsummarizedTokens: suffix.truncated
@@ -203,5 +219,40 @@ export function createSessionReadEffects(input: SessionReadEffectsInput): Sessio
       trySessionPromise(() => input.stores.tasks.listSnapshots(sessionId)),
     readSessionDebugSummaryEffect: (sessionId) =>
       trySessionPromise(() => input.stores.sessions.readDebugSummary(sessionId)),
+    readSessionScalabilityDebugEffect: (sessionId) =>
+      trySessionPromise(() => input.scalabilityDiagnostics.read(sessionId)),
+    readScalabilityHealthWarningsEffect: () =>
+      trySessionPromise(() => input.scalabilityDiagnostics.readHealthWarnings()),
   };
+}
+
+function buildTracedSessionContextView(
+  input: Parameters<typeof buildBoundedSessionContextView>[0],
+): SessionContextView {
+  const span = trace
+    .getTracer("tether-session-context")
+    .startSpan(sessionScalabilitySpanNames.contextBuild, {
+      attributes: {
+        "context.active_task_count": input.activeTasks.length,
+        "context.budget_tokens": input.budgetTokens,
+        "context.candidate_event_count": input.events.length,
+        "context.summary_available": input.latestSummary !== null,
+      },
+    });
+  try {
+    const context = buildBoundedSessionContextView(input);
+    span.setAttributes({
+      "context.estimated_tokens": context.budget.estimatedTokens,
+      "context.mode": context.mode,
+      "context.omitted_event_count": context.budget.omittedEventCount,
+    });
+    span.setStatus({ code: SpanStatusCode.OK });
+    return context;
+  } catch (error) {
+    span.setAttribute("context.failure_code", "context_build_failed");
+    span.setStatus({ code: SpanStatusCode.ERROR });
+    throw error;
+  } finally {
+    span.end();
+  }
 }
