@@ -8,6 +8,7 @@
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
     "dev": "tsx watch src/server.ts",
+    "eval:session-summary": "tsx evals/session-summary/run.ts",
     "format": "biome format --config-path=../../tooling/biome.json --write .",
     "format:check": "biome format --config-path=../../tooling/biome.json .",
     "lint": "biome lint --config-path=../../tooling/biome.json .",
