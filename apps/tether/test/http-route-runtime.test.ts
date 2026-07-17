@@ -28,6 +28,7 @@ describe("handleHttpRouteError", () => {
       "session.events.append",
       "session.participant.control.release",
       "session.participant.heartbeat",
+      "session.summary.candidate.submit",
       "task.approval",
       "task.cancel",
       "task.claim",

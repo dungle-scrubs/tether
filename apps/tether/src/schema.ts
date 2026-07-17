@@ -1,6 +1,8 @@
+import type { SessionSummaryContent, SessionSummaryFailure } from "@dungle-scrubs/tether-protocol";
 import { sql } from "drizzle-orm";
 import {
   bigint,
+  check,
   foreignKey,
   index,
   integer,
@@ -236,6 +238,63 @@ export const tasks = pgTable(
       table.scheduleIntervalMs,
       table.scheduleWindowStart,
     ),
+  ],
+);
+
+/**
+ * Durable Session Summary candidates and publication lifecycle. This table
+ * owns persistence only; range and publication decisions belong to the
+ * Session Summary publication-policy module.
+ */
+export const sessionSummaries = pgTable(
+  "session_summaries",
+  {
+    budgetClass: text("budget_class").notNull(),
+    content: jsonb("content").$type<SessionSummaryContent>(),
+    coversSeqFrom: bigint("covers_seq_from", { mode: "number" }).notNull(),
+    coversSeqTo: bigint("covers_seq_to", { mode: "number" }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    failure: jsonb("failure").$type<SessionSummaryFailure>(),
+    generationTaskId: text("generation_task_id").notNull(),
+    integrityAlgorithm: text("integrity_algorithm"),
+    integrityHash: text("integrity_hash"),
+    ollamaContextSize: integer("ollama_context_size").notNull(),
+    ollamaModel: text("ollama_model").notNull(),
+    ollamaQuantization: text("ollama_quantization").notNull(),
+    ollamaRevision: text("ollama_revision").notNull(),
+    ollamaThinkingMode: text("ollama_thinking_mode").notNull(),
+    outputSchemaVersion: text("output_schema_version").notNull(),
+    producerId: text("producer_id").notNull(),
+    producerVersion: text("producer_version").notNull(),
+    promptVersion: text("prompt_version").notNull(),
+    publishedAt: timestamp("published_at", { withTimezone: true }),
+    quarantinedAt: timestamp("quarantined_at", { withTimezone: true }),
+    sessionId: text("session_id")
+      .notNull()
+      .references(() => sessions.sessionId, { onDelete: "cascade" }),
+    sourceEventCount: bigint("source_event_count", { mode: "number" }).notNull(),
+    sourceFirstEventId: text("source_first_event_id").notNull(),
+    sourceLastEventId: text("source_last_event_id").notNull(),
+    sourceRangeHash: text("source_range_hash").notNull(),
+    summaryId: text("summary_id").primaryKey(),
+    supersededAt: timestamp("superseded_at", { withTimezone: true }),
+    validatedAt: timestamp("validated_at", { withTimezone: true }),
+  },
+  (table) => [
+    check("session_summaries_range_check", sql`${table.coversSeqFrom} <= ${table.coversSeqTo}`),
+    check(
+      "session_summaries_integrity_pair_check",
+      sql`(${table.integrityAlgorithm} IS NULL) = (${table.integrityHash} IS NULL)`,
+    ),
+    unique("session_summaries_generation_task_unique").on(table.generationTaskId),
+    index("session_summaries_session_budget_created_idx").on(
+      table.sessionId,
+      table.budgetClass,
+      table.createdAt.desc(),
+    ),
+    uniqueIndex("session_summaries_active_unique")
+      .on(table.sessionId, table.budgetClass)
+      .where(sql`${table.publishedAt} IS NOT NULL AND ${table.supersededAt} IS NULL`),
   ],
 );
 

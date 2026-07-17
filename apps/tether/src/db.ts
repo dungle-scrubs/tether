@@ -463,7 +463,7 @@ type ClientSessionBindingUpsert =
       readonly status: "inserted";
     };
 
-interface TransactionClient {
+export interface TransactionClient {
   readonly query: <TRow extends pg.QueryResultRow = pg.QueryResultRow>(
     sql: string,
     values?: readonly unknown[],
@@ -2178,6 +2178,30 @@ export async function createTaskWithEvent(
     mutate: (client) => insertTaskWithClient(client, input),
     buildEvent: (task) => buildTaskCreatedEventInput({ sessionId: input.sessionId, task }),
   });
+}
+
+/**
+ * Creates a task and its canonical event on an existing transaction client.
+ * The caller owns commit and rollback so adjacent durable state can be atomic.
+ */
+export async function createTaskWithEventOnClient(
+  client: TransactionClient,
+  input: {
+    readonly eventSourceId: string;
+    readonly input?: Record<string, unknown> | null;
+    readonly kind: string;
+    readonly objective: string;
+    readonly sessionId: string;
+    readonly taskId: string;
+  },
+): Promise<PersistedTaskEventResult> {
+  const task = await insertTaskWithClient(client, input);
+  const event = await appendEventWithClient(
+    client,
+    buildTaskCreatedEventInput({ sessionId: input.sessionId, task }),
+    input.eventSourceId,
+  );
+  return { event, task };
 }
 
 /**

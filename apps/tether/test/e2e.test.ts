@@ -54,6 +54,7 @@ import { sessionEventType, systemProducerId, webSocketOperation } from "../src/p
 import { defaultResourceLimits } from "../src/resource-limits.js";
 import { clientPublishDenyReason } from "../src/session-event-publish-policy.js";
 import { createSessionServiceEffect } from "../src/session-service.js";
+import { createSessionSummaryStore } from "../src/session-summary-store.js";
 import type {
   ControlLeaseSnapshot,
   ParticipantRuntimeSnapshot,
@@ -115,6 +116,8 @@ const generatedMigrationNames = [
   "0011_special_blue_marvel.sql",
   "0012_control_lease_generation_history.sql",
   "0013_misty_leo.sql",
+  "0014_flippant_caretaker.sql",
+  "0015_conscious_toad.sql",
 ] as const;
 
 interface JsonResponse {
@@ -532,6 +535,85 @@ e2e("tether e2e", () => {
     });
 
     expect(response.session.sessionId).toMatch(/^sess_/u);
+  });
+
+  it("serializes competing Session Summary publications to exactly one active row", async () => {
+    const sessionId = `sess_summary_publication_race_${randomUUID()}`;
+    await createDbSession(currentPool(), sessionId);
+    await appendEvent(
+      currentPool(),
+      {
+        eventId: `evt_summary_publication_race_${randomUUID()}`,
+        payload: { text: "source event" },
+        producerId: "summary-publication-race-e2e",
+        sessionId,
+        type: "user.message",
+      },
+      { sourceId: "src_summary_publication_race_e2e" },
+    );
+    const summaryIds = [
+      `summary_publication_race_a_${randomUUID()}`,
+      `summary_publication_race_b_${randomUUID()}`,
+    ] as const;
+    for (const [index, summaryId] of summaryIds.entries()) {
+      await currentPool().pool.query(
+        `
+          INSERT INTO session_summaries (
+            budget_class, content, covers_seq_from, covers_seq_to,
+            generation_task_id, integrity_algorithm, integrity_hash,
+            ollama_context_size, ollama_model, ollama_quantization,
+            ollama_revision, ollama_thinking_mode, output_schema_version,
+            producer_id, producer_version, prompt_version, session_id,
+            source_event_count, source_first_event_id, source_last_event_id,
+            source_range_hash, summary_id, validated_at
+          )
+          VALUES (
+            'standard', $1::jsonb, 1, 1, $2, 'sha256', $3,
+            32768, 'qwen3:8b', 'Q4_K_M', 'sha256:model-revision',
+            'enabled', 'session-summary.v1', 'session-summary-worker',
+            '1.0.0', 'session-summary-prompt.v1', $4, 1, $5, $5, $3,
+            $6, clock_timestamp()
+          )
+        `,
+        [
+          JSON.stringify({
+            facts: [],
+            headline: `Candidate ${index + 1}`,
+            narrative: "Competing publication candidate.",
+            openQuestions: [],
+          }),
+          `task_summary_publication_race_${index}_${randomUUID()}`,
+          String(index + 1).repeat(64),
+          sessionId,
+          `evt_summary_publication_race_source_${index}`,
+          summaryId,
+        ],
+      );
+    }
+    const store = createSessionSummaryStore(currentPool().pool);
+
+    const publications = await Promise.allSettled(
+      summaryIds.map((summaryId) => store.publishCandidate(summaryId)),
+    );
+    const active = await currentPool().pool.query<{
+      readonly count: number;
+      readonly summaryId: string;
+    }>(
+      `
+        SELECT count(*)::int AS count, min(summary_id) AS "summaryId"
+        FROM session_summaries
+        WHERE session_id = $1
+          AND budget_class = 'standard'
+          AND published_at IS NOT NULL
+          AND superseded_at IS NULL
+      `,
+      [sessionId],
+    );
+
+    expect(publications.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(publications.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect(active.rows[0]?.count).toBe(1);
+    expect(summaryIds).toContain(active.rows[0]?.summaryId);
   });
 
   it("rejects session-scoped writes for unknown sessions without creating phantom rows", async () => {

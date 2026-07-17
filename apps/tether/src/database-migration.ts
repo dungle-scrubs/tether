@@ -5,8 +5,8 @@
  * it does not own normal application persistence.
  */
 
-import { readMigrationFiles } from "drizzle-orm/migrator";
 import type { MigrationMeta } from "drizzle-orm/migrator";
+import { readMigrationFiles } from "drizzle-orm/migrator";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate as runDrizzleMigrations } from "drizzle-orm/node-postgres/migrator";
 import type pg from "pg";
@@ -19,6 +19,8 @@ const tetherTableNames = [
   "participants",
   "session_event_sequences",
   "session_events",
+  "session_projections",
+  "session_summaries",
   "sessions",
   "task_approvals",
   "tasks",
@@ -522,6 +524,74 @@ function legacyMigrationProbes(): readonly LegacyMigrationProbe[] {
           columnNames: ["session_id", "participant_id", "acquisition_id"],
           predicate: "acquisition_id IS NOT NULL",
           tableName: "participant_control_leases",
+          unique: true,
+        })),
+    },
+    {
+      label: "0014 durable session projections",
+      contradictionObserved: async (client) =>
+        (await hasTable(client, "session_projections")) &&
+        !(await hasColumns(client, "session_projections", [
+          "activity",
+          "covers_seq_to",
+          "event_count",
+          "reducer_version",
+          "session_id",
+          "updated_at",
+        ])),
+      represented: async (client) =>
+        (await hasTable(client, "session_projections")) &&
+        (await hasColumns(client, "session_projections", [
+          "activity",
+          "covers_seq_to",
+          "event_count",
+          "reducer_version",
+          "session_id",
+          "updated_at",
+        ])),
+    },
+    {
+      label: "0015 durable Session Summary lifecycle",
+      contradictionObserved: async (client) =>
+        ((await hasTable(client, "session_summaries")) ||
+          (await hasIndex(client, "session_summaries_active_unique"))) &&
+        !(
+          (await hasColumns(client, "session_summaries", [
+            "budget_class",
+            "covers_seq_from",
+            "covers_seq_to",
+            "generation_task_id",
+            "published_at",
+            "quarantined_at",
+            "session_id",
+            "summary_id",
+            "superseded_at",
+            "validated_at",
+          ])) &&
+          (await hasIndexSignature(client, "session_summaries_active_unique", {
+            columnNames: ["session_id", "budget_class"],
+            predicate: "published_at IS NOT NULL AND superseded_at IS NULL",
+            tableName: "session_summaries",
+            unique: true,
+          }))
+        ),
+      represented: async (client) =>
+        (await hasColumns(client, "session_summaries", [
+          "budget_class",
+          "covers_seq_from",
+          "covers_seq_to",
+          "generation_task_id",
+          "published_at",
+          "quarantined_at",
+          "session_id",
+          "summary_id",
+          "superseded_at",
+          "validated_at",
+        ])) &&
+        (await hasIndexSignature(client, "session_summaries_active_unique", {
+          columnNames: ["session_id", "budget_class"],
+          predicate: "published_at IS NOT NULL AND superseded_at IS NULL",
+          tableName: "session_summaries",
           unique: true,
         })),
     },

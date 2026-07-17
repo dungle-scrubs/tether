@@ -19,7 +19,6 @@ import { type DatabasePool, DatabaseService } from "./db.js";
 import { HostPresenceRuntime } from "./host-presence.js";
 import { handleClientBindingHttpRoute } from "./http-client-binding-route-handlers.js";
 import { directHttpRoutes } from "./http-direct-routes.js";
-import { matchHttpRoute } from "./http-route-spec.js";
 import {
   applyCorsResponseHeaders,
   broadcastEvents,
@@ -31,8 +30,10 @@ import {
   sendAuthError,
   sendJson,
 } from "./http-route-runtime.js";
+import { matchHttpRoute } from "./http-route-spec.js";
 import { handleSessionDebugHttpRoute } from "./http-session-debug-route-handlers.js";
 import { handleSessionHttpRoute } from "./http-session-route-handlers.js";
+import { handleSessionSummaryHttpRoute } from "./http-session-summary-route-handlers.js";
 import { handleTaskHttpRoute } from "./http-task-route-handlers.js";
 import { handleUiHttpRoute } from "./http-ui-route-handlers.js";
 import { SubscriptionHub, type SubscriptionHubDebugInfo } from "./hub.js";
@@ -56,6 +57,7 @@ import {
   SessionServiceEffectService,
   type SessionServiceOptions,
 } from "./session-service.js";
+import { createSessionSummaryStore, type SessionSummaryStore } from "./session-summary-store.js";
 import {
   TaskClaimSweeper,
   type TaskClaimSweeperConfig,
@@ -238,6 +240,7 @@ export function createAppServerWithSessionService(
     onEvents: (events) => broadcastEvents(hub, events),
     service,
   });
+  const sessionSummaryStore = createSessionSummaryStore(pool.pool);
   const auth = createAuthRuntime(
     options.auth ?? {
       activeKid: "disabled",
@@ -285,6 +288,7 @@ export function createAppServerWithSessionService(
           hub,
           auth,
           resourceLimitRuntime,
+          sessionSummaryStore,
           readDebugInfo,
           readReadiness,
           corsOptions,
@@ -359,6 +363,7 @@ function handleHttp(
   hub: SubscriptionHub,
   auth: AuthRuntime,
   resourceLimitRuntime: ResourceLimitRuntime,
+  sessionSummaryStore: SessionSummaryStore,
   readAppServerDebugInfo: ReadAppServerDebugInfo,
   readAppReadiness: ReadAppReadiness,
   corsOptions: CorsOptions,
@@ -374,6 +379,7 @@ function handleHttp(
     hub,
     auth,
     resourceLimitRuntime,
+    sessionSummaryStore,
     readAppServerDebugInfo,
     readAppReadiness,
     corsOptions,
@@ -403,6 +409,7 @@ function handleHttpRequest(
   hub: SubscriptionHub,
   auth: AuthRuntime,
   resourceLimitRuntime: ResourceLimitRuntime,
+  sessionSummaryStore: SessionSummaryStore,
   readAppServerDebugInfo: ReadAppServerDebugInfo,
   readAppReadiness: ReadAppReadiness,
   corsOptions: CorsOptions,
@@ -488,6 +495,19 @@ function handleHttpRequest(
         response,
         runtimeTopology,
         service,
+        url,
+      })
+    ) {
+      return;
+    }
+
+    if (
+      yield* handleSessionSummaryHttpRoute({
+        authContext,
+        request,
+        resourceLimits: resourceLimitRuntime.limits,
+        response,
+        store: sessionSummaryStore,
         url,
       })
     ) {
