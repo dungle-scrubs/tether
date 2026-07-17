@@ -6,6 +6,7 @@ import WebSocket from "ws";
 import {
   buildSessionEventStreamUrl,
   SessionEventStreamClient,
+  SessionEventStreamError,
   type SessionEvent,
   type SessionEventStreamWebSocketFactory,
 } from "../src/index.js";
@@ -93,6 +94,44 @@ describe("SessionEventStreamClient", () => {
 
     expect(errors).toContain("server rejected stream");
     expect(errors.some((message) => message.length > 0)).toBe(true);
+    client.close();
+  });
+
+  it("preserves typed replay-window details without leaking unknown fields", async () => {
+    const sockets: FakeWebSocket[] = [];
+    const client = await SessionEventStreamClient.connect({
+      afterSeq: 12,
+      serviceUrl: "http://tether.test",
+      sessionId: "sess_stream",
+      webSocketFactory: createFakeWebSocketFactory(sockets),
+    });
+    const socket = sockets[0];
+    if (!socket) {
+      throw new Error("Missing fake socket");
+    }
+    const replay = client.waitForReplayComplete();
+    const errors: Error[] = [];
+    client.onError((error) => errors.push(error));
+
+    socket.emit(
+      "message",
+      JSON.stringify({
+        error: "Replay window exceeded",
+        limit: 2_000,
+        op: "error",
+        reason: "replay_window_exceeded",
+        secret: "must-not-cross-client-boundary",
+      }),
+    );
+
+    await expect(replay).rejects.toBeInstanceOf(SessionEventStreamError);
+    expect(errors).toEqual([
+      expect.objectContaining({
+        reason: "replay_window_exceeded",
+        safeDetails: { limit: 2_000 },
+      }),
+    ]);
+    expect(JSON.stringify(errors[0])).not.toContain("must-not-cross-client-boundary");
     client.close();
   });
 

@@ -1,16 +1,16 @@
 import { Effect } from "effect";
-
-import {
-  buildTaskOutputEventInput,
-  buildTaskProgressEventInput,
-  type AppendSessionEventInput,
-} from "./protocol.js";
 import { sleepUnrefEffect } from "./effect-timing.js";
 import type { TaskCancellationContext } from "./participant-claimable-task-runner.js";
 import type {
   ParticipantTaskExecutor,
   ParticipantTaskExecutorContext,
 } from "./participant-runtime-client.js";
+import { ParticipantTaskExecutionError } from "./participant-task-execution-error.js";
+import {
+  type AppendSessionEventInput,
+  buildTaskOutputEventInput,
+  buildTaskProgressEventInput,
+} from "./protocol.js";
 import type { SessionEvent, TaskRecord } from "./types.js";
 
 /** Boundary log surface needed by the participant task claim flow. */
@@ -35,6 +35,8 @@ export interface ParticipantTaskClaimFlowClient {
 
 /** Runtime identity and event context for one task claim flow. */
 export interface ParticipantTaskClaimFlowContext {
+  /** Control epoch acquired for this participant WebSocket connection. */
+  readonly controlEpoch?: number;
   /** Concrete runtime process id that owns the task claim. */
   readonly instanceId: string;
   /** Latest observed event sequence. */
@@ -118,6 +120,7 @@ export function buildParticipantTaskClaimFlow(
         return;
       }
       const executorContext: ParticipantTaskExecutorContext = {
+        ...(context.controlEpoch === undefined ? {} : { controlEpoch: context.controlEpoch }),
         instanceId: context.instanceId,
         participantId: context.participantId,
         recentEvents: context.recentEvents.filter((event) => event.seq < context.lastObservedSeq),
@@ -154,9 +157,12 @@ export function buildParticipantTaskClaimFlow(
       if (execution.type === "executor_failed") {
         if (!shouldStop()) {
           yield* Effect.tryPromise(() =>
-            client.failTask(input.task.taskId, {
-              error: execution.error.message,
-            }),
+            client.failTask(
+              input.task.taskId,
+              execution.error instanceof ParticipantTaskExecutionError
+                ? { ...execution.error.failure }
+                : { error: execution.error.message },
+            ),
           );
         }
         return;

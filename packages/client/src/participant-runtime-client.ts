@@ -2,13 +2,19 @@ import { randomUUID } from "node:crypto";
 
 import { Effect, Either } from "effect";
 import WebSocket from "ws";
-
+import { resolveServiceAuthToken } from "./auth-token.js";
+import { sleepUnrefEffect } from "./effect-timing.js";
 import {
   type BoundaryDebugInfo,
   ModuleObservability,
   readModuleObservabilityOptions,
 } from "./observability.js";
-import { resolveServiceAuthToken } from "./auth-token.js";
+import {
+  buildParticipantClaimableTaskLoop,
+  type TaskCancellationContext,
+} from "./participant-claimable-task-runner.js";
+import { ParticipantCursorWriter } from "./participant-cursor-writer.js";
+import { runParticipantTaskClaimFlow } from "./participant-task-claim-flow.js";
 import {
   type AppendSessionEventInput,
   buildWsPublishMessage,
@@ -18,16 +24,10 @@ import {
   buildWsTaskRefreshMessage,
   type CommandResultEnvelope,
   parseWebSocketServerEnvelope,
+  parseWebSocketRecoveryCondition,
   type WebSocketCommandMessage,
   webSocketOperation,
 } from "./protocol.js";
-import {
-  buildParticipantClaimableTaskLoop,
-  type TaskCancellationContext,
-} from "./participant-claimable-task-runner.js";
-import { runParticipantTaskClaimFlow } from "./participant-task-claim-flow.js";
-import { ParticipantCursorWriter } from "./participant-cursor-writer.js";
-import { sleepUnrefEffect } from "./effect-timing.js";
 import { SerialEventDelivery, type SerialEventDeliveryOutcome } from "./serial-event-delivery.js";
 import type { ParticipantRuntimeKind, SessionEvent, TaskRecord } from "./types.js";
 
@@ -279,6 +279,8 @@ export interface ParticipantTaskExecutorResult {
  * Runtime helpers and claimed task state passed to adapter-specific executors.
  */
 export interface ParticipantTaskExecutorContext {
+  /** Control epoch acquired for this participant WebSocket connection. */
+  readonly controlEpoch?: number;
   /** Concrete runtime process id that owns the task claim. */
   readonly instanceId: string;
   /** Stable participant identity that owns the task claim. */
@@ -663,6 +665,7 @@ export class ParticipantRuntimeClient {
   private reconnectFailureCount = 0;
   private reconnectSuccessCount = 0;
   private recoveryCount = 0;
+  private currentControlEpoch: number | null = null;
   private replayComplete: Promise<void> = Promise.resolve();
   private rejectReplayComplete: ((error: Error) => void) | null = null;
   private resolveReplayComplete: (() => void) | null = null;
@@ -997,6 +1000,9 @@ export class ParticipantRuntimeClient {
         runParticipantTaskClaimFlow(
           this,
           {
+            ...(this.currentControlEpoch === null
+              ? {}
+              : { controlEpoch: this.currentControlEpoch }),
             instanceId: this.config.instanceId,
             lastObservedSeq: this.lastHandledSeq,
             participantId: this.config.participantId,
@@ -1028,6 +1034,7 @@ export class ParticipantRuntimeClient {
     const generation = this.connectionGeneration + 1;
     this.connectionGeneration = generation;
     this.replaceDelivery(afterSeq, generation);
+    this.currentControlEpoch = null;
     this.replayCompleteSettled = false;
     const replayComplete = new Promise<void>((resolve, reject) => {
       this.rejectReplayComplete = reject;
@@ -1208,7 +1215,13 @@ export class ParticipantRuntimeClient {
           envelope.reason === "replay_window_exceeded" ||
           envelope.reason === "replay_gap_unrepaired"
         ) {
-          this.enterPausedState(envelope.reason, error, {}, generation);
+          const recovery = parseWebSocketRecoveryCondition(envelope);
+          this.enterPausedState(
+            envelope.reason,
+            error,
+            recovery?.limit === undefined ? {} : { limit: recovery.limit },
+            generation,
+          );
           return;
         }
         this.settleReplayCompleteError(error);
@@ -1216,6 +1229,13 @@ export class ParticipantRuntimeClient {
         return;
       }
       if (envelope.op === webSocketOperation.replayComplete) {
+        if (
+          envelope.controlEpoch !== undefined &&
+          envelope.instanceId === this.config.instanceId &&
+          envelope.participantId === this.config.participantId
+        ) {
+          this.currentControlEpoch = envelope.controlEpoch;
+        }
         this.delivery.enqueueReplayComplete();
       }
     } catch (error) {

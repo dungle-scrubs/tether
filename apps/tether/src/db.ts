@@ -8,6 +8,10 @@ import { ServerConfigService } from "./config.js";
 import { ControlEpochStaleError, nextControlEpoch, parseControlEpoch } from "./control-epoch.js";
 import { migrateDatabase } from "./database-migration.js";
 import {
+  createSessionProjectionStore,
+  listSessionProjectionInventory,
+} from "./db-session-projections.js";
+import {
   type AppendSessionEventInput,
   type ApprovalDecision,
   buildParticipantHeartbeatEventInput,
@@ -29,7 +33,7 @@ import {
   clientSessionBindings,
   participantControlLeases,
   participants,
-  sessionEvents,
+  type sessionEvents,
   sessions,
   taskApprovals,
   tasks,
@@ -44,7 +48,6 @@ import type {
   ParticipantRuntimeSnapshot,
   ParticipantRuntimeSnapshotStatus,
   ScheduledMaintenanceIdentity,
-  SessionBindingSummary,
   SessionDebugSummary,
   SessionEvent,
   SessionEventListOptions,
@@ -58,6 +61,7 @@ import type {
 } from "./types.js";
 
 const { Pool } = pg;
+const sessionProjectionStore = createSessionProjectionStore();
 
 export type {
   DatabaseMigrationFailureContext,
@@ -459,7 +463,7 @@ type ClientSessionBindingUpsert =
       readonly status: "inserted";
     };
 
-interface TransactionClient {
+export interface TransactionClient {
   readonly query: <TRow extends pg.QueryResultRow = pg.QueryResultRow>(
     sql: string,
     values?: readonly unknown[],
@@ -1485,83 +1489,7 @@ export async function listControlLeaseSnapshots(
  * stays constant regardless of session count, then are merged in memory.
  */
 export async function listSessions(database: DatabasePool): Promise<SessionListItem[]> {
-  const [sessionRows, participantCounts, taskCounts, eventCounts, bindingRows] = await Promise.all([
-    database.db.select().from(sessions).orderBy(desc(sessions.createdAt)),
-    database.db
-      .select({
-        sessionId: participants.sessionId,
-        total: sql<number>`count(*)::int`,
-      })
-      .from(participants)
-      .groupBy(participants.sessionId),
-    database.db
-      .select({
-        active: sql<number>`(count(*) filter (
-          where ${tasks.cancelledAt} is null
-            and ${tasks.completedAt} is null
-            and ${tasks.failedAt} is null
-        ))::int`,
-        sessionId: tasks.sessionId,
-        total: sql<number>`count(*)::int`,
-      })
-      .from(tasks)
-      .groupBy(tasks.sessionId),
-    database.db
-      .select({
-        lastCreatedAt: sql<Date | null>`max(${sessionEvents.createdAt})`,
-        sessionId: sessionEvents.sessionId,
-        total: sql<number>`count(*)::int`,
-      })
-      .from(sessionEvents)
-      .groupBy(sessionEvents.sessionId),
-    database.db
-      .select({
-        externalId: clientSessionBindings.externalId,
-        provider: clientSessionBindings.provider,
-        sessionId: clientSessionBindings.sessionId,
-      })
-      .from(clientSessionBindings)
-      .where(isNull(clientSessionBindings.archivedAt))
-      .orderBy(clientSessionBindings.provider, clientSessionBindings.externalId),
-  ]);
-
-  const participantBySession = new Map(participantCounts.map((row) => [row.sessionId, row.total]));
-  const taskBySession = new Map(taskCounts.map((row) => [row.sessionId, row]));
-  const eventBySession = new Map(eventCounts.map((row) => [row.sessionId, row]));
-  const bindingsBySession = new Map<string, SessionBindingSummary[]>();
-  for (const row of bindingRows) {
-    const list = bindingsBySession.get(row.sessionId) ?? [];
-    list.push({ externalId: row.externalId, provider: row.provider });
-    bindingsBySession.set(row.sessionId, list);
-  }
-
-  const items = sessionRows.map((row): SessionListItem => {
-    const taskCount = taskBySession.get(row.sessionId);
-    const eventCount = eventBySession.get(row.sessionId);
-    const lastCreatedAt = eventCount?.lastCreatedAt ?? null;
-    return {
-      activeTaskCount: taskCount?.active ?? 0,
-      bindings: bindingsBySession.get(row.sessionId) ?? [],
-      createdAt: row.createdAt.toISOString(),
-      eventCount: eventCount?.total ?? 0,
-      lastEventAt: lastCreatedAt ? new Date(lastCreatedAt).toISOString() : null,
-      participantCount: participantBySession.get(row.sessionId) ?? 0,
-      sessionId: row.sessionId,
-      taskCount: taskCount?.total ?? 0,
-    };
-  });
-
-  return items.sort(compareSessionsByRecentActivity);
-}
-
-/** Orders sessions by most recent event, falling back to creation time. */
-function compareSessionsByRecentActivity(left: SessionListItem, right: SessionListItem): number {
-  const leftActivity = left.lastEventAt ?? left.createdAt;
-  const rightActivity = right.lastEventAt ?? right.createdAt;
-  if (leftActivity === rightActivity) {
-    return left.sessionId < right.sessionId ? -1 : 1;
-  }
-  return leftActivity < rightActivity ? 1 : -1;
+  return listSessionProjectionInventory(database.pool);
 }
 
 /**
@@ -2228,6 +2156,59 @@ export async function listEvents(
   return rows.rows.map(toSessionEvent);
 }
 
+/** Reads only the newest bounded context candidates and aggregate suffix size. */
+export async function listContextEventSuffix(
+  database: DatabasePool,
+  sessionId: string,
+  afterSeq: number,
+  limit: number,
+): Promise<{
+  readonly eligibleEventCount: number;
+  readonly estimatedTokens: number;
+  readonly events: readonly SessionEvent[];
+  readonly truncated: boolean;
+}> {
+  const head = await database.pool.query<{ readonly streamEndSeq: unknown }>(
+    `
+        SELECT covers_seq_to AS "streamEndSeq"
+        FROM session_projections
+        WHERE session_id = $1
+      `,
+    [sessionId],
+  );
+  const streamEndSeq = Number(head.rows[0]?.streamEndSeq ?? afterSeq);
+  if (!Number.isSafeInteger(streamEndSeq) || streamEndSeq < afterSeq) {
+    throw new Error("Invalid Session Context projection head");
+  }
+  const newest = await database.pool.query<PgSessionEventRow>(
+    `
+        SELECT
+          created_at AS "createdAt",
+          event_id AS "eventId",
+          payload,
+          producer_id AS "producerId",
+          seq AS "seq",
+          session_id AS "sessionId",
+          type
+        FROM session_events
+        WHERE session_id = $1
+          AND seq > $2
+          AND seq <= $4
+        ORDER BY seq DESC
+        LIMIT $3
+      `,
+    [sessionId, afterSeq, limit, streamEndSeq],
+  );
+  const eligibleEventCount = streamEndSeq - afterSeq;
+  const events = newest.rows.reverse().map(toSessionEvent);
+  return {
+    eligibleEventCount,
+    estimatedTokens: Math.ceil(JSON.stringify(events).length / 4),
+    events,
+    truncated: eligibleEventCount > events.length,
+  };
+}
+
 /**
  * Creates a durable task and appends its canonical lifecycle event in one
  * database transaction.
@@ -2250,6 +2231,30 @@ export async function createTaskWithEvent(
     mutate: (client) => insertTaskWithClient(client, input),
     buildEvent: (task) => buildTaskCreatedEventInput({ sessionId: input.sessionId, task }),
   });
+}
+
+/**
+ * Creates a task and its canonical event on an existing transaction client.
+ * The caller owns commit and rollback so adjacent durable state can be atomic.
+ */
+export async function createTaskWithEventOnClient(
+  client: TransactionClient,
+  input: {
+    readonly eventSourceId: string;
+    readonly input?: Record<string, unknown> | null;
+    readonly kind: string;
+    readonly objective: string;
+    readonly sessionId: string;
+    readonly taskId: string;
+  },
+): Promise<PersistedTaskEventResult> {
+  const task = await insertTaskWithClient(client, input);
+  const event = await appendEventWithClient(
+    client,
+    buildTaskCreatedEventInput({ sessionId: input.sessionId, task }),
+    input.eventSourceId,
+  );
+  return { event, task };
 }
 
 /**
@@ -3567,6 +3572,7 @@ async function appendEventWithClient(
     ],
   );
   const event = toSessionEvent(eventRows.rows[0]);
+  await sessionProjectionStore.updateForAppendedEvent(client, event);
   await notifySessionEventWithClient(client, event, sourceId);
   return event;
 }
@@ -3711,6 +3717,7 @@ async function createSessionWithClient(
   );
   const inserted = insertedRows.rows[0];
   if (inserted) {
+    await sessionProjectionStore.initializeForNewSession(client, sessionId);
     return { created: true, session: toSessionRecord(inserted) };
   }
   const rows = await client.query<Pick<PgSessionRow, "createdAt" | "sessionId">>(

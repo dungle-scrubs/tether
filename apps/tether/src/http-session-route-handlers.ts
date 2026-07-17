@@ -40,7 +40,6 @@ import {
 import { parseEventListLimit, type ResourceLimits } from "./resource-limits.js";
 import { authorizeClientPublishedEvent } from "./session-event-publish-policy.js";
 import type { SessionServiceEffect } from "./session-service.js";
-import type { SessionEvent } from "./types.js";
 
 interface SessionHttpRouteHandlerInput {
   readonly authContext: AuthContext | null;
@@ -165,13 +164,8 @@ export function handleSessionHttpRoute(
         return true;
       }
       const sessions = yield* service.listSessions();
-      const eventsBySession = yield* collectSessionEvents(
-        service,
-        sessions.map((session) => session.sessionId),
-      );
       sendJson(response, 200, {
         ...projectSessionInventory({
-          eventsBySession,
           replicaId: input.replicaId,
           runtime: input.hostPresence,
           sessions,
@@ -208,11 +202,7 @@ export function handleSessionHttpRoute(
       }
       const sessions = yield* service.listSessions();
       const session = sessions.find((candidate) => candidate.sessionId === route.sessionId) ?? null;
-      const events = session
-        ? yield* service.listEvents(route.sessionId, 0, { limit: 10_000 })
-        : [];
       const projected = findProjectedSession({
-        events,
         liveHosts: input.hostPresence.hosts(route.sessionId),
         session,
       });
@@ -618,23 +608,6 @@ function matchSessionResourceRoute(
     };
   }
   return null;
-}
-
-/** Materializes bounded event-log inputs for Host-presence inventory projection. */
-function collectSessionEvents(
-  service: SessionServiceEffect,
-  sessionIds: readonly string[],
-): Effect.Effect<ReadonlyMap<string, readonly SessionEvent[]>, unknown> {
-  return Effect.gen(function* () {
-    const eventsBySession = new Map<string, readonly SessionEvent[]>();
-    const eventLists = yield* Effect.all(
-      sessionIds.map((sessionId) => service.listEvents(sessionId, 0, { limit: 10_000 })),
-    );
-    sessionIds.forEach((sessionId, index) => {
-      eventsBySession.set(sessionId, eventLists[index] ?? []);
-    });
-    return eventsBySession;
-  });
 }
 
 function matchSingleParamRoute(

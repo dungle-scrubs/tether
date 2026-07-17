@@ -29,6 +29,8 @@ import {
 import { createSessionControlEffects } from "./session-service-control-effects.js";
 import { createSessionCoreEffects } from "./session-service-core-effects.js";
 import { createSessionReadEffects } from "./session-service-read-effects.js";
+import { SessionScalabilityDiagnostics } from "./session-scalability-diagnostics.js";
+import { createSessionSummaryStore } from "./session-summary-store.js";
 import {
   assertBroadcastEventsWithObservability,
   catchAtomicEpochStale,
@@ -190,6 +192,8 @@ function makeSessionServiceEffect(
   const claimLeaseTtlMs = options.taskClaimLeaseTtlMs ?? taskClaimLeaseTtlMs;
   const wsLeaseTtlMs = options.wsControlLeaseTtlMs ?? wsControlLeaseTtlMs;
   const stores = createSessionPersistenceStores(database);
+  const sessionSummaryStore = createSessionSummaryStore(database.pool);
+  const scalabilityDiagnostics = new SessionScalabilityDiagnostics(database.pool);
   const restControlPolicy = new RestControlPolicy(options.controlEpochEnforcement ?? true);
   const appendEventEffect = (
     input: AppendSessionEventInput,
@@ -292,7 +296,9 @@ function makeSessionServiceEffect(
     listTasksEffect,
     listTaskSnapshotsEffect,
     readSessionDebugSummaryEffect,
-  } = createSessionReadEffects({ stores });
+    readSessionScalabilityDebugEffect,
+    readScalabilityHealthWarningsEffect,
+  } = createSessionReadEffects({ scalabilityDiagnostics, sessionSummaryStore, stores });
   const withRestTaskMutationControl = <TInput extends RestControlledInput & TaskParticipantInput>(
     operation: RestTaskOperation,
     input: TInput,
@@ -352,6 +358,7 @@ function makeSessionServiceEffect(
       eventSourceId,
       restControlLeaseTtlMs,
       restControl: restControlPolicy.debugInfo(),
+      scalability: scalabilityDiagnostics.debugInfo(),
       taskClaimLeaseTtlMs: claimLeaseTtlMs,
       wsControlLeaseTtlMs: wsLeaseTtlMs,
     }),
@@ -472,6 +479,24 @@ function makeSessionServiceEffect(
           activeControlLeaseCount: summary.controlLeases.active,
           taskCount: summary.tasks.total,
         }),
+      ),
+    readSessionScalabilityDebug: (sessionId) =>
+      traceEffect(
+        "readSessionScalabilityDebug",
+        { sessionIdPresent: sessionId.length > 0 },
+        readSessionScalabilityDebugEffect(sessionId),
+        (record) => ({
+          activeSummaryCount: record.summary.active.length,
+          healthWarningCount: record.healthWarnings.length,
+          projectionCurrent: record.projection.current,
+        }),
+      ),
+    readScalabilityHealthWarnings: () =>
+      traceEffect(
+        "readScalabilityHealthWarnings",
+        {},
+        readScalabilityHealthWarningsEffect(),
+        (warnings) => ({ healthWarningCount: warnings.length }),
       ),
     listControlLeaseSnapshots: (sessionId) =>
       traceEffect(

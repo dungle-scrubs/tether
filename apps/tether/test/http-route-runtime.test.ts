@@ -28,6 +28,7 @@ describe("handleHttpRouteError", () => {
       "session.events.append",
       "session.participant.control.release",
       "session.participant.heartbeat",
+      "session.summary.candidate.submit",
       "task.approval",
       "task.cancel",
       "task.claim",
@@ -86,9 +87,38 @@ describe("handleHttpRouteError", () => {
 
     expect(projectHealthResponse(compatibility.debugInfo())).toEqual({
       ok: true,
-      warnings: ["REST_CONTROL_COMPATIBILITY_ENABLED"],
+      warnings: [
+        "summary_publication_disabled",
+        "summary_worker_disabled",
+        "ollama_disabled",
+        "retention_disabled",
+        "REST_CONTROL_COMPATIBILITY_ENABLED",
+      ],
     });
-    expect(projectHealthResponse(enforced.debugInfo())).toEqual({ ok: true });
+    expect(projectHealthResponse(enforced.debugInfo())).toEqual({
+      ok: true,
+      warnings: [
+        "summary_publication_disabled",
+        "summary_worker_disabled",
+        "ollama_disabled",
+        "retention_disabled",
+      ],
+    });
+  });
+
+  it("projects live scalability warnings without changing health readiness", () => {
+    const enforced = new RestControlPolicy(true);
+
+    expect(
+      projectHealthResponse(enforced.debugInfo(), [
+        "projection_stale",
+        "summary_invalid",
+        "ollama_disabled",
+      ]),
+    ).toEqual({
+      ok: true,
+      warnings: ["projection_stale", "summary_invalid", "ollama_disabled"],
+    });
   });
 
   it("redacts unexpected Error details from public 500 responses and logs them with a request id", () => {

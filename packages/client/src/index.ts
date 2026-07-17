@@ -37,6 +37,7 @@ export {
   buildSessionEventStreamUrl,
   sessionEventObserverRuntimeKind,
   SessionEventStreamClient,
+  SessionEventStreamError,
 } from "./session-event-stream-client.js";
 export type {
   ParticipantRuntimeClientConfig,
@@ -81,6 +82,7 @@ export {
   taskIdFromCancelledEvent,
 } from "./protocol.js";
 export { TaskCancellationRegistry } from "./task-cancellation-registry.js";
+export { ParticipantTaskExecutionError } from "./participant-task-execution-error.js";
 
 export type {
   ClientSessionBindingRecord,

@@ -1,15 +1,31 @@
+import {
+  sessionScalabilitySpanNames,
+  type SessionScalabilityDebugRecord,
+  type SessionScalabilityHealthWarning,
+} from "@dungle-scrubs/tether-protocol";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
 import { Effect } from "effect";
 
 import type { SessionPersistenceStores } from "./db-store-contracts.js";
 import {
   buildBoundedSessionContextView,
   buildParticipantTaskContracts,
+  canUseSessionSummaryForContext,
+  classifySessionContextBudget,
 } from "./session-service-context.js";
+import {
+  decideSessionContextMaintenance,
+  enqueueSessionContextMaintenance,
+  type SessionContextBudgetClass,
+  truncatedSessionContextSuffixTokenFloor,
+} from "./session-context-maintenance-policy.js";
 import {
   defaultRecentTerminalTaskLimit,
   type SessionServiceFailure,
 } from "./session-service-contracts.js";
 import { trySessionPromise } from "./session-service-runtime.js";
+import type { SessionSummaryStore } from "./session-summary-store.js";
+import type { SessionScalabilityDiagnostics } from "./session-scalability-diagnostics.js";
 import type {
   ControlLeaseSnapshot,
   ParticipantRecord,
@@ -26,8 +42,25 @@ import type {
   TaskSnapshot,
 } from "./types.js";
 
+/** Maximum newest raw events one context read may materialize before packing. */
+export const maxSessionContextCandidateEvents = 10_000;
+
 /** Dependencies for read-only session Effect builders. */
 export interface SessionReadEffectsInput {
+  /** Optional scheduler bundle enabled only after summary publication gates pass. */
+  readonly summaryMaintenance?: {
+    readonly reportFailure: (failure: {
+      readonly budgetClass: SessionContextBudgetClass;
+      readonly code: "schedule_failed";
+    }) => void;
+    readonly schedule: (input: {
+      readonly budgetClass: SessionContextBudgetClass;
+      readonly sessionId: string;
+      readonly unsummarizedTokens: number;
+    }) => Promise<void>;
+  };
+  readonly sessionSummaryStore: Pick<SessionSummaryStore, "readLatestPublished">;
+  readonly scalabilityDiagnostics: SessionScalabilityDiagnostics;
   readonly stores: SessionPersistenceStores;
 }
 
@@ -76,6 +109,13 @@ export interface SessionReadEffects {
   readonly readSessionDebugSummaryEffect: (
     sessionId: string,
   ) => Effect.Effect<SessionDebugSummary, SessionServiceFailure>;
+  readonly readSessionScalabilityDebugEffect: (
+    sessionId: string,
+  ) => Effect.Effect<SessionScalabilityDebugRecord, SessionServiceFailure>;
+  readonly readScalabilityHealthWarningsEffect: () => Effect.Effect<
+    readonly SessionScalabilityHealthWarning[],
+    SessionServiceFailure
+  >;
 }
 
 /** Builds read-only effects for one service instance. */
@@ -97,23 +137,61 @@ export function createSessionReadEffects(input: SessionReadEffectsInput): Sessio
   return {
     buildSessionContextViewEffect: (contextInput) =>
       Effect.gen(function* () {
-        const [events, activeTasks, terminalTasks, participants] = yield* trySessionPromise(() =>
+        const budgetClass = classifySessionContextBudget(contextInput.budgetTokens);
+        const publishedSummary = yield* trySessionPromise(() =>
+          input.sessionSummaryStore.readLatestPublished(contextInput.sessionId, budgetClass),
+        );
+        const latestSummary = canUseSessionSummaryForContext({
+          budgetTokens: contextInput.budgetTokens,
+          forParticipant: contextInput.forParticipant,
+          sessionId: contextInput.sessionId,
+          summary: publishedSummary,
+        })
+          ? publishedSummary
+          : null;
+        const [suffix, activeTasks, terminalTasks, participants] = yield* trySessionPromise(() =>
           Promise.all([
-            input.stores.events.list(contextInput.sessionId, 0),
+            input.stores.events.listContextSuffix(
+              contextInput.sessionId,
+              latestSummary?.coversSeqTo ?? 0,
+              maxSessionContextCandidateEvents,
+            ),
             input.stores.tasks.list(contextInput.sessionId, "active"),
             input.stores.tasks.list(contextInput.sessionId, "terminal"),
             input.stores.participants.list(contextInput.sessionId),
           ]),
         );
-        return buildBoundedSessionContextView({
+        const events = suffix.events;
+        const context = buildTracedSessionContextView({
           activeTasks,
           budgetTokens: contextInput.budgetTokens,
           events,
+          eligibleEventCount: suffix.eligibleEventCount,
           forParticipant: contextInput.forParticipant,
+          latestSummary,
           recentTerminalTasks: terminalTasks.slice(0, defaultRecentTerminalTaskLimit),
           sessionId: contextInput.sessionId,
           taskContracts: buildParticipantTaskContracts(participants),
         });
+        input.scalabilityDiagnostics.recordContext(context.mode);
+        const maintenanceDecision = decideSessionContextMaintenance({
+          budgetClass,
+          unsummarizedTokens: suffix.truncated
+            ? Math.max(suffix.estimatedTokens, truncatedSessionContextSuffixTokenFloor)
+            : suffix.estimatedTokens,
+        });
+        if (input.summaryMaintenance !== undefined) {
+          enqueueSessionContextMaintenance(
+            maintenanceDecision,
+            (maintenance) =>
+              input.summaryMaintenance?.schedule({
+                ...maintenance,
+                sessionId: contextInput.sessionId,
+              }) ?? Promise.resolve(),
+            input.summaryMaintenance.reportFailure,
+          );
+        }
+        return context;
       }),
     findParticipantTaskContractEffect: (contractInput) =>
       Effect.map(
@@ -141,5 +219,40 @@ export function createSessionReadEffects(input: SessionReadEffectsInput): Sessio
       trySessionPromise(() => input.stores.tasks.listSnapshots(sessionId)),
     readSessionDebugSummaryEffect: (sessionId) =>
       trySessionPromise(() => input.stores.sessions.readDebugSummary(sessionId)),
+    readSessionScalabilityDebugEffect: (sessionId) =>
+      trySessionPromise(() => input.scalabilityDiagnostics.read(sessionId)),
+    readScalabilityHealthWarningsEffect: () =>
+      trySessionPromise(() => input.scalabilityDiagnostics.readHealthWarnings()),
   };
+}
+
+function buildTracedSessionContextView(
+  input: Parameters<typeof buildBoundedSessionContextView>[0],
+): SessionContextView {
+  const span = trace
+    .getTracer("tether-session-context")
+    .startSpan(sessionScalabilitySpanNames.contextBuild, {
+      attributes: {
+        "context.active_task_count": input.activeTasks.length,
+        "context.budget_tokens": input.budgetTokens,
+        "context.candidate_event_count": input.events.length,
+        "context.summary_available": input.latestSummary !== null,
+      },
+    });
+  try {
+    const context = buildBoundedSessionContextView(input);
+    span.setAttributes({
+      "context.estimated_tokens": context.budget.estimatedTokens,
+      "context.mode": context.mode,
+      "context.omitted_event_count": context.budget.omittedEventCount,
+    });
+    span.setStatus({ code: SpanStatusCode.OK });
+    return context;
+  } catch (error) {
+    span.setAttribute("context.failure_code", "context_build_failed");
+    span.setStatus({ code: SpanStatusCode.ERROR });
+    throw error;
+  } finally {
+    span.end();
+  }
 }
