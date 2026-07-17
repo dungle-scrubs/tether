@@ -4,5 +4,5 @@
     "noEmit": true,
     "rootDir": "."
   },
-  "include": ["src/**/*.ts", "test/observability-public-api.test.ts"]
+  "include": ["src/**/*.ts", "test/observability-public-api.test.ts", "test/public-api.test.ts"]
 }
