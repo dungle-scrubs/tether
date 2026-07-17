@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { readMigrationFiles } from "drizzle-orm/migrator";
 import { Effect } from "effect";
 import pg from "pg";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, onTestFinished } from "vitest";
 import WebSocket from "ws";
 import {
   mintTestAuthToken,
@@ -23,6 +23,7 @@ import {
 import type { DatabasePool } from "../src/db.js";
 import {
   acquireRestParticipantControl,
+  appendEvent,
   archiveClientSessionBinding,
   claimTaskWithEvent,
   completeTaskWithEvent,
@@ -31,6 +32,7 @@ import {
   createTaskWithEvent,
   expireTaskClaims,
   getTask,
+  listEvents,
   listParticipants,
   listTaskApprovals,
   migrate,
@@ -53,6 +55,11 @@ import type {
   SessionDebugSummary,
   SessionEvent,
 } from "../src/types.js";
+import {
+  createPostgresConcurrencyCoordinator,
+  PostgresConcurrencyCleanupError,
+  wrapPoolQueries,
+} from "./postgres-concurrency-coordinator.js";
 
 const e2e = process.env.E2E === "true" ? describe : describe.skip;
 const adminDatabaseUrl = readRequiredE2eAdminDatabaseUrl();
@@ -61,6 +68,30 @@ const e2eAuthOptions = {
   mode: "required",
   secrets: { [testAuthSigningKid]: testAuthSigningSecret },
 } as const;
+
+/** Exact final Plan 32 current-lease fence used by protected mutations. */
+const currentControlLeaseFenceQuery = `
+      SELECT
+        control_channel AS "controlChannel",
+        epoch,
+        instance_id AS "instanceId",
+        lease_expires_at AS "leaseExpiresAt"
+      FROM participant_control_leases
+      WHERE session_id = $1
+        AND participant_id = $2
+        AND released_at IS NULL
+        AND superseded_at IS NULL
+      ORDER BY lease_expires_at DESC, claimed_at DESC, instance_id
+      FOR UPDATE
+    `;
+
+/** Exact sequence-row allocator whose transaction lock orders event publishers. */
+const eventSequenceAllocatorQuery = `
+      UPDATE session_event_sequences
+      SET next_seq = next_seq + 1
+      WHERE session_id = $1
+      RETURNING next_seq - 1 AS "seq"
+    `;
 
 /** Generated migration filenames in their authoritative application order. */
 const generatedMigrationNames = [
@@ -95,6 +126,10 @@ interface RunServerProcessOptions {
   readonly env?: NodeJS.ProcessEnv;
   readonly shutdownAfterStdout?: string;
 }
+
+type AsyncOutcome<TValue> =
+  | { readonly status: "fulfilled"; readonly value: TValue }
+  | { readonly reason: unknown; readonly status: "rejected" };
 
 /** Reads the admin database URL required for enabled e2e runs. */
 function readRequiredE2eAdminDatabaseUrl(): string {
@@ -200,6 +235,9 @@ interface EventsResponse extends JsonResponse {
 }
 
 interface ParticipantRegistrationResponse extends JsonResponse {
+  readonly acquisitionId?: string;
+  readonly acquisitionStatus?: "claimed" | "replayed" | "superseded";
+  readonly controlEpoch?: number;
   readonly registrationStatus: string;
 }
 
@@ -274,19 +312,6 @@ interface ControlLeaseSnapshotsResponse extends JsonResponse {
 interface ParticipantRuntimeSnapshotsResponse extends JsonResponse {
   readonly participants: readonly ParticipantRuntimeSnapshot[];
 }
-
-type PoolQueryInput = string | pg.QueryConfig;
-
-type PoolQueryNext = (
-  query: PoolQueryInput,
-  values?: readonly unknown[],
-) => Promise<pg.QueryResult<pg.QueryResultRow>>;
-
-type PoolQueryInterceptor = (
-  query: PoolQueryInput,
-  values: readonly unknown[] | undefined,
-  next: PoolQueryNext,
-) => Promise<pg.QueryResult<pg.QueryResultRow>>;
 
 interface TasksResponse extends JsonResponse {
   readonly tasks: readonly {
@@ -3177,7 +3202,21 @@ e2e("tether e2e", () => {
   it("serializes store participant registration classification", async () => {
     const sessionId = `sess_store_registration_race_${randomUUID()}`;
     const participantId = `part_store_registration_race_${randomUUID()}`;
-    const database = createParticipantAdvisoryLockBarrierDatabase(currentPool(), 2);
+    const participantAdvisoryLockQuery =
+      "SELECT pg_advisory_xact_lock(hashtext($1::text), hashtext($2::text))";
+    const coordinator = createPostgresConcurrencyCoordinator(currentPool(), {
+      actors: ["registration-a", "registration-b"],
+      barrierTimeoutMs: 2_000,
+      phases: [
+        {
+          actors: ["registration-a", "registration-b"],
+          name: "participant-advisory-lock-ready",
+          position: "before",
+          query: { class: "participant-advisory-lock", text: participantAdvisoryLockQuery },
+        },
+      ],
+      transactionTimeouts: { lockTimeoutMs: 2_000, statementTimeoutMs: 5_000 },
+    });
     const baseRegistration = {
       capabilities: {
         contracts: [{ taskKind: "software_dev" }],
@@ -3190,10 +3229,12 @@ e2e("tether e2e", () => {
     };
 
     await createDbSession(currentPool(), sessionId);
-    const registrations = await Promise.all([
-      upsertParticipant(database, baseRegistration),
-      upsertParticipant(database, baseRegistration),
-    ]);
+    const registrations = await coordinator.run(async ({ databaseFor }) =>
+      Promise.all([
+        upsertParticipant(databaseFor("registration-a"), baseRegistration),
+        upsertParticipant(databaseFor("registration-b"), baseRegistration),
+      ]),
+    );
     const visibleUpdate = await upsertParticipant(currentPool(), {
       ...baseRegistration,
       capabilities: { workKinds: ["software_dev"], z: true, a: true },
@@ -3222,6 +3263,857 @@ e2e("tether e2e", () => {
       Date.parse(visibleUpdate.participant.lastSeenAt),
     );
   });
+
+  it("coordinates exact named query phases on independent actor clients", async () => {
+    const probeQuery = "SELECT pg_backend_pid()::int AS pid";
+    const database = createPool(databaseUrl);
+    onTestFinished(async () => database.end());
+    const coordinator = createPostgresConcurrencyCoordinator(database, {
+      actors: ["probe-a", "probe-b"],
+      barrierTimeoutMs: 2_000,
+      phases: [
+        {
+          actors: ["probe-a", "probe-b"],
+          name: "probe-ready",
+          position: "before",
+          query: { class: "backend-probe", text: probeQuery },
+        },
+        {
+          actors: ["probe-a", "probe-b"],
+          name: "probe-finished",
+          position: "after",
+          query: { class: "backend-probe", text: probeQuery },
+        },
+      ],
+      transactionTimeouts: { lockTimeoutMs: 1_000, statementTimeoutMs: 3_000 },
+    });
+
+    const pids = await coordinator.run(async ({ databaseFor }) =>
+      Promise.all(
+        (["probe-a", "probe-b"] as const).map(async (actor) => {
+          const client = await databaseFor(actor).pool.connect();
+          try {
+            await client.query("BEGIN");
+            await client.query(`${probeQuery} `);
+            const result = await client.query<{ readonly pid: number }>(probeQuery);
+            await client.query("COMMIT");
+            return result.rows[0]?.pid;
+          } finally {
+            client.release();
+          }
+        }),
+      ),
+    );
+
+    expect(new Set(pids).size).toBe(2);
+    const phaseEvents = coordinator.snapshot().phaseEvents;
+    expect(phaseEvents).toHaveLength(4);
+    expect(phaseEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ actor: "probe-a", name: "probe-ready", position: "before" }),
+        expect.objectContaining({ actor: "probe-b", name: "probe-ready", position: "before" }),
+        expect.objectContaining({ actor: "probe-a", name: "probe-finished", position: "after" }),
+        expect.objectContaining({ actor: "probe-b", name: "probe-finished", position: "after" }),
+      ]),
+    );
+  });
+
+  it("cancels lock waiters and releases every actor after an assertion failure", async () => {
+    const advisoryLockQuery = "SELECT pg_advisory_xact_lock(hashtext($1::text))";
+    const secretLockValue = "secret-lock-value-plan-34";
+    const database = createPool(databaseUrl);
+    onTestFinished(async () => database.end());
+    const checkedOutBefore = database.pool.totalCount - database.pool.idleCount;
+    const coordinator = createPostgresConcurrencyCoordinator(database, {
+      actors: ["lock-holder", "lock-waiter"],
+      barrierTimeoutMs: 2_000,
+      phases: [
+        {
+          actors: ["lock-waiter"],
+          name: "waiting-for-advisory-lock",
+          position: "before",
+          query: { class: "advisory-lock", text: advisoryLockQuery },
+        },
+      ],
+      transactionTimeouts: { lockTimeoutMs: 5_000, statementTimeoutMs: 5_000 },
+    });
+    let blockedQuery: Promise<unknown> | null = null;
+
+    await expect(
+      coordinator.run(async ({ databaseFor, waitForLockWait }) => {
+        const holder = await databaseFor("lock-holder").pool.connect();
+        const waiter = await databaseFor("lock-waiter").pool.connect();
+        try {
+          await holder.query("BEGIN");
+          await waiter.query("BEGIN");
+          const [lockTimeout, statementTimeout] = await Promise.all([
+            waiter.query<{ readonly lockTimeout: string }>(
+              `SELECT current_setting('lock_timeout') AS "lockTimeout"`,
+            ),
+            waiter.query<{ readonly statementTimeout: string }>(
+              `SELECT current_setting('statement_timeout') AS "statementTimeout"`,
+            ),
+          ]);
+          expect(lockTimeout.rows[0]?.lockTimeout).toBe("5s");
+          expect(statementTimeout.rows[0]?.statementTimeout).toBe("5s");
+          await holder.query(advisoryLockQuery, [secretLockValue]);
+          blockedQuery = waiter
+            .query(advisoryLockQuery, [secretLockValue])
+            .catch((error: unknown) => error);
+
+          const lockWait = await waitForLockWait("lock-waiter");
+          expect(lockWait.blocked).toBe(true);
+          throw new Error("injected assertion failure");
+        } finally {
+          holder.release();
+          waiter.release();
+        }
+      }),
+    ).rejects.toThrow("injected assertion failure");
+    await blockedQuery;
+
+    const snapshot = coordinator.snapshot();
+    const waiter = snapshot.actors.find((actor) => actor.actor === "lock-waiter");
+    expect(waiter).toMatchObject({
+      actor: "lock-waiter",
+      phase: {
+        name: "waiting-for-advisory-lock",
+        position: "before",
+        queryClass: "advisory-lock",
+      },
+    });
+    expect(waiter?.backendPid).toEqual(expect.any(Number));
+    expect(waiter?.lockWait).toMatchObject({ blocked: true, waitEventType: "Lock" });
+    expect(snapshot.cleanup).toMatchObject({
+      blockedActorsAfterRollback: 0,
+      cancelledActors: 2,
+      checkedOutAfter: checkedOutBefore,
+      releasedActors: 2,
+      rolledBackActors: 2,
+    });
+    expect(JSON.stringify(snapshot)).not.toContain(secretLockValue);
+    expect(database.pool.totalCount - database.pool.idleCount).toBe(checkedOutBefore);
+    expect(database.pool.waitingCount).toBe(0);
+    const actorPids = snapshot.actors.map((actor) => actor.backendPid);
+    const blockedActors = await database.pool.query<{ readonly count: number }>(
+      `
+        SELECT count(*)::int AS count
+        FROM pg_stat_activity
+        WHERE pid = ANY($1::int[])
+          AND wait_event_type = 'Lock'
+      `,
+      [actorPids],
+    );
+    expect(blockedActors.rows[0]?.count).toBe(0);
+  });
+
+  it("reports bounded redacted diagnostics and cleans up after a barrier timeout", async () => {
+    const probeQuery = "SELECT $1::text AS value";
+    const secretValue = "secret-timeout-value-plan-34";
+    const database = createPool(databaseUrl);
+    onTestFinished(async () => database.end());
+    const checkedOutBefore = database.pool.totalCount - database.pool.idleCount;
+    const coordinator = createPostgresConcurrencyCoordinator(database, {
+      actors: ["timeout-a", "timeout-b"],
+      barrierTimeoutMs: 100,
+      phases: [
+        {
+          actors: ["timeout-a", "timeout-b"],
+          name: "both-probes-ready",
+          position: "before",
+          query: { class: "timeout-probe", text: probeQuery },
+        },
+      ],
+      transactionTimeouts: { lockTimeoutMs: 1_000, statementTimeoutMs: 2_000 },
+    });
+
+    const failure = await coordinator
+      .run(async ({ databaseFor }) => {
+        const client = await databaseFor("timeout-a").pool.connect();
+        try {
+          await client.query("BEGIN");
+          await client.query(probeQuery, [secretValue]);
+        } finally {
+          client.release();
+        }
+      })
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(Error);
+    const message = failure instanceof Error ? failure.message : String(failure);
+    expect(message).toContain("PostgreSQL concurrency barrier timed out");
+    expect(message).toContain('"actor":"timeout-a"');
+    expect(message).toContain('"name":"both-probes-ready"');
+    expect(message).toContain('"position":"before"');
+    expect(message).toContain('"queryClass":"timeout-probe"');
+    expect(message).toContain('"backendPid":');
+    expect(message).toContain('"lockWait":');
+    expect(message).not.toContain(secretValue);
+    expect(coordinator.snapshot().cleanup).toMatchObject({
+      blockedActorsAfterRollback: 0,
+      cancelledActors: 2,
+      checkedOutAfter: checkedOutBefore,
+      releasedActors: 2,
+      rolledBackActors: 2,
+    });
+    expect(database.pool.totalCount - database.pool.idleCount).toBe(checkedOutBefore);
+    expect(database.pool.waitingCount).toBe(0);
+  });
+
+  it("reports cleanup failures after attempting every actor release", async () => {
+    const database = createPool(databaseUrl);
+    onTestFinished(async () => database.end());
+    const coordinator = createPostgresConcurrencyCoordinator(database, {
+      actors: ["terminated-actor", "terminator"],
+      barrierTimeoutMs: 1_000,
+      phases: [],
+      transactionTimeouts: { lockTimeoutMs: 1_000, statementTimeoutMs: 2_000 },
+    });
+
+    const failure = await coordinator
+      .run(async ({ databaseFor }) => {
+        const terminatedActor = await databaseFor("terminated-actor").pool.connect();
+        const terminator = await databaseFor("terminator").pool.connect();
+        try {
+          await terminatedActor.query("BEGIN");
+          await terminator.query("BEGIN");
+          const pidResult = await terminatedActor.query<{ readonly pid: number }>(
+            "SELECT pg_backend_pid()::int AS pid",
+          );
+          const terminatedPid = pidResult.rows[0]?.pid;
+          if (terminatedPid === undefined) {
+            throw new Error("Missing terminated actor backend PID");
+          }
+          await terminator.query("SELECT pg_terminate_backend($1)", [terminatedPid]);
+          await terminatedActor.query("SELECT 1").catch(() => undefined);
+        } finally {
+          terminatedActor.release();
+          terminator.release();
+        }
+      })
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PostgresConcurrencyCleanupError);
+    const snapshot = coordinator.snapshot();
+    expect(snapshot.cleanup?.failures).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ actor: "terminated-actor", operation: "rollback" }),
+      ]),
+    );
+    expect(snapshot.cleanup).toMatchObject({
+      blockedActorsAfterRollback: 0,
+      checkedOutAfter: 0,
+      releaseAttempts: 2,
+      rollbackAttempts: 2,
+    });
+    expect(snapshot.cleanup?.releasedActors).toBeGreaterThanOrEqual(1);
+    expect(database.pool.totalCount - database.pool.idleCount).toBe(0);
+    expect(database.pool.waitingCount).toBe(0);
+  });
+
+  it("commits an epoch-N REST claim refresh before replacement installs epoch N+1", async () => {
+    const { claimed, controlEpoch, instanceId, participantId, session, task } =
+      await prepareControlEpochRaceFixture("mutation_first");
+    const replacementAcquisitionId = `acq_epoch_n_plus_one_${randomUUID()}`;
+    const coordinator = createPostgresConcurrencyCoordinator(currentPool(), {
+      actors: ["mutation", "supersession"],
+      barrierTimeoutMs: 5_000,
+      phases: [
+        {
+          actors: ["mutation"],
+          name: "epoch-n-fence-held",
+          position: "after",
+          query: { class: "current-control-lease-fence", text: currentControlLeaseFenceQuery },
+          release: "manual",
+        },
+      ],
+      transactionTimeouts: { lockTimeoutMs: 5_000, statementTimeoutMs: 10_000 },
+    });
+    const result = await coordinator.run(
+      async ({ databaseFor, releasePhase, waitForLockWait, waitForPhase }) => {
+        const mutationApp = createAppServer(databaseFor("mutation"), {
+          auth: e2eAuthOptions,
+          eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+          sessionService: {
+            controlEpochEnforcement: true,
+            taskClaimLeaseTtlMs: 120_000,
+            wsControlLeaseTtlMs: 60_000,
+          },
+          taskClaimSweeper: { intervalMs: 0 },
+        });
+        const supersessionApp = createAppServer(databaseFor("supersession"), {
+          auth: e2eAuthOptions,
+          eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+          sessionService: {
+            controlEpochEnforcement: true,
+            taskClaimLeaseTtlMs: 60_000,
+            wsControlLeaseTtlMs: 60_000,
+          },
+          taskClaimSweeper: { intervalMs: 0 },
+        });
+        const [mutationPort, supersessionPort] = await Promise.all([
+          findOpenPort(),
+          findOpenPort(),
+        ]);
+        await Promise.all([
+          mutationApp.listen(mutationPort),
+          supersessionApp.listen(supersessionPort),
+        ]);
+        const mutationBaseUrl = `http://127.0.0.1:${mutationPort}`;
+        const supersessionBaseUrl = `http://127.0.0.1:${supersessionPort}`;
+
+        try {
+          const mutation = requestStatusFrom<TaskResponse>(
+            mutationBaseUrl,
+            `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim/refresh`,
+            {
+              body: { controlEpoch, instanceId, participantId },
+              method: "POST",
+            },
+          );
+          await waitForPhase("epoch-n-fence-held");
+          const supersession = requestStatusFrom<ParticipantRegistrationResponse>(
+            supersessionBaseUrl,
+            `/sessions/${session.sessionId}/participants`,
+            {
+              body: {
+                acquisitionId: replacementAcquisitionId,
+                controlChannel: "rest",
+                displayName: "Epoch mutation-first participant",
+                instanceId,
+                participantId,
+                runtimeKind: "generic_agent",
+              },
+              method: "POST",
+            },
+          );
+          const lockWait = await waitForLockWait("supersession");
+          releasePhase("epoch-n-fence-held");
+          const [mutationResponse, supersessionResponse] = await Promise.all([
+            mutation,
+            supersession,
+          ]);
+          return { lockWait, mutationResponse, supersessionResponse };
+        } finally {
+          await Promise.all([mutationApp.close(), supersessionApp.close()]);
+        }
+      },
+    );
+    const durableTask = await getTask(currentPool(), {
+      sessionId: session.sessionId,
+      taskId: task.task.taskId,
+    });
+    const currentEpochRows = await currentPool().pool.query<{ readonly epoch: unknown }>(
+      `
+        SELECT epoch
+        FROM participant_control_leases
+        WHERE session_id = $1
+          AND participant_id = $2
+          AND released_at IS NULL
+          AND superseded_at IS NULL
+      `,
+      [session.sessionId, participantId],
+    );
+
+    expect(result.lockWait).toMatchObject({ blocked: true, waitEventType: "Lock" });
+    expect(result.mutationResponse.status).toBe(200);
+    expect(result.mutationResponse.body.task.claimExpiresAt).not.toBe(claimed.task.claimExpiresAt);
+    expect(durableTask?.claimExpiresAt).toBe(result.mutationResponse.body.task.claimExpiresAt);
+    expect(result.supersessionResponse.status).toBe(201);
+    expect(result.supersessionResponse.body).toMatchObject({
+      acquisitionStatus: "superseded",
+      controlEpoch: controlEpoch + 1,
+    });
+    expect(Number(currentEpochRows.rows[0]?.epoch)).toBe(controlEpoch + 1);
+  }, 30_000);
+
+  it("rejects an epoch-N REST claim refresh after replacement installs epoch N+1", async () => {
+    const { claimed, controlEpoch, instanceId, participantId, session, task } =
+      await prepareControlEpochRaceFixture("supersession_first");
+    const replacementAcquisitionId = `acq_epoch_n_plus_one_${randomUUID()}`;
+    const coordinator = createPostgresConcurrencyCoordinator(currentPool(), {
+      actors: ["mutation", "supersession"],
+      barrierTimeoutMs: 5_000,
+      phases: [
+        {
+          actors: ["mutation"],
+          name: "epoch-n-before-fence",
+          position: "before",
+          query: { class: "current-control-lease-fence", text: currentControlLeaseFenceQuery },
+          release: "manual",
+        },
+      ],
+      transactionTimeouts: { lockTimeoutMs: 5_000, statementTimeoutMs: 10_000 },
+    });
+
+    const result = await coordinator.run(async ({ databaseFor, releasePhase, waitForPhase }) => {
+      const mutationApp = createControlEpochRaceApp(databaseFor("mutation"), 120_000);
+      const supersessionApp = createControlEpochRaceApp(databaseFor("supersession"), 60_000);
+      const [mutationPort, supersessionPort] = await Promise.all([findOpenPort(), findOpenPort()]);
+      await Promise.all([
+        mutationApp.listen(mutationPort),
+        supersessionApp.listen(supersessionPort),
+      ]);
+      const mutationBaseUrl = `http://127.0.0.1:${mutationPort}`;
+      const supersessionBaseUrl = `http://127.0.0.1:${supersessionPort}`;
+
+      try {
+        const mutation = requestStatusFrom<TaskResponse>(
+          mutationBaseUrl,
+          `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim/refresh`,
+          {
+            body: { controlEpoch, instanceId, participantId },
+            method: "POST",
+          },
+        );
+        await waitForPhase("epoch-n-before-fence");
+        const supersessionResponse = await requestStatusFrom<ParticipantRegistrationResponse>(
+          supersessionBaseUrl,
+          `/sessions/${session.sessionId}/participants`,
+          {
+            body: {
+              acquisitionId: replacementAcquisitionId,
+              controlChannel: "rest",
+              displayName: "Epoch supersession-first participant",
+              instanceId,
+              participantId,
+              runtimeKind: "generic_agent",
+            },
+            method: "POST",
+          },
+        );
+        const currentBeforeStaleMutation = await currentPool().pool.query<{
+          readonly claimExpiresAt: Date | null;
+          readonly epoch: unknown;
+        }>(
+          `
+              SELECT
+                lease.epoch,
+                task.claim_expires_at AS "claimExpiresAt"
+              FROM participant_control_leases AS lease
+              CROSS JOIN tasks AS task
+              WHERE lease.session_id = $1
+                AND lease.participant_id = $2
+                AND lease.released_at IS NULL
+                AND lease.superseded_at IS NULL
+                AND task.session_id = $1
+                AND task.task_id = $3
+            `,
+          [session.sessionId, participantId, task.task.taskId],
+        );
+        releasePhase("epoch-n-before-fence");
+        return {
+          currentBeforeStaleMutation: currentBeforeStaleMutation.rows[0],
+          mutationResponse: await mutation,
+          supersessionResponse,
+        };
+      } finally {
+        await Promise.all([mutationApp.close(), supersessionApp.close()]);
+      }
+    });
+    const durableTask = await getTask(currentPool(), {
+      sessionId: session.sessionId,
+      taskId: task.task.taskId,
+    });
+    const currentEpochRows = await currentPool().pool.query<{ readonly epoch: unknown }>(
+      `
+        SELECT epoch
+        FROM participant_control_leases
+        WHERE session_id = $1
+          AND participant_id = $2
+          AND released_at IS NULL
+          AND superseded_at IS NULL
+      `,
+      [session.sessionId, participantId],
+    );
+
+    expect(result.supersessionResponse.status).toBe(201);
+    expect(result.supersessionResponse.body).toMatchObject({
+      acquisitionStatus: "superseded",
+      controlEpoch: controlEpoch + 1,
+    });
+    expect(Number(result.currentBeforeStaleMutation?.epoch)).toBe(controlEpoch + 1);
+    expect(result.currentBeforeStaleMutation?.claimExpiresAt?.toISOString()).toBe(
+      claimed.task.claimExpiresAt,
+    );
+    expect(durableTask?.claimExpiresAt).toBe(claimed.task.claimExpiresAt);
+    expect(result.mutationResponse.status).toBe(409);
+    expect(result.mutationResponse.body).toMatchObject({
+      code: "CONTROL_EPOCH_STALE",
+      currentEpoch: controlEpoch + 1,
+    });
+    expect(Number(currentEpochRows.rows[0]?.epoch)).toBe(controlEpoch + 1);
+    expect(coordinator.snapshot().phaseEvents).toEqual([
+      expect.objectContaining({
+        actor: "mutation",
+        name: "epoch-n-before-fence",
+        position: "before",
+        queryClass: "current-control-lease-fence",
+      }),
+    ]);
+  }, 30_000);
+
+  it("allows exactly one of two synchronized REST claimants to claim one task", async () => {
+    const session = await createSession();
+    const task = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
+      body: { kind: "software_dev", objective: "Claim this task exactly once" },
+      method: "POST",
+    });
+    const claimants = [
+      {
+        actor: "claimant-a",
+        displayName: "Synchronized claimant A",
+        instanceId: `inst_claimant_a_${randomUUID()}`,
+        participantId: `part_claimant_a_${randomUUID()}`,
+      },
+      {
+        actor: "claimant-b",
+        displayName: "Synchronized claimant B",
+        instanceId: `inst_claimant_b_${randomUUID()}`,
+        participantId: `part_claimant_b_${randomUUID()}`,
+      },
+    ] as const;
+    await Promise.all(
+      claimants.map((claimant) =>
+        request(`/sessions/${session.sessionId}/participants`, {
+          body: {
+            capabilities: { workKinds: ["software_dev"] },
+            displayName: claimant.displayName,
+            instanceId: claimant.instanceId,
+            participantId: claimant.participantId,
+            runtimeKind: "codex",
+          },
+          method: "POST",
+        }),
+      ),
+    );
+    const coordinator = createPostgresConcurrencyCoordinator(currentPool(), {
+      actors: ["claimant-a", "claimant-b"],
+      barrierTimeoutMs: 5_000,
+      phases: [
+        {
+          actors: ["claimant-a", "claimant-b"],
+          name: "both-task-claim-transactions-open",
+          position: "after",
+          query: { class: "task-claim-transaction-start", text: "BEGIN" },
+          release: "manual",
+        },
+      ],
+      transactionTimeouts: { lockTimeoutMs: 5_000, statementTimeoutMs: 10_000 },
+    });
+
+    const responses = await coordinator.run(async ({ databaseFor, releasePhase, waitForPhase }) => {
+      const claimantAApp = createTaskClaimRaceApp(databaseFor("claimant-a"));
+      const claimantBApp = createTaskClaimRaceApp(databaseFor("claimant-b"));
+      const [claimantAPort, claimantBPort] = await Promise.all([findOpenPort(), findOpenPort()]);
+      let claimantAStarted = false;
+      let claimantBStarted = false;
+      try {
+        await claimantAApp.listen(claimantAPort);
+        claimantAStarted = true;
+        await claimantBApp.listen(claimantBPort);
+        claimantBStarted = true;
+        const requests = [
+          requestStatusFrom(
+            `http://127.0.0.1:${claimantAPort}`,
+            `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`,
+            {
+              body: {
+                instanceId: claimants[0].instanceId,
+                participantId: claimants[0].participantId,
+              },
+              method: "POST",
+            },
+          ),
+          requestStatusFrom(
+            `http://127.0.0.1:${claimantBPort}`,
+            `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`,
+            {
+              body: {
+                instanceId: claimants[1].instanceId,
+                participantId: claimants[1].participantId,
+              },
+              method: "POST",
+            },
+          ),
+        ] as const;
+        try {
+          await waitForPhase("both-task-claim-transactions-open");
+          releasePhase("both-task-claim-transactions-open");
+          return await Promise.all(requests);
+        } catch (error) {
+          await Promise.allSettled(requests);
+          throw error;
+        }
+      } finally {
+        await Promise.all([
+          ...(claimantAStarted ? [claimantAApp.close()] : []),
+          ...(claimantBStarted ? [claimantBApp.close()] : []),
+        ]);
+      }
+    });
+    const durableClaims = await currentPool().pool.query<{
+      readonly claimExpiresAt: Date;
+      readonly claimedAt: Date;
+      readonly claimedBy: string;
+    }>(
+      `
+        SELECT
+          claim_expires_at AS "claimExpiresAt",
+          claimed_at AS "claimedAt",
+          claimed_by AS "claimedBy"
+        FROM tasks
+        WHERE session_id = $1
+          AND task_id = $2
+          AND claimed_at IS NOT NULL
+          AND claimed_by IS NOT NULL
+          AND claim_expires_at > now()
+          AND completed_at IS NULL
+          AND failed_at IS NULL
+          AND cancelled_at IS NULL
+      `,
+      [session.sessionId, task.task.taskId],
+    );
+    const events = await request<EventsResponse>(`/sessions/${session.sessionId}/events?after=0`);
+    const claimedEvents = events.events.filter(
+      (event) =>
+        event.type === "task.claimed" && taskIdFromEventPayload(event) === task.task.taskId,
+    );
+    const winningClaimant = claimants.find((_claimant, index) => responses[index]?.status === 200);
+    const claimedEvent = claimedEvents[0];
+
+    expect(responses.map((response) => response.status).sort()).toEqual([200, 409]);
+    expect(responses.find((response) => response.status === 409)?.body).toEqual({
+      error: "Task is already claimed or terminal",
+    });
+    expect(winningClaimant).toBeDefined();
+    expect(durableClaims.rows).toHaveLength(1);
+    expect(durableClaims.rows[0]?.claimedBy).toBe(winningClaimant?.participantId);
+    expect(claimedEvents).toHaveLength(1);
+    expect(claimedEvent).toBeDefined();
+    if (claimedEvent === undefined) {
+      throw new Error(`Missing task.claimed event for ${task.task.taskId}`);
+    }
+    expect(readEventTaskPayload(claimedEvent)).toMatchObject({
+      claimedBy: winningClaimant?.participantId,
+      sessionId: session.sessionId,
+      taskId: task.task.taskId,
+    });
+    const phaseEvents = coordinator.snapshot().phaseEvents;
+    expect(phaseEvents).toHaveLength(2);
+    expect(phaseEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          actor: "claimant-a",
+          name: "both-task-claim-transactions-open",
+          position: "after",
+          queryClass: "task-claim-transaction-start",
+        }),
+        expect.objectContaining({
+          actor: "claimant-b",
+          name: "both-task-claim-transactions-open",
+          position: "after",
+          queryClass: "task-claim-transaction-start",
+        }),
+      ]),
+    );
+    const cleanup = coordinator.snapshot().cleanup;
+    expect(cleanup).toMatchObject({
+      blockedActorsAfterRollback: 0,
+      releasedActors: 2,
+      rolledBackActors: 2,
+    });
+  }, 30_000);
+
+  it("keeps concurrent event sequence visibility ordered through allocator commit", async () => {
+    const sessionId = `sess_sequence_commit_${randomUUID()}`;
+    const publisherAInput = {
+      eventId: `evt_sequence_commit_a_${randomUUID()}`,
+      payload: { outcome: "commit", publisher: "a" },
+      producerId: "part_sequence_commit_a",
+      sessionId,
+      type: "test.sequence.commit",
+    } as const;
+    const publisherBInput = {
+      eventId: `evt_sequence_commit_b_${randomUUID()}`,
+      payload: { outcome: "commit", publisher: "b" },
+      producerId: "part_sequence_commit_b",
+      sessionId,
+      type: "test.sequence.commit",
+    } as const;
+    await createDbSession(currentPool(), sessionId);
+    const sequenceBefore = await readNextEventSequence(currentPool(), sessionId);
+    const coordinator = createPostgresConcurrencyCoordinator(currentPool(), {
+      actors: ["publisher-a", "publisher-b"],
+      barrierTimeoutMs: 5_000,
+      phases: [
+        {
+          actors: ["publisher-a"],
+          name: "publisher-a-sequence-allocated",
+          position: "after",
+          query: { class: "event-sequence-allocation", text: eventSequenceAllocatorQuery },
+          release: "manual",
+        },
+      ],
+      transactionTimeouts: { lockTimeoutMs: 5_000, statementTimeoutMs: 10_000 },
+    });
+
+    const result = await coordinator.run(
+      async ({ databaseFor, releasePhase, waitForLockWait, waitForPhase }) => {
+        let publisherA: Promise<AsyncOutcome<SessionEvent>> | null = null;
+        let publisherB: Promise<AsyncOutcome<SessionEvent>> | null = null;
+        let phaseReleased = false;
+        try {
+          publisherA = observeAsyncOutcome(
+            appendEvent(databaseFor("publisher-a"), publisherAInput, {
+              sourceId: "src_sequence_commit_a",
+            }),
+          );
+          await waitForPhase("publisher-a-sequence-allocated");
+          publisherB = observeAsyncOutcome(
+            appendEvent(databaseFor("publisher-b"), publisherBInput, {
+              sourceId: "src_sequence_commit_b",
+            }),
+          );
+          const lockWait = await waitForLockWait("publisher-b");
+          const eventsBeforeRelease = await listEvents(
+            currentPool(),
+            sessionId,
+            sequenceBefore - 1,
+          );
+
+          expect(eventsBeforeRelease).toEqual([]);
+          releasePhase("publisher-a-sequence-allocated");
+          phaseReleased = true;
+          const [eventA, eventB] = await Promise.all([publisherA, publisherB]);
+          return {
+            eventA: requireFulfilledOutcome(eventA),
+            eventB: requireFulfilledOutcome(eventB),
+            lockWait,
+          };
+        } catch (error) {
+          await settleEventPublishersAfterFailure({
+            phaseName: "publisher-a-sequence-allocated",
+            phaseReleased,
+            publishers: [publisherA, publisherB],
+            releasePhase,
+          });
+          throw error;
+        }
+      },
+    );
+    const committedEvents = await listEvents(currentPool(), sessionId, sequenceBefore - 1);
+
+    expect(result.lockWait).toMatchObject({ blocked: true, waitEventType: "Lock" });
+    expect([result.eventA.seq, result.eventB.seq]).toEqual([sequenceBefore, sequenceBefore + 1]);
+    expect(committedEvents).toHaveLength(2);
+    expect(committedEvents).toEqual([
+      expect.objectContaining({
+        eventId: publisherAInput.eventId,
+        payload: publisherAInput.payload,
+        seq: sequenceBefore,
+      }),
+      expect.objectContaining({
+        eventId: publisherBInput.eventId,
+        payload: publisherBInput.payload,
+        seq: sequenceBefore + 1,
+      }),
+    ]);
+    expect(await readNextEventSequence(currentPool(), sessionId)).toBe(sequenceBefore + 2);
+  }, 15_000);
+
+  it("reuses a rolled-back event allocation without leaving a durable gap", async () => {
+    const sessionId = `sess_sequence_rollback_${randomUUID()}`;
+    const publisherAInput = {
+      eventId: `evt_sequence_rollback_a_${randomUUID()}`,
+      payload: { outcome: "rollback", publisher: "a" },
+      producerId: "part_sequence_rollback_a",
+      sessionId,
+      type: "test.sequence.rollback",
+    } as const;
+    const publisherBInput = {
+      eventId: `evt_sequence_rollback_b_${randomUUID()}`,
+      payload: { outcome: "commit", publisher: "b" },
+      producerId: "part_sequence_rollback_b",
+      sessionId,
+      type: "test.sequence.rollback",
+    } as const;
+    await createDbSession(currentPool(), sessionId);
+    const sequenceBefore = await readNextEventSequence(currentPool(), sessionId);
+    const coordinator = createPostgresConcurrencyCoordinator(currentPool(), {
+      actors: ["publisher-a", "publisher-b"],
+      barrierTimeoutMs: 5_000,
+      phases: [
+        {
+          actors: ["publisher-a"],
+          name: "publisher-a-rollback-sequence-allocated",
+          position: "after",
+          query: { class: "event-sequence-allocation", text: eventSequenceAllocatorQuery },
+          release: "manual",
+        },
+      ],
+      transactionTimeouts: { lockTimeoutMs: 5_000, statementTimeoutMs: 10_000 },
+    });
+
+    const result = await coordinator.run(
+      async ({ databaseFor, releasePhase, waitForLockWait, waitForPhase }) => {
+        let publisherA: Promise<AsyncOutcome<SessionEvent>> | null = null;
+        let publisherB: Promise<AsyncOutcome<SessionEvent>> | null = null;
+        let phaseReleased = false;
+        try {
+          const failingPublisherA = await createEventInsertFailingDatabase(
+            databaseFor("publisher-a"),
+          );
+          publisherA = observeAsyncOutcome(
+            appendEvent(failingPublisherA, publisherAInput, {
+              sourceId: "src_sequence_rollback_a",
+            }),
+          );
+          await waitForPhase("publisher-a-rollback-sequence-allocated");
+          publisherB = observeAsyncOutcome(
+            appendEvent(databaseFor("publisher-b"), publisherBInput, {
+              sourceId: "src_sequence_rollback_b",
+            }),
+          );
+          const lockWait = await waitForLockWait("publisher-b");
+          releasePhase("publisher-a-rollback-sequence-allocated");
+          phaseReleased = true;
+          const [eventA, eventB] = await Promise.all([publisherA, publisherB]);
+          return { eventA, eventB, lockWait };
+        } catch (error) {
+          await settleEventPublishersAfterFailure({
+            phaseName: "publisher-a-rollback-sequence-allocated",
+            phaseReleased,
+            publishers: [publisherA, publisherB],
+            releasePhase,
+          });
+          throw error;
+        }
+      },
+    );
+    const eventB = requireFulfilledOutcome(result.eventB);
+    const committedEvents = await listEvents(currentPool(), sessionId, sequenceBefore - 1);
+
+    expect(result.lockWait).toMatchObject({ blocked: true, waitEventType: "Lock" });
+    expect(result.eventA).toMatchObject({
+      reason: expect.objectContaining({ message: "injected session event insert failure" }),
+      status: "rejected",
+    });
+    expect(eventB).toMatchObject({
+      eventId: publisherBInput.eventId,
+      payload: publisherBInput.payload,
+      seq: sequenceBefore,
+    });
+    expect(committedEvents).toEqual([
+      expect.objectContaining({
+        eventId: publisherBInput.eventId,
+        payload: publisherBInput.payload,
+        seq: sequenceBefore,
+      }),
+    ]);
+    expect(committedEvents.map((event) => event.eventId)).not.toContain(publisherAInput.eventId);
+    expect(await readNextEventSequence(currentPool(), sessionId)).toBe(sequenceBefore + 1);
+  }, 15_000);
 
   it("rolls back participant registration when composed event insert fails", async () => {
     const session = await createSession();
@@ -6249,6 +7141,112 @@ e2e("tether e2e", () => {
     return pool;
   }
 
+  /** Reads the durable allocator cursor for one session as a safe event sequence. */
+  async function readNextEventSequence(database: DatabasePool, sessionId: string): Promise<number> {
+    const rows = await database.pool.query<{ readonly nextSeq: string }>(
+      `
+        SELECT next_seq::text AS "nextSeq"
+        FROM session_event_sequences
+        WHERE session_id = $1
+      `,
+      [sessionId],
+    );
+    const nextSeq = Number(rows.rows[0]?.nextSeq);
+    if (!Number.isSafeInteger(nextSeq) || nextSeq <= 0) {
+      throw new Error(`Invalid next event sequence for ${sessionId}`);
+    }
+    return nextSeq;
+  }
+
+  /** Creates one public REST lease and claimed task for a Control Epoch race. */
+  async function prepareControlEpochRaceFixture(label: string): Promise<{
+    readonly claimed: TaskResponse;
+    readonly controlEpoch: number;
+    readonly instanceId: string;
+    readonly participantId: string;
+    readonly session: SessionResponse["session"];
+    readonly task: TaskResponse;
+  }> {
+    const session = await createSession();
+    const participantId = `part_epoch_${label}_${randomUUID()}`;
+    const instanceId = `inst_epoch_${label}_${randomUUID()}`;
+    const setupApp = createControlEpochRaceApp(currentPool(), 60_000);
+    const setupPort = await findOpenPort();
+    await setupApp.listen(setupPort);
+    const setupBaseUrl = `http://127.0.0.1:${setupPort}`;
+    try {
+      const acquisition = await requestFrom<ParticipantRegistrationResponse>(
+        setupBaseUrl,
+        `/sessions/${session.sessionId}/participants`,
+        {
+          body: {
+            acquisitionId: `acq_epoch_n_${randomUUID()}`,
+            controlChannel: "rest",
+            displayName: `Epoch ${label} participant`,
+            instanceId,
+            participantId,
+            runtimeKind: "generic_agent",
+          },
+          method: "POST",
+        },
+      );
+      const controlEpoch = acquisition.controlEpoch;
+      if (controlEpoch === undefined) {
+        throw new Error("Initial REST acquisition did not return a Control Epoch");
+      }
+      const task = await requestFrom<TaskResponse>(
+        setupBaseUrl,
+        `/sessions/${session.sessionId}/tasks`,
+        {
+          body: { kind: "software_dev", objective: "Refresh under epoch serialization" },
+          method: "POST",
+        },
+      );
+      const claimed = await requestFrom<TaskResponse>(
+        setupBaseUrl,
+        `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`,
+        {
+          body: { controlEpoch, instanceId, participantId },
+          method: "POST",
+        },
+      );
+      return { claimed, controlEpoch, instanceId, participantId, session, task };
+    } finally {
+      await setupApp.close();
+    }
+  }
+
+  /** Builds a scoped enforced REST server without fanout or sweep background work. */
+  function createControlEpochRaceApp(
+    database: DatabasePool,
+    taskClaimLeaseTtlMs: number,
+  ): AppServer {
+    return createAppServer(database, {
+      auth: e2eAuthOptions,
+      eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+      sessionService: {
+        controlEpochEnforcement: true,
+        taskClaimLeaseTtlMs,
+        wsControlLeaseTtlMs: 60_000,
+      },
+      taskClaimSweeper: { intervalMs: 0 },
+    });
+  }
+
+  /** Builds one scoped claimant server without fanout or background sweep work. */
+  function createTaskClaimRaceApp(database: DatabasePool): AppServer {
+    return createAppServer(database, {
+      auth: e2eAuthOptions,
+      eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+      sessionService: {
+        controlEpochEnforcement: false,
+        taskClaimLeaseTtlMs: 60_000,
+        wsControlLeaseTtlMs: 60_000,
+      },
+      taskClaimSweeper: { intervalMs: 0 },
+    });
+  }
+
   /**
    * Starts a scoped app-server replica whose claim command fails after command
    * parsing, preserving production gateway behavior.
@@ -6389,40 +7387,6 @@ e2e("tether e2e", () => {
       `,
       [sessionId, participantId, instanceId],
     );
-  }
-
-  /**
-   * Wraps the participant advisory-lock query so concurrent calls both reach
-   * the serialized registration boundary before either mutation continues.
-   */
-  function createParticipantAdvisoryLockBarrierDatabase(
-    database: DatabasePool,
-    waitForLocks: number,
-  ): DatabasePool {
-    const barrier = createCountdownBarrier(waitForLocks);
-    return wrapPoolQueries(database, async (query, values, next) => {
-      const text = typeof query === "string" ? query : query.text;
-      if (text.includes("pg_advisory_xact_lock")) {
-        await barrier();
-      }
-      return next(query, values);
-    });
-  }
-
-  /** Creates a one-shot barrier that resolves after the requested arrivals. */
-  function createCountdownBarrier(expectedArrivals: number): () => Promise<void> {
-    let arrivals = 0;
-    let releaseBarrier: (() => void) | null = null;
-    const released = new Promise<void>((resolve) => {
-      releaseBarrier = resolve;
-    });
-    return async () => {
-      arrivals += 1;
-      if (arrivals >= expectedArrivals) {
-        releaseBarrier?.();
-      }
-      await released;
-    };
   }
 
   /** Creates and claims a task through the public REST lifecycle. */
@@ -7012,29 +7976,6 @@ async function createEventInsertFailingDatabase(database: DatabasePool): Promise
   });
 }
 
-/** Creates a test-only pool wrapper for injecting behavior around raw pg queries. */
-function wrapPoolQueries(database: DatabasePool, interceptor: PoolQueryInterceptor): DatabasePool {
-  const wrappedPool = Object.create(database.pool) as pg.Pool;
-  wrappedPool.connect = async () => {
-    const client = await database.pool.connect();
-    const wrappedClient = Object.create(client) as pg.PoolClient;
-    const originalQuery = client.query.bind(client) as pg.PoolClient["query"];
-    const next: PoolQueryNext = (query, values) => {
-      return values === undefined
-        ? (originalQuery(query as never) as Promise<pg.QueryResult<pg.QueryResultRow>>)
-        : (originalQuery(query as never, values as never) as Promise<
-            pg.QueryResult<pg.QueryResultRow>
-          >);
-    };
-    wrappedClient.query = ((query: PoolQueryInput, values?: readonly unknown[]) => {
-      return interceptor(query, values, next);
-    }) as pg.PoolClient["query"];
-    wrappedClient.release = client.release.bind(client);
-    return wrappedClient;
-  };
-  return { ...database, pool: wrappedPool };
-}
-
 /** Parses an HTTP JSON response body, treating empty bodies as empty objects. */
 function parseJsonResponseBody<TResponse extends JsonResponse>(text: string): TResponse {
   return (text.trim() ? JSON.parse(text) : {}) as TResponse;
@@ -7358,6 +8299,44 @@ function createGenericApprovalTaskRecord(sessionId: string, taskId: string): Tas
 /** Checks whether a value is a non-null object record. */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+/** Observes both promise outcomes immediately so delayed cleanup cannot leak rejections. */
+async function observeAsyncOutcome<TValue>(
+  operation: Promise<TValue>,
+): Promise<AsyncOutcome<TValue>> {
+  try {
+    return { status: "fulfilled", value: await operation };
+  } catch (reason) {
+    return { reason, status: "rejected" };
+  }
+}
+
+/** Returns a fulfilled test operation or rethrows its already-observed failure. */
+function requireFulfilledOutcome<TValue>(outcome: AsyncOutcome<TValue>): TValue {
+  if (outcome.status === "rejected") {
+    throw outcome.reason;
+  }
+  return outcome.value;
+}
+
+/** Releases a failed manual phase and waits for every publisher to settle. */
+async function settleEventPublishersAfterFailure(input: {
+  readonly phaseName: string;
+  readonly phaseReleased: boolean;
+  readonly publishers: readonly (Promise<AsyncOutcome<SessionEvent>> | null)[];
+  readonly releasePhase: (name: string) => void;
+}): Promise<void> {
+  if (!input.phaseReleased) {
+    try {
+      input.releasePhase(input.phaseName);
+    } catch {}
+  }
+  await Promise.all(
+    input.publishers.filter(
+      (publisher): publisher is Promise<AsyncOutcome<SessionEvent>> => publisher !== null,
+    ),
+  );
 }
 
 /** Rejects with a diagnostic when an asynchronous E2E operation stops making progress. */

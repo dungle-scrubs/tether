@@ -249,7 +249,7 @@ export function createSessionControlEffects(
             );
           }
           const acquisition = yield* trySessionPromise(() =>
-            acquireRest({
+            acquireRest.call(input.stores.controlLeases, {
               acquisitionId,
               capabilities: participantInput.capabilities,
               displayName: participantInput.displayName ?? participantId,
