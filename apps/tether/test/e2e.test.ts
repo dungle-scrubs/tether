@@ -9300,6 +9300,72 @@ e2e("tether e2e", () => {
       expect(durable?.failedAt).toBeNull();
     });
 
+    it("fences a same-participant stale Claim ID after it reclaims its own elapsed task", async () => {
+      const { previousClaimId, previousClaimedBy, sessionId, taskId } =
+        await prepareElapsedClaim("self-fence");
+
+      // The SAME participant reclaims its own elapsed task, minting a new Claim
+      // ID. Because claimed_by is unchanged, only the Claim ID predicate can
+      // reject the stale generation below.
+      const reclaim = await claimTaskWithEvent(pool(), {
+        claimLeaseTtlMs: 60_000,
+        eventSourceId: "src_reclaim_self_fence_e2e",
+        participantId: previousClaimedBy,
+        sessionId,
+        taskId,
+      });
+      const newClaimId = reclaim?.task.claimId ?? null;
+      expect(newClaimId).not.toBeNull();
+      expect(newClaimId).not.toBe(previousClaimId);
+      expect(reclaim?.task.claimedBy).toBe(previousClaimedBy);
+
+      const eventCountBefore = (await listEvents(pool(), sessionId, 0)).length;
+      // Same participant, same still-live lease: the old Claim ID is the only
+      // failing predicate, so these prove the Claim ID fence in isolation.
+      const refreshed = await refreshTaskClaim(pool(), {
+        claimId: previousClaimId,
+        claimLeaseTtlMs: 60_000,
+        participantId: previousClaimedBy,
+        sessionId,
+        taskId,
+      });
+      expect(refreshed).toBeNull();
+      const completed = await completeTaskWithEvent(pool(), {
+        claimId: previousClaimId,
+        eventSourceId: "src_reclaim_self_fence_e2e",
+        participantId: previousClaimedBy,
+        result: { summary: "stale self complete" },
+        sessionId,
+        taskId,
+      });
+      expect(completed).toBeNull();
+      const failed = await failTaskWithEvent(pool(), {
+        claimId: previousClaimId,
+        eventSourceId: "src_reclaim_self_fence_e2e",
+        failure: { reason: "stale self fail" },
+        participantId: previousClaimedBy,
+        sessionId,
+        taskId,
+      });
+      expect(failed).toBeNull();
+      const released = await releaseTaskWithEvent(pool(), {
+        claimId: previousClaimId,
+        eventSourceId: "src_reclaim_self_fence_e2e",
+        participantId: previousClaimedBy,
+        sessionId,
+        taskId,
+      });
+      expect(released).toBeNull();
+
+      expect((await listEvents(pool(), sessionId, 0)).length).toBe(eventCountBefore);
+      const durable = await getTask(pool(), { sessionId, taskId });
+      expect(durable?.claimId).toBe(newClaimId);
+      expect(durable?.claimedBy).toBe(previousClaimedBy);
+      expect(durable?.completedAt).toBeNull();
+      expect(durable?.failedAt).toBeNull();
+      expect(durable?.releasedAt).toBeNull();
+    });
+
     it("keeps a legacy claim without a Claim ID immutable until it is reclaimed", async () => {
       const sessionId = `sess_reclaim_legacy_${randomUUID()}`;
       const taskId = `task_reclaim_legacy_${randomUUID()}`;

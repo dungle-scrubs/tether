@@ -2631,7 +2631,9 @@ export async function claimTaskWithEvent(
       const previousClaimedBy = lockedTask.claimedBy;
       if (previousClaimedBy === null) {
         // Defensive: an elapsed claim with no recorded owner cannot produce a
-        // well-formed claim-expired event; leave it for the sweeper.
+        // well-formed claim-expired event. A claimed task always records its
+        // owner, so this state is unreachable; decline rather than emit a
+        // malformed event or silently drop the expiration.
         await client.query("COMMIT");
         return null;
       }
