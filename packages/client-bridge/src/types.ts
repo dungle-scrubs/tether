@@ -216,26 +216,75 @@ export type ClientBridgeTaskApprovalRecord =
 export interface ClientBridgeSessionResolverConfig {
   /** Bearer token sent to Tether; falls back to SERVICE_AUTH_TOKEN/TETHER_AUTH_TOKEN when omitted. */
   readonly authToken?: string | null;
+  /**
+   * Maximum number of external-id → session-id entries retained by the bounded
+   * LRU cache. Must be a positive finite integer; the resolver never runs
+   * unbounded. Defaults to 1,024.
+   */
+  readonly cacheCapacity?: number;
   /** Optional session id that new bindings should target. */
   readonly defaultSessionId?: string | null;
+  /**
+   * Idle time-to-live, in milliseconds, after which an untouched cache entry is
+   * treated as a miss and evicted. Must be positive and finite. Defaults to
+   * 1,800,000 (30 minutes).
+   */
+  readonly idleTtlMs?: number;
+  /**
+   * Maximum number of distinct in-flight resolutions allowed at once. Must be a
+   * positive finite integer; a new distinct key beyond this cap is rejected with
+   * a {@link ClientBridgeSessionResolverResourceLimitError}. Defaults to 64.
+   */
+  readonly maxInFlight?: number;
   /** External client provider, such as `external-chat` or `slack`. */
   readonly provider: string;
   /** Tether service URL. */
   readonly serviceUrl: string;
 }
 
+/** Monotonic-enough clock used to drive deterministic cache expiry. */
+export interface ClientBridgeSessionResolverClock {
+  /** Returns the current time in epoch milliseconds. */
+  readonly now: () => number;
+}
+
 /** Optional dependencies for bridge session resolution. */
 export interface ClientBridgeSessionResolverOptions {
+  /** Clock used for idle-expiry decisions; defaults to `Date.now`. */
+  readonly clock?: ClientBridgeSessionResolverClock;
   /** Fetch implementation, injected by tests and host runtimes. */
   readonly fetch?: ClientBridgeFetch;
 }
 
+/** Most recent bounded-cache outcome observed by a bridge session resolver. */
+export type ClientBridgeSessionResolverOutcome =
+  | "cache-hit"
+  | "evicted"
+  | "expired"
+  | "in-flight-joined"
+  | "in-flight-overflow"
+  | "invalidated"
+  | "resolved"
+  | "seeded";
+
 /** Runtime diagnostics for a bridge session resolver. */
 export interface ClientBridgeSessionResolverDebugInfo {
+  /** Maximum number of cache entries retained before LRU eviction. */
+  readonly cacheCapacity: number;
+  /** Number of external ids currently cached by this resolver. */
+  readonly cacheSize: number;
   /** Most recent session id resolved by this process. */
   readonly currentSessionId: string | null;
-  /** External ids currently cached by this resolver. */
-  readonly resolvedExternalIdCount: number;
+  /** Number of entries dropped by LRU eviction over this resolver's lifetime. */
+  readonly evictionCount: number;
+  /** Number of entries dropped by idle expiry over this resolver's lifetime. */
+  readonly expiryCount: number;
+  /** Number of distinct resolutions currently in flight. */
+  readonly inFlightCount: number;
+  /** Most recent bounded-cache outcome, or null before any activity. */
+  readonly lastOutcome: ClientBridgeSessionResolverOutcome | null;
+  /** Maximum number of distinct in-flight resolutions allowed at once. */
+  readonly maxInFlight: number;
   /** Number of HTTP requests issued to Tether by this resolver. */
   readonly requestCount: number;
 }

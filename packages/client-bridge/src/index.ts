@@ -6,7 +6,10 @@ export {
 } from "./transport.js";
 export { readServiceAuthToken, resolveServiceAuthToken } from "./auth-token.js";
 export { ClientBridgeSessionEventClient } from "./session-event-client.js";
-export { ClientBridgeSessionResolver } from "./session-resolver.js";
+export {
+  ClientBridgeSessionResolver,
+  ClientBridgeSessionResolverResourceLimitError,
+} from "./session-resolver.js";
 export { ClientBridgeTaskClient } from "./task-client.js";
 export { SessionEventStreamClient, SessionEventStreamError } from "@dungle-scrubs/tether-client";
 export type {
@@ -49,9 +52,11 @@ export type {
   ClientBridgeSessionEventClientConfig,
   ClientBridgeSessionEventClientDebugInfo,
   ClientBridgeSessionEventClientOptions,
+  ClientBridgeSessionResolverClock,
   ClientBridgeSessionResolverConfig,
   ClientBridgeSessionResolverDebugInfo,
   ClientBridgeSessionResolverOptions,
+  ClientBridgeSessionResolverOutcome,
   ClientBridgeTaskApprovalIgnored,
   ClientBridgeTaskApprovalRecord,
   ClientBridgeTaskApprovalRecorded,
