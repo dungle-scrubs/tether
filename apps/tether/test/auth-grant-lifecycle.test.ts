@@ -21,6 +21,11 @@ function fakeStores(): AuthPersistenceStores & {
       records.set(grant.jti, grant);
     }),
     grants: {
+      findManyByJti: async (grantJtis) =>
+        grantJtis.flatMap((jti) => {
+          const grant = records.get(jti);
+          return grant === undefined ? [] : [grant];
+        }),
       findByJti: async (jti) => records.get(jti) ?? null,
       list: async (limit) => [...records.values()].slice(0, limit),
     },

@@ -2270,6 +2270,242 @@ e2e("tether e2e", () => {
     }
   });
 
+  it("registers participant, observer, host, and viewer sockets in one auth registry", async () => {
+    const session = await createSession();
+    const participantId = `part_auth_registry_${randomUUID()}`;
+    const parent = await request<AuthGrantCreateResponse>("/auth/grants", {
+      body: {
+        role: "participant",
+        sessionScope: session.sessionId,
+        subject: participantId,
+        ttlSeconds: 3_600,
+      },
+      method: "POST",
+    });
+    const registryApp = createAppServer(currentPool(), {
+      auth: e2eAuthOptions,
+      authRevocation: { listenEnabled: false, pollIntervalMs: 0 },
+      eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+      sessionService: { controlEpochEnforcement: false },
+      taskClaimSweeper: { intervalMs: 0 },
+    });
+    const port = await findOpenPort();
+    await registryApp.listen(port);
+    const streamKinds = ["codex", "observer", "host", "viewer"] as const;
+    const sockets = streamKinds.map((runtimeKind) => {
+      const url = new URL(`ws://127.0.0.1:${port}/sessions/${session.sessionId}/stream`);
+      url.searchParams.set("after", "0");
+      url.searchParams.set("instanceId", `inst_auth_registry_${runtimeKind}_${randomUUID()}`);
+      url.searchParams.set("participantId", participantId);
+      url.searchParams.set("runtimeKind", runtimeKind);
+      return new WebSocket(url, {
+        headers: { authorization: `Bearer ${parent.bearer}` },
+      });
+    });
+    const messages = sockets.map((): unknown[] => []);
+    sockets.forEach((socket, index) => {
+      socket.on("message", (data) => messages[index]?.push(JSON.parse(String(data)) as unknown));
+    });
+
+    try {
+      await Promise.all(sockets.map(waitForSocketOpen));
+      await waitFor(() => messages.every((received) => received.some(isReplayCompleteEnvelope)));
+      expect(registryApp.debugInfo().authSockets).toMatchObject({
+        grantCount: 1,
+        socketCount: 4,
+        socketsByStream: {
+          host: 1,
+          observer: 1,
+          participant: 1,
+          viewer: 1,
+        },
+        timerCount: 4,
+      });
+      expect(JSON.stringify(registryApp.debugInfo().authSockets)).not.toContain(parent.grant.jti);
+    } finally {
+      for (const socket of sockets) {
+        if (socket.readyState !== WebSocket.CLOSED) {
+          socket.close();
+          await waitForSocketClose(socket);
+        }
+      }
+      await waitFor(() => registryApp.debugInfo().authSockets.socketCount === 0);
+      expect(registryApp.debugInfo().authSockets).toMatchObject({
+        grantCount: 0,
+        socketCount: 0,
+        timerCount: 0,
+      });
+      await registryApp.close();
+    }
+  });
+
+  it("closes matching sockets across two replicas within five seconds of revocation", async () => {
+    const session = await createSession();
+    const parent = await request<AuthGrantCreateResponse>("/auth/grants", {
+      body: {
+        role: "observer",
+        sessionScope: session.sessionId,
+        subject: `part_revocation_replica_${randomUUID()}`,
+        ttlSeconds: 3_600,
+      },
+      method: "POST",
+    });
+    const replicas = [
+      createAppServer(currentPool(), {
+        auth: e2eAuthOptions,
+        eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+        taskClaimSweeper: { intervalMs: 0 },
+      }),
+      createAppServer(currentPool(), {
+        auth: e2eAuthOptions,
+        eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+        taskClaimSweeper: { intervalMs: 0 },
+      }),
+    ] as const;
+    const firstPort = await findOpenPort();
+    await replicas[0].listen(firstPort);
+    const secondPort = await findOpenPort();
+    await replicas[1].listen(secondPort);
+    const sockets = [firstPort, secondPort].map((port, index) => {
+      const url = new URL(`ws://127.0.0.1:${port}/sessions/${session.sessionId}/stream`);
+      url.searchParams.set("after", "0");
+      url.searchParams.set("instanceId", `inst_revocation_replica_${index}_${randomUUID()}`);
+      url.searchParams.set("runtimeKind", "observer");
+      return new WebSocket(url, {
+        headers: { authorization: `Bearer ${parent.bearer}` },
+      });
+    });
+    const messages = sockets.map((): unknown[] => []);
+    sockets.forEach((socket, index) => {
+      socket.on("message", (data) => messages[index]?.push(JSON.parse(String(data)) as unknown));
+    });
+
+    try {
+      await Promise.all(sockets.map(waitForSocketOpen));
+      await waitFor(() => messages.every((received) => received.some(isReplayCompleteEnvelope)));
+      const closeResults = sockets.map(waitForSocketCloseDetails);
+      const revokedAt = Date.now();
+      await request(`/auth/grants/${parent.grant.jti}/revoke`, {
+        body: {},
+        method: "POST",
+      });
+      const closed = await Promise.all(closeResults);
+
+      expect(Date.now() - revokedAt).toBeLessThan(5_000);
+      expect(closed).toEqual([
+        { code: 1008, reason: "auth_grant_revoked" },
+        { code: 1008, reason: "auth_grant_revoked" },
+      ]);
+      for (const replica of replicas) {
+        expect(replica.debugInfo()).toMatchObject({
+          authSockets: { closeCount: 1, socketCount: 0 },
+        });
+      }
+    } finally {
+      for (const socket of sockets) {
+        if (socket.readyState !== WebSocket.CLOSED) socket.terminate();
+      }
+      await Promise.all(replicas.map((replica) => replica.close()));
+    }
+  });
+
+  it("repairs a missed revocation notification through bounded PostgreSQL polling", async () => {
+    const session = await createSession();
+    const parent = await request<AuthGrantCreateResponse>("/auth/grants", {
+      body: {
+        role: "observer",
+        sessionScope: session.sessionId,
+        subject: `part_revocation_poll_${randomUUID()}`,
+        ttlSeconds: 3_600,
+      },
+      method: "POST",
+    });
+    const pollingApp = createAppServer(currentPool(), {
+      auth: e2eAuthOptions,
+      authRevocation: { listenEnabled: false, pollIntervalMs: 100 },
+      eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+      taskClaimSweeper: { intervalMs: 0 },
+    });
+    const port = await findOpenPort();
+    await pollingApp.listen(port);
+    const url = new URL(`ws://127.0.0.1:${port}/sessions/${session.sessionId}/stream`);
+    url.searchParams.set("after", "0");
+    url.searchParams.set("runtimeKind", "observer");
+    const socket = new WebSocket(url, {
+      headers: { authorization: `Bearer ${parent.bearer}` },
+    });
+    const messages: unknown[] = [];
+    socket.on("message", (data) => messages.push(JSON.parse(String(data)) as unknown));
+
+    try {
+      await waitForSocketOpen(socket);
+      await waitFor(() => messages.some(isReplayCompleteEnvelope));
+      const closedPromise = waitForSocketCloseDetails(socket);
+      const revokedAt = Date.now();
+      await request(`/auth/grants/${parent.grant.jti}/revoke`, {
+        body: {},
+        method: "POST",
+      });
+
+      await expect(closedPromise).resolves.toEqual({
+        code: 1008,
+        reason: "auth_grant_revoked",
+      });
+      expect(Date.now() - revokedAt).toBeLessThan(5_000);
+      expect(pollingApp.debugInfo().authRevocation).toMatchObject({
+        notificationCount: 0,
+        pollCloseCount: 1,
+        pollFailureCount: 0,
+      });
+    } finally {
+      if (socket.readyState !== WebSocket.CLOSED) socket.terminate();
+      await pollingApp.close();
+    }
+  });
+
+  it("closes an admitted socket at parent grant expiry without late grace", async () => {
+    const session = await createSession();
+    const parent = await request<AuthGrantCreateResponse>("/auth/grants", {
+      body: {
+        role: "observer",
+        sessionScope: session.sessionId,
+        subject: `part_expiry_socket_${randomUUID()}`,
+        ttlSeconds: 2,
+      },
+      method: "POST",
+    });
+    const expiryApp = createAppServer(currentPool(), {
+      auth: e2eAuthOptions,
+      authRevocation: { listenEnabled: false, pollIntervalMs: 0 },
+      eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+      taskClaimSweeper: { intervalMs: 0 },
+    });
+    const port = await findOpenPort();
+    await expiryApp.listen(port);
+    const url = new URL(`ws://127.0.0.1:${port}/sessions/${session.sessionId}/stream`);
+    url.searchParams.set("after", "0");
+    url.searchParams.set("runtimeKind", "observer");
+    const socket = new WebSocket(url, {
+      headers: { authorization: `Bearer ${parent.bearer}` },
+    });
+    const messages: unknown[] = [];
+    socket.on("message", (data) => messages.push(JSON.parse(String(data)) as unknown));
+
+    try {
+      await waitForSocketOpen(socket);
+      await waitFor(() => messages.some(isReplayCompleteEnvelope));
+      const closed = await waitForSocketCloseDetails(socket);
+      const closedAt = Date.now();
+
+      expect(closed).toEqual({ code: 1008, reason: "auth_grant_expired" });
+      expect(closedAt).toBeGreaterThanOrEqual(new Date(parent.grant.expiresAt).getTime());
+      expect(closedAt).toBeLessThan(new Date(parent.grant.expiresAt).getTime() + 500);
+    } finally {
+      if (socket.readyState !== WebSocket.CLOSED) socket.terminate();
+      await expiryApp.close();
+    }
+  });
+
   it("reauthorizes established WebSocket commands against durable revocation", async () => {
     const session = await createSession();
     const participantId = `part_ws_grant_${randomUUID()}`;
@@ -2289,7 +2525,22 @@ e2e("tether e2e", () => {
       },
       method: "POST",
     });
-    const url = new URL(`${baseUrl.replace("http:", "ws:")}/sessions/${session.sessionId}/stream`);
+    const delayedClosureApp = createAppServer(currentPool(), {
+      auth: e2eAuthOptions,
+      authRevocation: { listenEnabled: false, pollIntervalMs: 0 },
+      eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+      sessionService: {
+        controlEpochEnforcement: false,
+        taskClaimLeaseTtlMs: 200,
+        wsControlLeaseTtlMs: 1_000,
+      },
+      taskClaimSweeper: { intervalMs: 0 },
+    });
+    const delayedClosurePort = await findOpenPort();
+    await delayedClosureApp.listen(delayedClosurePort);
+    const url = new URL(
+      `ws://127.0.0.1:${delayedClosurePort}/sessions/${session.sessionId}/stream`,
+    );
     url.searchParams.set("access_token", created.bearer);
     url.searchParams.set("after", "0");
     url.searchParams.set("instanceId", `inst_ws_grant_${randomUUID()}`);
@@ -2383,6 +2634,7 @@ e2e("tether e2e", () => {
         socket.close();
         await waitForSocketClose(socket);
       }
+      await delayedClosureApp.close();
     }
   });
 
@@ -10095,6 +10347,16 @@ async function waitForSocketClose(socket: WebSocket): Promise<void> {
   }
   await new Promise<void>((resolve, reject) => {
     socket.once("close", resolve);
+    socket.once("error", reject);
+  });
+}
+
+/** Resolves with the bounded close code and reason observed by a WebSocket peer. */
+async function waitForSocketCloseDetails(
+  socket: WebSocket,
+): Promise<{ readonly code: number; readonly reason: string }> {
+  return new Promise((resolve, reject) => {
+    socket.once("close", (code, reason) => resolve({ code, reason: reason.toString("utf8") }));
     socket.once("error", reject);
   });
 }

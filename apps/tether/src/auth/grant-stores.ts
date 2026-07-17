@@ -140,6 +140,18 @@ export interface AuthGrantStore {
   readonly list: (limit: number) => Promise<readonly AuthGrantRecord[]>;
 }
 
+/** Cancellation-aware batch reads used only by proactive socket revocation repair. */
+export interface AuthGrantRevocationStore {
+  /** Reads one bounded grant batch and aborts any in-flight database work when signalled. */
+  readonly findManyByJti: (
+    grantJtis: readonly string[],
+    options: {
+      readonly signal: AbortSignal;
+      readonly timeoutMs: number;
+    },
+  ) => Promise<readonly AuthGrantRecord[]>;
+}
+
 /** Narrow grant-audit reads. Lifecycle writes are transaction-owning operations. */
 export interface AuthGrantAuditStore {
   /** Lists a bounded number of events for one grant. */
@@ -164,7 +176,7 @@ export interface AuthPersistenceStores {
   readonly audits: AuthGrantAuditStore;
   /** Atomically inserts a grant and its required creation audit. */
   readonly createGrantWithAudit: (input: CreateAuthGrantWithAuditInput) => Promise<void>;
-  readonly grants: AuthGrantStore;
+  readonly grants: AuthGrantRevocationStore & AuthGrantStore;
   /** Atomically and idempotently revokes a grant and appends its required audit. */
   readonly revokeGrantWithAudit: (
     input: RevokeAuthGrantWithAuditInput,

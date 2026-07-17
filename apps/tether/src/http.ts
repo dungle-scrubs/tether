@@ -14,6 +14,11 @@ import {
   authRuntimeOptionsFromConfig,
   createAuthRuntime,
 } from "./auth/enforcement.js";
+import {
+  AuthGrantRevocationRuntime,
+  type AuthGrantRevocationDebugInfo,
+} from "./auth/grant-revocation-runtime.js";
+import { AuthSocketRegistry, type AuthSocketRegistryDebugInfo } from "./auth/socket-registry.js";
 import type { AuthContext } from "./auth/token.js";
 import { createAuthTicketLifecycle, type AuthTicketLifecycle } from "./auth/ticket-lifecycle.js";
 import { ServerConfigService } from "./config.js";
@@ -94,6 +99,10 @@ export interface AppServer {
 export interface AppServerDebugInfo {
   /** Authentication mode and accepted key diagnostics, without secrets. */
   readonly auth: AuthRuntimeDebugInfo;
+  /** Cross-replica parent-grant revocation propagation diagnostics. */
+  readonly authRevocation: AuthGrantRevocationDebugInfo;
+  /** Process-local authenticated socket counts and timer ownership. */
+  readonly authSockets: AuthSocketRegistryDebugInfo;
   /** Cross-replica event fanout listener and catch-up diagnostics. */
   readonly eventFanout: SessionEventFanoutDebugInfo;
   /** Process-local Host-presence stream diagnostics. */
@@ -118,6 +127,12 @@ export interface AppServerDebugInfo {
 export interface AppServerOptions {
   /** Authentication configuration for direct app-server construction. */
   readonly auth?: AuthRuntimeOptions;
+  /** Parent-grant notification and bounded polling configuration. */
+  readonly authRevocation?: {
+    readonly listenEnabled?: boolean;
+    readonly pollBatchLimit?: number;
+    readonly pollIntervalMs?: number;
+  };
   /** Cross-replica event fanout listener configuration. */
   readonly eventFanout?: {
     readonly catchUpPollIntervalMs?: number;
@@ -250,10 +265,18 @@ export function createAppServerWithSessionService(
     secrets: {},
   };
   const authPersistenceStores = createAuthPersistenceStores(pool);
+  const authGrantStore = authOptions.grantStore ?? authPersistenceStores.grants;
   const auth = createAuthRuntime({
     ...authOptions,
-    grantStore: authOptions.grantStore ?? authPersistenceStores.grants,
+    grantStore: authGrantStore,
     ticketStore: authOptions.ticketStore ?? authPersistenceStores.tickets,
+  });
+  const authSocketRegistry = new AuthSocketRegistry();
+  const authRevocation = new AuthGrantRevocationRuntime({
+    database: pool,
+    ...(options.authRevocation ?? {}),
+    registry: authSocketRegistry,
+    store: authPersistenceStores.grants,
   });
   const authGrantLifecycle = createAuthGrantLifecycle({
     activeKid: authOptions.activeKid,
@@ -271,6 +294,8 @@ export function createAppServerWithSessionService(
    */
   const readDebugInfo = (): AppServerDebugInfo => ({
     auth: auth.debugInfo(),
+    authRevocation: authRevocation.debugInfo(),
+    authSockets: authSocketRegistry.debugInfo(),
     eventFanout: eventFanout.debugInfo(),
     hostPresence: hostPresence.debugInfo(),
     hub: hub.debugInfo(),
@@ -323,6 +348,7 @@ export function createAppServerWithSessionService(
   );
   const wsServer = createParticipantWebSocketGateway({
     auth,
+    authSocketRegistry,
     hostPresence,
     hub,
     replicaId,
@@ -335,6 +361,7 @@ export function createAppServerWithSessionService(
     close: async () => {
       await taskClaimSweeper.stop();
       await eventFanout.stop();
+      await authRevocation.stop();
       auth.close();
       await new Promise<void>((resolve, reject) => {
         wsServer.close((wsError) => {
@@ -354,6 +381,7 @@ export function createAppServerWithSessionService(
     },
     debugInfo: readDebugInfo,
     listen: async (port) => {
+      await authRevocation.start();
       await eventFanout.start();
       await new Promise<void>((resolve) => {
         server.listen(port, resolve);

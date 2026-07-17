@@ -16,6 +16,7 @@ import {
   type AuthenticatedWebSocketAuth,
   type AuthRuntime,
 } from "./auth/enforcement.js";
+import type { AuthSocketRegistry, AuthSocketStreamKind } from "./auth/socket-registry.js";
 import type { AuthContext } from "./auth/token.js";
 import { sleepUnrefEffect } from "./effect-runtime.js";
 import { broadcastEvents, controlLeaseConflictError } from "./http-route-runtime.js";
@@ -60,6 +61,7 @@ import { findClientWebSocketCommandSpec } from "./websocket-command-spec.js";
 
 interface ParticipantWebSocketGatewayInput {
   readonly auth: AuthRuntime;
+  readonly authSocketRegistry: AuthSocketRegistry;
   readonly hostPresence: HostPresenceRuntime;
   readonly hub: SubscriptionHub;
   readonly replicaId: string;
@@ -195,6 +197,7 @@ export function createParticipantWebSocketGateway(
     void handleParticipantWebSocketUpgrade({
       head,
       auth: input.auth,
+      authSocketRegistry: input.authSocketRegistry,
       controlSocketRegistry,
       hub: input.hub,
       hostPresence: input.hostPresence,
@@ -218,6 +221,7 @@ export function createParticipantWebSocketGateway(
 
 interface ParticipantWebSocketUpgradeInput {
   readonly auth: AuthRuntime;
+  readonly authSocketRegistry: AuthSocketRegistry;
   readonly controlSocketRegistry: ControlSocketRegistry;
   readonly head: Buffer;
   readonly hostPresence: HostPresenceRuntime;
@@ -274,6 +278,7 @@ async function handleParticipantWebSocketUpgrade(
         webSocket,
         input.hostPresence,
         input.controlSocketRegistry,
+        input.authSocketRegistry,
       ),
     ).catch((error: unknown) => {
       console.error(error);
@@ -304,6 +309,7 @@ function handleWebSocket(
   socket: WebSocket,
   hostPresence: HostPresenceRuntime,
   controlSocketRegistry: ControlSocketRegistry,
+  authSocketRegistry: AuthSocketRegistry,
 ): Effect.Effect<void, unknown> {
   return Effect.gen(function* () {
     const authContext = authenticated.context;
@@ -323,6 +329,20 @@ function handleWebSocket(
       return;
     }
     const hostPresenceStream = classifyHostPresenceStream(searchParams.get("runtimeKind"));
+    const authStreamKind: AuthSocketStreamKind = hostPresenceStream ?? "participant";
+    const unregisterAuthSocket = authContext
+      ? authSocketRegistry.register({
+          context: authContext,
+          socket,
+          streamKind: authStreamKind,
+        })
+      : null;
+    if (unregisterAuthSocket !== null) {
+      socket.once("close", unregisterAuthSocket);
+    }
+    if (socket.readyState !== socket.OPEN) {
+      return;
+    }
     if (hostPresenceStream) {
       yield* handleHostPresenceWebSocket({
         hub,

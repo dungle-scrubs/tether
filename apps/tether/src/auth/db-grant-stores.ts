@@ -1,14 +1,20 @@
 import { and, asc, desc, eq, gt, isNull, sql } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
+import type { PoolClient, QueryConfig } from "pg";
 
 import type { DatabasePool } from "../db.js";
 import type * as schema from "../schema.js";
 import { authGrantAuditEvents, authGrants, authTickets } from "../schema.js";
+import {
+  authGrantRevocationNotificationChannel,
+  serializeAuthGrantRevocationNotification,
+} from "./grant-revocation-runtime.js";
 import type {
   AuthGrantAuditMetadata,
   AuthGrantAuditRecord,
   AuthGrantMetadata,
   AuthGrantRecord,
+  AuthGrantRevocationStore,
   AuthGrantStore,
   AuthPersistenceStores,
   AuthTicketAdmissionMetadata,
@@ -37,7 +43,7 @@ export function createAuthPersistenceStores(database: DatabasePool): AuthPersist
   return {
     audits: createAuditStore(database.db),
     createGrantWithAudit: (input) => createGrantWithAudit(database, input),
-    grants: createGrantStore(database.db),
+    grants: createGrantStore(database),
     revokeGrantWithAudit: (input) => revokeGrantWithAudit(database, input),
     tickets: createTicketStore(database.db),
   };
@@ -83,6 +89,12 @@ async function revokeGrantWithAudit(
             ...input.audit,
             grantJti: input.jti,
           });
+          await transaction.execute(
+            sql`SELECT pg_notify(
+              ${authGrantRevocationNotificationChannel},
+              ${serializeAuthGrantRevocationNotification(input.jti)}
+            )`,
+          );
           return { grant: parseGrantRecord(revokedGrant), status: "revoked" };
         }
         const existing = await transaction
@@ -103,11 +115,14 @@ async function revokeGrantWithAudit(
 }
 
 /** Creates the durable-grant read adapter. */
-function createGrantStore(database: AuthStoreDatabase): AuthGrantStore {
+function createGrantStore(database: DatabasePool): AuthGrantRevocationStore & AuthGrantStore {
+  const revocationConnections = createRevocationConnectionOwner(database);
   return {
+    findManyByJti: (grantJtis, options) =>
+      findManyGrantsByJti(revocationConnections, grantJtis, options),
     findByJti: async (jti) => {
       const rows = await runAuthStoreOperation(
-        () => database.select().from(authGrants).where(eq(authGrants.jti, jti)).limit(1),
+        () => database.db.select().from(authGrants).where(eq(authGrants.jti, jti)).limit(1),
         "auth_grant_read_failed",
       );
       const row = rows[0];
@@ -119,7 +134,7 @@ function createGrantStore(database: AuthStoreDatabase): AuthGrantStore {
       }
       const rows = await runAuthStoreOperation(
         () =>
-          database
+          database.db
             .select()
             .from(authGrants)
             .orderBy(desc(authGrants.issuedAt), desc(authGrants.jti))
@@ -127,6 +142,134 @@ function createGrantStore(database: AuthStoreDatabase): AuthGrantStore {
         "auth_grant_list_failed",
       );
       return rows.map(parseGrantRecord);
+    },
+  };
+}
+
+/** Runs one cancellation-aware grant batch read on a disposable pool client. */
+async function findManyGrantsByJti(
+  connections: RevocationConnectionOwner,
+  grantJtis: readonly string[],
+  options: { readonly signal: AbortSignal; readonly timeoutMs: number },
+): Promise<readonly AuthGrantRecord[]> {
+  if (grantJtis.length === 0) {
+    return [];
+  }
+  let client: PoolClient | null = null;
+  let released = false;
+  const release = (destroy: boolean): void => {
+    if (client === null || released) {
+      return;
+    }
+    released = true;
+    client.release(destroy);
+  };
+  const abort = (): void => release(true);
+  try {
+    if (options.signal.aborted) {
+      throw new AuthPersistenceError("auth_grant_read_failed");
+    }
+    client = await connections.acquire(options.signal);
+    if (options.signal.aborted) {
+      release(true);
+      throw new AuthPersistenceError("auth_grant_read_failed");
+    }
+    options.signal.addEventListener("abort", abort, { once: true });
+    const query: QueryConfig<string[][]> & { readonly query_timeout: number } = {
+      name: "auth-grants-revocation-batch",
+      query_timeout: options.timeoutMs,
+      text: `
+        SELECT
+          audience,
+          expires_at AS "expiresAt",
+          issued_at AS "issuedAt",
+          issuer,
+          jti,
+          kid,
+          metadata,
+          revoked_at AS "revokedAt",
+          role,
+          session_scope AS "sessionScope",
+          subject
+        FROM auth_grants
+        WHERE jti = ANY($1::text[])
+      `,
+      values: [[...grantJtis]],
+    };
+    const result = await client.query<typeof authGrants.$inferSelect, string[][]>(query);
+    return result.rows.map(parseGrantRecord);
+  } catch (error) {
+    release(true);
+    if (error instanceof AuthPersistenceError) {
+      throw error;
+    }
+    throw new AuthPersistenceError("auth_grant_read_failed");
+  } finally {
+    options.signal.removeEventListener("abort", abort);
+    release(false);
+  }
+}
+
+interface RevocationConnectionOwner {
+  readonly acquire: (signal: AbortSignal) => Promise<PoolClient>;
+}
+
+interface PendingRevocationConnection {
+  discard: boolean;
+  readonly promise: Promise<PoolClient>;
+}
+
+/** Owns at most one unresolved pool waiter and destroys it after cancellation. */
+function createRevocationConnectionOwner(database: DatabasePool): RevocationConnectionOwner {
+  let pending: PendingRevocationConnection | null = null;
+  return {
+    acquire: async (signal) => {
+      if (pending !== null || signal.aborted) {
+        throw new AuthPersistenceError("auth_grant_read_failed");
+      }
+      const acquisition: PendingRevocationConnection = {
+        discard: false,
+        promise: database.pool.connect(),
+      };
+      pending = acquisition;
+      let removeAbortListener = (): void => undefined;
+      const aborted = new Promise<never>((_resolve, reject) => {
+        const abort = (): void => {
+          acquisition.discard = true;
+          reject(new AuthPersistenceError("auth_grant_read_failed"));
+        };
+        signal.addEventListener("abort", abort, { once: true });
+        removeAbortListener = () => signal.removeEventListener("abort", abort);
+        if (signal.aborted) {
+          abort();
+        }
+      });
+      try {
+        const client = await Promise.race([acquisition.promise, aborted]);
+        if (acquisition.discard || signal.aborted) {
+          throw new AuthPersistenceError("auth_grant_read_failed");
+        }
+        pending = null;
+        return client;
+      } catch (error) {
+        if (acquisition.discard || signal.aborted) {
+          void acquisition.promise
+            .then(
+              (lateClient) => lateClient.release(true),
+              () => undefined,
+            )
+            .finally(() => {
+              if (pending === acquisition) {
+                pending = null;
+              }
+            });
+        } else if (pending === acquisition) {
+          pending = null;
+        }
+        throw error;
+      } finally {
+        removeAbortListener();
+      }
     },
   };
 }
