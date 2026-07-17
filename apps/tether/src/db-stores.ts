@@ -301,6 +301,7 @@ class DbTaskStore implements TaskStore {
   }
 
   completeWithEvent(input: {
+    readonly claimId: string;
     readonly controlGuard?: ControlEpochGuard | undefined;
     readonly eventSourceId: string;
     readonly participantId: string;
@@ -337,6 +338,7 @@ class DbTaskStore implements TaskStore {
   }
 
   failWithEvent(input: {
+    readonly claimId: string;
     readonly controlGuard?: ControlEpochGuard | undefined;
     readonly eventSourceId: string;
     readonly failure: Record<string, unknown>;
@@ -360,6 +362,7 @@ class DbTaskStore implements TaskStore {
   }
 
   refreshClaim(input: {
+    readonly claimId: string;
     readonly claimLeaseTtlMs: number;
     readonly controlGuard?: ControlEpochGuard | undefined;
     readonly participantId: string;
@@ -370,6 +373,7 @@ class DbTaskStore implements TaskStore {
   }
 
   releaseWithEvent(input: {
+    readonly claimId: string;
     readonly controlGuard?: ControlEpochGuard | undefined;
     readonly eventSourceId: string;
     readonly participantId: string;

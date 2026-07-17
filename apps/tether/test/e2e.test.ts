@@ -52,6 +52,7 @@ import {
   createPool,
   createTaskWithEvent,
   expireTaskClaims,
+  failTaskWithEvent,
   getTask,
   listContextEventSuffix,
   listEvents,
@@ -59,7 +60,10 @@ import {
   listTaskApprovals,
   migrate,
   recordTaskApproval,
+  refreshTaskClaim,
   releaseControlLease,
+  releaseTaskWithEvent,
+  taskClaimLockQuery,
   upsertClientSessionBinding,
   upsertParticipant,
   upsertParticipantWithEvent,
@@ -151,6 +155,7 @@ const generatedMigrationNames = [
   "0014_flippant_caretaker.sql",
   "0015_conscious_toad.sql",
   "0016_daffy_surge.sql",
+  "0017_skinny_lockheed.sql",
 ] as const;
 
 interface JsonResponse {
@@ -261,6 +266,7 @@ interface TaskResponse extends JsonResponse {
     readonly claimExpiredAt: string | null;
     readonly claimExpiredBy: string | null;
     readonly claimExpiresAt: string | null;
+    readonly claimId: string | null;
     readonly claimedAt: string | null;
     readonly claimedBy: string | null;
     readonly completedAt: string | null;
@@ -281,6 +287,14 @@ interface TaskResponse extends JsonResponse {
 interface PublishedEventResponse extends JsonResponse {
   readonly event: SessionEvent;
   readonly status?: "created" | "replayed";
+}
+
+/** Narrows a claimed task's server-issued claim id to a required string. */
+function requireClaimId(task: { readonly claimId: string | null }): string {
+  if (task.claimId === null) {
+    throw new Error("Expected a server-issued claim id on a claimed task");
+  }
+  return task.claimId;
 }
 
 interface TaskApprovalResponse extends JsonResponse {
@@ -1523,7 +1537,7 @@ e2e("tether e2e", () => {
     const database = createPool(buildDatabaseUrl(databaseName));
     try {
       await createDatabase(databaseName);
-      await applyLegacyMigrationPrefix(database, generatedMigrationNames.length - 1);
+      await applyLegacyMigrationPrefix(database, generatedMigrationNames.length - 2);
       await database.pool.query(`
         ALTER TABLE auth_grants DROP CONSTRAINT auth_grants_lifetime_check;
         ALTER TABLE auth_grants ADD CONSTRAINT auth_grants_lifetime_check
@@ -1533,7 +1547,7 @@ e2e("tether e2e", () => {
       await expect(migrate(database)).rejects.toMatchObject({
         name: "DatabaseMigrationError",
         reason: "unsupported_schema",
-        recognizedPrefix: generatedMigrationNames.length - 2,
+        recognizedPrefix: generatedMigrationNames.length - 3,
       });
 
       const journal = await database.pool.query<{ readonly count: number }>(
@@ -1551,13 +1565,13 @@ e2e("tether e2e", () => {
     const database = createPool(buildDatabaseUrl(databaseName));
     try {
       await createDatabase(databaseName);
-      await applyLegacyMigrationPrefix(database, generatedMigrationNames.length - 2);
+      await applyLegacyMigrationPrefix(database, generatedMigrationNames.length - 3);
       await database.pool.query(`CREATE TABLE auth_grants (jti text PRIMARY KEY NOT NULL)`);
 
       await expect(migrate(database)).rejects.toMatchObject({
         name: "DatabaseMigrationError",
         reason: "unsupported_schema",
-        recognizedPrefix: generatedMigrationNames.length - 2,
+        recognizedPrefix: generatedMigrationNames.length - 3,
       });
 
       const journal = await database.pool.query<{ readonly count: number }>(
@@ -1623,13 +1637,13 @@ e2e("tether e2e", () => {
     const database = createPool(buildDatabaseUrl(databaseName));
     try {
       await createDatabase(databaseName);
-      await applyLegacyMigrationPrefix(database, generatedMigrationNames.length - 1);
+      await applyLegacyMigrationPrefix(database, generatedMigrationNames.length - 2);
       await database.pool.query(mutationSql);
 
       await expect(migrate(database)).rejects.toMatchObject({
         name: "DatabaseMigrationError",
         reason: "unsupported_schema",
-        recognizedPrefix: generatedMigrationNames.length - 2,
+        recognizedPrefix: generatedMigrationNames.length - 3,
       });
       const journal = await database.pool.query<{ readonly count: number }>(
         `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
@@ -5153,14 +5167,18 @@ e2e("tether e2e", () => {
       method: "POST",
     });
 
-    await request(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`, {
-      body: { instanceId: "inst_codex_e2e", participantId: "part_codex_e2e" },
-      method: "POST",
-    });
+    const claimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`,
+      {
+        body: { instanceId: "inst_codex_e2e", participantId: "part_codex_e2e" },
+        method: "POST",
+      },
+    );
     const completion = await request<TaskResponse>(
       `/sessions/${session.sessionId}/tasks/${task.task.taskId}/complete`,
       {
         body: {
+          claimId: claimed.task.claimId,
           instanceId: "inst_codex_e2e",
           participantId: "part_codex_e2e",
           result: { summary: "done" },
@@ -5656,7 +5674,7 @@ e2e("tether e2e", () => {
             mutationBaseUrl,
             `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim/refresh`,
             {
-              body: { controlEpoch, instanceId, participantId },
+              body: { claimId: claimed.task.claimId, controlEpoch, instanceId, participantId },
               method: "POST",
             },
           );
@@ -5759,7 +5777,7 @@ e2e("tether e2e", () => {
           mutationBaseUrl,
           `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim/refresh`,
           {
-            body: { controlEpoch, instanceId, participantId },
+            body: { claimId: claimed.task.claimId, controlEpoch, instanceId, participantId },
             method: "POST",
           },
         );
@@ -6294,7 +6312,7 @@ e2e("tether e2e", () => {
     const completion = await request<TaskResponse>(
       `/sessions/${sessionId}/tasks/${completed.task.taskId}/complete`,
       {
-        body: { ...controller, result: { summary: "done" } },
+        body: { ...controller, claimId: completed.task.claimId, result: { summary: "done" } },
         method: "POST",
       },
     );
@@ -6302,7 +6320,7 @@ e2e("tether e2e", () => {
     const failure = await request<TaskResponse>(
       `/sessions/${sessionId}/tasks/${failed.task.taskId}/fail`,
       {
-        body: { ...controller, failure: { reason: "expected" } },
+        body: { ...controller, claimId: failed.task.claimId, failure: { reason: "expected" } },
         method: "POST",
       },
     );
@@ -6310,7 +6328,7 @@ e2e("tether e2e", () => {
     const release = await request<TaskResponse>(
       `/sessions/${sessionId}/tasks/${released.task.taskId}/release`,
       {
-        body: controller,
+        body: { ...controller, claimId: released.task.claimId },
         method: "POST",
       },
     );
@@ -6413,7 +6431,7 @@ e2e("tether e2e", () => {
       await request<TaskResponse>(
         `/sessions/${session.sessionId}/tasks/${claimed.task.taskId}/release`,
         {
-          body: controller,
+          body: { ...controller, claimId: claimed.task.claimId },
           method: "POST",
         },
       );
@@ -6481,14 +6499,18 @@ e2e("tether e2e", () => {
       sessionId: session.sessionId,
       taskId,
     });
-    await request(`/sessions/${session.sessionId}/tasks/${taskId}/claim`, {
-      body: { instanceId: "inst_retryable", participantId: "part_retryable" },
-      method: "POST",
-    });
+    const claimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${taskId}/claim`,
+      {
+        body: { instanceId: "inst_retryable", participantId: "part_retryable" },
+        method: "POST",
+      },
+    );
     const failingDatabase = await createEventInsertFailingDatabase(currentPool());
 
     await expect(
       completeTaskWithEvent(failingDatabase, {
+        claimId: requireClaimId(claimed.task),
         eventSourceId: "src_e2e_atomicity",
         participantId: "part_retryable",
         result: { summary: "rolled back" },
@@ -6505,6 +6527,7 @@ e2e("tether e2e", () => {
     await expect(
       request<TaskResponse>(`/sessions/${session.sessionId}/tasks/${taskId}/complete`, {
         body: {
+          claimId: claimed.task.claimId,
           instanceId: "inst_retryable",
           participantId: "part_retryable",
           result: { summary: "retried" },
@@ -6526,14 +6549,21 @@ e2e("tether e2e", () => {
       body: { kind: "software_dev", objective: "race terminal transitions" },
       method: "POST",
     });
-    await request(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`, {
-      body: controller,
-      method: "POST",
-    });
+    const claimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`,
+      {
+        body: controller,
+        method: "POST",
+      },
+    );
 
     const [completeResult, cancelResult] = await Promise.allSettled([
       request<TaskResponse>(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/complete`, {
-        body: { ...controller, result: { summary: "completed first" } },
+        body: {
+          ...controller,
+          claimId: claimed.task.claimId,
+          result: { summary: "completed first" },
+        },
         method: "POST",
       }),
       request<TaskResponse>(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/cancel`, {
@@ -6597,17 +6627,21 @@ e2e("tether e2e", () => {
       },
       method: "POST",
     });
-    await request(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`, {
-      body: {
-        instanceId: "inst_generic_agent_e2e",
-        participantId: "part_generic_agent_e2e",
+    const claimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`,
+      {
+        body: {
+          instanceId: "inst_generic_agent_e2e",
+          participantId: "part_generic_agent_e2e",
+        },
+        method: "POST",
       },
-      method: "POST",
-    });
+    );
     await request<TaskResponse>(
       `/sessions/${session.sessionId}/tasks/${task.task.taskId}/complete`,
       {
         body: {
+          claimId: claimed.task.claimId,
           instanceId: "inst_generic_agent_e2e",
           participantId: "part_generic_agent_e2e",
           result: createGenericApprovalResult(),
@@ -6701,17 +6735,21 @@ e2e("tether e2e", () => {
       },
       method: "POST",
     });
-    await request(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`, {
-      body: {
-        instanceId: "inst_generic_agent_e2e",
-        participantId: "part_generic_agent_e2e",
+    const claimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`,
+      {
+        body: {
+          instanceId: "inst_generic_agent_e2e",
+          participantId: "part_generic_agent_e2e",
+        },
+        method: "POST",
       },
-      method: "POST",
-    });
+    );
     await request<TaskResponse>(
       `/sessions/${session.sessionId}/tasks/${task.task.taskId}/complete`,
       {
         body: {
+          claimId: claimed.task.claimId,
           instanceId: "inst_generic_agent_e2e",
           participantId: "part_generic_agent_e2e",
           result: {
@@ -6954,17 +6992,21 @@ e2e("tether e2e", () => {
       },
       method: "POST",
     });
-    await request(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`, {
-      body: {
-        instanceId: "inst_approval_target_e2e",
-        participantId: "part_approval_target_e2e",
+    const claimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`,
+      {
+        body: {
+          instanceId: "inst_approval_target_e2e",
+          participantId: "part_approval_target_e2e",
+        },
+        method: "POST",
       },
-      method: "POST",
-    });
+    );
     await request<TaskResponse>(
       `/sessions/${session.sessionId}/tasks/${task.task.taskId}/complete`,
       {
         body: {
+          claimId: claimed.task.claimId,
           instanceId: "inst_approval_target_e2e",
           participantId: "part_approval_target_e2e",
           result: {
@@ -7074,17 +7116,21 @@ e2e("tether e2e", () => {
       body: { kind: "software_dev", objective: "generic approval" },
       method: "POST",
     });
-    await request(`/sessions/${session.sessionId}/tasks/${unsupportedTask.task.taskId}/claim`, {
-      body: {
-        instanceId: "inst_software_invalid_e2e",
-        participantId: "part_software_invalid_e2e",
+    const unsupportedClaimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${unsupportedTask.task.taskId}/claim`,
+      {
+        body: {
+          instanceId: "inst_software_invalid_e2e",
+          participantId: "part_software_invalid_e2e",
+        },
+        method: "POST",
       },
-      method: "POST",
-    });
+    );
     await request<TaskResponse>(
       `/sessions/${session.sessionId}/tasks/${unsupportedTask.task.taskId}/complete`,
       {
         body: {
+          claimId: unsupportedClaimed.task.claimId,
           instanceId: "inst_software_invalid_e2e",
           participantId: "part_software_invalid_e2e",
           result: { dryRun: true, organizationRecommendations: [] },
@@ -7099,17 +7145,21 @@ e2e("tether e2e", () => {
       },
       method: "POST",
     });
-    await request(`/sessions/${session.sessionId}/tasks/${invalidPlanTask.task.taskId}/claim`, {
-      body: {
-        instanceId: "inst_email_invalid_e2e",
-        participantId: "part_email_invalid_e2e",
+    const invalidPlanClaimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${invalidPlanTask.task.taskId}/claim`,
+      {
+        body: {
+          instanceId: "inst_email_invalid_e2e",
+          participantId: "part_email_invalid_e2e",
+        },
+        method: "POST",
       },
-      method: "POST",
-    });
+    );
     await request<TaskResponse>(
       `/sessions/${session.sessionId}/tasks/${invalidPlanTask.task.taskId}/complete`,
       {
         body: {
+          claimId: invalidPlanClaimed.task.claimId,
           instanceId: "inst_email_invalid_e2e",
           participantId: "part_email_invalid_e2e",
           result: { dryRun: true, organizationRecommendations: [] },
@@ -7180,7 +7230,7 @@ e2e("tether e2e", () => {
           method: "POST",
         },
       );
-      await requestFrom(
+      const claimed = await requestFrom<TaskResponse>(
         unvalidatedOrigin,
         `/sessions/${sessionId}/tasks/${task.task.taskId}/claim`,
         {
@@ -7196,6 +7246,7 @@ e2e("tether e2e", () => {
         `/sessions/${sessionId}/tasks/${task.task.taskId}/complete`,
         {
           body: {
+            claimId: claimed.task.claimId,
             instanceId: "inst_email_unvalidated_e2e",
             participantId: "part_email_unvalidated_e2e",
             result: {
@@ -7255,15 +7306,19 @@ e2e("tether e2e", () => {
       method: "POST",
     });
 
-    await request(`/sessions/${session.sessionId}/tasks/${completedTask.task.taskId}/claim`, {
-      body: {
-        instanceId: "inst_codex_filter_e2e",
-        participantId: "part_codex_filter_e2e",
+    const filterClaimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${completedTask.task.taskId}/claim`,
+      {
+        body: {
+          instanceId: "inst_codex_filter_e2e",
+          participantId: "part_codex_filter_e2e",
+        },
+        method: "POST",
       },
-      method: "POST",
-    });
+    );
     await request(`/sessions/${session.sessionId}/tasks/${completedTask.task.taskId}/complete`, {
       body: {
+        claimId: filterClaimed.task.claimId,
         instanceId: "inst_codex_filter_e2e",
         participantId: "part_codex_filter_e2e",
         result: { summary: "done" },
@@ -7668,15 +7723,19 @@ e2e("tether e2e", () => {
       body: { kind: "generic_status", objective: "status" },
       method: "POST",
     });
-    await request(`/sessions/${session.sessionId}/tasks/${terminalTask.task.taskId}/claim`, {
-      body: {
-        instanceId: "inst_context_generic_e2e",
-        participantId: "part_context_generic_e2e",
+    const terminalClaimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${terminalTask.task.taskId}/claim`,
+      {
+        body: {
+          instanceId: "inst_context_generic_e2e",
+          participantId: "part_context_generic_e2e",
+        },
+        method: "POST",
       },
-      method: "POST",
-    });
+    );
     await request(`/sessions/${session.sessionId}/tasks/${terminalTask.task.taskId}/complete`, {
       body: {
+        claimId: terminalClaimed.task.claimId,
         instanceId: "inst_context_generic_e2e",
         participantId: "part_context_generic_e2e",
         result: { kind: "generic_status", readOnly: true },
@@ -8582,19 +8641,23 @@ e2e("tether e2e", () => {
     expect(unclaimedSnapshot?.status).toBe("unclaimed");
     expect(eventsAfterDebug.events).toHaveLength(eventsBeforeDebug.events.length);
 
-    await request(`/sessions/${session.sessionId}/tasks/${releasedTask.task.taskId}/claim`, {
-      body: {
-        instanceId: "inst_task_snapshot",
-        participantId: "part_task_snapshot",
+    const releasedClaimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${releasedTask.task.taskId}/claim`,
+      {
+        body: {
+          instanceId: "inst_task_snapshot",
+          participantId: "part_task_snapshot",
+        },
+        method: "POST",
       },
-      method: "POST",
-    });
+    );
     snapshots = await request<TaskSnapshotsResponse>(`/sessions/${session.sessionId}/debug/tasks`);
     const activeSnapshot = snapshots.tasks.find((task) => task.taskId === releasedTask.task.taskId);
     expect(activeSnapshot?.status).toBe("claim_active");
 
     await request(`/sessions/${session.sessionId}/tasks/${releasedTask.task.taskId}/release`, {
       body: {
+        claimId: releasedClaimed.task.claimId,
         instanceId: "inst_task_snapshot",
         participantId: "part_task_snapshot",
       },
@@ -8611,15 +8674,19 @@ e2e("tether e2e", () => {
       body: { kind: "software_dev", objective: "Complete this task" },
       method: "POST",
     });
-    await request(`/sessions/${session.sessionId}/tasks/${completedTask.task.taskId}/claim`, {
-      body: {
-        instanceId: "inst_task_snapshot",
-        participantId: "part_task_snapshot",
+    const completedClaimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${completedTask.task.taskId}/claim`,
+      {
+        body: {
+          instanceId: "inst_task_snapshot",
+          participantId: "part_task_snapshot",
+        },
+        method: "POST",
       },
-      method: "POST",
-    });
+    );
     await request(`/sessions/${session.sessionId}/tasks/${completedTask.task.taskId}/complete`, {
       body: {
+        claimId: completedClaimed.task.claimId,
         instanceId: "inst_task_snapshot",
         participantId: "part_task_snapshot",
         result: { summary: "complete" },
@@ -8683,20 +8750,27 @@ e2e("tether e2e", () => {
       body: { kind: "software_dev", objective: "Keep this task claimed" },
       method: "POST",
     });
-    await request(`/sessions/${session.sessionId}/tasks/${activeTask.task.taskId}/claim`, {
-      body: { instanceId: "inst_summary", participantId: "part_summary" },
-      method: "POST",
-    });
+    const activeClaimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${activeTask.task.taskId}/claim`,
+      {
+        body: { instanceId: "inst_summary", participantId: "part_summary" },
+        method: "POST",
+      },
+    );
     const completedTask = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
       body: { kind: "software_dev", objective: "Complete this summary task" },
       method: "POST",
     });
-    await request(`/sessions/${session.sessionId}/tasks/${completedTask.task.taskId}/claim`, {
-      body: { instanceId: "inst_summary", participantId: "part_summary" },
-      method: "POST",
-    });
+    const summaryCompletedClaimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${completedTask.task.taskId}/claim`,
+      {
+        body: { instanceId: "inst_summary", participantId: "part_summary" },
+        method: "POST",
+      },
+    );
     await request(`/sessions/${session.sessionId}/tasks/${completedTask.task.taskId}/complete`, {
       body: {
+        claimId: summaryCompletedClaimed.task.claimId,
         instanceId: "inst_summary",
         participantId: "part_summary",
         result: { summary: "complete" },
@@ -8704,7 +8778,11 @@ e2e("tether e2e", () => {
       method: "POST",
     });
     await request(`/sessions/${session.sessionId}/tasks/${activeTask.task.taskId}/claim/refresh`, {
-      body: { instanceId: "inst_summary", participantId: "part_summary" },
+      body: {
+        claimId: activeClaimed.task.claimId,
+        instanceId: "inst_summary",
+        participantId: "part_summary",
+      },
       method: "POST",
     });
     const eventsBeforeDebug = await request<EventsResponse>(
@@ -8891,6 +8969,7 @@ e2e("tether e2e", () => {
     await expect(
       request(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/complete`, {
         body: {
+          claimId: firstClaim.task.claimId,
           instanceId: "inst_first_claimant",
           participantId: "part_first_claimant",
           result: { summary: "too late" },
@@ -8920,6 +8999,458 @@ e2e("tether e2e", () => {
       "part_first_claimant",
       secondClaim.task.sessionId,
     );
+  });
+
+  // Milestone M4 (RFC D-008/D-009): a claim attempt on an ELAPSED claim atomically
+  // expires and re-claims the task in one transaction, so the task never waits for
+  // the background sweeper. These tests run on an isolated database with NO
+  // background sweeper, so every reclaim is exercised deterministically.
+  describe("atomic on-demand reclaim", () => {
+    const reclaimDatabaseName = `tether_e2e_reclaim_${randomUUID().replaceAll("-", "_")}`;
+    let reclaimPool: DatabasePool | null = null;
+
+    beforeAll(async () => {
+      await createDatabase(reclaimDatabaseName);
+      reclaimPool = createPool(buildDatabaseUrl(reclaimDatabaseName));
+      await migrate(reclaimPool);
+    }, 30_000);
+
+    afterAll(async () => {
+      await reclaimPool?.end();
+      await dropDatabase(reclaimDatabaseName);
+    }, 30_000);
+
+    /** Returns the isolated, sweeper-free reclaim database pool. */
+    function pool(): DatabasePool {
+      if (reclaimPool === null) {
+        throw new Error("Reclaim database pool is not initialized");
+      }
+      return reclaimPool;
+    }
+
+    /** Forces one live claim to elapse relative to the database clock. */
+    async function elapseClaim(sessionId: string, taskId: string): Promise<void> {
+      await pool().pool.query(
+        `
+          UPDATE tasks
+          SET claim_expires_at = now() - interval '1 second'
+          WHERE session_id = $1 AND task_id = $2
+        `,
+        [sessionId, taskId],
+      );
+    }
+
+    /** Counts committed events of one type for a single task. */
+    async function countTaskEvents(
+      sessionId: string,
+      taskId: string,
+      type: SessionEvent["type"],
+    ): Promise<number> {
+      const events = await listEvents(pool(), sessionId, 0);
+      return events.filter(
+        (event) => event.type === type && taskIdFromEventPayload(event) === taskId,
+      ).length;
+    }
+
+    /** Seeds a task with an initial claim and then elapses that claim's lease. */
+    async function prepareElapsedClaim(suffix: string): Promise<{
+      readonly previousClaimId: string;
+      readonly previousClaimedBy: string;
+      readonly sessionId: string;
+      readonly taskId: string;
+    }> {
+      const sessionId = `sess_reclaim_${suffix}_${randomUUID()}`;
+      const taskId = `task_reclaim_${suffix}_${randomUUID()}`;
+      const previousClaimedBy = `part_prev_${suffix}`;
+      await createDbSession(pool(), sessionId);
+      await createTaskWithEvent(pool(), {
+        eventSourceId: "src_reclaim_setup_e2e",
+        kind: "software_dev",
+        objective: "Reclaim this elapsed claim",
+        sessionId,
+        taskId,
+      });
+      const firstClaim = await claimTaskWithEvent(pool(), {
+        claimLeaseTtlMs: 60_000,
+        eventSourceId: "src_reclaim_setup_e2e",
+        participantId: previousClaimedBy,
+        sessionId,
+        taskId,
+      });
+      const previousClaimId = firstClaim?.task.claimId ?? null;
+      if (firstClaim === null || previousClaimId === null) {
+        throw new Error("Failed to seed the initial claim");
+      }
+      await elapseClaim(sessionId, taskId);
+      return { previousClaimId, previousClaimedBy, sessionId, taskId };
+    }
+
+    it("atomically expires and re-claims an elapsed claim without the sweeper", async () => {
+      const { previousClaimId, previousClaimedBy, sessionId, taskId } =
+        await prepareElapsedClaim("solo");
+      const reclaimer = "part_reclaimer_solo";
+
+      const result = await claimTaskWithEvent(pool(), {
+        claimLeaseTtlMs: 60_000,
+        eventSourceId: "src_reclaim_solo_e2e",
+        participantId: reclaimer,
+        sessionId,
+        taskId,
+      });
+
+      expect(result).not.toBeNull();
+      if (result === null) {
+        throw new Error("Reclaim returned null");
+      }
+      // The reclaim commits an ordered pair: claim_expired (old owner) then
+      // claimed (new owner), with a strictly lower sequence for the expiry.
+      expect(result.events.map((event) => event.type)).toEqual([
+        "task.claim_expired",
+        "task.claimed",
+      ]);
+      const [expiredEvent, claimedEvent] = result.events;
+      expect(expiredEvent?.seq ?? 0).toBeLessThan(claimedEvent?.seq ?? 0);
+      expect(expiredEvent?.payload.previousClaimedBy).toBe(previousClaimedBy);
+      // A fresh server-issued Claim ID replaces the elapsed one.
+      expect(result.task.claimId).not.toBe(previousClaimId);
+      expect(result.task.claimId).not.toBeNull();
+      expect(result.task.claimedBy).toBe(reclaimer);
+      // No sweeper ran, yet the durable event log carries exactly one expiry and
+      // the two claims (initial plus reclaim).
+      expect(await countTaskEvents(sessionId, taskId, "task.claim_expired")).toBe(1);
+      expect(await countTaskEvents(sessionId, taskId, "task.claimed")).toBe(2);
+    });
+
+    it("lets exactly one of two racing claimants reclaim an elapsed task", async () => {
+      const { sessionId, taskId } = await prepareElapsedClaim("race");
+      const coordinator = createPostgresConcurrencyCoordinator(pool(), {
+        actors: ["winner", "loser"],
+        barrierTimeoutMs: 5_000,
+        phases: [
+          {
+            // The winner is held immediately after it has locked the task row via
+            // FOR UPDATE, so the loser must block on the same row. This boundary
+            // runs exactly once per claim, unlike the event-sequence allocator that
+            // a reclaim visits twice.
+            actors: ["winner"],
+            name: "winner-holds-task-lock",
+            position: "after",
+            query: { class: "task-claim-lock", text: taskClaimLockQuery },
+            release: "manual",
+          },
+        ],
+        transactionTimeouts: { lockTimeoutMs: 5_000, statementTimeoutMs: 10_000 },
+      });
+
+      const { loserResult, lockWait, winnerResult } = await coordinator.run(
+        async ({ databaseFor, releasePhase, waitForLockWait, waitForPhase }) => {
+          const winner = claimTaskWithEvent(databaseFor("winner"), {
+            claimLeaseTtlMs: 60_000,
+            eventSourceId: "src_reclaim_winner_e2e",
+            participantId: "part_winner",
+            sessionId,
+            taskId,
+          });
+          await waitForPhase("winner-holds-task-lock");
+          const loser = claimTaskWithEvent(databaseFor("loser"), {
+            claimLeaseTtlMs: 60_000,
+            eventSourceId: "src_reclaim_loser_e2e",
+            participantId: "part_loser",
+            sessionId,
+            taskId,
+          });
+          const lockWait = await waitForLockWait("loser");
+          releasePhase("winner-holds-task-lock");
+          const [winnerResult, loserResult] = await Promise.all([winner, loser]);
+          return { loserResult, lockWait, winnerResult };
+        },
+      );
+
+      // The loser blocked on the task row FOR UPDATE the winner held.
+      expect(lockWait).toMatchObject({ blocked: true, waitEventType: "Lock" });
+      // Exactly one claimant won and performed the atomic reclaim.
+      expect(winnerResult).not.toBeNull();
+      expect(winnerResult?.events.map((event) => event.type)).toEqual([
+        "task.claim_expired",
+        "task.claimed",
+      ]);
+      expect(winnerResult?.task.claimedBy).toBe("part_winner");
+      // The loser observed the fresh live claim and did NOT double-expire it.
+      expect(loserResult).toBeNull();
+      expect(await countTaskEvents(sessionId, taskId, "task.claim_expired")).toBe(1);
+      expect(await countTaskEvents(sessionId, taskId, "task.claimed")).toBe(2);
+      const durable = await getTask(pool(), { sessionId, taskId });
+      expect(durable?.claimedBy).toBe("part_winner");
+      expect(durable?.claimId).toBe(winnerResult?.task.claimId);
+    });
+
+    it("skips a reclaiming claimant's locked task during a concurrent sweep", async () => {
+      const { sessionId, taskId } = await prepareElapsedClaim("sweeper");
+      const coordinator = createPostgresConcurrencyCoordinator(pool(), {
+        actors: ["claimant"],
+        barrierTimeoutMs: 5_000,
+        phases: [
+          {
+            // Hold the claimant right after it locks the task row (once per claim).
+            actors: ["claimant"],
+            name: "claimant-holds-task-lock",
+            position: "after",
+            query: { class: "task-claim-lock", text: taskClaimLockQuery },
+            release: "manual",
+          },
+        ],
+        transactionTimeouts: { lockTimeoutMs: 5_000, statementTimeoutMs: 10_000 },
+      });
+
+      const { claimResult, sweepEvents } = await coordinator.run(
+        async ({ databaseFor, releasePhase, waitForPhase }) => {
+          const claim = claimTaskWithEvent(databaseFor("claimant"), {
+            claimLeaseTtlMs: 60_000,
+            eventSourceId: "src_reclaim_claimant_e2e",
+            participantId: "part_claimant",
+            sessionId,
+            taskId,
+          });
+          await waitForPhase("claimant-holds-task-lock");
+          // The sweeper runs while the claimant holds the task row lock. Its
+          // `FOR UPDATE SKIP LOCKED` skips the locked row rather than deadlocking.
+          const sweepEvents = await expireTaskClaims(pool(), {
+            batchSize: 10,
+            sourceId: "src_reclaim_sweep_e2e",
+          });
+          releasePhase("claimant-holds-task-lock");
+          const claimResult = await claim;
+          return { claimResult, sweepEvents };
+        },
+      );
+
+      // The sweeper skipped the locked task, so it emitted no expiry for it.
+      expect(sweepEvents.filter((event) => taskIdFromEventPayload(event) === taskId)).toHaveLength(
+        0,
+      );
+      // The claimant completed the atomic reclaim after the sweep finished.
+      expect(claimResult?.events.map((event) => event.type)).toEqual([
+        "task.claim_expired",
+        "task.claimed",
+      ]);
+      expect(claimResult?.task.claimedBy).toBe("part_claimant");
+      // No duplicate expiration: exactly one claim_expired for the task.
+      expect(await countTaskEvents(sessionId, taskId, "task.claim_expired")).toBe(1);
+    });
+
+    it("fences stale claim generations after an atomic reclaim", async () => {
+      const { previousClaimId, previousClaimedBy, sessionId, taskId } =
+        await prepareElapsedClaim("fence");
+
+      const reclaim = await claimTaskWithEvent(pool(), {
+        claimLeaseTtlMs: 60_000,
+        eventSourceId: "src_reclaim_fence_e2e",
+        participantId: "part_new_owner",
+        sessionId,
+        taskId,
+      });
+      const newClaimId = reclaim?.task.claimId ?? null;
+      expect(newClaimId).not.toBeNull();
+      expect(newClaimId).not.toBe(previousClaimId);
+
+      const eventCountBefore = (await listEvents(pool(), sessionId, 0)).length;
+      // The stale generation (old owner + old Claim ID) cannot refresh, complete,
+      // fail, or release the replacement claim.
+      const refreshed = await refreshTaskClaim(pool(), {
+        claimId: previousClaimId,
+        claimLeaseTtlMs: 60_000,
+        participantId: previousClaimedBy,
+        sessionId,
+        taskId,
+      });
+      expect(refreshed).toBeNull();
+      const completed = await completeTaskWithEvent(pool(), {
+        claimId: previousClaimId,
+        eventSourceId: "src_reclaim_fence_e2e",
+        participantId: previousClaimedBy,
+        result: { summary: "stale complete" },
+        sessionId,
+        taskId,
+      });
+      expect(completed).toBeNull();
+      const failed = await failTaskWithEvent(pool(), {
+        claimId: previousClaimId,
+        eventSourceId: "src_reclaim_fence_e2e",
+        failure: { reason: "stale fail" },
+        participantId: previousClaimedBy,
+        sessionId,
+        taskId,
+      });
+      expect(failed).toBeNull();
+      const released = await releaseTaskWithEvent(pool(), {
+        claimId: previousClaimId,
+        eventSourceId: "src_reclaim_fence_e2e",
+        participantId: previousClaimedBy,
+        sessionId,
+        taskId,
+      });
+      expect(released).toBeNull();
+
+      // None of the stale mutations appended an event or displaced the owner.
+      expect((await listEvents(pool(), sessionId, 0)).length).toBe(eventCountBefore);
+      const durable = await getTask(pool(), { sessionId, taskId });
+      expect(durable?.claimId).toBe(newClaimId);
+      expect(durable?.claimedBy).toBe("part_new_owner");
+      expect(durable?.completedAt).toBeNull();
+      expect(durable?.failedAt).toBeNull();
+    });
+
+    it("fences a same-participant stale Claim ID after it reclaims its own elapsed task", async () => {
+      const { previousClaimId, previousClaimedBy, sessionId, taskId } =
+        await prepareElapsedClaim("self-fence");
+
+      // The SAME participant reclaims its own elapsed task, minting a new Claim
+      // ID. Because claimed_by is unchanged, only the Claim ID predicate can
+      // reject the stale generation below.
+      const reclaim = await claimTaskWithEvent(pool(), {
+        claimLeaseTtlMs: 60_000,
+        eventSourceId: "src_reclaim_self_fence_e2e",
+        participantId: previousClaimedBy,
+        sessionId,
+        taskId,
+      });
+      const newClaimId = reclaim?.task.claimId ?? null;
+      expect(newClaimId).not.toBeNull();
+      expect(newClaimId).not.toBe(previousClaimId);
+      expect(reclaim?.task.claimedBy).toBe(previousClaimedBy);
+
+      const eventCountBefore = (await listEvents(pool(), sessionId, 0)).length;
+      // Same participant, same still-live lease: the old Claim ID is the only
+      // failing predicate, so these prove the Claim ID fence in isolation.
+      const refreshed = await refreshTaskClaim(pool(), {
+        claimId: previousClaimId,
+        claimLeaseTtlMs: 60_000,
+        participantId: previousClaimedBy,
+        sessionId,
+        taskId,
+      });
+      expect(refreshed).toBeNull();
+      const completed = await completeTaskWithEvent(pool(), {
+        claimId: previousClaimId,
+        eventSourceId: "src_reclaim_self_fence_e2e",
+        participantId: previousClaimedBy,
+        result: { summary: "stale self complete" },
+        sessionId,
+        taskId,
+      });
+      expect(completed).toBeNull();
+      const failed = await failTaskWithEvent(pool(), {
+        claimId: previousClaimId,
+        eventSourceId: "src_reclaim_self_fence_e2e",
+        failure: { reason: "stale self fail" },
+        participantId: previousClaimedBy,
+        sessionId,
+        taskId,
+      });
+      expect(failed).toBeNull();
+      const released = await releaseTaskWithEvent(pool(), {
+        claimId: previousClaimId,
+        eventSourceId: "src_reclaim_self_fence_e2e",
+        participantId: previousClaimedBy,
+        sessionId,
+        taskId,
+      });
+      expect(released).toBeNull();
+
+      expect((await listEvents(pool(), sessionId, 0)).length).toBe(eventCountBefore);
+      const durable = await getTask(pool(), { sessionId, taskId });
+      expect(durable?.claimId).toBe(newClaimId);
+      expect(durable?.claimedBy).toBe(previousClaimedBy);
+      expect(durable?.completedAt).toBeNull();
+      expect(durable?.failedAt).toBeNull();
+      expect(durable?.releasedAt).toBeNull();
+    });
+
+    it("keeps a legacy claim without a Claim ID immutable until it is reclaimed", async () => {
+      const sessionId = `sess_reclaim_legacy_${randomUUID()}`;
+      const taskId = `task_reclaim_legacy_${randomUUID()}`;
+      const legacyOwner = "part_legacy_owner";
+      await createDbSession(pool(), sessionId);
+      await createTaskWithEvent(pool(), {
+        eventSourceId: "src_reclaim_legacy_e2e",
+        kind: "software_dev",
+        objective: "Legacy claim without a Claim ID",
+        sessionId,
+        taskId,
+      });
+      await claimTaskWithEvent(pool(), {
+        claimLeaseTtlMs: 60_000,
+        eventSourceId: "src_reclaim_legacy_e2e",
+        participantId: legacyOwner,
+        sessionId,
+        taskId,
+      });
+      // Simulate a pre-Claim-ID migration row: an active claim whose claim_id is
+      // NULL and whose lease has not yet elapsed.
+      await pool().pool.query(
+        `UPDATE tasks SET claim_id = NULL WHERE session_id = $1 AND task_id = $2`,
+        [sessionId, taskId],
+      );
+
+      // Claim-owned mutations require the exact current Claim ID, so a NULL-id row
+      // cannot be completed, failed, released, or refreshed.
+      expect(
+        await completeTaskWithEvent(pool(), {
+          claimId: "claim_missing",
+          eventSourceId: "src_reclaim_legacy_e2e",
+          participantId: legacyOwner,
+          result: { summary: "legacy complete" },
+          sessionId,
+          taskId,
+        }),
+      ).toBeNull();
+      expect(
+        await releaseTaskWithEvent(pool(), {
+          claimId: "claim_missing",
+          eventSourceId: "src_reclaim_legacy_e2e",
+          participantId: legacyOwner,
+          sessionId,
+          taskId,
+        }),
+      ).toBeNull();
+      expect(
+        await refreshTaskClaim(pool(), {
+          claimId: "claim_missing",
+          claimLeaseTtlMs: 60_000,
+          participantId: legacyOwner,
+          sessionId,
+          taskId,
+        }),
+      ).toBeNull();
+      // The claim is still live, so another participant cannot win it yet.
+      expect(
+        await claimTaskWithEvent(pool(), {
+          claimLeaseTtlMs: 60_000,
+          eventSourceId: "src_reclaim_legacy_e2e",
+          participantId: "part_early_challenger",
+          sessionId,
+          taskId,
+        }),
+      ).toBeNull();
+
+      // Once the legacy claim elapses it can be atomically reclaimed.
+      await elapseClaim(sessionId, taskId);
+      const reclaim = await claimTaskWithEvent(pool(), {
+        claimLeaseTtlMs: 60_000,
+        eventSourceId: "src_reclaim_legacy_e2e",
+        participantId: "part_reclaimer_legacy",
+        sessionId,
+        taskId,
+      });
+      expect(reclaim?.events.map((event) => event.type)).toEqual([
+        "task.claim_expired",
+        "task.claimed",
+      ]);
+      const [legacyExpired] = reclaim?.events ?? [];
+      expect(legacyExpired?.payload.previousClaimedBy).toBe(legacyOwner);
+      expect(reclaim?.task.claimedBy).toBe("part_reclaimer_legacy");
+      expect(reclaim?.task.claimId).not.toBeNull();
+    });
   });
 
   it("expires concurrent task claim batches without duplicate or missing claim-expired events", async () => {
@@ -9042,6 +9573,7 @@ e2e("tether e2e", () => {
     const completed = await withSkewedAppClock(-10_000, () =>
       request<TaskResponse>(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/complete`, {
         body: {
+          claimId: claimed.task.claimId,
           instanceId: "inst_skewed_claim",
           participantId: "part_skewed_claim",
           result: { summary: "completed before DB TTL elapsed" },
@@ -9061,19 +9593,23 @@ e2e("tether e2e", () => {
       body: { kind: "software_dev", objective: "Refresh under skew" },
       method: "POST",
     });
-    await request(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`, {
-      body: {
-        instanceId: "inst_skewed_refresh",
-        participantId: "part_skewed_refresh",
+    const claimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`,
+      {
+        body: {
+          instanceId: "inst_skewed_refresh",
+          participantId: "part_skewed_refresh",
+        },
+        method: "POST",
       },
-      method: "POST",
-    });
+    );
 
     const refreshed = await withSkewedAppClock(-10_000, () =>
       request<TaskResponse>(
         `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim/refresh`,
         {
           body: {
+            claimId: claimed.task.claimId,
             instanceId: "inst_skewed_refresh",
             participantId: "part_skewed_refresh",
           },
@@ -9085,6 +9621,7 @@ e2e("tether e2e", () => {
     const completed = await withSkewedAppClock(-10_000, () =>
       request<TaskResponse>(`/sessions/${session.sessionId}/tasks/${task.task.taskId}/complete`, {
         body: {
+          claimId: refreshed.task.claimId,
           instanceId: "inst_skewed_refresh",
           participantId: "part_skewed_refresh",
           result: { summary: "refreshed before DB TTL elapsed" },
@@ -10185,11 +10722,10 @@ e2e("tether e2e", () => {
       body: { kind: "software_dev", objective },
       method: "POST",
     });
-    await request(`/sessions/${sessionId}/tasks/${task.task.taskId}/claim`, {
+    return request<TaskResponse>(`/sessions/${sessionId}/tasks/${task.task.taskId}/claim`, {
       body: controller,
       method: "POST",
     });
-    return task;
   }
 
   /** Creates a completed email task that can receive approval decisions. */
@@ -10208,13 +10744,17 @@ e2e("tether e2e", () => {
       instanceId: `inst_email_${idSuffix.replaceAll("-", "_")}_e2e`,
       participantId: `part_email_${idSuffix.replaceAll("-", "_")}_e2e`,
     };
-    await request(`/sessions/${sessionId}/tasks/${task.task.taskId}/claim`, {
-      body: controller,
-      method: "POST",
-    });
+    const claimed = await request<TaskResponse>(
+      `/sessions/${sessionId}/tasks/${task.task.taskId}/claim`,
+      {
+        body: controller,
+        method: "POST",
+      },
+    );
     await request<TaskResponse>(`/sessions/${sessionId}/tasks/${task.task.taskId}/complete`, {
       body: {
         ...controller,
+        claimId: claimed.task.claimId,
         result: createGenericApprovalResult(),
       },
       method: "POST",
@@ -11204,6 +11744,7 @@ function createGenericApprovalTaskRecord(sessionId: string, taskId: string): Tas
     claimExpiredAt: null,
     claimExpiredBy: null,
     claimExpiresAt: null,
+    claimId: null,
     claimedAt: null,
     claimedBy: null,
     completedAt: now,

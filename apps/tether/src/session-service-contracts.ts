@@ -300,11 +300,11 @@ export interface SessionServiceEffect {
   ) => Effect.Effect<RestTaskMutationResult, SessionServiceFailure>;
   /** Refreshes an active task claim without appending a visible event. */
   readonly refreshTaskClaim: (
-    input: TaskParticipantInput,
+    input: ClaimOwnedTaskInput,
   ) => Effect.Effect<TaskClaimRefreshResult, SessionServiceFailure>;
   /** Refreshes a task claim over REST after refreshing participant control. */
   readonly refreshTaskClaimOverRest: (
-    input: RestControlledInput & TaskParticipantInput,
+    input: RestControlledInput & ClaimOwnedTaskInput,
   ) => Effect.Effect<RestTaskClaimRefreshResult, SessionServiceFailure>;
   /** Cancels a task and appends the canonical cancellation event. */
   readonly cancelTask: (
@@ -332,11 +332,11 @@ export interface SessionServiceEffect {
   ) => Effect.Effect<RestTaskMutationResult, SessionServiceFailure>;
   /** Releases a task claim and appends the canonical release event. */
   readonly releaseTask: (
-    input: TaskParticipantInput,
+    input: ClaimOwnedTaskInput,
   ) => Effect.Effect<TaskMutationResult, SessionServiceFailure>;
   /** Releases a task over REST after refreshing participant control. */
   readonly releaseTaskOverRest: (
-    input: RestControlledInput & TaskParticipantInput,
+    input: RestControlledInput & ClaimOwnedTaskInput,
   ) => Effect.Effect<RestTaskMutationResult, SessionServiceFailure>;
   /** Records an approval decision as a durable session event. */
   readonly recordTaskApproval: (
@@ -493,7 +493,10 @@ export type RestParticipantRegistrationResult =
  */
 export type TaskMutationResult =
   | {
-      readonly events: readonly [SessionEvent];
+      // Single-event mutations (complete, fail, release, cancel) commit exactly
+      // one event; an atomic claim that reclaims an elapsed claim commits the
+      // ordered pair `task.claim_expired` then `task.claimed`, so this is a list.
+      readonly events: readonly SessionEvent[];
       readonly status: "applied";
       readonly task: TaskRecord;
     }
@@ -679,7 +682,17 @@ export interface TaskParticipantInput {
   readonly taskId: string;
 }
 
-export interface CompleteTaskInput extends TaskParticipantInput {
+/**
+ * Participant input for a claim-owned mutation, fenced by the Claim ID minted on
+ * the current claim generation. The value must equal the task's current
+ * `claim_id` or the mutation is rejected.
+ */
+export interface ClaimOwnedTaskInput extends TaskParticipantInput {
+  /** Server-issued Claim ID of the current claim generation. */
+  readonly claimId: string;
+}
+
+export interface CompleteTaskInput extends ClaimOwnedTaskInput {
   readonly result: Record<string, unknown>;
 }
 
@@ -776,7 +789,7 @@ export interface ResolveClientSessionInput {
   readonly sessionId: string | undefined;
 }
 
-export interface FailTaskInput extends TaskParticipantInput {
+export interface FailTaskInput extends ClaimOwnedTaskInput {
   readonly failure: Record<string, unknown>;
 }
 

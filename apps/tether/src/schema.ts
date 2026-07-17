@@ -369,9 +369,11 @@ export const tasks = pgTable(
     cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
     claimExpiredAt: timestamp("claim_expired_at", { withTimezone: true }),
     claimExpiredBy: text("claim_expired_by"),
+    claimExpiresAt: timestamp("claim_expires_at", { withTimezone: true }),
+    /** Server-issued opaque identity of the current claim generation; null when unclaimed or claimed before Claim IDs existed. */
+    claimId: text("claim_id"),
     claimedAt: timestamp("claimed_at", { withTimezone: true }),
     claimedBy: text("claimed_by"),
-    claimExpiresAt: timestamp("claim_expires_at", { withTimezone: true }),
     completedAt: timestamp("completed_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     failedAt: timestamp("failed_at", { withTimezone: true }),

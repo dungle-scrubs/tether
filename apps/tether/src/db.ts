@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { and, desc, eq, isNotNull, isNull, or, type SQL, sql } from "drizzle-orm";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { Context, Effect, Layer } from "effect";
@@ -279,6 +281,7 @@ interface ExpiredTaskClaimRow {
   readonly claimExpiredAt: Date | null;
   readonly claimExpiredBy: string | null;
   readonly claimExpiresAt: Date | null;
+  readonly claimId: string | null;
   readonly claimedAt: Date | null;
   readonly claimedBy: string | null;
   readonly completedAt: Date | null;
@@ -306,6 +309,7 @@ interface PgTaskRow {
   readonly claimExpiredAt: Date | null;
   readonly claimExpiredBy: string | null;
   readonly claimExpiresAt: Date | null;
+  readonly claimId: string | null;
   readonly claimedAt: Date | null;
   readonly claimedBy: string | null;
   readonly completedAt: Date | null;
@@ -543,6 +547,20 @@ export type PersistedTaskEventResult = {
   readonly task: TaskRecord;
 } | null;
 
+/**
+ * Persistence result for an atomic task claim. A claim commits either one
+ * `task.claimed` event (a normal claim of an unclaimed task) or, when it
+ * reclaims an elapsed claim, an ordered pair of `task.claim_expired` then
+ * `task.claimed` events. The list therefore carries every committed event so the
+ * caller can broadcast all of them, rather than a single event.
+ */
+export type PersistedTaskClaimResult = {
+  /** Committed events in sequence order: reclaim yields `[claimExpired, claimed]`. */
+  readonly events: readonly SessionEvent[];
+  /** The final claimed task row after the transaction commits. */
+  readonly task: TaskRecord;
+} | null;
+
 /** Persistence result for caller-supplied event ids. */
 export type PersistedEventAppendResult =
   | {
@@ -649,6 +667,7 @@ const taskReturningColumns = `
   claim_expired_at AS "claimExpiredAt",
   claim_expired_by AS "claimExpiredBy",
   claim_expires_at AS "claimExpiresAt",
+  claim_id AS "claimId",
   claimed_at AS "claimedAt",
   claimed_by AS "claimedBy",
   completed_at AS "completedAt",
@@ -669,6 +688,21 @@ const taskReturningColumns = `
   session_id AS "sessionId",
   task_id AS "taskId"
 `;
+
+/**
+ * Exact task-row lock read a claimant runs before allocating any event sequence.
+ * Locking the task row first (then `session_event_sequences` inside
+ * `appendEventWithClient`) is the mandatory lock order (D-009) and matches the
+ * sweeper's `FOR UPDATE SKIP LOCKED` on tasks. Exported so concurrency tests can
+ * rendezvous on this lock boundary. `now()` is sampled in the same statement so
+ * the elapsed decision uses the transaction clock the reclaim UPDATEs use.
+ */
+export const taskClaimLockQuery = `
+        SELECT ${taskReturningColumns}, now() AS "databaseNow"
+        FROM tasks
+        WHERE session_id = $1 AND task_id = $2
+        FOR UPDATE
+      `;
 
 const taskApprovalReturningColumns = `
   approval_event_id AS "approvalEventId",
@@ -1651,6 +1685,7 @@ export async function expireTaskClaims(
           claimed_at = NULL,
           claimed_by = NULL,
           claim_expires_at = NULL,
+          claim_id = NULL,
           claim_expired_at = now(),
           claim_expired_by = expired.previous_claimed_by,
           released_at = NULL,
@@ -1663,6 +1698,7 @@ export async function expireTaskClaims(
           tasks.claim_expired_at AS "claimExpiredAt",
           tasks.claim_expired_by AS "claimExpiredBy",
           tasks.claim_expires_at AS "claimExpiresAt",
+          tasks.claim_id AS "claimId",
           tasks.claimed_at AS "claimedAt",
           tasks.claimed_by AS "claimedBy",
           tasks.completed_at AS "completedAt",
@@ -2520,6 +2556,15 @@ export async function recordTaskApproval(
 /**
  * Claims an unclaimed task and appends `task.claimed` in the same transaction.
  */
+/**
+ * Mints a new server-issued opaque Claim ID for one claim generation. Every
+ * successful claim mints a fresh value; claim-owned mutations must echo the
+ * exact current value to be accepted.
+ */
+function generateClaimId(): string {
+  return `claim_${randomUUID().replaceAll("-", "")}`;
+}
+
 export async function claimTaskWithEvent(
   database: DatabasePool,
   input: {
@@ -2530,44 +2575,142 @@ export async function claimTaskWithEvent(
     readonly sessionId: string;
     readonly taskId: string;
   },
-): Promise<PersistedTaskEventResult> {
+): Promise<PersistedTaskClaimResult> {
   assertPositiveFiniteTtlMs(input.claimLeaseTtlMs, "task claim TTL");
-  return runTaskEventTransaction(database, {
-    controlGuard: input.controlGuard,
-    operation: "claimTask",
-    sourceId: input.eventSourceId,
-    mutate: async (client) => {
-      const rows = await client.query<PgTaskRow>(
+  const newClaimId = generateClaimId();
+  const client = await database.pool.connect();
+  try {
+    await client.query("BEGIN");
+    // The optional epoch fence locks the lease row BEFORE the task is touched, so
+    // a fenced caller can never observe or mutate the task row.
+    if (input.controlGuard) {
+      await assertControlEpochCurrentWithClient(client, input.controlGuard);
+    }
+    // Lock the task row FIRST, before any event-sequence allocation. The
+    // event-sequence row is locked later inside appendEventWithClient, so this
+    // establishes the mandatory lock order (task row, then
+    // session_event_sequences). It matches the sweeper's `FOR UPDATE SKIP LOCKED`
+    // on tasks, so a claimant and the sweeper acquire the same rows in the same
+    // order and cannot deadlock (D-009). `now()` is sampled in the same statement
+    // and is stable for the rest of the transaction, so the elapsed decision below
+    // uses the identical clock the reclaim UPDATEs use.
+    const lockedRows = await client.query<PgTaskRow & { readonly databaseNow: Date }>(
+      taskClaimLockQuery,
+      [input.sessionId, input.taskId],
+    );
+    const lockedRow = lockedRows.rows[0];
+    if (!lockedRow) {
+      // Task does not exist; nothing to claim.
+      await client.query("COMMIT");
+      return null;
+    }
+    const lockedTask = toTaskRecord(lockedRow);
+    if (
+      lockedTask.completedAt !== null ||
+      lockedTask.failedAt !== null ||
+      lockedTask.cancelledAt !== null
+    ) {
+      // Terminal tasks can never be claimed.
+      await client.query("COMMIT");
+      return null;
+    }
+    const databaseNowMs = lockedRow.databaseNow.getTime();
+    const claimExpiresAtMs = lockedRow.claimExpiresAt?.getTime() ?? null;
+    const isElapsed = claimExpiresAtMs !== null && claimExpiresAtMs <= databaseNowMs;
+    if (lockedTask.claimedAt !== null && !isElapsed) {
+      // A live claim (or a claim without a known deadline) still holds the task;
+      // this claim attempt does not win it.
+      await client.query("COMMIT");
+      return null;
+    }
+    const events: SessionEvent[] = [];
+    if (lockedTask.claimedAt !== null) {
+      // RECLAIM: the current claim has elapsed. Materialize its expiration, append
+      // `task.claim_expired` first (so it receives the lower sequence), then apply
+      // the new claim generation and append `task.claimed`.
+      const previousClaimedBy = lockedTask.claimedBy;
+      if (previousClaimedBy === null) {
+        // Defensive: an elapsed claim with no recorded owner cannot produce a
+        // well-formed claim-expired event. A claimed task always records its
+        // owner, so this state is unreachable; decline rather than emit a
+        // malformed event or silently drop the expiration.
+        await client.query("COMMIT");
+        return null;
+      }
+      const expiredRows = await client.query<PgTaskRow>(
         `
           UPDATE tasks
           SET
-            claimed_at = now(),
-            claimed_by = $1,
-            claim_expires_at = now() + ($2::text || ' milliseconds')::interval,
-            claim_expired_at = NULL,
-            claim_expired_by = NULL,
+            claim_expired_at = now(),
+            claim_expired_by = $3,
+            claim_expires_at = NULL,
+            claim_id = NULL,
+            claimed_at = NULL,
+            claimed_by = NULL,
             released_at = NULL,
             released_by = NULL
-          WHERE session_id = $3
-            AND task_id = $4
-            AND claimed_at IS NULL
-            AND claimed_by IS NULL
-            AND completed_at IS NULL
-            AND failed_at IS NULL
-            AND cancelled_at IS NULL
+          WHERE session_id = $1 AND task_id = $2
           RETURNING ${taskReturningColumns}
         `,
-        [input.participantId, input.claimLeaseTtlMs, input.sessionId, input.taskId],
+        [input.sessionId, input.taskId, previousClaimedBy],
       );
-      return rows.rows[0] ? toTaskRecord(rows.rows[0]) : null;
-    },
-    buildEvent: (task) =>
-      buildTaskClaimedEventInput({
-        participantId: input.participantId,
-        sessionId: input.sessionId,
-        task,
-      }),
-  });
+      const expiredTask = toTaskRecord(expiredRows.rows[0]);
+      events.push(
+        await appendEventWithClient(
+          client,
+          buildTaskClaimExpiredEventInput({
+            previousClaimedBy,
+            sessionId: input.sessionId,
+            task: expiredTask,
+          }),
+          input.eventSourceId,
+        ),
+      );
+    }
+    // NORMAL CLAIM (unclaimed) or the second half of a RECLAIM: apply the new
+    // claim generation to the already row-locked task.
+    const claimedRows = await client.query<PgTaskRow>(
+      `
+        UPDATE tasks
+        SET
+          claim_expired_at = NULL,
+          claim_expired_by = NULL,
+          claim_expires_at = now() + ($3::text || ' milliseconds')::interval,
+          claim_id = $4,
+          claimed_at = now(),
+          claimed_by = $5,
+          released_at = NULL,
+          released_by = NULL
+        WHERE session_id = $1 AND task_id = $2
+        RETURNING ${taskReturningColumns}
+      `,
+      [input.sessionId, input.taskId, input.claimLeaseTtlMs, newClaimId, input.participantId],
+    );
+    const claimedTask = toTaskRecord(claimedRows.rows[0]);
+    events.push(
+      await appendEventWithClient(
+        client,
+        buildTaskClaimedEventInput({
+          participantId: input.participantId,
+          sessionId: input.sessionId,
+          task: claimedTask,
+        }),
+        input.eventSourceId,
+      ),
+    );
+    await client.query("COMMIT");
+    return { events, task: claimedTask };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    // A fenced epoch is a caller-facing control outcome, not a transaction
+    // failure; surface it untouched so the service maps it to CONTROL_EPOCH_STALE.
+    if (error instanceof ControlEpochStaleError) {
+      throw error;
+    }
+    throw new TaskEventTransactionRollbackError("claimTask", error);
+  } finally {
+    client.release();
+  }
 }
 
 /**
@@ -2576,6 +2719,7 @@ export async function claimTaskWithEvent(
 export async function refreshTaskClaim(
   database: DatabasePool,
   input: {
+    readonly claimId: string;
     readonly claimLeaseTtlMs: number;
     readonly controlGuard?: ControlEpochGuard | undefined;
     readonly participantId: string;
@@ -2598,6 +2742,7 @@ export async function refreshTaskClaim(
         eq(tasks.sessionId, input.sessionId),
         eq(tasks.taskId, input.taskId),
         eq(tasks.claimedBy, input.participantId),
+        eq(tasks.claimId, input.claimId),
         sql`${tasks.claimExpiresAt} > now()`,
         isNull(tasks.completedAt),
         isNull(tasks.failedAt),
@@ -2617,6 +2762,7 @@ export async function refreshTaskClaim(
 async function refreshTaskClaimGuarded(
   database: DatabasePool,
   input: {
+    readonly claimId: string;
     readonly claimLeaseTtlMs: number;
     readonly controlGuard: ControlEpochGuard;
     readonly participantId: string;
@@ -2635,13 +2781,14 @@ async function refreshTaskClaimGuarded(
         WHERE session_id = $2
           AND task_id = $3
           AND claimed_by = $4
+          AND claim_id = $5
           AND claim_expires_at > now()
           AND completed_at IS NULL
           AND failed_at IS NULL
           AND cancelled_at IS NULL
         RETURNING ${taskReturningColumns}
       `,
-      [input.claimLeaseTtlMs, input.sessionId, input.taskId, input.participantId],
+      [input.claimLeaseTtlMs, input.sessionId, input.taskId, input.participantId, input.claimId],
     );
     await client.query("COMMIT");
     return rows.rows[0] ? toTaskRecord(rows.rows[0]) : null;
@@ -3113,6 +3260,7 @@ export async function ensureScheduledRunWithEvents(
 export async function completeTaskWithEvent(
   database: DatabasePool,
   input: {
+    readonly claimId: string;
     readonly controlGuard?: ControlEpochGuard | undefined;
     readonly eventSourceId: string;
     readonly participantId: string;
@@ -3136,13 +3284,20 @@ export async function completeTaskWithEvent(
           WHERE session_id = $2
             AND task_id = $3
             AND claimed_by = $4
+            AND claim_id = $5
             AND claim_expires_at > now()
             AND completed_at IS NULL
             AND failed_at IS NULL
             AND cancelled_at IS NULL
           RETURNING ${taskReturningColumns}
         `,
-        [JSON.stringify(input.result), input.sessionId, input.taskId, input.participantId],
+        [
+          JSON.stringify(input.result),
+          input.sessionId,
+          input.taskId,
+          input.participantId,
+          input.claimId,
+        ],
       );
       return rows.rows[0] ? toTaskRecord(rows.rows[0]) : null;
     },
@@ -3161,6 +3316,7 @@ export async function completeTaskWithEvent(
 export async function failTaskWithEvent(
   database: DatabasePool,
   input: {
+    readonly claimId: string;
     readonly controlGuard?: ControlEpochGuard | undefined;
     readonly eventSourceId: string;
     readonly failure: Record<string, unknown>;
@@ -3184,13 +3340,20 @@ export async function failTaskWithEvent(
           WHERE session_id = $2
             AND task_id = $3
             AND claimed_by = $4
+            AND claim_id = $5
             AND claim_expires_at > now()
             AND completed_at IS NULL
             AND failed_at IS NULL
             AND cancelled_at IS NULL
           RETURNING ${taskReturningColumns}
         `,
-        [JSON.stringify(input.failure), input.sessionId, input.taskId, input.participantId],
+        [
+          JSON.stringify(input.failure),
+          input.sessionId,
+          input.taskId,
+          input.participantId,
+          input.claimId,
+        ],
       );
       return rows.rows[0] ? toTaskRecord(rows.rows[0]) : null;
     },
@@ -3209,6 +3372,7 @@ export async function failTaskWithEvent(
 export async function releaseTaskWithEvent(
   database: DatabasePool,
   input: {
+    readonly claimId: string;
     readonly controlGuard?: ControlEpochGuard | undefined;
     readonly eventSourceId: string;
     readonly participantId: string;
@@ -3228,6 +3392,7 @@ export async function releaseTaskWithEvent(
             claimed_at = NULL,
             claimed_by = NULL,
             claim_expires_at = NULL,
+            claim_id = NULL,
             claim_expired_at = NULL,
             claim_expired_by = NULL,
             released_at = now(),
@@ -3235,13 +3400,14 @@ export async function releaseTaskWithEvent(
           WHERE session_id = $1
             AND task_id = $2
             AND claimed_by = $3
+            AND claim_id = $4
             AND claim_expires_at > now()
             AND completed_at IS NULL
             AND failed_at IS NULL
             AND cancelled_at IS NULL
           RETURNING ${taskReturningColumns}
         `,
-        [input.sessionId, input.taskId, input.participantId],
+        [input.sessionId, input.taskId, input.participantId, input.claimId],
       );
       return rows.rows[0] ? toTaskRecord(rows.rows[0]) : null;
     },
@@ -3885,6 +4051,7 @@ function toTaskRecord(row: DbTaskRow | ExpiredTaskClaimRow | PgTaskRow | undefin
     claimExpiredAt: row.claimExpiredAt?.toISOString() ?? null,
     claimExpiredBy: row.claimExpiredBy,
     claimExpiresAt: row.claimExpiresAt?.toISOString() ?? null,
+    claimId: row.claimId,
     claimedAt: row.claimedAt?.toISOString() ?? null,
     claimedBy: row.claimedBy,
     completedAt: row.completedAt?.toISOString() ?? null,

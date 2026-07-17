@@ -1,6 +1,6 @@
 {
-  "id": "30ad2451-bedf-454f-a6ee-4479d4124f41",
-  "prevId": "65df38b5-39fc-4d71-b187-799bdae8dd35",
+  "id": "64cb58fc-4bbe-4fcc-9214-239f02ffab33",
+  "prevId": "30ad2451-bedf-454f-a6ee-4479d4124f41",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -1488,6 +1488,18 @@
           "primaryKey": false,
           "notNull": false
         },
+        "claim_expires_at": {
+          "name": "claim_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "claim_id": {
+          "name": "claim_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "claimed_at": {
           "name": "claimed_at",
           "type": "timestamp with time zone",
@@ -1497,12 +1509,6 @@
         "claimed_by": {
           "name": "claimed_by",
           "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "claim_expires_at": {
-          "name": "claim_expires_at",
-          "type": "timestamp with time zone",
           "primaryKey": false,
           "notNull": false
         },

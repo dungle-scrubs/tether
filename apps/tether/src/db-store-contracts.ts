@@ -10,6 +10,7 @@ import type {
   PersistedEventAppendResult,
   PersistedParticipantRegistrationResult,
   PersistedTaskApprovalResult,
+  PersistedTaskClaimResult,
   PersistedTaskCreateResult,
   PersistedTaskEventResult,
   RestControlAcquisition,
@@ -242,8 +243,9 @@ export interface TaskStore {
     readonly participantId: string;
     readonly sessionId: string;
     readonly taskId: string;
-  }) => Promise<PersistedTaskEventResult>;
+  }) => Promise<PersistedTaskClaimResult>;
   readonly completeWithEvent: (input: {
+    readonly claimId: string;
     readonly controlGuard?: ControlEpochGuard | undefined;
     readonly eventSourceId: string;
     readonly participantId: string;
@@ -266,6 +268,7 @@ export interface TaskStore {
     readonly sourceId: string;
   }) => Promise<SessionEvent[]>;
   readonly failWithEvent: (input: {
+    readonly claimId: string;
     readonly controlGuard?: ControlEpochGuard | undefined;
     readonly eventSourceId: string;
     readonly failure: Record<string, unknown>;
@@ -280,6 +283,7 @@ export interface TaskStore {
   readonly list: (sessionId: string, status?: TaskListStatus) => Promise<TaskRecord[]>;
   readonly listSnapshots: (sessionId: string) => Promise<TaskSnapshot[]>;
   readonly refreshClaim: (input: {
+    readonly claimId: string;
     readonly claimLeaseTtlMs: number;
     readonly controlGuard?: ControlEpochGuard | undefined;
     readonly participantId: string;
@@ -287,6 +291,7 @@ export interface TaskStore {
     readonly taskId: string;
   }) => Promise<TaskRecord | null>;
   readonly releaseWithEvent: (input: {
+    readonly claimId: string;
     readonly controlGuard?: ControlEpochGuard | undefined;
     readonly eventSourceId: string;
     readonly participantId: string;

@@ -16,6 +16,7 @@ import {
   type AppliedTaskClaimRefreshResult,
   type AppliedTaskMutationResult,
   type CancelTaskInput,
+  type ClaimOwnedTaskInput,
   type CompleteTaskInput,
   type CreateTaskInput,
   type EnsureScheduledRunRequest,
@@ -108,10 +109,10 @@ export interface SessionTaskEffects {
     operation?: string,
   ) => Effect.Effect<RecordedTaskApprovalResult, SessionServiceFailure>;
   readonly refreshTaskClaimEffect: (
-    input: TaskParticipantInput,
+    input: ClaimOwnedTaskInput,
   ) => Effect.Effect<AppliedTaskClaimRefreshResult, SessionServiceFailure>;
   readonly releaseTaskEffect: (
-    input: TaskParticipantInput,
+    input: ClaimOwnedTaskInput,
   ) => Effect.Effect<AppliedTaskMutationResult, SessionServiceFailure>;
   readonly supersedeScheduledRunsEffect: (
     input: SupersedeScheduledRunsRequest,
@@ -166,13 +167,53 @@ export function createSessionTaskEffects(input: SessionTaskEffectsInput): Sessio
         }),
       ),
     claimTaskEffect: (taskInput) =>
-      taskMutationWithEventEffect("claimTask", taskInput, () =>
-        input.stores.tasks.claimWithEvent({
-          ...taskInput,
-          claimLeaseTtlMs: input.taskClaimLeaseTtlMs,
-          eventSourceId: input.eventSourceId,
-        }),
-      ),
+      // A claim has its own path because it can commit MORE than one event: a
+      // normal claim appends a single `task.claimed`, while an atomic reclaim of
+      // an elapsed claim appends the ordered pair `task.claim_expired` then
+      // `task.claimed`. Every committed event is broadcast, unlike the
+      // single-event mutations routed through `taskMutationWithEventEffect`.
+      Effect.gen(function* () {
+        const persisted = yield* trySessionPromise(() =>
+          input.stores.tasks.claimWithEvent({
+            ...taskInput,
+            claimLeaseTtlMs: input.taskClaimLeaseTtlMs,
+            eventSourceId: input.eventSourceId,
+          }),
+        );
+        if (!persisted) {
+          return yield* Effect.fail(new TaskMutationRejectedError("claimTask"));
+        }
+        const result = {
+          events: persisted.events,
+          status: "applied" as const,
+          task: persisted.task,
+        };
+        yield* Effect.sync(() => {
+          // A normal claim commits one event; an atomic reclaim commits exactly
+          // two (`task.claim_expired` then `task.claimed`). Any other count is an
+          // invariant violation.
+          input.observability.assertInvariant(
+            result.events.length === 1 || result.events.length === 2,
+            "claimTask",
+            "Claim must commit one or two events",
+            {
+              eventCount: result.events.length,
+              participantId: taskInput.participantId,
+              sessionId: taskInput.sessionId,
+              taskId: taskInput.taskId,
+            },
+          );
+          assertTaskMutationResultWithObservability(
+            input.observability,
+            input.assertBroadcastEvents,
+            "claimTask",
+            taskInput,
+            result,
+            result.events.length,
+          );
+        });
+        return result;
+      }),
     completeTaskEffect: (taskInput) =>
       taskMutationWithEventEffect("completeTask", taskInput, () =>
         input.stores.tasks.completeWithEvent({ ...taskInput, eventSourceId: input.eventSourceId }),
@@ -661,6 +702,7 @@ function assertTaskMutationResultWithObservability(
   operation: string,
   input: TaskParticipantInput,
   result: TaskMutationResult,
+  expectedEventCount = 1,
 ): void {
   if (result.status === "rejected") {
     observability.assertInvariant(
@@ -682,7 +724,13 @@ function assertTaskMutationResultWithObservability(
       sessionId: input.sessionId,
     },
   );
-  assertBroadcastEvents(observability, operation, input.sessionId, result.events, 1);
+  assertBroadcastEvents(
+    observability,
+    operation,
+    input.sessionId,
+    result.events,
+    expectedEventCount,
+  );
 }
 
 /** Ensures claim-expiration sweeps only produce claim-expired events. */

@@ -8,7 +8,7 @@ type PromiseReturning<TArgs extends readonly unknown[], TValue> = (
 
 interface ParticipantRuntimePromiseContract {
   readonly claimTask: PromiseReturning<[string], Client.TaskRecord | null>;
-  readonly completeTask: PromiseReturning<[string, Record<string, unknown>], void>;
+  readonly completeTask: PromiseReturning<[string, Record<string, unknown>, string], void>;
   readonly closeAndWait: PromiseReturning<[], void>;
   readonly connect: PromiseReturning<
     [Client.ParticipantRuntimeClientConfig],
@@ -18,10 +18,10 @@ interface ParticipantRuntimePromiseContract {
     [Client.ParticipantRuntimeClientConfig],
     Client.ParticipantRuntimeClient
   >;
-  readonly failTask: PromiseReturning<[string, Record<string, unknown>], void>;
+  readonly failTask: PromiseReturning<[string, Record<string, unknown>, string], void>;
   readonly reconnect: PromiseReturning<[], Client.ParticipantRuntimeClient>;
   readonly open: PromiseReturning<[], Client.ParticipantRuntimeClient>;
-  readonly refreshTaskClaim: PromiseReturning<[string], Client.TaskRecord | null>;
+  readonly refreshTaskClaim: PromiseReturning<[string, string], Client.TaskRecord | null>;
   readonly runClaimableTasks: PromiseReturning<[Client.ParticipantRuntimeTaskLoopOptions], void>;
   readonly runParticipantRuntime: PromiseReturning<[Client.RunParticipantRuntimeInput], void>;
   readonly waitForClose: PromiseReturning<[], void>;

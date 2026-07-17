@@ -16,6 +16,13 @@ export interface TaskRecord {
   readonly claimExpiredBy: string | null;
   /** Claim lease expiry timestamp, when a claimed task should become claimable again. */
   readonly claimExpiresAt: string | null;
+  /**
+   * Server-issued opaque identity of the current claim generation, or null when
+   * the task is unclaimed or was claimed before Claim IDs existed. Every
+   * successful claim mints a new value; claim-owned mutations must carry the
+   * exact current value to be accepted.
+   */
+  readonly claimId: string | null;
   /** Claim timestamp, when a participant runtime currently owns the task. */
   readonly claimedAt: string | null;
   /** Participant id currently claiming the task. */
@@ -477,7 +484,8 @@ export const taskRecordSchema = z.object({
   cancelledAt: z.string().nullable(),
   claimExpiredAt: z.string().nullable(),
   claimExpiredBy: z.string().nullable(),
-  claimExpiresAt: z.string().nullable(),
+  claimExpiresAt: z.string().datetime({ offset: true }).nullable(),
+  claimId: z.string().nullable(),
   claimedAt: z.string().nullable(),
   claimedBy: z.string().nullable(),
   completedAt: z.string().nullable(),
