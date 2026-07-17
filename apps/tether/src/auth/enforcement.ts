@@ -8,6 +8,12 @@ import {
   type AuthGrantAuthority,
 } from "./grant-authority.js";
 import type { AuthGrantStore } from "./grant-stores.js";
+import type { AuthTicketStore } from "./grant-stores.js";
+import {
+  AuthTicketAuthorityError,
+  createAuthTicketAuthority,
+  type AuthTicketAuthority,
+} from "./ticket-authority.js";
 import {
   AuthError,
   createAuthContext,
@@ -48,6 +54,8 @@ export interface AuthRuntimeOptions {
   readonly preEnforcementGrantIssuanceEnabled?: boolean;
   /** Accepted verification secrets keyed by kid. */
   readonly secrets: AuthSigningSecrets;
+  /** PostgreSQL ticket store required for single-use browser admission. */
+  readonly ticketStore?: AuthTicketStore;
 }
 
 export interface AuthRuntimeLogger {
@@ -90,6 +98,7 @@ export function createAuthRuntime(options: AuthRuntimeOptions): AuthRuntime {
   const logger = options.logger ?? noopAuthRuntimeLogger;
   const disabledWarning = options.mode === "disabled" ? startDisabledModeWarning(logger) : null;
   const authority = createConfiguredGrantAuthority(options);
+  const ticketAuthority = createConfiguredTicketAuthority(options, authority);
   return {
     authenticateHttpRequest: async (request, url) => {
       if (options.mode === "disabled") {
@@ -110,8 +119,38 @@ export function createAuthRuntime(options: AuthRuntimeOptions): AuthRuntime {
       if (options.mode === "disabled") {
         return { authorizeCommand: async () => undefined, context: null };
       }
-      const token = url.searchParams.get("access_token");
       const route = url.pathname;
+      const authorizationHeader = request.headers.authorization;
+      const headerToken = extractBearerToken(authorizationHeader);
+      const queryToken = url.searchParams.get("access_token");
+      const ticket = url.searchParams.get("ticket");
+      const credentialCount = [authorizationHeader, queryToken, ticket].filter(
+        (credential) => credential !== undefined && credential !== null,
+      ).length;
+      if (credentialCount !== 1) {
+        const rejected = {
+          authority,
+          logger,
+          method: request.method,
+          now: options.now,
+          route,
+          secrets: options.secrets,
+          token: null,
+          type: "ws" as const,
+        };
+        logAuthReject(rejected, AuthError.ClaimInvalid);
+        throw new Error(AuthError.ClaimInvalid);
+      }
+      if (ticket !== null) {
+        return authenticateWebSocketTicket({
+          logger,
+          method: request.method,
+          route,
+          ticket,
+          ticketAuthority,
+        });
+      }
+      const token = headerToken ?? queryToken;
       const context = await authenticateBearerToken({
         authority,
         method: request.method,
@@ -242,6 +281,43 @@ function createConfiguredGrantAuthority(options: AuthRuntimeOptions): AuthGrantA
     : null;
 }
 
+function createConfiguredTicketAuthority(
+  options: AuthRuntimeOptions,
+  authority: AuthGrantAuthority | null,
+): AuthTicketAuthority | null {
+  return authority && options.ticketStore
+    ? createAuthTicketAuthority({
+        grantAuthority: authority,
+        ...(options.now === undefined ? {} : { now: options.now }),
+        store: options.ticketStore,
+      })
+    : null;
+}
+
+async function authenticateWebSocketTicket(input: {
+  readonly logger: AuthRuntimeLogger;
+  readonly method: string | undefined;
+  readonly route: string;
+  readonly ticket: string;
+  readonly ticketAuthority: AuthTicketAuthority | null;
+}): Promise<AuthenticatedWebSocketAuth> {
+  try {
+    if (input.ticketAuthority === null) {
+      throw new AuthTicketAuthorityError("auth_claim_invalid");
+    }
+    return await input.ticketAuthority.authenticateTicket(input.ticket);
+  } catch (error) {
+    const reason = parseAuthError(error);
+    input.logger.warn("auth.reject", {
+      method: input.method ?? null,
+      reason,
+      route: input.route,
+      transport: "ws",
+    });
+    throw new Error(reason);
+  }
+}
+
 /** Extracts a Bearer token from an Authorization header value. */
 function extractBearerToken(value: string | undefined): string | null {
   const match = value?.match(/^Bearer\s+(.+)$/iu);
@@ -260,6 +336,9 @@ function buildSigningSecrets(config: ServerConfig): AuthSigningSecrets {
 
 /** Normalizes thrown auth failures back into the typed reason set. */
 function parseAuthError(error: unknown): AuthError {
+  if (error instanceof AuthTicketAuthorityError) {
+    return error.code as AuthError;
+  }
   if (error instanceof AuthGrantAuthorityError) {
     return error.code as AuthError;
   }

@@ -34,8 +34,29 @@ describe("durable grant authority", () => {
     expect(store.findByJti).toHaveBeenCalledTimes(2);
   });
 
+  it("reauthorizes a ticket-derived parent grant without bearer claim state", async () => {
+    const grant = createGrant();
+    const store = createStore(grant);
+    const authority = createAuthority(store);
+
+    const first = await authority.authenticateGrantJti(grant.jti);
+    const second = await authority.authenticateGrantJti(grant.jti);
+
+    expect(first).toMatchObject({
+      grantJti: grant.jti,
+      participantId: grant.subject,
+      role: grant.role,
+      sessionScope: grant.sessionScope,
+    });
+    expect(second).toEqual(first);
+    expect(store.findByJti).toHaveBeenCalledTimes(2);
+  });
+
   it("fails closed with bounded reasons for mismatched, revoked, and unavailable authority", async () => {
-    const mismatchedStore = createStore({ ...createGrant(), subject: "different-subject" });
+    const mismatchedStore = createStore({
+      ...createGrant(),
+      subject: "different-subject",
+    });
     await expect(
       createAuthority(mismatchedStore).authenticateRestBearer(createBearer()),
     ).rejects.toMatchObject({ code: "auth_claim_invalid" });

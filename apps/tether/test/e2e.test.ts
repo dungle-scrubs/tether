@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { createServer } from "node:net";
+import { createConnection, createServer } from "node:net";
 import { fileURLToPath } from "node:url";
 
 import { readMigrationFiles } from "drizzle-orm/migrator";
@@ -17,6 +17,7 @@ import {
 import type { AuthRole } from "../src/auth/token.js";
 import { createAuthPersistenceStores } from "../src/auth/db-grant-stores.js";
 import { runBootstrapAdminCli } from "../src/auth/bootstrap-cli.js";
+import { hashAuthTicket } from "../src/auth/ticket-lifecycle.js";
 import type {
   AuthGrantAuditMetadata,
   AuthGrantMetadata,
@@ -149,6 +150,11 @@ interface AuthGrantReadResponse extends JsonResponse {
 
 interface AuthGrantListResponse extends JsonResponse {
   readonly grants: readonly AuthGrantPublicResponse[];
+}
+
+interface AuthTicketCreateResponse extends JsonResponse {
+  readonly expiresAt: string;
+  readonly ticket: string;
 }
 
 interface ServerProcessResult {
@@ -581,7 +587,10 @@ e2e("tether e2e", () => {
         issuer: "https://auth.e2e.tether.local",
         jti: revokeRollbackJti,
         kid: testAuthSigningKid,
-        metadata: { requestId: "req_e2e_revoke_rollback_create", source: "bootstrap" },
+        metadata: {
+          requestId: "req_e2e_revoke_rollback_create",
+          source: "bootstrap",
+        },
         revokedAt: null,
         role: "observer",
         sessionScope: "*",
@@ -767,7 +776,9 @@ e2e("tether e2e", () => {
     ).resolves.toMatchObject({ status: "already_revoked" });
     await expect(stores.audits.listForGrant(jti, 10)).resolves.toHaveLength(2);
 
-    const authColumns = await currentPool().pool.query<{ readonly columnName: string }>(`
+    const authColumns = await currentPool().pool.query<{
+      readonly columnName: string;
+    }>(`
       SELECT column_name AS "columnName"
       FROM information_schema.columns
       WHERE table_schema = 'public'
@@ -831,7 +842,11 @@ e2e("tether e2e", () => {
           )
         `,
         [
-          JSON.stringify({ remoteAddressHash: null, replicaId: null, transport: "websocket" }),
+          JSON.stringify({
+            remoteAddressHash: null,
+            replicaId: null,
+            transport: "websocket",
+          }),
           new Date("2026-01-01T00:00:30.000Z"),
           issuedAt,
           jti,
@@ -1316,9 +1331,9 @@ e2e("tether e2e", () => {
       const journal = await database.pool.query<{ readonly count: number }>(
         `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
       );
-      const laterAuthTable = await database.pool.query<{ readonly exists: boolean }>(
-        `SELECT to_regclass('public.auth_tickets') IS NOT NULL AS exists`,
-      );
+      const laterAuthTable = await database.pool.query<{
+        readonly exists: boolean;
+      }>(`SELECT to_regclass('public.auth_tickets') IS NOT NULL AS exists`);
       expect(journal.rows[0]?.count).toBe(0);
       expect(laterAuthTable.rows[0]?.exists).toBe(false);
     } finally {
@@ -1920,8 +1935,40 @@ e2e("tether e2e", () => {
     expect(created.grant).not.toHaveProperty("metadata");
 
     await expect(
-      requestFrom<SessionListResponse>(baseUrl, "/sessions", { authToken: created.bearer }),
+      requestFrom<SessionListResponse>(baseUrl, "/sessions", {
+        authToken: created.bearer,
+      }),
     ).resolves.toEqual(expect.objectContaining({ sessions: expect.any(Array) }));
+
+    const ticket = await requestFrom<AuthTicketCreateResponse>(baseUrl, "/auth/tickets", {
+      authToken: created.bearer,
+      body: {},
+      method: "POST",
+    });
+    expect(ticket.ticket).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    expect(new Date(ticket.expiresAt).getTime() - Date.now()).toBeGreaterThan(25_000);
+    const persistedTicket = await currentPool().pool.query<{
+      readonly parentGrantJti: string;
+      readonly rawTicketMatches: boolean;
+      readonly ticketHash: string;
+    }>(
+      `
+        SELECT
+          parent_grant_jti AS "parentGrantJti",
+          ticket_hash = $1 AS "rawTicketMatches",
+          ticket_hash AS "ticketHash"
+        FROM auth_tickets
+        WHERE parent_grant_jti = $2
+      `,
+      [ticket.ticket, created.grant.jti],
+    );
+    expect(persistedTicket.rows).toEqual([
+      {
+        parentGrantJti: created.grant.jti,
+        rawTicketMatches: false,
+        ticketHash: expect.stringMatching(/^[0-9a-f]{64}$/u) as string,
+      },
+    ]);
 
     const inspected = await requestFrom<AuthGrantReadResponse>(
       baseUrl,
@@ -1939,7 +1986,10 @@ e2e("tether e2e", () => {
     const revoked = await requestStatusFrom<AuthGrantReadResponse & { readonly status: string }>(
       baseUrl,
       `/auth/grants/${created.grant.jti}/revoke`,
-      { body: {}, method: "POST" },
+      {
+        body: {},
+        method: "POST",
+      },
     );
     expect(revoked.status).toBe(200);
     expect(revoked.body.status).toBe("revoked");
@@ -1948,7 +1998,10 @@ e2e("tether e2e", () => {
     const repeated = await requestStatusFrom<AuthGrantReadResponse & { readonly status: string }>(
       baseUrl,
       `/auth/grants/${created.grant.jti}/revoke`,
-      { body: {}, method: "POST" },
+      {
+        body: {},
+        method: "POST",
+      },
     );
     expect(repeated.status).toBe(200);
     expect(repeated.body.status).toBe("already_revoked");
@@ -1983,11 +2036,248 @@ e2e("tether e2e", () => {
     expect(invalidJti.text).not.toContain(created.bearer);
   });
 
+  it("atomically consumes one ticket exactly once under a concurrent race", async () => {
+    const parent = await request<AuthGrantCreateResponse>("/auth/grants", {
+      body: {
+        role: "observer",
+        sessionScope: "*",
+        subject: `part_ticket_race_${randomUUID()}`,
+        ttlSeconds: 3_600,
+      },
+      method: "POST",
+    });
+    const minted = await request<AuthTicketCreateResponse>("/auth/tickets", {
+      authToken: parent.bearer,
+      body: {},
+      method: "POST",
+    });
+    const store = createAuthPersistenceStores(currentPool()).tickets;
+
+    const results = await Promise.all([
+      store.consume(hashAuthTicket(minted.ticket)),
+      store.consume(hashAuthTicket(minted.ticket)),
+    ]);
+
+    expect(results.filter((result) => result !== null)).toHaveLength(1);
+    expect(results.find((result) => result !== null)).toMatchObject({
+      parentGrantJti: parent.grant.jti,
+      ticketHash: hashAuthTicket(minted.ticket),
+    });
+    await expect(store.findByHash(hashAuthTicket(minted.ticket))).resolves.toMatchObject({
+      consumedAt: expect.any(Date) as Date,
+    });
+  });
+
+  it("admits one of two replicas with one ticket and binds the winner to its parent grant", async () => {
+    const session = await createSession();
+    const participantId = `part_ticket_replica_${randomUUID()}`;
+    const parent = await request<AuthGrantCreateResponse>("/auth/grants", {
+      body: {
+        role: "participant",
+        sessionScope: session.sessionId,
+        subject: participantId,
+        ttlSeconds: 3_600,
+      },
+      method: "POST",
+    });
+    const minted = await request<AuthTicketCreateResponse>("/auth/tickets", {
+      authToken: parent.bearer,
+      body: {},
+      method: "POST",
+    });
+    const durableTicketStore = createAuthPersistenceStores(currentPool()).tickets;
+    let consumeArrivals = 0;
+    let releaseConsumes = (): void => undefined;
+    const bothConsumesArrived = new Promise<void>((resolve) => {
+      releaseConsumes = resolve;
+    });
+    const coordinatedTicketStore = {
+      consume: async (ticketHash: string) => {
+        consumeArrivals += 1;
+        if (consumeArrivals === 2) releaseConsumes();
+        await bothConsumesArrived;
+        return durableTicketStore.consume(ticketHash);
+      },
+      create: durableTicketStore.create,
+      findByHash: durableTicketStore.findByHash,
+    };
+    const replicas = [
+      createAppServer(currentPool(), {
+        auth: { ...e2eAuthOptions, ticketStore: coordinatedTicketStore },
+        eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+        taskClaimSweeper: { intervalMs: 0 },
+      }),
+      createAppServer(currentPool(), {
+        auth: { ...e2eAuthOptions, ticketStore: coordinatedTicketStore },
+        eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+        taskClaimSweeper: { intervalMs: 0 },
+      }),
+    ] as const;
+    const ports = await Promise.all([findOpenPort(), findOpenPort()]);
+    await Promise.all(replicas.map((replica, index) => replica.listen(ports[index] ?? 0)));
+    const sockets = ports.map((port, index) => {
+      const url = new URL(`ws://127.0.0.1:${port}/sessions/${session.sessionId}/stream`);
+      url.searchParams.set("after", "0");
+      url.searchParams.set("instanceId", `inst_ticket_replica_${index}_${randomUUID()}`);
+      url.searchParams.set("participantId", participantId);
+      url.searchParams.set("runtimeKind", "codex");
+      url.searchParams.set("ticket", minted.ticket);
+      return new WebSocket(url);
+    });
+    const messages = sockets.map((): unknown[] => []);
+    sockets.forEach((socket, index) => {
+      socket.on("message", (data) => messages[index]?.push(JSON.parse(String(data)) as unknown));
+    });
+
+    try {
+      await Promise.all(sockets.map(waitForSocketOpen));
+      await waitFor(() => messages.every((received) => received.length > 0));
+      expect(messages.filter((received) => received.some(isReplayCompleteEnvelope))).toHaveLength(
+        1,
+      );
+      expect(
+        messages.filter((received) =>
+          received.some((message) => isWebSocketErrorWithReason(message, "auth_ticket_consumed")),
+        ),
+      ).toHaveLength(1);
+      const winnerIndex = messages.findIndex((received) => received.some(isReplayCompleteEnvelope));
+      const winner = sockets[winnerIndex];
+      const winnerMessages = messages[winnerIndex];
+      if (winner === undefined || winnerMessages === undefined) {
+        throw new Error("Ticket race did not produce one admitted socket");
+      }
+
+      await currentPool().pool.query(
+        `UPDATE auth_tickets
+         SET expires_at = GREATEST(consumed_at, created_at + INTERVAL '1 millisecond')
+         WHERE ticket_hash = $1`,
+        [hashAuthTicket(minted.ticket)],
+      );
+      const eventId = `evt_ticket_expired_after_admission_${randomUUID()}`;
+      const requestId = `req_ticket_expired_after_admission_${randomUUID()}`;
+      winner.send(
+        JSON.stringify({
+          eventId,
+          op: webSocketOperation.publish,
+          payload: { text: "ticket expiry does not close admitted socket" },
+          producerId: participantId,
+          requestId,
+          type: sessionEventType.userMessage,
+        }),
+      );
+      await waitFor(() =>
+        winnerMessages.some(
+          (message) => isCommandResultEnvelope(message) && message.requestId === requestId,
+        ),
+      );
+      const events = await request<EventsResponse>(`/sessions/${session.sessionId}/events?after=0`);
+      expect(events.events.map((event) => event.eventId)).toContain(eventId);
+      expect(JSON.stringify(messages)).not.toContain(minted.ticket);
+    } finally {
+      releaseConsumes();
+      for (const socket of sockets) {
+        if (socket.readyState !== WebSocket.CLOSED) {
+          socket.close();
+          await waitForSocketClose(socket);
+        }
+      }
+      await Promise.all(replicas.map((replica) => replica.close()));
+    }
+  });
+
+  it("burns a consumed ticket when the transport fails before the upgrade response", async () => {
+    const session = await createSession();
+    const participantId = `part_ticket_transport_${randomUUID()}`;
+    const parent = await request<AuthGrantCreateResponse>("/auth/grants", {
+      body: {
+        role: "participant",
+        sessionScope: session.sessionId,
+        subject: participantId,
+        ttlSeconds: 3_600,
+      },
+      method: "POST",
+    });
+    const minted = await request<AuthTicketCreateResponse>("/auth/tickets", {
+      authToken: parent.bearer,
+      body: {},
+      method: "POST",
+    });
+    const url = new URL(`${baseUrl.replace("http:", "ws:")}/sessions/${session.sessionId}/stream`);
+    url.searchParams.set("after", "0");
+    url.searchParams.set("instanceId", `inst_ticket_transport_${randomUUID()}`);
+    url.searchParams.set("participantId", participantId);
+    url.searchParams.set("runtimeKind", "codex");
+    url.searchParams.set("ticket", minted.ticket);
+
+    const failedUpgrade = await sendInvalidWebSocketUpgrade(url);
+    expect(failedUpgrade).toContain("HTTP/1.1 400");
+    await expect(
+      createAuthPersistenceStores(currentPool()).tickets.findByHash(hashAuthTicket(minted.ticket)),
+    ).resolves.toMatchObject({ consumedAt: expect.any(Date) as Date });
+
+    const replay = new WebSocket(url);
+    const messages: unknown[] = [];
+    replay.on("message", (data) => messages.push(JSON.parse(String(data)) as unknown));
+    try {
+      await waitForSocketOpen(replay);
+      await waitFor(() =>
+        messages.some((message) => isWebSocketErrorWithReason(message, "auth_ticket_consumed")),
+      );
+      expect(JSON.stringify(messages)).not.toContain(minted.ticket);
+    } finally {
+      if (replay.readyState !== WebSocket.CLOSED) {
+        replay.close();
+        await waitForSocketClose(replay);
+      }
+    }
+  });
+
+  it("admits Node WebSockets with an Authorization header and no credential query", async () => {
+    const session = await createSession();
+    const participantId = `part_ws_header_${randomUUID()}`;
+    const parent = await request<AuthGrantCreateResponse>("/auth/grants", {
+      body: {
+        role: "participant",
+        sessionScope: session.sessionId,
+        subject: participantId,
+        ttlSeconds: 3_600,
+      },
+      method: "POST",
+    });
+    const url = new URL(`${baseUrl.replace("http:", "ws:")}/sessions/${session.sessionId}/stream`);
+    url.searchParams.set("after", "0");
+    url.searchParams.set("instanceId", `inst_ws_header_${randomUUID()}`);
+    url.searchParams.set("participantId", participantId);
+    url.searchParams.set("runtimeKind", "codex");
+    expect(url.searchParams.has("access_token")).toBe(false);
+    expect(url.searchParams.has("ticket")).toBe(false);
+    expect(url.toString()).not.toContain(parent.bearer);
+
+    const socket = new WebSocket(url, {
+      headers: { authorization: `Bearer ${parent.bearer}` },
+    });
+    const messages: unknown[] = [];
+    socket.on("message", (data) => messages.push(JSON.parse(String(data)) as unknown));
+    try {
+      await waitForSocketOpen(socket);
+      await waitFor(() => messages.some(isReplayCompleteEnvelope));
+      expect(JSON.stringify(messages)).not.toContain(parent.bearer);
+    } finally {
+      if (socket.readyState !== WebSocket.CLOSED) {
+        socket.close();
+        await waitForSocketClose(socket);
+      }
+    }
+  });
+
   it("reauthorizes established WebSocket commands against durable revocation", async () => {
     const session = await createSession();
     const participantId = `part_ws_grant_${randomUUID()}`;
     const task = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
-      body: { kind: "text", objective: "Remain unclaimed after grant revocation" },
+      body: {
+        kind: "text",
+        objective: "Remain unclaimed after grant revocation",
+      },
       method: "POST",
     });
     const created = await request<AuthGrantCreateResponse>("/auth/grants", {
@@ -2304,7 +2594,11 @@ e2e("tether e2e", () => {
     expect(gatedApp.debugInfo().auth.grantIssuanceEnabled).toBe(false);
     const subject = `admin_gated_${randomUUID()}`;
     const response = await requestStatusFrom(`http://127.0.0.1:${port}`, "/auth/grants", {
-      authToken: mintE2eToken({ participantId: "part_gate_admin", role: "admin", sessionId: "*" }),
+      authToken: mintE2eToken({
+        participantId: "part_gate_admin",
+        role: "admin",
+        sessionId: "*",
+      }),
       body: { role: "admin", sessionScope: "*", subject },
       method: "POST",
     });
@@ -2313,10 +2607,9 @@ e2e("tether e2e", () => {
       error: "Authentication grant issuance unavailable",
       reason: "auth_grant_issuance_gated",
     });
-    const persisted = await currentPool().pool.query<{ readonly count: number }>(
-      `SELECT count(*)::int AS count FROM auth_grants WHERE subject = $1`,
-      [subject],
-    );
+    const persisted = await currentPool().pool.query<{
+      readonly count: number;
+    }>(`SELECT count(*)::int AS count FROM auth_grants WHERE subject = $1`, [subject]);
     expect(persisted.rows[0]?.count).toBe(0);
   });
 
@@ -2339,7 +2632,11 @@ e2e("tether e2e", () => {
       "/auth/grants",
       {
         authToken: null,
-        body: { role: "admin", sessionScope: "*", subject: "bootstrap_disabled_mode" },
+        body: {
+          role: "admin",
+          sessionScope: "*",
+          subject: "bootstrap_disabled_mode",
+        },
         method: "POST",
       },
     );
@@ -2377,7 +2674,10 @@ e2e("tether e2e", () => {
     });
     const audits = await stores.audits.listForGrant(created.grant.jti, 10);
     expect(audits).toEqual([
-      expect.objectContaining({ action: "grant.created", reasonCode: "bootstrap" }),
+      expect.objectContaining({
+        action: "grant.created",
+        reasonCode: "bootstrap",
+      }),
     ]);
     expect(JSON.stringify(audits)).not.toContain(created.bearer);
   });
@@ -4271,7 +4571,10 @@ e2e("tether e2e", () => {
           actors: ["registration-a", "registration-b"],
           name: "participant-advisory-lock-ready",
           position: "before",
-          query: { class: "participant-advisory-lock", text: participantAdvisoryLockQuery },
+          query: {
+            class: "participant-advisory-lock",
+            text: participantAdvisoryLockQuery,
+          },
         },
       ],
       transactionTimeouts: { lockTimeoutMs: 2_000, statementTimeoutMs: 5_000 },
@@ -4369,10 +4672,26 @@ e2e("tether e2e", () => {
     expect(phaseEvents).toHaveLength(4);
     expect(phaseEvents).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ actor: "probe-a", name: "probe-ready", position: "before" }),
-        expect.objectContaining({ actor: "probe-b", name: "probe-ready", position: "before" }),
-        expect.objectContaining({ actor: "probe-a", name: "probe-finished", position: "after" }),
-        expect.objectContaining({ actor: "probe-b", name: "probe-finished", position: "after" }),
+        expect.objectContaining({
+          actor: "probe-a",
+          name: "probe-ready",
+          position: "before",
+        }),
+        expect.objectContaining({
+          actor: "probe-b",
+          name: "probe-ready",
+          position: "before",
+        }),
+        expect.objectContaining({
+          actor: "probe-a",
+          name: "probe-finished",
+          position: "after",
+        }),
+        expect.objectContaining({
+          actor: "probe-b",
+          name: "probe-finished",
+          position: "after",
+        }),
       ]),
     );
   });
@@ -4442,7 +4761,10 @@ e2e("tether e2e", () => {
       },
     });
     expect(waiter?.backendPid).toEqual(expect.any(Number));
-    expect(waiter?.lockWait).toMatchObject({ blocked: true, waitEventType: "Lock" });
+    expect(waiter?.lockWait).toMatchObject({
+      blocked: true,
+      waitEventType: "Lock",
+    });
     expect(snapshot.cleanup).toMatchObject({
       blockedActorsAfterRollback: 0,
       cancelledActors: 2,
@@ -4536,9 +4858,9 @@ e2e("tether e2e", () => {
         try {
           await terminatedActor.query("BEGIN");
           await terminator.query("BEGIN");
-          const pidResult = await terminatedActor.query<{ readonly pid: number }>(
-            "SELECT pg_backend_pid()::int AS pid",
-          );
+          const pidResult = await terminatedActor.query<{
+            readonly pid: number;
+          }>("SELECT pg_backend_pid()::int AS pid");
           const terminatedPid = pidResult.rows[0]?.pid;
           if (terminatedPid === undefined) {
             throw new Error("Missing terminated actor backend PID");
@@ -4556,7 +4878,10 @@ e2e("tether e2e", () => {
     const snapshot = coordinator.snapshot();
     expect(snapshot.cleanup?.failures).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ actor: "terminated-actor", operation: "rollback" }),
+        expect.objectContaining({
+          actor: "terminated-actor",
+          operation: "rollback",
+        }),
       ]),
     );
     expect(snapshot.cleanup).toMatchObject({
@@ -4582,7 +4907,10 @@ e2e("tether e2e", () => {
           actors: ["mutation"],
           name: "epoch-n-fence-held",
           position: "after",
-          query: { class: "current-control-lease-fence", text: currentControlLeaseFenceQuery },
+          query: {
+            class: "current-control-lease-fence",
+            text: currentControlLeaseFenceQuery,
+          },
           release: "manual",
         },
       ],
@@ -4662,7 +4990,9 @@ e2e("tether e2e", () => {
       sessionId: session.sessionId,
       taskId: task.task.taskId,
     });
-    const currentEpochRows = await currentPool().pool.query<{ readonly epoch: unknown }>(
+    const currentEpochRows = await currentPool().pool.query<{
+      readonly epoch: unknown;
+    }>(
       `
         SELECT epoch
         FROM participant_control_leases
@@ -4674,7 +5004,10 @@ e2e("tether e2e", () => {
       [session.sessionId, participantId],
     );
 
-    expect(result.lockWait).toMatchObject({ blocked: true, waitEventType: "Lock" });
+    expect(result.lockWait).toMatchObject({
+      blocked: true,
+      waitEventType: "Lock",
+    });
     expect(result.mutationResponse.status).toBe(200);
     expect(result.mutationResponse.body.task.claimExpiresAt).not.toBe(claimed.task.claimExpiresAt);
     expect(durableTask?.claimExpiresAt).toBe(result.mutationResponse.body.task.claimExpiresAt);
@@ -4698,7 +5031,10 @@ e2e("tether e2e", () => {
           actors: ["mutation"],
           name: "epoch-n-before-fence",
           position: "before",
-          query: { class: "current-control-lease-fence", text: currentControlLeaseFenceQuery },
+          query: {
+            class: "current-control-lease-fence",
+            text: currentControlLeaseFenceQuery,
+          },
           release: "manual",
         },
       ],
@@ -4774,7 +5110,9 @@ e2e("tether e2e", () => {
       sessionId: session.sessionId,
       taskId: task.task.taskId,
     });
-    const currentEpochRows = await currentPool().pool.query<{ readonly epoch: unknown }>(
+    const currentEpochRows = await currentPool().pool.query<{
+      readonly epoch: unknown;
+    }>(
       `
         SELECT epoch
         FROM participant_control_leases
@@ -4815,7 +5153,10 @@ e2e("tether e2e", () => {
   it("allows exactly one of two synchronized REST claimants to claim one task", async () => {
     const session = await createSession();
     const task = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
-      body: { kind: "software_dev", objective: "Claim this task exactly once" },
+      body: {
+        kind: "software_dev",
+        objective: "Claim this task exactly once",
+      },
       method: "POST",
     });
     const claimants = [
@@ -5010,7 +5351,10 @@ e2e("tether e2e", () => {
           actors: ["publisher-a"],
           name: "publisher-a-sequence-allocated",
           position: "after",
-          query: { class: "event-sequence-allocation", text: eventSequenceAllocatorQuery },
+          query: {
+            class: "event-sequence-allocation",
+            text: eventSequenceAllocatorQuery,
+          },
           release: "manual",
         },
       ],
@@ -5063,7 +5407,10 @@ e2e("tether e2e", () => {
     );
     const committedEvents = await listEvents(currentPool(), sessionId, sequenceBefore - 1);
 
-    expect(result.lockWait).toMatchObject({ blocked: true, waitEventType: "Lock" });
+    expect(result.lockWait).toMatchObject({
+      blocked: true,
+      waitEventType: "Lock",
+    });
     expect([result.eventA.seq, result.eventB.seq]).toEqual([sequenceBefore, sequenceBefore + 1]);
     expect(committedEvents).toHaveLength(2);
     expect(committedEvents).toEqual([
@@ -5107,7 +5454,10 @@ e2e("tether e2e", () => {
           actors: ["publisher-a"],
           name: "publisher-a-rollback-sequence-allocated",
           position: "after",
-          query: { class: "event-sequence-allocation", text: eventSequenceAllocatorQuery },
+          query: {
+            class: "event-sequence-allocation",
+            text: eventSequenceAllocatorQuery,
+          },
           release: "manual",
         },
       ],
@@ -5153,9 +5503,14 @@ e2e("tether e2e", () => {
     const eventB = requireFulfilledOutcome(result.eventB);
     const committedEvents = await listEvents(currentPool(), sessionId, sequenceBefore - 1);
 
-    expect(result.lockWait).toMatchObject({ blocked: true, waitEventType: "Lock" });
+    expect(result.lockWait).toMatchObject({
+      blocked: true,
+      waitEventType: "Lock",
+    });
     expect(result.eventA).toMatchObject({
-      reason: expect.objectContaining({ message: "injected session event insert failure" }),
+      reason: expect.objectContaining({
+        message: "injected session event insert failure",
+      }),
       status: "rejected",
     });
     expect(eventB).toMatchObject({
@@ -8448,7 +8803,10 @@ e2e("tether e2e", () => {
         setupBaseUrl,
         `/sessions/${session.sessionId}/tasks`,
         {
-          body: { kind: "software_dev", objective: "Refresh under epoch serialization" },
+          body: {
+            kind: "software_dev",
+            objective: "Refresh under epoch serialization",
+          },
           method: "POST",
         },
       );
@@ -8460,7 +8818,14 @@ e2e("tether e2e", () => {
           method: "POST",
         },
       );
-      return { claimed, controlEpoch, instanceId, participantId, session, task };
+      return {
+        claimed,
+        controlEpoch,
+        instanceId,
+        participantId,
+        session,
+        task,
+      };
     } finally {
       await setupApp.close();
     }
@@ -9353,6 +9718,38 @@ async function findOpenPort(): Promise<number> {
 }
 
 /**
+ * Sends an authenticated but structurally invalid WebSocket handshake and
+ * returns the server response after the peer closes the transport.
+ */
+async function sendInvalidWebSocketUpgrade(url: URL): Promise<string> {
+  const port = Number(url.port);
+  if (!Number.isSafeInteger(port) || port <= 0) {
+    throw new Error("Invalid WebSocket test port");
+  }
+  return new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const socket = createConnection({ host: url.hostname, port });
+    socket.once("error", reject);
+    socket.on("data", (chunk: Buffer) => chunks.push(chunk));
+    socket.once("close", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    socket.once("connect", () => {
+      socket.write(
+        [
+          `GET ${url.pathname}${url.search} HTTP/1.1`,
+          `Host: ${url.host}`,
+          "Connection: Upgrade",
+          "Upgrade: websocket",
+          "Sec-WebSocket-Version: 13",
+          "Sec-WebSocket-Key: invalid",
+          "",
+          "",
+        ].join("\r\n"),
+      );
+    });
+  });
+}
+
+/**
  * Checks whether a parsed WebSocket message is an event envelope.
  */
 function isEventEnvelope(value: unknown): value is {
@@ -9426,6 +9823,18 @@ function isErrorEnvelope(value: unknown): value is {
 } {
   return (
     isRecord(value) && value.op === webSocketOperation.error && typeof value.error === "string"
+  );
+}
+
+/**
+ * Checks whether a parsed WebSocket message is an error with the expected reason.
+ */
+function isWebSocketErrorWithReason(value: unknown, reason: string): boolean {
+  return (
+    isRecord(value) &&
+    value.op === webSocketOperation.error &&
+    value.reason === reason &&
+    typeof value.error === "string"
   );
 }
 

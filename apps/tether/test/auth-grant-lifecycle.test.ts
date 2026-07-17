@@ -11,7 +11,9 @@ import {
 const secret = "test-secret-value-long-enough";
 
 /** Builds a transaction-shaped in-memory persistence seam for lifecycle unit tests. */
-function fakeStores(): AuthPersistenceStores & { readonly records: Map<string, AuthGrantRecord> } {
+function fakeStores(): AuthPersistenceStores & {
+  readonly records: Map<string, AuthGrantRecord>;
+} {
   const records = new Map<string, AuthGrantRecord>();
   return {
     audits: { listForGrant: async () => [] },
@@ -31,7 +33,11 @@ function fakeStores(): AuthPersistenceStores & { readonly records: Map<string, A
       records.set(jti, revoked);
       return { grant: revoked, status: "revoked" } as const;
     }),
-    tickets: { create: async () => undefined, findByHash: async () => null },
+    tickets: {
+      consume: async () => null,
+      create: async () => undefined,
+      findByHash: async () => null,
+    },
   };
 }
 
@@ -138,7 +144,10 @@ describe("auth grant lifecycle", () => {
 
     await expect(
       lifecycle.revoke(created.grant.jti, "operator", "operator-request"),
-    ).resolves.toMatchObject({ grant: { revokedAt: expect.any(String) }, status: "revoked" });
+    ).resolves.toMatchObject({
+      grant: { revokedAt: expect.any(String) },
+      status: "revoked",
+    });
     expect(read).not.toHaveBeenCalled();
   });
 });

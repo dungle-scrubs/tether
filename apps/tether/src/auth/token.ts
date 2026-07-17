@@ -11,6 +11,8 @@ export const AuthError = {
   GrantExpired: "auth_grant_expired",
   GrantRevoked: "auth_grant_revoked",
   StoreUnavailable: "auth_store_unavailable",
+  TicketConsumed: "auth_ticket_consumed",
+  TicketExpired: "auth_ticket_expired",
   BadSignature: "bad_sig",
   Expired: "expired",
   Malformed: "malformed",

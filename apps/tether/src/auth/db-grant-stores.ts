@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, isNull } from "drizzle-orm";
+import { and, asc, desc, eq, gt, isNull, sql } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import type { DatabasePool } from "../db.js";
@@ -93,7 +93,10 @@ async function revokeGrantWithAudit(
         const existingGrant = existing[0];
         return existingGrant === undefined
           ? { grant: null, status: "not_found" }
-          : { grant: parseGrantRecord(existingGrant), status: "already_revoked" };
+          : {
+              grant: parseGrantRecord(existingGrant),
+              status: "already_revoked",
+            };
       }),
     "auth_grant_revoke_failed",
   );
@@ -153,6 +156,36 @@ function createAuditStore(database: AuthStoreDatabase): AuthPersistenceStores["a
 /** Creates the validated hashed-ticket adapter. */
 function createTicketStore(database: AuthStoreDatabase): AuthTicketStore {
   return {
+    consume: async (ticketHash) => {
+      validateTicketHash(ticketHash);
+      const rows = await runAuthStoreOperation(
+        () =>
+          database
+            .update(authTickets)
+            .set({
+              consumedAt: sql`GREATEST(statement_timestamp(), ${authTickets.createdAt})`,
+            })
+            .where(
+              and(
+                eq(authTickets.ticketHash, ticketHash),
+                eq(authTickets.audience, "tether-websocket"),
+                isNull(authTickets.consumedAt),
+                gt(authTickets.expiresAt, sql`statement_timestamp()`),
+                sql`EXISTS (
+                  SELECT 1
+                  FROM ${authGrants}
+                  WHERE ${authGrants.jti} = ${authTickets.parentGrantJti}
+                    AND ${authGrants.revokedAt} IS NULL
+                    AND ${authGrants.expiresAt} > statement_timestamp()
+                )`,
+              ),
+            )
+            .returning(),
+        "auth_ticket_consume_failed",
+      );
+      const row = rows[0];
+      return row === undefined ? null : parseTicketRecord(row);
+    },
     create: async (record) => {
       validateTicketRecord(record);
       await runAuthStoreOperation(
@@ -172,13 +205,7 @@ function createTicketStore(database: AuthStoreDatabase): AuthTicketStore {
         "auth_ticket_read_failed",
       );
       const row = rows[0];
-      return row === undefined
-        ? null
-        : {
-            ...row,
-            admissionMetadata: row.admissionMetadata as AuthTicketAdmissionMetadata,
-            audience: "tether-websocket",
-          };
+      return row === undefined ? null : parseTicketRecord(row);
     },
   };
 }
@@ -280,6 +307,15 @@ function parseGrantRecord(row: typeof authGrants.$inferSelect): AuthGrantRecord 
     audience: row.audience as AuthAudience,
     metadata: row.metadata as AuthGrantMetadata,
     role: row.role as AuthRole,
+  };
+}
+
+/** Parses a database ticket row without manufacturing a valid audience value. */
+function parseTicketRecord(row: typeof authTickets.$inferSelect): AuthTicketRecord {
+  return {
+    ...row,
+    admissionMetadata: row.admissionMetadata as AuthTicketAdmissionMetadata,
+    audience: row.audience as AuthTicketRecord["audience"],
   };
 }
 

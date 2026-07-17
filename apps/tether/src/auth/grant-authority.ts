@@ -26,6 +26,8 @@ export class AuthGrantAuthorityError extends Error {
 
 /** PostgreSQL-authoritative grant verifier used at REST and command boundaries. */
 export interface AuthGrantAuthority {
+  /** Reauthorizes a ticket-derived parent grant directly from durable authority. */
+  readonly authenticateGrantJti: (jti: string) => Promise<AuthContext>;
   /** Verifies a raw REST bearer and its matching durable row. */
   readonly authenticateRestBearer: (bearer: string) => Promise<AuthContext>;
   /** Returns bounded cache diagnostics without grant identifiers or bearer material. */
@@ -115,6 +117,18 @@ export function createAuthGrantAuthority(options: AuthGrantAuthorityOptions): Au
   };
 
   return {
+    authenticateGrantJti: async (jti) => {
+      const at = now();
+      const cached = readNegative(jti, at);
+      if (cached) throw new AuthGrantAuthorityError(cached.code);
+      const record = await readGrant(jti);
+      if (!record || !recordIsAcceptedParent(record, jti, options)) {
+        throw new AuthGrantAuthorityError("auth_claim_invalid");
+      }
+      const inactive = denyInactive(record, at);
+      if (inactive) throw new AuthGrantAuthorityError(inactive);
+      return contextFromGrant(record);
+    },
     authenticateRestBearer: async (bearer) => {
       const at = now();
       const claims = verifyClaims(bearer, options, at);
@@ -126,15 +140,7 @@ export function createAuthGrantAuthority(options: AuthGrantAuthorityOptions): Au
       }
       const inactive = denyInactive(record, at);
       if (inactive) throw new AuthGrantAuthorityError(inactive);
-      return {
-        expiresAt: record.expiresAt.toISOString(),
-        grantJti: record.jti,
-        issuer: record.issuer,
-        kid: record.kid,
-        participantId: record.subject,
-        role: record.role,
-        sessionScope: record.sessionScope,
-      };
+      return contextFromGrant(record);
     },
     debugInfo: () => {
       const at = now();
@@ -146,6 +152,31 @@ export function createAuthGrantAuthority(options: AuthGrantAuthorityOptions): Au
         negativeCacheMaximumEntries: maximumNegativeCacheEntries,
       };
     },
+  };
+}
+
+function recordIsAcceptedParent(
+  record: AuthGrantRecord,
+  jti: string,
+  options: AuthGrantAuthorityOptions,
+): boolean {
+  return (
+    record.audience === "tether-rest" &&
+    record.issuer === options.issuer &&
+    record.jti === jti &&
+    options.secrets[record.kid] !== undefined
+  );
+}
+
+function contextFromGrant(record: AuthGrantRecord): AuthContext {
+  return {
+    expiresAt: record.expiresAt.toISOString(),
+    grantJti: record.jti,
+    issuer: record.issuer,
+    kid: record.kid,
+    participantId: record.subject,
+    role: record.role,
+    sessionScope: record.sessionScope,
   };
 }
 

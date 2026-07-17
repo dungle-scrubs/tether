@@ -137,7 +137,10 @@ export class ControlSocketRegistry {
         // this late, strictly-lower-epoch registration. Reject the stale socket
         // rather than overwriting the current higher-epoch entry with it.
         safeSendWebSocketEnvelope(socket, {
-          details: { currentEpoch: existing.epoch, reason: "control_epoch_superseded" },
+          details: {
+            currentEpoch: existing.epoch,
+            reason: "control_epoch_superseded",
+          },
           error: "WebSocket control epoch was superseded",
         });
         safeCloseWebSocket(socket, 1008, "control epoch superseded");
@@ -243,7 +246,7 @@ async function handleParticipantWebSocketUpgrade(
     authenticated = await input.auth.authenticateWebSocketUpgrade(input.request, url);
   } catch (error) {
     const reason = authErrorFromUnknown(error);
-    redactWebSocketAccessToken(input.request, url);
+    redactWebSocketCredentials(input.request, url);
     input.wsServer.handleUpgrade(input.request, input.socket, input.head, (webSocket) => {
       input.wsServer.emit("connection", webSocket, input.request);
       observeWebSocketPayloadErrors(webSocket, input.resourceLimitRuntime);
@@ -255,7 +258,7 @@ async function handleParticipantWebSocketUpgrade(
     });
     return;
   }
-  const streamSearchParams = redactWebSocketAccessToken(input.request, url);
+  const streamSearchParams = redactWebSocketCredentials(input.request, url);
   input.wsServer.handleUpgrade(input.request, input.socket, input.head, (webSocket) => {
     input.wsServer.emit("connection", webSocket, input.request);
     observeWebSocketPayloadErrors(webSocket, input.resourceLimitRuntime);
@@ -279,10 +282,12 @@ async function handleParticipantWebSocketUpgrade(
   });
 }
 
-/** Removes a captured bearer before request metadata enters long-lived socket surfaces. */
-export function redactWebSocketAccessToken(request: IncomingMessage, url: URL): URLSearchParams {
+/** Removes captured credentials before request metadata enters long-lived socket surfaces. */
+export function redactWebSocketCredentials(request: IncomingMessage, url: URL): URLSearchParams {
   const redactedUrl = new URL(url);
   redactedUrl.searchParams.delete("access_token");
+  redactedUrl.searchParams.delete("ticket");
+  delete request.headers.authorization;
   request.url = `${redactedUrl.pathname}${redactedUrl.search}`;
   return new URLSearchParams(redactedUrl.searchParams);
 }
@@ -302,7 +307,11 @@ function handleWebSocket(
 ): Effect.Effect<void, unknown> {
   return Effect.gen(function* () {
     const authContext = authenticated.context;
-    const readDenied = authorize({ action: "read", context: authContext, sessionId });
+    const readDenied = authorize({
+      action: "read",
+      context: authContext,
+      sessionId,
+    });
     if (readDenied) {
       socket.send(
         serializeErrorEnvelope({
@@ -421,7 +430,9 @@ function handleWebSocket(
     // replay and buffered-live boundary, or the socket has been closed with a
     // typed replay_gap_unrepaired error.
     const replayLimit = resourceLimitRuntime.limits.wsReplayMaxEvents;
-    const events = yield* service.listEvents(sessionId, afterSeq, { limit: replayLimit + 1 });
+    const events = yield* service.listEvents(sessionId, afterSeq, {
+      limit: replayLimit + 1,
+    });
     if (events.length > replayLimit) {
       resourceLimitRuntime.recordReplayWindowExceeded();
       safeSendWebSocketEnvelope(socket, {
@@ -683,16 +694,28 @@ function registerWebSocketParticipant(
     if (authContext?.role === "observer") {
       return null;
     }
-    const denied = authorize({ action: "task-mutate", context: authContext, sessionId });
+    const denied = authorize({
+      action: "task-mutate",
+      context: authContext,
+      sessionId,
+    });
     if (denied) {
-      socket.send(serializeErrorEnvelope({ error: "WebSocket participant is not authorized" }));
+      socket.send(
+        serializeErrorEnvelope({
+          error: "WebSocket participant is not authorized",
+        }),
+      );
       socket.close(1008, "unauthorized");
       return null;
     }
     const requestedParticipantId = searchParams.get("participantId");
     const identityDenied = authorizeParticipantIdentity(authContext, requestedParticipantId);
     if (identityDenied) {
-      socket.send(serializeErrorEnvelope({ error: "WebSocket participant identity mismatch" }));
+      socket.send(
+        serializeErrorEnvelope({
+          error: "WebSocket participant identity mismatch",
+        }),
+      );
       socket.close(1008, "identity mismatch");
       return null;
     }
@@ -728,7 +751,10 @@ function registerWebSocketParticipant(
     if (result.status === "control_epoch_stale") {
       socket.send(
         serializeErrorEnvelope({
-          details: { currentEpoch: result.currentEpoch, reason: "control_epoch_stale" },
+          details: {
+            currentEpoch: result.currentEpoch,
+            reason: "control_epoch_stale",
+          },
           error: "WebSocket control epoch is stale",
         }),
       );
@@ -841,7 +867,11 @@ function handleParsedWebSocketMessage(
       return;
     }
     if (op === webSocketOperation.publish) {
-      const denied = authorize({ action: "publish", context: authContext, sessionId });
+      const denied = authorize({
+        action: "publish",
+        context: authContext,
+        sessionId,
+      });
       if (denied) {
         sendCommandContextError(socket, commandContext, "WebSocket publish is not authorized", {
           category: "authorization_failed",
@@ -922,7 +952,11 @@ function handleParsedWebSocketMessage(
     if (!context) {
       return;
     }
-    const commandDenied = authorize({ action: "task-mutate", context: authContext, sessionId });
+    const commandDenied = authorize({
+      action: "task-mutate",
+      context: authContext,
+      sessionId,
+    });
     if (commandDenied) {
       sendCommandContextError(socket, commandContext, "WebSocket command is not authorized", {
         category: "authorization_failed",
@@ -1131,7 +1165,10 @@ function webSocketControlLeaseRefreshLoop(
                 // apply protected commands.
                 closeForRefreshError(
                   "WebSocket control epoch was superseded",
-                  { currentEpoch: result.currentEpoch, reason: "control_epoch_stale" },
+                  {
+                    currentEpoch: result.currentEpoch,
+                    reason: "control_epoch_stale",
+                  },
                   1008,
                   "control epoch stale",
                 );
@@ -1297,7 +1334,10 @@ function safeCloseWebSocket(socket: WebSocket, code: number, reason: string): vo
 /** Sends an error envelope to a WebSocket, ignoring failures from already-closed sockets. */
 function safeSendWebSocketEnvelope(
   socket: WebSocket,
-  envelope: { readonly details?: Record<string, unknown>; readonly error: string },
+  envelope: {
+    readonly details?: Record<string, unknown>;
+    readonly error: string;
+  },
 ): void {
   if (socket.readyState !== socket.OPEN) {
     return;

@@ -15,12 +15,14 @@ import {
   createAuthRuntime,
 } from "./auth/enforcement.js";
 import type { AuthContext } from "./auth/token.js";
+import { createAuthTicketLifecycle, type AuthTicketLifecycle } from "./auth/ticket-lifecycle.js";
 import { ServerConfigService } from "./config.js";
 import type { RuntimeTopology } from "./config.js";
 import { type DatabasePool, DatabaseService } from "./db.js";
 import { HostPresenceRuntime } from "./host-presence.js";
 import { handleClientBindingHttpRoute } from "./http-client-binding-route-handlers.js";
 import { handleAuthGrantHttpRoute } from "./http-auth-grant-route-handlers.js";
+import { handleAuthTicketHttpRoute } from "./http-auth-ticket-route-handlers.js";
 import { directHttpRoutes } from "./http-direct-routes.js";
 import { matchHttpRoute } from "./http-route-spec.js";
 import {
@@ -251,6 +253,7 @@ export function createAppServerWithSessionService(
   const auth = createAuthRuntime({
     ...authOptions,
     grantStore: authOptions.grantStore ?? authPersistenceStores.grants,
+    ticketStore: authOptions.ticketStore ?? authPersistenceStores.tickets,
   });
   const authGrantLifecycle = createAuthGrantLifecycle({
     activeKid: authOptions.activeKid,
@@ -258,6 +261,10 @@ export function createAppServerWithSessionService(
     issuanceEnabled: authOptions.preEnforcementGrantIssuanceEnabled ?? false,
     secrets: authOptions.secrets,
     stores: authPersistenceStores,
+  });
+  const authTicketLifecycle = createAuthTicketLifecycle({
+    replicaId: `replica_${replicaId}`,
+    store: authPersistenceStores.tickets,
   });
   /**
    * Reads process-local diagnostics for the app server and its child modules.
@@ -299,6 +306,7 @@ export function createAppServerWithSessionService(
           hub,
           auth,
           authGrantLifecycle,
+          authTicketLifecycle,
           resourceLimitRuntime,
           readDebugInfo,
           readReadiness,
@@ -374,6 +382,7 @@ function handleHttp(
   hub: SubscriptionHub,
   auth: AuthRuntime,
   authGrantLifecycle: AuthGrantLifecycle,
+  authTicketLifecycle: AuthTicketLifecycle,
   resourceLimitRuntime: ResourceLimitRuntime,
   readAppServerDebugInfo: ReadAppServerDebugInfo,
   readAppReadiness: ReadAppReadiness,
@@ -390,6 +399,7 @@ function handleHttp(
     hub,
     auth,
     authGrantLifecycle,
+    authTicketLifecycle,
     resourceLimitRuntime,
     readAppServerDebugInfo,
     readAppReadiness,
@@ -420,6 +430,7 @@ function handleHttpRequest(
   hub: SubscriptionHub,
   auth: AuthRuntime,
   authGrantLifecycle: AuthGrantLifecycle,
+  authTicketLifecycle: AuthTicketLifecycle,
   resourceLimitRuntime: ResourceLimitRuntime,
   readAppServerDebugInfo: ReadAppServerDebugInfo,
   readAppReadiness: ReadAppReadiness,
@@ -454,6 +465,17 @@ function handleHttpRequest(
       authenticateHttpRequest(auth, request, response, url),
     );
     if (authContext === undefined) {
+      return;
+    }
+    if (
+      yield* handleAuthTicketHttpRoute({
+        authContext,
+        lifecycle: authTicketLifecycle,
+        request,
+        response,
+        url,
+      })
+    ) {
       return;
     }
     if (

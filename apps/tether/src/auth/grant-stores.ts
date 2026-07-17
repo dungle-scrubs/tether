@@ -34,6 +34,7 @@ export type AuthPersistenceErrorCode =
   | "auth_grant_revoke_failed"
   | "auth_metadata_invalid"
   | "auth_ticket_create_failed"
+  | "auth_ticket_consume_failed"
   | "auth_ticket_hash_invalid"
   | "auth_ticket_read_failed";
 
@@ -108,20 +109,27 @@ export interface AuthTicketRecord {
 
 /** Input for atomically creating a grant and its required audit event. */
 export interface CreateAuthGrantWithAuditInput {
-  readonly audit: AuthGrantLifecycleAuditInput & { readonly action: "grant.created" };
+  readonly audit: AuthGrantLifecycleAuditInput & {
+    readonly action: "grant.created";
+  };
   readonly grant: AuthGrantRecord;
 }
 
 /** Input for atomically revoking a grant and appending its required audit event. */
 export interface RevokeAuthGrantWithAuditInput {
-  readonly audit: AuthGrantLifecycleAuditInput & { readonly action: "grant.revoked" };
+  readonly audit: AuthGrantLifecycleAuditInput & {
+    readonly action: "grant.revoked";
+  };
   readonly jti: string;
   readonly revokedAt: Date;
 }
 
 /** Observable result of an idempotent atomic revocation with its committed row. */
 export type RevokeAuthGrantResult =
-  | { readonly grant: AuthGrantRecord; readonly status: "already_revoked" | "revoked" }
+  | {
+      readonly grant: AuthGrantRecord;
+      readonly status: "already_revoked" | "revoked";
+    }
   | { readonly grant: null; readonly status: "not_found" };
 
 /** Narrow grant reads required by later authorization layers. */
@@ -143,6 +151,8 @@ export interface AuthGrantAuditStore {
 
 /** Narrow hashed-ticket persistence operations. */
 export interface AuthTicketStore {
+  /** Atomically consumes one eligible ticket, returning null when no row can transition. */
+  readonly consume: (ticketHash: string) => Promise<AuthTicketRecord | null>;
   /** Inserts one validated ticket hash and its bounded admission state. */
   readonly create: (record: AuthTicketRecord) => Promise<void>;
   /** Reads one ticket by SHA-256 hash. */

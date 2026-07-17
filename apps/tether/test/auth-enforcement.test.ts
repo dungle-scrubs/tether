@@ -185,6 +185,47 @@ describe("auth enforcement runtime", () => {
     ]);
   });
 
+  it("rejects ambiguous WebSocket credentials without exposing either secret", async () => {
+    const warnings: AuthWarning[] = [];
+    const runtime = createAuthRuntime({
+      activeKid: "default",
+      logger: collectWarnings(warnings),
+      mode: "required",
+      secrets: { default: "secret" },
+    });
+    const bearer = "tgr2.secret_payload_marker.secret_signature_marker";
+    const ticket = "A".repeat(43);
+    const url = new URL(`http://localhost/sessions/sess_1/stream?ticket=${ticket}`);
+
+    await expect(
+      runtime.authenticateWebSocketUpgrade(
+        {
+          headers: { authorization: `Bearer ${bearer}` },
+          method: "GET",
+          url: `${url.pathname}${url.search}`,
+        } as IncomingMessage,
+        url,
+      ),
+    ).rejects.toThrow(AuthError.ClaimInvalid);
+
+    const diagnostics = JSON.stringify({ debug: runtime.debugInfo(), warnings });
+    expect(diagnostics).not.toContain(bearer);
+    expect(diagnostics).not.toContain("secret_payload_marker");
+    expect(diagnostics).not.toContain("secret_signature_marker");
+    expect(diagnostics).not.toContain(ticket);
+    expect(warnings).toEqual([
+      {
+        details: {
+          method: "GET",
+          reason: AuthError.ClaimInvalid,
+          route: "/sessions/sess_1/stream",
+          transport: "ws",
+        },
+        event: "auth.reject",
+      },
+    ]);
+  });
+
   it("logs disabled mode warning through the injected logger", () => {
     const warnings: AuthWarning[] = [];
     const runtime = createAuthRuntime({
