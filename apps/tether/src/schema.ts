@@ -16,10 +16,186 @@ import {
 } from "drizzle-orm/pg-core";
 
 import type {
+  AuthGrantAuditMetadata,
+  AuthGrantMetadata,
+  AuthTicketAdmissionMetadata,
+} from "./auth/grant-stores.js";
+import type {
   SessionProjectionActivity,
   SessionProjectionForkLineage,
   SessionProjectionTangentLineage,
 } from "./session-projection.js";
+
+/** Durable authorization grants. Bearer values are intentionally absent. */
+export const authGrants = pgTable(
+  "auth_grants",
+  {
+    audience: text("audience").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    issuedAt: timestamp("issued_at", { withTimezone: true }).notNull(),
+    issuer: text("issuer").notNull(),
+    jti: text("jti").primaryKey(),
+    kid: text("kid").notNull(),
+    metadata: jsonb("metadata").$type<AuthGrantMetadata>().notNull(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    role: text("role").notNull(),
+    sessionScope: text("session_scope").notNull(),
+    subject: text("subject").notNull(),
+  },
+  (table) => [
+    check("auth_grants_audience_check", sql`${table.audience} = 'tether-rest'`),
+    check("auth_grants_expiry_check", sql`${table.expiresAt} > ${table.issuedAt}`),
+    check(
+      "auth_grants_lifetime_check",
+      sql`${table.expiresAt} <= ${table.issuedAt} + interval '7 days'`,
+    ),
+    check("auth_grants_issuer_length_check", sql`char_length(${table.issuer}) BETWEEN 1 AND 512`),
+    check("auth_grants_jti_length_check", sql`char_length(${table.jti}) BETWEEN 1 AND 128`),
+    check("auth_grants_kid_length_check", sql`char_length(${table.kid}) BETWEEN 1 AND 128`),
+    check("auth_grants_metadata_size_check", sql`octet_length(${table.metadata}::text) <= 4096`),
+    check(
+      "auth_grants_metadata_shape_check",
+      sql`jsonb_typeof(${table.metadata}) = 'object'
+        AND ${table.metadata} ? 'requestId'
+        AND ${table.metadata} ? 'source'
+        AND ${table.metadata} - ARRAY['requestId', 'source'] = '{}'::jsonb
+        AND jsonb_typeof(${table.metadata}->'source') = 'string'
+        AND ${table.metadata}->>'source' IN ('admin', 'bootstrap', 'migration')
+        AND (
+          jsonb_typeof(${table.metadata}->'requestId') = 'null'
+          OR (
+            jsonb_typeof(${table.metadata}->'requestId') = 'string'
+            AND ${table.metadata}->>'requestId' ~ '^req_[A-Za-z0-9_-]{1,120}$'
+          )
+        )`,
+    ),
+    check(
+      "auth_grants_revoked_check",
+      sql`${table.revokedAt} IS NULL OR ${table.revokedAt} >= ${table.issuedAt}`,
+    ),
+    check("auth_grants_role_check", sql`${table.role} IN ('observer', 'participant', 'admin')`),
+    check(
+      "auth_grants_session_scope_length_check",
+      sql`char_length(${table.sessionScope}) BETWEEN 1 AND 255`,
+    ),
+    check("auth_grants_subject_length_check", sql`char_length(${table.subject}) BETWEEN 1 AND 255`),
+    index("auth_grants_expiry_idx").on(table.expiresAt),
+    index("auth_grants_revoked_expiry_idx").on(table.revokedAt, table.expiresAt),
+  ],
+);
+
+/** Bounded durable grant lifecycle audit state without raw credential material. */
+export const authGrantAuditEvents = pgTable(
+  "auth_grant_audit_events",
+  {
+    action: text("action").notNull(),
+    actorSubject: text("actor_subject").notNull(),
+    auditId: text("audit_id").primaryKey(),
+    grantJti: text("grant_jti")
+      .notNull()
+      .references(() => authGrants.jti),
+    metadata: jsonb("metadata").$type<AuthGrantAuditMetadata>().notNull(),
+    occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull().defaultNow(),
+    reasonCode: text("reason_code").notNull(),
+  },
+  (table) => [
+    check(
+      "auth_grant_audit_action_length_check",
+      sql`char_length(${table.action}) BETWEEN 1 AND 64`,
+    ),
+    check(
+      "auth_grant_audit_actor_length_check",
+      sql`char_length(${table.actorSubject}) BETWEEN 1 AND 255`,
+    ),
+    check("auth_grant_audit_id_length_check", sql`char_length(${table.auditId}) BETWEEN 1 AND 128`),
+    check(
+      "auth_grant_audit_metadata_size_check",
+      sql`octet_length(${table.metadata}::text) <= 4096`,
+    ),
+    check(
+      "auth_grant_audit_metadata_shape_check",
+      sql`jsonb_typeof(${table.metadata}) = 'object'
+        AND ${table.metadata} ? 'requestId'
+        AND ${table.metadata} - 'requestId' = '{}'::jsonb
+        AND (
+          jsonb_typeof(${table.metadata}->'requestId') = 'null'
+          OR (
+            jsonb_typeof(${table.metadata}->'requestId') = 'string'
+            AND ${table.metadata}->>'requestId' ~ '^req_[A-Za-z0-9_-]{1,120}$'
+          )
+        )`,
+    ),
+    check(
+      "auth_grant_audit_action_check",
+      sql`${table.action} IN ('grant.created', 'grant.revoked')`,
+    ),
+    check(
+      "auth_grant_audit_reason_length_check",
+      sql`char_length(${table.reasonCode}) BETWEEN 1 AND 64`,
+    ),
+    check(
+      "auth_grant_audit_reason_check",
+      sql`${table.reasonCode} IN ('bootstrap', 'key-rotation', 'migration', 'operator-request', 'security-response')`,
+    ),
+    index("auth_grant_audit_grant_occurred_idx").on(table.grantJti, table.occurredAt),
+    index("auth_grant_audit_occurred_idx").on(table.occurredAt),
+  ],
+);
+
+/** Single-use WebSocket admission tickets stored only by SHA-256 hash. */
+export const authTickets = pgTable(
+  "auth_tickets",
+  {
+    admissionMetadata: jsonb("admission_metadata").$type<AuthTicketAdmissionMetadata>().notNull(),
+    audience: text("audience").notNull(),
+    consumedAt: timestamp("consumed_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    parentGrantJti: text("parent_grant_jti")
+      .notNull()
+      .references(() => authGrants.jti),
+    ticketHash: text("ticket_hash").primaryKey(),
+  },
+  (table) => [
+    check(
+      "auth_tickets_admission_metadata_size_check",
+      sql`octet_length(${table.admissionMetadata}::text) <= 4096`,
+    ),
+    check(
+      "auth_tickets_admission_metadata_shape_check",
+      sql`jsonb_typeof(${table.admissionMetadata}) = 'object'
+        AND ${table.admissionMetadata} ? 'remoteAddressHash'
+        AND ${table.admissionMetadata} ? 'replicaId'
+        AND ${table.admissionMetadata} ? 'transport'
+        AND ${table.admissionMetadata} - ARRAY['remoteAddressHash', 'replicaId', 'transport'] = '{}'::jsonb
+        AND jsonb_typeof(${table.admissionMetadata}->'replicaId') = 'string'
+        AND ${table.admissionMetadata}->>'replicaId' ~ '^replica_[A-Za-z0-9_-]{1,120}$'
+        AND jsonb_typeof(${table.admissionMetadata}->'transport') = 'string'
+        AND ${table.admissionMetadata}->>'transport' = 'websocket'
+        AND (
+          jsonb_typeof(${table.admissionMetadata}->'remoteAddressHash') = 'null'
+          OR (
+            jsonb_typeof(${table.admissionMetadata}->'remoteAddressHash') = 'string'
+            AND ${table.admissionMetadata}->>'remoteAddressHash' ~ '^[0-9a-f]{64}$'
+          )
+        )`,
+    ),
+    check("auth_tickets_audience_check", sql`${table.audience} = 'tether-websocket'`),
+    check("auth_tickets_expiry_check", sql`${table.expiresAt} > ${table.createdAt}`),
+    check(
+      "auth_tickets_lifetime_check",
+      sql`${table.expiresAt} <= ${table.createdAt} + interval '30 seconds'`,
+    ),
+    check(
+      "auth_tickets_consumed_check",
+      sql`${table.consumedAt} IS NULL OR (${table.consumedAt} >= ${table.createdAt} AND ${table.consumedAt} <= ${table.expiresAt})`,
+    ),
+    check("auth_tickets_hash_check", sql`${table.ticketHash} ~ '^[0-9a-f]{64}$'`),
+    index("auth_tickets_expiry_idx").on(table.expiresAt),
+    index("auth_tickets_parent_expiry_idx").on(table.parentGrantJti, table.expiresAt),
+    index("auth_tickets_consumed_idx").on(table.consumedAt),
+  ],
+);
 
 /**
  * Durable session records. A session is the shared coordination object that

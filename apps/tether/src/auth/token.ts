@@ -7,6 +7,12 @@ export const authRoles = ["observer", "participant", "admin"] as const;
 export type AuthRole = (typeof authRoles)[number];
 
 export const AuthError = {
+  ClaimInvalid: "auth_claim_invalid",
+  GrantExpired: "auth_grant_expired",
+  GrantRevoked: "auth_grant_revoked",
+  StoreUnavailable: "auth_store_unavailable",
+  TicketConsumed: "auth_ticket_consumed",
+  TicketExpired: "auth_ticket_expired",
   BadSignature: "bad_sig",
   Expired: "expired",
   Malformed: "malformed",
@@ -21,6 +27,10 @@ export type AuthError = (typeof AuthError)[keyof typeof AuthError];
 export interface AuthContext {
   /** Token expiration time as an ISO string for diagnostics, never authorization source data. */
   readonly expiresAt: string;
+  /** Durable grant id, or null for a compatibility legacy token. */
+  readonly grantJti: string | null;
+  /** Durable grant issuer, or null for a compatibility legacy token. */
+  readonly issuer: string | null;
   /** Signing key id that verified this token. */
   readonly kid: string;
   /** Durable participant identity authenticated by the token. */
@@ -72,8 +82,11 @@ export function mintAuthToken(payload: AuthTokenPayload, secrets: AuthSigningSec
   return `${encodedPayload}.${signEncodedPayload(encodedPayload, secret)}`;
 }
 
-/** Verifies a signed stateless auth token and returns its validated payload. */
-export function verifyAuthToken(token: string, options: VerifyAuthTokenOptions): AuthTokenPayload {
+/** Verifies the legacy two-segment stateless token format. */
+export function verifyLegacyAuthToken(
+  token: string,
+  options: VerifyAuthTokenOptions,
+): AuthTokenPayload {
   const [encodedPayload, encodedSignature, extra] = token.split(".");
   if (!encodedPayload || !encodedSignature || extra !== undefined) {
     throw new Error(AuthError.Malformed);
@@ -98,6 +111,8 @@ export function verifyAuthToken(token: string, options: VerifyAuthTokenOptions):
 export function createAuthContext(payload: AuthTokenPayload): AuthContext {
   return {
     expiresAt: new Date(payload.exp * 1_000).toISOString(),
+    grantJti: null,
+    issuer: null,
     kid: payload.kid,
     participantId: payload.participantId,
     role: payload.role,

@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { createServer } from "node:net";
+import { createConnection, createServer } from "node:net";
 import { fileURLToPath } from "node:url";
 
 import { readMigrationFiles } from "drizzle-orm/migrator";
@@ -28,6 +28,14 @@ import {
   testAuthSigningSecret,
 } from "../src/auth/test-tokens.js";
 import type { AuthRole } from "../src/auth/token.js";
+import { createAuthPersistenceStores } from "../src/auth/db-grant-stores.js";
+import { runBootstrapAdminCli } from "../src/auth/bootstrap-cli.js";
+import { hashAuthTicket } from "../src/auth/ticket-lifecycle.js";
+import type {
+  AuthGrantAuditMetadata,
+  AuthGrantMetadata,
+  AuthTicketAdmissionMetadata,
+} from "../src/auth/grant-stores.js";
 import { ParticipantRuntimeClient } from "../src/client.js";
 import {
   DatabaseMigrationError,
@@ -87,7 +95,9 @@ const projectionBenchmark = process.env.E2E_PROJECTION_BENCHMARK === "true" ? it
 const adminDatabaseUrl = readRequiredE2eAdminDatabaseUrl();
 const e2eAuthOptions = {
   activeKid: testAuthSigningKid,
+  issuer: "https://auth.e2e.tether.local",
   mode: "required",
+  preEnforcementGrantIssuanceEnabled: true,
   secrets: { [testAuthSigningKid]: testAuthSigningSecret },
 } as const;
 const summaryWorkerOllamaIdentity = {
@@ -140,10 +150,42 @@ const generatedMigrationNames = [
   "0013_misty_leo.sql",
   "0014_flippant_caretaker.sql",
   "0015_conscious_toad.sql",
+  "0016_daffy_surge.sql",
 ] as const;
 
 interface JsonResponse {
   readonly [key: string]: unknown;
+}
+
+interface AuthGrantPublicResponse {
+  readonly audience: "tether-rest";
+  readonly expiresAt: string;
+  readonly issuedAt: string;
+  readonly issuer: string;
+  readonly jti: string;
+  readonly kid: string;
+  readonly revokedAt: string | null;
+  readonly role: "admin" | "observer" | "participant";
+  readonly sessionScope: string;
+  readonly subject: string;
+}
+
+interface AuthGrantCreateResponse extends JsonResponse {
+  readonly bearer: string;
+  readonly grant: AuthGrantPublicResponse;
+}
+
+interface AuthGrantReadResponse extends JsonResponse {
+  readonly grant: AuthGrantPublicResponse;
+}
+
+interface AuthGrantListResponse extends JsonResponse {
+  readonly grants: readonly AuthGrantPublicResponse[];
+}
+
+interface AuthTicketCreateResponse extends JsonResponse {
+  readonly expiresAt: string;
+  readonly ticket: string;
 }
 
 interface ServerProcessResult {
@@ -664,6 +706,403 @@ e2e("tether e2e", () => {
     expect(summaryIds).toContain(active.rows[0]?.summaryId);
   });
 
+  it("persists grant authority, bounded audit state, and hashed tickets through narrow stores", async () => {
+    const stores = createAuthPersistenceStores(currentPool());
+    const issuedAt = new Date("2026-01-01T00:00:00.000Z");
+    const expiresAt = new Date("2026-01-02T00:00:00.000Z");
+    const jti = `grant_${randomUUID()}`;
+    const ticketHash = "a".repeat(64);
+    const auditId = `audit_${randomUUID()}`;
+
+    await stores.createGrantWithAudit({
+      audit: {
+        action: "grant.created",
+        actorSubject: "part_e2e_store",
+        auditId,
+        metadata: { requestId: "req_e2e_create" },
+        occurredAt: issuedAt,
+        reasonCode: "bootstrap",
+      },
+      grant: {
+        audience: "tether-rest",
+        expiresAt,
+        issuedAt,
+        issuer: "https://auth.e2e.tether.local",
+        jti,
+        kid: testAuthSigningKid,
+        metadata: { requestId: "req_e2e_create", source: "bootstrap" },
+        revokedAt: null,
+        role: "admin",
+        sessionScope: "*",
+        subject: "part_e2e_store",
+      },
+    });
+    await stores.tickets.create({
+      admissionMetadata: {
+        remoteAddressHash: null,
+        replicaId: "replica_e2e",
+        transport: "websocket",
+      },
+      audience: "tether-websocket",
+      consumedAt: null,
+      createdAt: issuedAt,
+      expiresAt: new Date("2026-01-01T00:00:30.000Z"),
+      parentGrantJti: jti,
+      ticketHash,
+    });
+
+    await expect(stores.grants.findByJti(jti)).resolves.toMatchObject({
+      audience: "tether-rest",
+      jti,
+      revokedAt: null,
+      subject: "part_e2e_store",
+    });
+    await expect(stores.audits.listForGrant(jti, 10)).resolves.toEqual([
+      expect.objectContaining({ action: "grant.created", grantJti: jti }),
+    ]);
+    await expect(stores.tickets.findByHash(ticketHash)).resolves.toMatchObject({
+      parentGrantJti: jti,
+      ticketHash,
+    });
+
+    const rolledBackJti = `grant_${randomUUID()}`;
+    await expect(
+      stores.createGrantWithAudit({
+        audit: {
+          action: "grant.created",
+          actorSubject: "part_e2e_store",
+          auditId,
+          metadata: { requestId: "req_e2e_rollback" },
+          occurredAt: issuedAt,
+          reasonCode: "bootstrap",
+        },
+        grant: {
+          audience: "tether-rest",
+          expiresAt,
+          issuedAt,
+          issuer: "https://auth.e2e.tether.local",
+          jti: rolledBackJti,
+          kid: testAuthSigningKid,
+          metadata: { requestId: "req_e2e_rollback", source: "bootstrap" },
+          revokedAt: null,
+          role: "observer",
+          sessionScope: "*",
+          subject: "part_e2e_rollback",
+        },
+      }),
+    ).rejects.toThrow("auth_grant_create_failed");
+    await expect(stores.grants.findByJti(rolledBackJti)).resolves.toBeNull();
+
+    const revokeRollbackJti = `grant_${randomUUID()}`;
+    await stores.createGrantWithAudit({
+      audit: {
+        action: "grant.created",
+        actorSubject: "part_e2e_store",
+        auditId: `audit_${randomUUID()}`,
+        metadata: { requestId: "req_e2e_revoke_rollback_create" },
+        occurredAt: issuedAt,
+        reasonCode: "bootstrap",
+      },
+      grant: {
+        audience: "tether-rest",
+        expiresAt,
+        issuedAt,
+        issuer: "https://auth.e2e.tether.local",
+        jti: revokeRollbackJti,
+        kid: testAuthSigningKid,
+        metadata: {
+          requestId: "req_e2e_revoke_rollback_create",
+          source: "bootstrap",
+        },
+        revokedAt: null,
+        role: "observer",
+        sessionScope: "*",
+        subject: "part_e2e_revoke_rollback",
+      },
+    });
+    await expect(
+      stores.revokeGrantWithAudit({
+        audit: {
+          action: "grant.revoked",
+          actorSubject: "part_e2e_store",
+          auditId,
+          metadata: { requestId: "req_e2e_revoke_rollback" },
+          occurredAt: new Date("2026-01-01T00:01:00.000Z"),
+          reasonCode: "operator-request",
+        },
+        jti: revokeRollbackJti,
+        revokedAt: new Date("2026-01-01T00:01:00.000Z"),
+      }),
+    ).rejects.toThrow("auth_grant_revoke_failed");
+    await expect(stores.grants.findByJti(revokeRollbackJti)).resolves.toMatchObject({
+      revokedAt: null,
+    });
+    await expect(stores.audits.listForGrant(revokeRollbackJti, 10)).resolves.toHaveLength(1);
+
+    const overlongGrantJti = `grant_${randomUUID()}`;
+    await expect(
+      stores.createGrantWithAudit({
+        audit: {
+          action: "grant.created",
+          actorSubject: "part_e2e_store",
+          auditId: `audit_${randomUUID()}`,
+          metadata: { requestId: "req_e2e_overlong" },
+          occurredAt: issuedAt,
+          reasonCode: "bootstrap",
+        },
+        grant: {
+          audience: "tether-rest",
+          expiresAt: new Date("2026-01-08T00:00:00.001Z"),
+          issuedAt,
+          issuer: "https://auth.e2e.tether.local",
+          jti: overlongGrantJti,
+          kid: testAuthSigningKid,
+          metadata: { requestId: "req_e2e_overlong", source: "bootstrap" },
+          revokedAt: null,
+          role: "observer",
+          sessionScope: "*",
+          subject: "part_e2e_overlong",
+        },
+      }),
+    ).rejects.toThrow("auth_grant_create_failed");
+    await expect(stores.grants.findByJti(overlongGrantJti)).resolves.toBeNull();
+
+    const credentialMarker = "tgr2.secret_payload.secret_signature";
+    const unsafeGrantMetadata = {
+      bearer: credentialMarker,
+      requestId: null,
+      source: "bootstrap",
+    } as unknown as AuthGrantMetadata;
+    const rejectedMetadataWrite = stores.createGrantWithAudit({
+      audit: {
+        action: "grant.created",
+        actorSubject: "part_e2e_store",
+        auditId: `audit_${randomUUID()}`,
+        metadata: { requestId: null },
+        occurredAt: issuedAt,
+        reasonCode: "bootstrap",
+      },
+      grant: {
+        audience: "tether-rest",
+        expiresAt,
+        issuedAt,
+        issuer: "https://auth.e2e.tether.local",
+        jti: `grant_${randomUUID()}`,
+        kid: testAuthSigningKid,
+        metadata: unsafeGrantMetadata,
+        revokedAt: null,
+        role: "observer",
+        sessionScope: "*",
+        subject: "part_e2e_rejected_metadata",
+      },
+    });
+    await expect(rejectedMetadataWrite).rejects.toThrow("auth_metadata_invalid");
+    await rejectedMetadataWrite.catch((error: unknown) => {
+      expect(String(error)).not.toContain(credentialMarker);
+      expect(String(error)).not.toContain("part_e2e_rejected_metadata");
+    });
+
+    const unsafeAuditMetadata = {
+      authorization: credentialMarker,
+      requestId: null,
+    } as unknown as AuthGrantAuditMetadata;
+    await expect(
+      stores.createGrantWithAudit({
+        audit: {
+          action: "grant.created",
+          actorSubject: "part_e2e_store",
+          auditId: `audit_${randomUUID()}`,
+          metadata: unsafeAuditMetadata,
+          occurredAt: issuedAt,
+          reasonCode: "bootstrap",
+        },
+        grant: {
+          audience: "tether-rest",
+          expiresAt,
+          issuedAt,
+          issuer: "https://auth.e2e.tether.local",
+          jti: `grant_${randomUUID()}`,
+          kid: testAuthSigningKid,
+          metadata: { requestId: null, source: "bootstrap" },
+          revokedAt: null,
+          role: "observer",
+          sessionScope: "*",
+          subject: "part_e2e_rejected_audit_metadata",
+        },
+      }),
+    ).rejects.toThrow("auth_metadata_invalid");
+
+    const unsafeAdmissionMetadata = {
+      remoteAddressHash: null,
+      replicaId: "replica_e2e",
+      ticket: credentialMarker,
+      transport: "websocket",
+    } as unknown as AuthTicketAdmissionMetadata;
+    await expect(
+      stores.tickets.create({
+        admissionMetadata: unsafeAdmissionMetadata,
+        audience: "tether-websocket",
+        consumedAt: null,
+        createdAt: issuedAt,
+        expiresAt: new Date("2026-01-01T00:00:30.000Z"),
+        parentGrantJti: jti,
+        ticketHash: "b".repeat(64),
+      }),
+    ).rejects.toThrow("auth_metadata_invalid");
+
+    const overlongTicketHash = "d".repeat(64);
+    await expect(
+      stores.tickets.create({
+        admissionMetadata: {
+          remoteAddressHash: null,
+          replicaId: "replica_e2e",
+          transport: "websocket",
+        },
+        audience: "tether-websocket",
+        consumedAt: null,
+        createdAt: issuedAt,
+        expiresAt: new Date("2026-01-01T00:00:30.001Z"),
+        parentGrantJti: jti,
+        ticketHash: overlongTicketHash,
+      }),
+    ).rejects.toThrow("auth_ticket_create_failed");
+    await expect(stores.tickets.findByHash(overlongTicketHash)).resolves.toBeNull();
+
+    const revokedAt = new Date("2026-01-01T00:01:00.000Z");
+    await expect(
+      stores.revokeGrantWithAudit({
+        audit: {
+          action: "grant.revoked",
+          actorSubject: "part_e2e_store",
+          auditId: `audit_${randomUUID()}`,
+          metadata: { requestId: "req_e2e_revoke" },
+          occurredAt: revokedAt,
+          reasonCode: "operator-request",
+        },
+        jti,
+        revokedAt,
+      }),
+    ).resolves.toMatchObject({ status: "revoked" });
+    await expect(
+      stores.revokeGrantWithAudit({
+        audit: {
+          action: "grant.revoked",
+          actorSubject: "part_e2e_store",
+          auditId: `audit_${randomUUID()}`,
+          metadata: { requestId: "req_e2e_revoke_retry" },
+          occurredAt: revokedAt,
+          reasonCode: "operator-request",
+        },
+        jti,
+        revokedAt,
+      }),
+    ).resolves.toMatchObject({ status: "already_revoked" });
+    await expect(stores.audits.listForGrant(jti, 10)).resolves.toHaveLength(2);
+
+    const authColumns = await currentPool().pool.query<{
+      readonly columnName: string;
+    }>(`
+      SELECT column_name AS "columnName"
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name IN ('auth_grants', 'auth_grant_audit_events', 'auth_tickets')
+    `);
+    const authColumnNames = authColumns.rows.map((row) => row.columnName);
+    for (const forbiddenColumnName of ["bearer", "token", "ticket"]) {
+      expect(authColumnNames).not.toContain(forbiddenColumnName);
+    }
+
+    await expect(
+      currentPool().pool.query(
+        `
+          INSERT INTO auth_grants (
+            audience, expires_at, issued_at, issuer, jti, kid, metadata,
+            revoked_at, role, session_scope, subject
+          ) VALUES (
+            'tether-rest', $1, $2, 'https://auth.e2e.tether.local', $3,
+            $4, $5::jsonb, NULL, 'observer', '*', 'part_invalid_metadata'
+          )
+        `,
+        [
+          expiresAt,
+          issuedAt,
+          `grant_${randomUUID()}`,
+          testAuthSigningKid,
+          JSON.stringify({ requestId: null, source: null }),
+        ],
+      ),
+    ).rejects.toThrow();
+
+    await expect(
+      currentPool().pool.query(
+        `
+          INSERT INTO auth_grants (
+            audience, expires_at, issued_at, issuer, jti, kid, metadata,
+            revoked_at, role, session_scope, subject
+          ) VALUES (
+            'tether-rest', $1, $2, 'https://auth.e2e.tether.local', $3,
+            $4, $5::jsonb, NULL, 'observer', '*', 'part_overlong_database_grant'
+          )
+        `,
+        [
+          new Date("2026-01-08T00:00:00.001Z"),
+          issuedAt,
+          `grant_${randomUUID()}`,
+          testAuthSigningKid,
+          JSON.stringify({ requestId: null, source: "bootstrap" }),
+        ],
+      ),
+    ).rejects.toThrow();
+
+    await expect(
+      currentPool().pool.query(
+        `
+          INSERT INTO auth_tickets (
+            admission_metadata, audience, consumed_at, created_at, expires_at,
+            parent_grant_jti, ticket_hash
+          ) VALUES (
+            $1::jsonb, 'tether-websocket', NULL, $3, $2, $4, $5
+          )
+        `,
+        [
+          JSON.stringify({
+            remoteAddressHash: null,
+            replicaId: null,
+            transport: "websocket",
+          }),
+          new Date("2026-01-01T00:00:30.000Z"),
+          issuedAt,
+          jti,
+          "c".repeat(64),
+        ],
+      ),
+    ).rejects.toThrow();
+
+    await expect(
+      currentPool().pool.query(
+        `
+          INSERT INTO auth_tickets (
+            admission_metadata, audience, consumed_at, created_at, expires_at,
+            parent_grant_jti, ticket_hash
+          ) VALUES (
+            $1::jsonb, 'tether-websocket', NULL, $2, $3, $4, $5
+          )
+        `,
+        [
+          JSON.stringify({
+            remoteAddressHash: null,
+            replicaId: "replica_e2e",
+            transport: "websocket",
+          }),
+          issuedAt,
+          new Date("2026-01-01T00:00:30.001Z"),
+          jti,
+          "e".repeat(64),
+        ],
+      ),
+    ).rejects.toThrow();
+  });
+
   it("rejects session-scoped writes for unknown sessions without creating phantom rows", async () => {
     const missingSessionId = `sess_missing_${randomUUID()}`;
     const before = await request<SessionListResponse>("/sessions");
@@ -1073,6 +1512,129 @@ e2e("tether e2e", () => {
       expect(journal.rows[0]?.count).toBe(
         readMigrationFiles({ migrationsFolder: "drizzle" }).length,
       );
+    } finally {
+      await database.end();
+      await dropDatabase(databaseName);
+    }
+  });
+
+  it("rejects a journal-less auth schema with a weakened lifetime constraint", async () => {
+    const databaseName = `tether_e2e_weakened_auth_${randomUUID().replaceAll("-", "_")}`;
+    const database = createPool(buildDatabaseUrl(databaseName));
+    try {
+      await createDatabase(databaseName);
+      await applyLegacyMigrationPrefix(database, generatedMigrationNames.length - 1);
+      await database.pool.query(`
+        ALTER TABLE auth_grants DROP CONSTRAINT auth_grants_lifetime_check;
+        ALTER TABLE auth_grants ADD CONSTRAINT auth_grants_lifetime_check
+          CHECK (expires_at > issued_at);
+      `);
+
+      await expect(migrate(database)).rejects.toMatchObject({
+        name: "DatabaseMigrationError",
+        reason: "unsupported_schema",
+        recognizedPrefix: generatedMigrationNames.length - 2,
+      });
+
+      const journal = await database.pool.query<{ readonly count: number }>(
+        `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
+      );
+      expect(journal.rows[0]?.count).toBe(0);
+    } finally {
+      await database.end();
+      await dropDatabase(databaseName);
+    }
+  });
+
+  it("rejects a partial journal-less auth migration before generated DDL", async () => {
+    const databaseName = `tether_e2e_partial_auth_${randomUUID().replaceAll("-", "_")}`;
+    const database = createPool(buildDatabaseUrl(databaseName));
+    try {
+      await createDatabase(databaseName);
+      await applyLegacyMigrationPrefix(database, generatedMigrationNames.length - 2);
+      await database.pool.query(`CREATE TABLE auth_grants (jti text PRIMARY KEY NOT NULL)`);
+
+      await expect(migrate(database)).rejects.toMatchObject({
+        name: "DatabaseMigrationError",
+        reason: "unsupported_schema",
+        recognizedPrefix: generatedMigrationNames.length - 2,
+      });
+
+      const journal = await database.pool.query<{ readonly count: number }>(
+        `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
+      );
+      const laterAuthTable = await database.pool.query<{
+        readonly exists: boolean;
+      }>(`SELECT to_regclass('public.auth_tickets') IS NOT NULL AS exists`);
+      expect(journal.rows[0]?.count).toBe(0);
+      expect(laterAuthTable.rows[0]?.exists).toBe(false);
+    } finally {
+      await database.end();
+      await dropDatabase(databaseName);
+    }
+  });
+
+  it.each([
+    {
+      label: "removed nullability",
+      mutationSql: "ALTER TABLE auth_grants ALTER COLUMN subject DROP NOT NULL",
+    },
+    {
+      label: "changed column type",
+      mutationSql: "ALTER TABLE auth_grants ALTER COLUMN issuer TYPE varchar(512)",
+    },
+    {
+      label: "changed column default",
+      mutationSql: "ALTER TABLE auth_tickets ALTER COLUMN created_at SET DEFAULT now()",
+    },
+    {
+      label: "credential-bearing extra column",
+      mutationSql:
+        "ALTER TABLE auth_grants ADD COLUMN bearer text NOT NULL DEFAULT 'tgr2.secret.signature'",
+    },
+    {
+      label: "weakened constraint suffix",
+      mutationSql: `
+        ALTER TABLE auth_grants DROP CONSTRAINT auth_grants_lifetime_check;
+        ALTER TABLE auth_grants ADD CONSTRAINT auth_grants_lifetime_check
+          CHECK (expires_at <= issued_at + interval '7 days' OR true);
+      `,
+    },
+    {
+      label: "unvalidated constraint",
+      mutationSql: `
+        ALTER TABLE auth_tickets DROP CONSTRAINT auth_tickets_hash_check;
+        ALTER TABLE auth_tickets ADD CONSTRAINT auth_tickets_hash_check
+          CHECK (ticket_hash ~ '^[0-9a-f]{64}$') NOT VALID;
+      `,
+    },
+    {
+      label: "altered foreign-key action",
+      mutationSql: `
+        ALTER TABLE auth_tickets
+          DROP CONSTRAINT auth_tickets_parent_grant_jti_auth_grants_jti_fk;
+        ALTER TABLE auth_tickets
+          ADD CONSTRAINT auth_tickets_parent_grant_jti_auth_grants_jti_fk
+          FOREIGN KEY (parent_grant_jti) REFERENCES auth_grants(jti) ON DELETE CASCADE;
+      `,
+    },
+  ])("rejects journal-less auth schema with $label", async ({ label, mutationSql }) => {
+    const databaseName = `tether_e2e_auth_fact_${label.replaceAll(/[^a-z]+/gu, "_")}_${randomUUID().replaceAll("-", "_")}`;
+    const database = createPool(buildDatabaseUrl(databaseName));
+    try {
+      await createDatabase(databaseName);
+      await applyLegacyMigrationPrefix(database, generatedMigrationNames.length - 1);
+      await database.pool.query(mutationSql);
+
+      await expect(migrate(database)).rejects.toMatchObject({
+        name: "DatabaseMigrationError",
+        reason: "unsupported_schema",
+        recognizedPrefix: generatedMigrationNames.length - 2,
+      });
+      const journal = await database.pool.query<{ readonly count: number }>(
+        `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
+      );
+      expect(journal.rows[0]?.count).toBe(0);
     } finally {
       await database.end();
       await dropDatabase(databaseName);
@@ -1558,6 +2120,1050 @@ e2e("tether e2e", () => {
     });
 
     await expect(requestFrom(baseUrl, "/sessions", { authToken: null })).rejects.toThrow("401");
+  });
+
+  it("reproduces that a current legacy bearer has no server-side revocation lifecycle", async () => {
+    const authToken = mintE2eToken({
+      participantId: "part_e2e_non_revocable",
+      role: "admin",
+      sessionId: "*",
+    });
+
+    await expect(
+      requestFrom<SessionListResponse>(baseUrl, "/sessions", { authToken }),
+    ).resolves.toEqual(expect.objectContaining({ sessions: expect.any(Array) }));
+
+    const attemptedRevocation = await requestStatusFrom(baseUrl, "/auth/grants/revoke", {
+      authToken,
+      body: {},
+      method: "POST",
+    });
+    expect(attemptedRevocation.status).toBe(404);
+
+    await expect(
+      requestFrom<SessionListResponse>(baseUrl, "/sessions", { authToken }),
+    ).resolves.toEqual(expect.objectContaining({ sessions: expect.any(Array) }));
+  });
+
+  it("creates, inspects, lists, and idempotently revokes a durable auth grant", async () => {
+    const created = await requestFrom<AuthGrantCreateResponse>(baseUrl, "/auth/grants", {
+      body: {
+        role: "admin",
+        sessionScope: "*",
+        subject: "part_auth_lifecycle",
+        ttlSeconds: 3_600,
+      },
+      method: "POST",
+    });
+
+    expect(created.bearer).toMatch(/^tgr2\./u);
+    expect(created.grant).toMatchObject({
+      audience: "tether-rest",
+      revokedAt: null,
+      role: "admin",
+      sessionScope: "*",
+      subject: "part_auth_lifecycle",
+    });
+    expect(created.grant).not.toHaveProperty("metadata");
+
+    await expect(
+      requestFrom<SessionListResponse>(baseUrl, "/sessions", {
+        authToken: created.bearer,
+      }),
+    ).resolves.toEqual(expect.objectContaining({ sessions: expect.any(Array) }));
+
+    const ticket = await requestFrom<AuthTicketCreateResponse>(baseUrl, "/auth/tickets", {
+      authToken: created.bearer,
+      body: {},
+      method: "POST",
+    });
+    expect(ticket.ticket).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    expect(new Date(ticket.expiresAt).getTime() - Date.now()).toBeGreaterThan(25_000);
+    const persistedTicket = await currentPool().pool.query<{
+      readonly parentGrantJti: string;
+      readonly rawTicketMatches: boolean;
+      readonly ticketHash: string;
+    }>(
+      `
+        SELECT
+          parent_grant_jti AS "parentGrantJti",
+          ticket_hash = $1 AS "rawTicketMatches",
+          ticket_hash AS "ticketHash"
+        FROM auth_tickets
+        WHERE parent_grant_jti = $2
+      `,
+      [ticket.ticket, created.grant.jti],
+    );
+    expect(persistedTicket.rows).toEqual([
+      {
+        parentGrantJti: created.grant.jti,
+        rawTicketMatches: false,
+        ticketHash: expect.stringMatching(/^[0-9a-f]{64}$/u) as string,
+      },
+    ]);
+
+    const inspected = await requestFrom<AuthGrantReadResponse>(
+      baseUrl,
+      `/auth/grants/${created.grant.jti}`,
+    );
+    expect(inspected.grant).toEqual(created.grant);
+    expect(JSON.stringify(inspected)).not.toContain(created.bearer);
+    expect(inspected.grant).not.toHaveProperty("signature");
+
+    const listed = await requestFrom<AuthGrantListResponse>(baseUrl, "/auth/grants?limit=1");
+    expect(listed.grants).toHaveLength(1);
+    expect(listed.grants[0]).toEqual(created.grant);
+    expect(JSON.stringify(listed)).not.toContain(created.bearer);
+
+    const revoked = await requestStatusFrom<AuthGrantReadResponse & { readonly status: string }>(
+      baseUrl,
+      `/auth/grants/${created.grant.jti}/revoke`,
+      {
+        body: {},
+        method: "POST",
+      },
+    );
+    expect(revoked.status).toBe(200);
+    expect(revoked.body.status).toBe("revoked");
+    expect(revoked.body.grant.revokedAt).not.toBeNull();
+
+    const repeated = await requestStatusFrom<AuthGrantReadResponse & { readonly status: string }>(
+      baseUrl,
+      `/auth/grants/${created.grant.jti}/revoke`,
+      {
+        body: {},
+        method: "POST",
+      },
+    );
+    expect(repeated.status).toBe(200);
+    expect(repeated.body.status).toBe("already_revoked");
+    expect(repeated.body.grant.revokedAt).toBe(revoked.body.grant.revokedAt);
+
+    const deniedAfterRevocation = await requestStatusFrom(baseUrl, "/sessions", {
+      authToken: created.bearer,
+    });
+    expect(deniedAfterRevocation.status).toBe(401);
+    expect(deniedAfterRevocation.body).toEqual({
+      error: "Unauthorized",
+      reason: "auth_grant_revoked",
+    });
+
+    const audits = await createAuthPersistenceStores(currentPool()).audits.listForGrant(
+      created.grant.jti,
+      10,
+    );
+    expect(audits.map((audit) => audit.action).sort()).toEqual(["grant.created", "grant.revoked"]);
+    expect(JSON.stringify(audits)).not.toContain(created.bearer);
+
+    const missing = await requestStatusFrom(baseUrl, "/auth/grants/grant_missing");
+    expect(missing.status).toBe(404);
+    expect(missing.text).not.toContain(created.bearer);
+
+    const invalidLimit = await requestStatusFrom(baseUrl, "/auth/grants?limit=101");
+    expect(invalidLimit.status).toBe(400);
+    expect(invalidLimit.text).not.toContain(created.bearer);
+
+    const invalidJti = await requestStatusFrom(baseUrl, "/auth/grants/not-a-grant");
+    expect(invalidJti.status).toBe(400);
+    expect(invalidJti.text).not.toContain(created.bearer);
+  });
+
+  it("atomically consumes one ticket exactly once under a concurrent race", async () => {
+    const parent = await request<AuthGrantCreateResponse>("/auth/grants", {
+      body: {
+        role: "observer",
+        sessionScope: "*",
+        subject: `part_ticket_race_${randomUUID()}`,
+        ttlSeconds: 3_600,
+      },
+      method: "POST",
+    });
+    const minted = await request<AuthTicketCreateResponse>("/auth/tickets", {
+      authToken: parent.bearer,
+      body: {},
+      method: "POST",
+    });
+    const store = createAuthPersistenceStores(currentPool()).tickets;
+
+    const results = await Promise.all([
+      store.consume(hashAuthTicket(minted.ticket)),
+      store.consume(hashAuthTicket(minted.ticket)),
+    ]);
+
+    expect(results.filter((result) => result !== null)).toHaveLength(1);
+    expect(results.find((result) => result !== null)).toMatchObject({
+      parentGrantJti: parent.grant.jti,
+      ticketHash: hashAuthTicket(minted.ticket),
+    });
+    await expect(store.findByHash(hashAuthTicket(minted.ticket))).resolves.toMatchObject({
+      consumedAt: expect.any(Date) as Date,
+    });
+  });
+
+  it("admits one of two replicas with one ticket and binds the winner to its parent grant", async () => {
+    const session = await createSession();
+    const participantId = `part_ticket_replica_${randomUUID()}`;
+    const parent = await request<AuthGrantCreateResponse>("/auth/grants", {
+      body: {
+        role: "participant",
+        sessionScope: session.sessionId,
+        subject: participantId,
+        ttlSeconds: 3_600,
+      },
+      method: "POST",
+    });
+    const minted = await request<AuthTicketCreateResponse>("/auth/tickets", {
+      authToken: parent.bearer,
+      body: {},
+      method: "POST",
+    });
+    const durableTicketStore = createAuthPersistenceStores(currentPool()).tickets;
+    let consumeArrivals = 0;
+    let releaseConsumes = (): void => undefined;
+    const bothConsumesArrived = new Promise<void>((resolve) => {
+      releaseConsumes = resolve;
+    });
+    const coordinatedTicketStore = {
+      consume: async (ticketHash: string) => {
+        consumeArrivals += 1;
+        if (consumeArrivals === 2) releaseConsumes();
+        await bothConsumesArrived;
+        return durableTicketStore.consume(ticketHash);
+      },
+      create: durableTicketStore.create,
+      findByHash: durableTicketStore.findByHash,
+    };
+    const replicas = [
+      createAppServer(currentPool(), {
+        auth: { ...e2eAuthOptions, ticketStore: coordinatedTicketStore },
+        eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+        taskClaimSweeper: { intervalMs: 0 },
+      }),
+      createAppServer(currentPool(), {
+        auth: { ...e2eAuthOptions, ticketStore: coordinatedTicketStore },
+        eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+        taskClaimSweeper: { intervalMs: 0 },
+      }),
+    ] as const;
+    const ports = await Promise.all([findOpenPort(), findOpenPort()]);
+    await Promise.all(replicas.map((replica, index) => replica.listen(ports[index] ?? 0)));
+    const sockets = ports.map((port, index) => {
+      const url = new URL(`ws://127.0.0.1:${port}/sessions/${session.sessionId}/stream`);
+      url.searchParams.set("after", "0");
+      url.searchParams.set("instanceId", `inst_ticket_replica_${index}_${randomUUID()}`);
+      url.searchParams.set("participantId", participantId);
+      url.searchParams.set("runtimeKind", "codex");
+      url.searchParams.set("ticket", minted.ticket);
+      return new WebSocket(url);
+    });
+    const messages = sockets.map((): unknown[] => []);
+    sockets.forEach((socket, index) => {
+      socket.on("message", (data) => messages[index]?.push(JSON.parse(String(data)) as unknown));
+    });
+
+    try {
+      await Promise.all(sockets.map(waitForSocketOpen));
+      await waitFor(() => messages.every((received) => received.length > 0));
+      expect(messages.filter((received) => received.some(isReplayCompleteEnvelope))).toHaveLength(
+        1,
+      );
+      expect(
+        messages.filter((received) =>
+          received.some((message) => isWebSocketErrorWithReason(message, "auth_ticket_consumed")),
+        ),
+      ).toHaveLength(1);
+      const winnerIndex = messages.findIndex((received) => received.some(isReplayCompleteEnvelope));
+      const winner = sockets[winnerIndex];
+      const winnerMessages = messages[winnerIndex];
+      if (winner === undefined || winnerMessages === undefined) {
+        throw new Error("Ticket race did not produce one admitted socket");
+      }
+
+      await currentPool().pool.query(
+        `UPDATE auth_tickets
+         SET expires_at = GREATEST(consumed_at, created_at + INTERVAL '1 millisecond')
+         WHERE ticket_hash = $1`,
+        [hashAuthTicket(minted.ticket)],
+      );
+      const eventId = `evt_ticket_expired_after_admission_${randomUUID()}`;
+      const requestId = `req_ticket_expired_after_admission_${randomUUID()}`;
+      winner.send(
+        JSON.stringify({
+          eventId,
+          op: webSocketOperation.publish,
+          payload: { text: "ticket expiry does not close admitted socket" },
+          producerId: participantId,
+          requestId,
+          type: sessionEventType.userMessage,
+        }),
+      );
+      await waitFor(() =>
+        winnerMessages.some(
+          (message) => isCommandResultEnvelope(message) && message.requestId === requestId,
+        ),
+      );
+      const events = await request<EventsResponse>(`/sessions/${session.sessionId}/events?after=0`);
+      expect(events.events.map((event) => event.eventId)).toContain(eventId);
+      expect(JSON.stringify(messages)).not.toContain(minted.ticket);
+    } finally {
+      releaseConsumes();
+      for (const socket of sockets) {
+        if (socket.readyState !== WebSocket.CLOSED) {
+          socket.close();
+          await waitForSocketClose(socket);
+        }
+      }
+      await Promise.all(replicas.map((replica) => replica.close()));
+    }
+  });
+
+  it("burns a consumed ticket when the transport fails before the upgrade response", async () => {
+    const session = await createSession();
+    const participantId = `part_ticket_transport_${randomUUID()}`;
+    const parent = await request<AuthGrantCreateResponse>("/auth/grants", {
+      body: {
+        role: "participant",
+        sessionScope: session.sessionId,
+        subject: participantId,
+        ttlSeconds: 3_600,
+      },
+      method: "POST",
+    });
+    const minted = await request<AuthTicketCreateResponse>("/auth/tickets", {
+      authToken: parent.bearer,
+      body: {},
+      method: "POST",
+    });
+    const url = new URL(`${baseUrl.replace("http:", "ws:")}/sessions/${session.sessionId}/stream`);
+    url.searchParams.set("after", "0");
+    url.searchParams.set("instanceId", `inst_ticket_transport_${randomUUID()}`);
+    url.searchParams.set("participantId", participantId);
+    url.searchParams.set("runtimeKind", "codex");
+    url.searchParams.set("ticket", minted.ticket);
+
+    const failedUpgrade = await sendInvalidWebSocketUpgrade(url);
+    expect(failedUpgrade).toContain("HTTP/1.1 400");
+    await expect(
+      createAuthPersistenceStores(currentPool()).tickets.findByHash(hashAuthTicket(minted.ticket)),
+    ).resolves.toMatchObject({ consumedAt: expect.any(Date) as Date });
+
+    const replay = new WebSocket(url);
+    const messages: unknown[] = [];
+    replay.on("message", (data) => messages.push(JSON.parse(String(data)) as unknown));
+    try {
+      await waitForSocketOpen(replay);
+      await waitFor(() =>
+        messages.some((message) => isWebSocketErrorWithReason(message, "auth_ticket_consumed")),
+      );
+      expect(JSON.stringify(messages)).not.toContain(minted.ticket);
+    } finally {
+      if (replay.readyState !== WebSocket.CLOSED) {
+        replay.close();
+        await waitForSocketClose(replay);
+      }
+    }
+  });
+
+  it("admits Node WebSockets with an Authorization header and no credential query", async () => {
+    const session = await createSession();
+    const participantId = `part_ws_header_${randomUUID()}`;
+    const parent = await request<AuthGrantCreateResponse>("/auth/grants", {
+      body: {
+        role: "participant",
+        sessionScope: session.sessionId,
+        subject: participantId,
+        ttlSeconds: 3_600,
+      },
+      method: "POST",
+    });
+    const url = new URL(`${baseUrl.replace("http:", "ws:")}/sessions/${session.sessionId}/stream`);
+    url.searchParams.set("after", "0");
+    url.searchParams.set("instanceId", `inst_ws_header_${randomUUID()}`);
+    url.searchParams.set("participantId", participantId);
+    url.searchParams.set("runtimeKind", "codex");
+    expect(url.searchParams.has("access_token")).toBe(false);
+    expect(url.searchParams.has("ticket")).toBe(false);
+    expect(url.toString()).not.toContain(parent.bearer);
+
+    const socket = new WebSocket(url, {
+      headers: { authorization: `Bearer ${parent.bearer}` },
+    });
+    const messages: unknown[] = [];
+    socket.on("message", (data) => messages.push(JSON.parse(String(data)) as unknown));
+    try {
+      await waitForSocketOpen(socket);
+      await waitFor(() => messages.some(isReplayCompleteEnvelope));
+      expect(JSON.stringify(messages)).not.toContain(parent.bearer);
+    } finally {
+      if (socket.readyState !== WebSocket.CLOSED) {
+        socket.close();
+        await waitForSocketClose(socket);
+      }
+    }
+  });
+
+  it("registers participant, observer, host, and viewer sockets in one auth registry", async () => {
+    const session = await createSession();
+    const participantId = `part_auth_registry_${randomUUID()}`;
+    const parent = await request<AuthGrantCreateResponse>("/auth/grants", {
+      body: {
+        role: "participant",
+        sessionScope: session.sessionId,
+        subject: participantId,
+        ttlSeconds: 3_600,
+      },
+      method: "POST",
+    });
+    const registryApp = createAppServer(currentPool(), {
+      auth: e2eAuthOptions,
+      authRevocation: { listenEnabled: false, pollIntervalMs: 0 },
+      eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+      sessionService: { controlEpochEnforcement: false },
+      taskClaimSweeper: { intervalMs: 0 },
+    });
+    const port = await findOpenPort();
+    await registryApp.listen(port);
+    const streamKinds = ["codex", "observer", "host", "viewer"] as const;
+    const sockets = streamKinds.map((runtimeKind) => {
+      const url = new URL(`ws://127.0.0.1:${port}/sessions/${session.sessionId}/stream`);
+      url.searchParams.set("after", "0");
+      url.searchParams.set("instanceId", `inst_auth_registry_${runtimeKind}_${randomUUID()}`);
+      url.searchParams.set("participantId", participantId);
+      url.searchParams.set("runtimeKind", runtimeKind);
+      return new WebSocket(url, {
+        headers: { authorization: `Bearer ${parent.bearer}` },
+      });
+    });
+    const messages = sockets.map((): unknown[] => []);
+    sockets.forEach((socket, index) => {
+      socket.on("message", (data) => messages[index]?.push(JSON.parse(String(data)) as unknown));
+    });
+
+    try {
+      await Promise.all(sockets.map(waitForSocketOpen));
+      await waitFor(() => messages.every((received) => received.some(isReplayCompleteEnvelope)));
+      expect(registryApp.debugInfo().authSockets).toMatchObject({
+        grantCount: 1,
+        socketCount: 4,
+        socketsByStream: {
+          host: 1,
+          observer: 1,
+          participant: 1,
+          viewer: 1,
+        },
+        timerCount: 4,
+      });
+      expect(JSON.stringify(registryApp.debugInfo().authSockets)).not.toContain(parent.grant.jti);
+    } finally {
+      for (const socket of sockets) {
+        if (socket.readyState !== WebSocket.CLOSED) {
+          socket.close();
+          await waitForSocketClose(socket);
+        }
+      }
+      await waitFor(() => registryApp.debugInfo().authSockets.socketCount === 0);
+      expect(registryApp.debugInfo().authSockets).toMatchObject({
+        grantCount: 0,
+        socketCount: 0,
+        timerCount: 0,
+      });
+      await registryApp.close();
+    }
+  });
+
+  it("closes matching sockets across two replicas within five seconds of revocation", async () => {
+    const session = await createSession();
+    const parent = await request<AuthGrantCreateResponse>("/auth/grants", {
+      body: {
+        role: "observer",
+        sessionScope: session.sessionId,
+        subject: `part_revocation_replica_${randomUUID()}`,
+        ttlSeconds: 3_600,
+      },
+      method: "POST",
+    });
+    const replicas = [
+      createAppServer(currentPool(), {
+        auth: e2eAuthOptions,
+        eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+        taskClaimSweeper: { intervalMs: 0 },
+      }),
+      createAppServer(currentPool(), {
+        auth: e2eAuthOptions,
+        eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+        taskClaimSweeper: { intervalMs: 0 },
+      }),
+    ] as const;
+    const firstPort = await findOpenPort();
+    await replicas[0].listen(firstPort);
+    const secondPort = await findOpenPort();
+    await replicas[1].listen(secondPort);
+    const sockets = [firstPort, secondPort].map((port, index) => {
+      const url = new URL(`ws://127.0.0.1:${port}/sessions/${session.sessionId}/stream`);
+      url.searchParams.set("after", "0");
+      url.searchParams.set("instanceId", `inst_revocation_replica_${index}_${randomUUID()}`);
+      url.searchParams.set("runtimeKind", "observer");
+      return new WebSocket(url, {
+        headers: { authorization: `Bearer ${parent.bearer}` },
+      });
+    });
+    const messages = sockets.map((): unknown[] => []);
+    sockets.forEach((socket, index) => {
+      socket.on("message", (data) => messages[index]?.push(JSON.parse(String(data)) as unknown));
+    });
+
+    try {
+      await Promise.all(sockets.map(waitForSocketOpen));
+      await waitFor(() => messages.every((received) => received.some(isReplayCompleteEnvelope)));
+      const closeResults = sockets.map(waitForSocketCloseDetails);
+      const revokedAt = Date.now();
+      await request(`/auth/grants/${parent.grant.jti}/revoke`, {
+        body: {},
+        method: "POST",
+      });
+      const closed = await Promise.all(closeResults);
+
+      expect(Date.now() - revokedAt).toBeLessThan(5_000);
+      expect(closed).toEqual([
+        { code: 1008, reason: "auth_grant_revoked" },
+        { code: 1008, reason: "auth_grant_revoked" },
+      ]);
+      for (const replica of replicas) {
+        expect(replica.debugInfo()).toMatchObject({
+          authSockets: { closeCount: 1, socketCount: 0 },
+        });
+      }
+    } finally {
+      for (const socket of sockets) {
+        if (socket.readyState !== WebSocket.CLOSED) socket.terminate();
+      }
+      await Promise.all(replicas.map((replica) => replica.close()));
+    }
+  });
+
+  it("repairs a missed revocation notification through bounded PostgreSQL polling", async () => {
+    const session = await createSession();
+    const parent = await request<AuthGrantCreateResponse>("/auth/grants", {
+      body: {
+        role: "observer",
+        sessionScope: session.sessionId,
+        subject: `part_revocation_poll_${randomUUID()}`,
+        ttlSeconds: 3_600,
+      },
+      method: "POST",
+    });
+    const pollingApp = createAppServer(currentPool(), {
+      auth: e2eAuthOptions,
+      authRevocation: { listenEnabled: false, pollIntervalMs: 100 },
+      eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+      taskClaimSweeper: { intervalMs: 0 },
+    });
+    const port = await findOpenPort();
+    await pollingApp.listen(port);
+    const url = new URL(`ws://127.0.0.1:${port}/sessions/${session.sessionId}/stream`);
+    url.searchParams.set("after", "0");
+    url.searchParams.set("runtimeKind", "observer");
+    const socket = new WebSocket(url, {
+      headers: { authorization: `Bearer ${parent.bearer}` },
+    });
+    const messages: unknown[] = [];
+    socket.on("message", (data) => messages.push(JSON.parse(String(data)) as unknown));
+
+    try {
+      await waitForSocketOpen(socket);
+      await waitFor(() => messages.some(isReplayCompleteEnvelope));
+      const closedPromise = waitForSocketCloseDetails(socket);
+      const revokedAt = Date.now();
+      await request(`/auth/grants/${parent.grant.jti}/revoke`, {
+        body: {},
+        method: "POST",
+      });
+
+      await expect(closedPromise).resolves.toEqual({
+        code: 1008,
+        reason: "auth_grant_revoked",
+      });
+      expect(Date.now() - revokedAt).toBeLessThan(5_000);
+      expect(pollingApp.debugInfo().authRevocation).toMatchObject({
+        notificationCount: 0,
+        pollCloseCount: 1,
+        pollFailureCount: 0,
+      });
+    } finally {
+      if (socket.readyState !== WebSocket.CLOSED) socket.terminate();
+      await pollingApp.close();
+    }
+  });
+
+  it("closes an admitted socket at parent grant expiry without late grace", async () => {
+    const session = await createSession();
+    const parent = await request<AuthGrantCreateResponse>("/auth/grants", {
+      body: {
+        role: "observer",
+        sessionScope: session.sessionId,
+        subject: `part_expiry_socket_${randomUUID()}`,
+        ttlSeconds: 2,
+      },
+      method: "POST",
+    });
+    const expiryApp = createAppServer(currentPool(), {
+      auth: e2eAuthOptions,
+      authRevocation: { listenEnabled: false, pollIntervalMs: 0 },
+      eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+      taskClaimSweeper: { intervalMs: 0 },
+    });
+    const port = await findOpenPort();
+    await expiryApp.listen(port);
+    const url = new URL(`ws://127.0.0.1:${port}/sessions/${session.sessionId}/stream`);
+    url.searchParams.set("after", "0");
+    url.searchParams.set("runtimeKind", "observer");
+    const socket = new WebSocket(url, {
+      headers: { authorization: `Bearer ${parent.bearer}` },
+    });
+    const messages: unknown[] = [];
+    socket.on("message", (data) => messages.push(JSON.parse(String(data)) as unknown));
+
+    try {
+      await waitForSocketOpen(socket);
+      await waitFor(() => messages.some(isReplayCompleteEnvelope));
+      const closed = await waitForSocketCloseDetails(socket);
+      const closedAt = Date.now();
+
+      expect(closed).toEqual({ code: 1008, reason: "auth_grant_expired" });
+      expect(closedAt).toBeGreaterThanOrEqual(new Date(parent.grant.expiresAt).getTime());
+      expect(closedAt).toBeLessThan(new Date(parent.grant.expiresAt).getTime() + 500);
+    } finally {
+      if (socket.readyState !== WebSocket.CLOSED) socket.terminate();
+      await expiryApp.close();
+    }
+  });
+
+  it("reauthorizes established WebSocket commands against durable revocation", async () => {
+    const session = await createSession();
+    const participantId = `part_ws_grant_${randomUUID()}`;
+    const task = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
+      body: {
+        kind: "text",
+        objective: "Remain unclaimed after grant revocation",
+      },
+      method: "POST",
+    });
+    const created = await request<AuthGrantCreateResponse>("/auth/grants", {
+      body: {
+        role: "participant",
+        sessionScope: session.sessionId,
+        subject: participantId,
+        ttlSeconds: 3_600,
+      },
+      method: "POST",
+    });
+    const delayedClosureApp = createAppServer(currentPool(), {
+      auth: e2eAuthOptions,
+      authRevocation: { listenEnabled: false, pollIntervalMs: 0 },
+      eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+      sessionService: {
+        controlEpochEnforcement: false,
+        taskClaimLeaseTtlMs: 200,
+        wsControlLeaseTtlMs: 1_000,
+      },
+      taskClaimSweeper: { intervalMs: 0 },
+    });
+    const delayedClosurePort = await findOpenPort();
+    await delayedClosureApp.listen(delayedClosurePort);
+    const url = new URL(
+      `ws://127.0.0.1:${delayedClosurePort}/sessions/${session.sessionId}/stream`,
+    );
+    url.searchParams.set("access_token", created.bearer);
+    url.searchParams.set("after", "0");
+    url.searchParams.set("instanceId", `inst_ws_grant_${randomUUID()}`);
+    url.searchParams.set("participantId", participantId);
+    url.searchParams.set("runtimeKind", "codex");
+    const socket = new WebSocket(url);
+    const messages: unknown[] = [];
+    socket.on("message", (data) => messages.push(JSON.parse(String(data)) as unknown));
+
+    try {
+      await waitForSocketOpen(socket);
+      await waitFor(() => messages.some(isReplayCompleteEnvelope));
+
+      const allowedEventId = `evt_ws_grant_allowed_${randomUUID()}`;
+      const allowedRequestId = `req_ws_grant_allowed_${randomUUID()}`;
+      socket.send(
+        JSON.stringify({
+          eventId: allowedEventId,
+          op: webSocketOperation.publish,
+          payload: { text: "authorized before revocation" },
+          producerId: participantId,
+          requestId: allowedRequestId,
+          type: sessionEventType.userMessage,
+        }),
+      );
+      await waitFor(() =>
+        messages.some(
+          (message) => isCommandResultEnvelope(message) && message.requestId === allowedRequestId,
+        ),
+      );
+
+      await request(`/auth/grants/${created.grant.jti}/revoke`, {
+        body: {},
+        method: "POST",
+      });
+      const deniedEventId = `evt_ws_grant_denied_${randomUUID()}`;
+      const deniedPublishRequestId = `req_ws_grant_denied_publish_${randomUUID()}`;
+      const deniedTaskCommands = [
+        webSocketOperation.taskClaim,
+        webSocketOperation.taskCancel,
+        webSocketOperation.taskRefresh,
+        webSocketOperation.taskComplete,
+        webSocketOperation.taskFail,
+        webSocketOperation.taskRelease,
+      ] as const;
+      const deniedTaskRequests = deniedTaskCommands.map((op) => ({
+        op,
+        requestId: `req_ws_grant_denied_${op.replace(".", "_")}_${randomUUID()}`,
+      }));
+      socket.send(
+        JSON.stringify({
+          eventId: deniedEventId,
+          op: webSocketOperation.publish,
+          payload: { text: "must not persist after revocation" },
+          producerId: participantId,
+          requestId: deniedPublishRequestId,
+          type: sessionEventType.userMessage,
+        }),
+      );
+      for (const command of deniedTaskRequests) {
+        socket.send(JSON.stringify({ ...command, taskId: task.task.taskId }));
+      }
+      await waitFor(
+        () =>
+          messages.some((message) =>
+            isErrorEnvelopeWithReason(message, deniedPublishRequestId, "auth_grant_revoked"),
+          ) &&
+          deniedTaskRequests.every(({ op, requestId }) =>
+            messages.some(
+              (message) =>
+                isErrorEnvelopeWithReason(message, requestId, "auth_grant_revoked") &&
+                message.command === op,
+            ),
+          ),
+      );
+
+      const events = await request<EventsResponse>(`/sessions/${session.sessionId}/events?after=0`);
+      const tasks = await request<TasksResponse>(`/sessions/${session.sessionId}/tasks`);
+      expect(events.events.map((event) => event.eventId)).toContain(allowedEventId);
+      expect(events.events.map((event) => event.eventId)).not.toContain(deniedEventId);
+      expect(
+        tasks.tasks.find((candidate) => candidate.taskId === task.task.taskId)?.claimedBy,
+      ).toBe(null);
+      const [, encodedPayload, encodedSignature] = created.bearer.split(".");
+      const diagnostics = JSON.stringify(messages);
+      expect(diagnostics).not.toContain(created.bearer);
+      expect(diagnostics).not.toContain(encodedPayload);
+      expect(diagnostics).not.toContain(encodedSignature);
+    } finally {
+      if (socket.readyState !== WebSocket.CLOSED) {
+        socket.close();
+        await waitForSocketClose(socket);
+      }
+      await delayedClosureApp.close();
+    }
+  });
+
+  it("does not positively cache established WebSocket grants and fails closed on store outage", async () => {
+    const session = await createSession();
+    const participantId = `part_ws_store_${randomUUID()}`;
+    const created = await request<AuthGrantCreateResponse>("/auth/grants", {
+      body: {
+        role: "participant",
+        sessionScope: session.sessionId,
+        subject: participantId,
+        ttlSeconds: 3_600,
+      },
+      method: "POST",
+    });
+    let authReadCount = 0;
+    let failAuthReads = false;
+    const durableGrantStore = createAuthPersistenceStores(currentPool()).grants;
+    const observedGrantStore = {
+      findByJti: async (jti: string) => {
+        authReadCount += 1;
+        if (failAuthReads) throw new Error("injected auth store credential detail");
+        return durableGrantStore.findByJti(jti);
+      },
+      list: durableGrantStore.list,
+    };
+    const authorityApp = createAppServer(currentPool(), {
+      auth: { ...e2eAuthOptions, grantStore: observedGrantStore },
+      eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+      sessionService: {
+        controlEpochEnforcement: false,
+        taskClaimLeaseTtlMs: 200,
+        wsControlLeaseTtlMs: 1_000,
+      },
+      taskClaimSweeper: { intervalMs: 0 },
+    });
+    const port = await findOpenPort();
+    await authorityApp.listen(port);
+    const url = new URL(`ws://127.0.0.1:${port}/sessions/${session.sessionId}/stream`);
+    url.searchParams.set("access_token", created.bearer);
+    url.searchParams.set("after", "0");
+    url.searchParams.set("instanceId", `inst_ws_store_${randomUUID()}`);
+    url.searchParams.set("participantId", participantId);
+    url.searchParams.set("runtimeKind", "codex");
+    const socket = new WebSocket(url);
+    const messages: unknown[] = [];
+    socket.on("message", (data) => messages.push(JSON.parse(String(data)) as unknown));
+
+    try {
+      await waitForSocketOpen(socket);
+      await waitFor(() => messages.some(isReplayCompleteEnvelope));
+      expect(authReadCount).toBe(1);
+
+      const allowedEventId = `evt_ws_store_allowed_${randomUUID()}`;
+      const allowedRequestId = `req_ws_store_allowed_${randomUUID()}`;
+      socket.send(
+        JSON.stringify({
+          eventId: allowedEventId,
+          op: webSocketOperation.publish,
+          payload: { text: "requires a second grant read" },
+          producerId: participantId,
+          requestId: allowedRequestId,
+          type: sessionEventType.userMessage,
+        }),
+      );
+      await waitFor(() =>
+        messages.some(
+          (message) => isCommandResultEnvelope(message) && message.requestId === allowedRequestId,
+        ),
+      );
+      expect(authReadCount).toBe(2);
+
+      failAuthReads = true;
+      const deniedEventId = `evt_ws_store_denied_${randomUUID()}`;
+      const deniedRequestId = `req_ws_store_denied_${randomUUID()}`;
+      socket.send(
+        JSON.stringify({
+          eventId: deniedEventId,
+          op: webSocketOperation.publish,
+          payload: { text: "must fail closed during outage" },
+          producerId: participantId,
+          requestId: deniedRequestId,
+          type: sessionEventType.userMessage,
+        }),
+      );
+      await waitFor(() =>
+        messages.some((message) =>
+          isErrorEnvelopeWithReason(message, deniedRequestId, "auth_store_unavailable"),
+        ),
+      );
+      expect(authReadCount).toBe(3);
+
+      const events = await request<EventsResponse>(`/sessions/${session.sessionId}/events?after=0`);
+      expect(events.events.map((event) => event.eventId)).toContain(allowedEventId);
+      expect(events.events.map((event) => event.eventId)).not.toContain(deniedEventId);
+    } finally {
+      if (socket.readyState !== WebSocket.CLOSED) {
+        socket.close();
+        await waitForSocketClose(socket);
+      }
+      await authorityApp.close();
+    }
+  });
+
+  it("absorbs an asynchronous upgrade rejection after the peer disconnects", async () => {
+    const session = await createSession();
+    const participantId = `part_ws_disconnect_${randomUUID()}`;
+    const created = await request<AuthGrantCreateResponse>("/auth/grants", {
+      body: {
+        role: "participant",
+        sessionScope: session.sessionId,
+        subject: participantId,
+        ttlSeconds: 3_600,
+      },
+      method: "POST",
+    });
+    let markAuthReadStarted = (): void => undefined;
+    const authReadStarted = new Promise<void>((resolve) => {
+      markAuthReadStarted = resolve;
+    });
+    let releaseAuthRead = (): void => undefined;
+    const authReadRelease = new Promise<void>((resolve) => {
+      releaseAuthRead = resolve;
+    });
+    const durableGrantStore = createAuthPersistenceStores(currentPool()).grants;
+    const delayedFailureGrantStore = {
+      findByJti: async (_jti: string) => {
+        markAuthReadStarted();
+        await authReadRelease;
+        throw new Error("injected delayed auth read failure");
+      },
+      list: durableGrantStore.list,
+    };
+    const delayedFailureApp = createAppServer(currentPool(), {
+      auth: { ...e2eAuthOptions, grantStore: delayedFailureGrantStore },
+      eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+      taskClaimSweeper: { intervalMs: 0 },
+    });
+    const port = await findOpenPort();
+    await delayedFailureApp.listen(port);
+    const url = new URL(`ws://127.0.0.1:${port}/sessions/${session.sessionId}/stream`);
+    url.searchParams.set("access_token", created.bearer);
+    url.searchParams.set("participantId", participantId);
+    const socket = new WebSocket(url);
+    socket.on("error", () => undefined);
+    const unhandledRejections: unknown[] = [];
+    const observeUnhandled = (reason: unknown): void => {
+      unhandledRejections.push(reason);
+    };
+    process.on("unhandledRejection", observeUnhandled);
+
+    try {
+      await authReadStarted;
+      socket.terminate();
+      releaseAuthRead();
+      await sleep(50);
+      expect(unhandledRejections).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", observeUnhandled);
+      releaseAuthRead();
+      if (socket.readyState !== WebSocket.CLOSED) socket.terminate();
+      await delayedFailureApp.close();
+    }
+  });
+
+  it("authorizes grant lifecycle routes before revealing grant existence", async () => {
+    const participant = mintE2eToken({
+      participantId: "part_auth_denied",
+      role: "participant",
+      sessionId: "*",
+    });
+    const paths = [
+      "/auth/grants/grant_known_only_to_admin",
+      "/auth/grants/grant_missing/revoke",
+    ] as const;
+    for (const path of paths) {
+      const response = await requestStatusFrom(baseUrl, path, {
+        authToken: participant,
+        ...(path.endsWith("/revoke") ? { body: {}, method: "POST" } : {}),
+      });
+      expect(response.status).toBe(403);
+      expect(response.body).toEqual({ error: "Forbidden", reason: "role" });
+      expect(response.text).not.toContain("grant_missing");
+      expect(response.text).not.toContain("grant_known_only_to_admin");
+    }
+  });
+
+  it("requires authentication before grant lifecycle routing", async () => {
+    const response = await requestStatusFrom(baseUrl, "/auth/grants/grant_missing", {
+      authToken: null,
+    });
+    expect(response.status).toBe(401);
+    expect(response.body).toEqual({ error: "Unauthorized", reason: "missing" });
+  });
+
+  it("keeps provisional tgr2 issuance observably gated before persistence", async () => {
+    const gatedApp = createAppServer(currentPool(), {
+      auth: {
+        activeKid: testAuthSigningKid,
+        issuer: "https://auth.e2e.tether.local",
+        mode: "required",
+        secrets: { [testAuthSigningKid]: testAuthSigningSecret },
+      },
+    });
+    const port = await findOpenPort();
+    await gatedApp.listen(port);
+    onTestFinished(() => gatedApp.close());
+
+    expect(gatedApp.debugInfo().auth.grantIssuanceEnabled).toBe(false);
+    const subject = `admin_gated_${randomUUID()}`;
+    const response = await requestStatusFrom(`http://127.0.0.1:${port}`, "/auth/grants", {
+      authToken: mintE2eToken({
+        participantId: "part_gate_admin",
+        role: "admin",
+        sessionId: "*",
+      }),
+      body: { role: "admin", sessionScope: "*", subject },
+      method: "POST",
+    });
+    expect(response.status).toBe(503);
+    expect(response.body).toEqual({
+      error: "Authentication grant issuance unavailable",
+      reason: "auth_grant_issuance_gated",
+    });
+    const persisted = await currentPool().pool.query<{
+      readonly count: number;
+    }>(`SELECT count(*)::int AS count FROM auth_grants WHERE subject = $1`, [subject]);
+    expect(persisted.rows[0]?.count).toBe(0);
+  });
+
+  it("preserves explicit auth-disabled development access to the grant lifecycle", async () => {
+    const disabledApp = createAppServer(currentPool(), {
+      auth: {
+        activeKid: testAuthSigningKid,
+        issuer: "https://auth.e2e.tether.local",
+        mode: "disabled",
+        preEnforcementGrantIssuanceEnabled: true,
+        secrets: { [testAuthSigningKid]: testAuthSigningSecret },
+      },
+    });
+    const port = await findOpenPort();
+    await disabledApp.listen(port);
+    onTestFinished(() => disabledApp.close());
+
+    const response = await requestStatusFrom<AuthGrantCreateResponse>(
+      `http://127.0.0.1:${port}`,
+      "/auth/grants",
+      {
+        authToken: null,
+        body: {
+          role: "admin",
+          sessionScope: "*",
+          subject: "bootstrap_disabled_mode",
+        },
+        method: "POST",
+      },
+    );
+    expect(response.status).toBe(201);
+    expect(response.body.bearer).toMatch(/^tgr2\./u);
+  });
+
+  it("bootstraps one audited administrator and writes its bearer once", async () => {
+    const output: string[] = [];
+    await runBootstrapAdminCli(
+      ["--subject", "admin_bootstrap_e2e", "--ttl", "1h"],
+      {
+        AUTH_ISSUER: "https://auth.e2e.tether.local",
+        AUTH_GRANT_BOOTSTRAP_COMPATIBILITY_CONFIRMED: "true",
+        AUTH_SIGNING_KID: testAuthSigningKid,
+        AUTH_SIGNING_SECRET: testAuthSigningSecret,
+        DATABASE_URL: databaseUrl,
+      },
+      (value) => output.push(value),
+    );
+
+    expect(output).toHaveLength(1);
+    expect(output[0]?.endsWith("\n")).toBe(true);
+    const created = JSON.parse(output[0] ?? "") as AuthGrantCreateResponse;
+    expect(created.bearer).toMatch(/^tgr2\./u);
+    expect(created.grant).toMatchObject({
+      role: "admin",
+      sessionScope: "*",
+      subject: "admin_bootstrap_e2e",
+    });
+    const stores = createAuthPersistenceStores(currentPool());
+    await expect(stores.grants.findByJti(created.grant.jti)).resolves.toMatchObject({
+      metadata: { source: "bootstrap" },
+      subject: "admin_bootstrap_e2e",
+    });
+    const audits = await stores.audits.listForGrant(created.grant.jti, 10);
+    expect(audits).toEqual([
+      expect.objectContaining({
+        action: "grant.created",
+        reasonCode: "bootstrap",
+      }),
+    ]);
+    expect(JSON.stringify(audits)).not.toContain(created.bearer);
   });
 
   it("enforces REST role and session scope", async () => {
@@ -3667,7 +5273,10 @@ e2e("tether e2e", () => {
           actors: ["registration-a", "registration-b"],
           name: "participant-advisory-lock-ready",
           position: "before",
-          query: { class: "participant-advisory-lock", text: participantAdvisoryLockQuery },
+          query: {
+            class: "participant-advisory-lock",
+            text: participantAdvisoryLockQuery,
+          },
         },
       ],
       transactionTimeouts: { lockTimeoutMs: 2_000, statementTimeoutMs: 5_000 },
@@ -3765,10 +5374,26 @@ e2e("tether e2e", () => {
     expect(phaseEvents).toHaveLength(4);
     expect(phaseEvents).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ actor: "probe-a", name: "probe-ready", position: "before" }),
-        expect.objectContaining({ actor: "probe-b", name: "probe-ready", position: "before" }),
-        expect.objectContaining({ actor: "probe-a", name: "probe-finished", position: "after" }),
-        expect.objectContaining({ actor: "probe-b", name: "probe-finished", position: "after" }),
+        expect.objectContaining({
+          actor: "probe-a",
+          name: "probe-ready",
+          position: "before",
+        }),
+        expect.objectContaining({
+          actor: "probe-b",
+          name: "probe-ready",
+          position: "before",
+        }),
+        expect.objectContaining({
+          actor: "probe-a",
+          name: "probe-finished",
+          position: "after",
+        }),
+        expect.objectContaining({
+          actor: "probe-b",
+          name: "probe-finished",
+          position: "after",
+        }),
       ]),
     );
   });
@@ -3838,7 +5463,10 @@ e2e("tether e2e", () => {
       },
     });
     expect(waiter?.backendPid).toEqual(expect.any(Number));
-    expect(waiter?.lockWait).toMatchObject({ blocked: true, waitEventType: "Lock" });
+    expect(waiter?.lockWait).toMatchObject({
+      blocked: true,
+      waitEventType: "Lock",
+    });
     expect(snapshot.cleanup).toMatchObject({
       blockedActorsAfterRollback: 0,
       cancelledActors: 2,
@@ -3932,9 +5560,9 @@ e2e("tether e2e", () => {
         try {
           await terminatedActor.query("BEGIN");
           await terminator.query("BEGIN");
-          const pidResult = await terminatedActor.query<{ readonly pid: number }>(
-            "SELECT pg_backend_pid()::int AS pid",
-          );
+          const pidResult = await terminatedActor.query<{
+            readonly pid: number;
+          }>("SELECT pg_backend_pid()::int AS pid");
           const terminatedPid = pidResult.rows[0]?.pid;
           if (terminatedPid === undefined) {
             throw new Error("Missing terminated actor backend PID");
@@ -3952,7 +5580,10 @@ e2e("tether e2e", () => {
     const snapshot = coordinator.snapshot();
     expect(snapshot.cleanup?.failures).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ actor: "terminated-actor", operation: "rollback" }),
+        expect.objectContaining({
+          actor: "terminated-actor",
+          operation: "rollback",
+        }),
       ]),
     );
     expect(snapshot.cleanup).toMatchObject({
@@ -3978,7 +5609,10 @@ e2e("tether e2e", () => {
           actors: ["mutation"],
           name: "epoch-n-fence-held",
           position: "after",
-          query: { class: "current-control-lease-fence", text: currentControlLeaseFenceQuery },
+          query: {
+            class: "current-control-lease-fence",
+            text: currentControlLeaseFenceQuery,
+          },
           release: "manual",
         },
       ],
@@ -4058,7 +5692,9 @@ e2e("tether e2e", () => {
       sessionId: session.sessionId,
       taskId: task.task.taskId,
     });
-    const currentEpochRows = await currentPool().pool.query<{ readonly epoch: unknown }>(
+    const currentEpochRows = await currentPool().pool.query<{
+      readonly epoch: unknown;
+    }>(
       `
         SELECT epoch
         FROM participant_control_leases
@@ -4070,7 +5706,10 @@ e2e("tether e2e", () => {
       [session.sessionId, participantId],
     );
 
-    expect(result.lockWait).toMatchObject({ blocked: true, waitEventType: "Lock" });
+    expect(result.lockWait).toMatchObject({
+      blocked: true,
+      waitEventType: "Lock",
+    });
     expect(result.mutationResponse.status).toBe(200);
     expect(result.mutationResponse.body.task.claimExpiresAt).not.toBe(claimed.task.claimExpiresAt);
     expect(durableTask?.claimExpiresAt).toBe(result.mutationResponse.body.task.claimExpiresAt);
@@ -4094,7 +5733,10 @@ e2e("tether e2e", () => {
           actors: ["mutation"],
           name: "epoch-n-before-fence",
           position: "before",
-          query: { class: "current-control-lease-fence", text: currentControlLeaseFenceQuery },
+          query: {
+            class: "current-control-lease-fence",
+            text: currentControlLeaseFenceQuery,
+          },
           release: "manual",
         },
       ],
@@ -4170,7 +5812,9 @@ e2e("tether e2e", () => {
       sessionId: session.sessionId,
       taskId: task.task.taskId,
     });
-    const currentEpochRows = await currentPool().pool.query<{ readonly epoch: unknown }>(
+    const currentEpochRows = await currentPool().pool.query<{
+      readonly epoch: unknown;
+    }>(
       `
         SELECT epoch
         FROM participant_control_leases
@@ -4211,7 +5855,10 @@ e2e("tether e2e", () => {
   it("allows exactly one of two synchronized REST claimants to claim one task", async () => {
     const session = await createSession();
     const task = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
-      body: { kind: "software_dev", objective: "Claim this task exactly once" },
+      body: {
+        kind: "software_dev",
+        objective: "Claim this task exactly once",
+      },
       method: "POST",
     });
     const claimants = [
@@ -4406,7 +6053,10 @@ e2e("tether e2e", () => {
           actors: ["publisher-a"],
           name: "publisher-a-sequence-allocated",
           position: "after",
-          query: { class: "event-sequence-allocation", text: eventSequenceAllocatorQuery },
+          query: {
+            class: "event-sequence-allocation",
+            text: eventSequenceAllocatorQuery,
+          },
           release: "manual",
         },
       ],
@@ -4459,7 +6109,10 @@ e2e("tether e2e", () => {
     );
     const committedEvents = await listEvents(currentPool(), sessionId, sequenceBefore - 1);
 
-    expect(result.lockWait).toMatchObject({ blocked: true, waitEventType: "Lock" });
+    expect(result.lockWait).toMatchObject({
+      blocked: true,
+      waitEventType: "Lock",
+    });
     expect([result.eventA.seq, result.eventB.seq]).toEqual([sequenceBefore, sequenceBefore + 1]);
     expect(committedEvents).toHaveLength(2);
     expect(committedEvents).toEqual([
@@ -4503,7 +6156,10 @@ e2e("tether e2e", () => {
           actors: ["publisher-a"],
           name: "publisher-a-rollback-sequence-allocated",
           position: "after",
-          query: { class: "event-sequence-allocation", text: eventSequenceAllocatorQuery },
+          query: {
+            class: "event-sequence-allocation",
+            text: eventSequenceAllocatorQuery,
+          },
           release: "manual",
         },
       ],
@@ -4549,9 +6205,14 @@ e2e("tether e2e", () => {
     const eventB = requireFulfilledOutcome(result.eventB);
     const committedEvents = await listEvents(currentPool(), sessionId, sequenceBefore - 1);
 
-    expect(result.lockWait).toMatchObject({ blocked: true, waitEventType: "Lock" });
+    expect(result.lockWait).toMatchObject({
+      blocked: true,
+      waitEventType: "Lock",
+    });
     expect(result.eventA).toMatchObject({
-      reason: expect.objectContaining({ message: "injected session event insert failure" }),
+      reason: expect.objectContaining({
+        message: "injected session event insert failure",
+      }),
       status: "rejected",
     });
     expect(eventB).toMatchObject({
@@ -8222,7 +9883,10 @@ e2e("tether e2e", () => {
         setupBaseUrl,
         `/sessions/${session.sessionId}/tasks`,
         {
-          body: { kind: "software_dev", objective: "Refresh under epoch serialization" },
+          body: {
+            kind: "software_dev",
+            objective: "Refresh under epoch serialization",
+          },
           method: "POST",
         },
       );
@@ -8234,7 +9898,14 @@ e2e("tether e2e", () => {
           method: "POST",
         },
       );
-      return { claimed, controlEpoch, instanceId, participantId, session, task };
+      return {
+        claimed,
+        controlEpoch,
+        instanceId,
+        participantId,
+        session,
+        task,
+      };
     } finally {
       await setupApp.close();
     }
@@ -9311,6 +10982,38 @@ async function findOpenPort(): Promise<number> {
 }
 
 /**
+ * Sends an authenticated but structurally invalid WebSocket handshake and
+ * returns the server response after the peer closes the transport.
+ */
+async function sendInvalidWebSocketUpgrade(url: URL): Promise<string> {
+  const port = Number(url.port);
+  if (!Number.isSafeInteger(port) || port <= 0) {
+    throw new Error("Invalid WebSocket test port");
+  }
+  return new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const socket = createConnection({ host: url.hostname, port });
+    socket.once("error", reject);
+    socket.on("data", (chunk: Buffer) => chunks.push(chunk));
+    socket.once("close", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    socket.once("connect", () => {
+      socket.write(
+        [
+          `GET ${url.pathname}${url.search} HTTP/1.1`,
+          `Host: ${url.host}`,
+          "Connection: Upgrade",
+          "Upgrade: websocket",
+          "Sec-WebSocket-Version: 13",
+          "Sec-WebSocket-Key: invalid",
+          "",
+          "",
+        ].join("\r\n"),
+      );
+    });
+  });
+}
+
+/**
  * Checks whether a parsed WebSocket message is an event envelope.
  */
 function isEventEnvelope(value: unknown): value is {
@@ -9388,6 +11091,18 @@ function isErrorEnvelope(value: unknown): value is {
 }
 
 /**
+ * Checks whether a parsed WebSocket message is an error with the expected reason.
+ */
+function isWebSocketErrorWithReason(value: unknown, reason: string): boolean {
+  return (
+    isRecord(value) &&
+    value.op === webSocketOperation.error &&
+    value.reason === reason &&
+    typeof value.error === "string"
+  );
+}
+
+/**
  * Checks whether a parsed WebSocket message is a publish policy error.
  */
 function isErrorEnvelopeWithReason(
@@ -9395,6 +11110,7 @@ function isErrorEnvelopeWithReason(
   requestId: string,
   reason: string,
 ): value is {
+  readonly command?: string;
   readonly error: string;
   readonly op: "error";
   readonly reason: string;
@@ -9643,6 +11359,16 @@ async function waitForSocketClose(socket: WebSocket): Promise<void> {
   }
   await new Promise<void>((resolve, reject) => {
     socket.once("close", resolve);
+    socket.once("error", reject);
+  });
+}
+
+/** Resolves with the bounded close code and reason observed by a WebSocket peer. */
+async function waitForSocketCloseDetails(
+  socket: WebSocket,
+): Promise<{ readonly code: number; readonly reason: string }> {
+  return new Promise((resolve, reject) => {
+    socket.once("close", (code, reason) => resolve({ code, reason: reason.toString("utf8") }));
     socket.once("error", reject);
   });
 }

@@ -44,6 +44,12 @@ describe("session event retention cutoff", () => {
       ),
     ).toEqual([]);
     expect(collectDeleteCallInventory(sources)).toEqual([
+      "apps/tether/src/auth/grant-authority.ts:key",
+      "apps/tether/src/auth/grant-authority.ts:key",
+      "apps/tether/src/auth/grant-authority.ts:oldestKey",
+      "apps/tether/src/auth/socket-registry.ts:entry.grantJti",
+      "apps/tether/src/auth/socket-registry.ts:socket",
+      "apps/tether/src/auth/socket-registry.ts:socket",
       "apps/tether/src/db.ts:sessions",
       "apps/tether/src/host-presence.ts:instanceId",
       "apps/tether/src/host-presence.ts:listener",
@@ -56,6 +62,8 @@ describe("session event retention cutoff", () => {
       "apps/tether/src/session-scalability-runtime-state.ts:key",
       "apps/tether/src/session-scalability-runtime-state.ts:oldest",
       "apps/tether/src/session-service-core-effects.ts:deleteInput.sessionId",
+      'apps/tether/src/websocket-participant-gateway.ts:"access_token"',
+      'apps/tether/src/websocket-participant-gateway.ts:"ticket"',
       "apps/tether/src/websocket-participant-gateway.ts:key",
     ]);
   });

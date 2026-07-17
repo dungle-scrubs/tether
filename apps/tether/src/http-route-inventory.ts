@@ -5,6 +5,7 @@
  */
 
 import { clientBindingRoutes } from "./http-client-binding-route-handlers.js";
+import { authGrantHttpRoutes } from "./http-auth-grant-route-handlers.js";
 import { directHttpRoutes } from "./http-direct-routes.js";
 import type { HttpRouteSpec } from "./http-route-spec.js";
 import { sessionDebugRoutes } from "./http-session-debug-route-handlers.js";
@@ -14,6 +15,7 @@ import { taskHttpRoutes } from "./http-task-route-handlers.js";
 
 /** Every route declared through defineHttpRoute, sorted by stable name. */
 export const httpRouteInventory: readonly HttpRouteSpec[] = [
+  ...Object.values(authGrantHttpRoutes),
   ...Object.values(clientBindingRoutes),
   ...Object.values(directHttpRoutes),
   ...sessionDebugRoutes.map((entry) => entry.route),

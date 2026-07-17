@@ -9,10 +9,13 @@ import {
 } from "../src/config.js";
 import { defaultResourceLimits } from "../src/resource-limits.js";
 
+const testAuthIssuer = "https://auth.example.test";
+
 describe("server config", () => {
   it("fails closed when runtime topology is missing", () => {
     expect(() =>
       readConfig({
+        AUTH_ISSUER: testAuthIssuer,
         AUTH_SIGNING_SECRET: "test-secret",
         DATABASE_URL: "postgres://example.test/tether",
       }),
@@ -22,6 +25,7 @@ describe("server config", () => {
   it("rejects unsupported runtime topology without echoing its value", () => {
     expect(() =>
       readConfig({
+        AUTH_ISSUER: testAuthIssuer,
         AUTH_SIGNING_SECRET: "test-secret",
         DATABASE_URL: "postgres://example.test/tether",
         RUNTIME_TOPOLOGY: "secret-unsupported-topology",
@@ -33,6 +37,7 @@ describe("server config", () => {
     await expect(
       Effect.runPromise(
         readConfigEffectFromEnv({
+          AUTH_ISSUER: testAuthIssuer,
           AUTH_SIGNING_SECRET: "test-secret",
           DATABASE_URL: "postgres://example.test/tether",
         }),
@@ -44,6 +49,7 @@ describe("server config", () => {
     await expect(
       Effect.runPromise(
         readConfigEffectFromEnv({
+          AUTH_ISSUER: testAuthIssuer,
           AUTH_SIGNING_SECRET: "test-secret",
           DATABASE_URL: "postgres://example.test/tether",
           RUNTIME_TOPOLOGY: "cluster",
@@ -55,6 +61,7 @@ describe("server config", () => {
   it("reads current scheduler environment names", () => {
     expect(
       readConfig({
+        AUTH_ISSUER: testAuthIssuer,
         AUTH_SIGNING_SECRET: "test-secret",
         DATABASE_POOL_MAX: "20",
         DATABASE_URL: "postgres://example.test/tether",
@@ -76,6 +83,7 @@ describe("server config", () => {
       }),
     ).toEqual({
       authAcceptedSigningSecrets: {},
+      authIssuer: testAuthIssuer,
       authMode: "required",
       authSigningKid: "default",
       authSigningSecret: "test-secret",
@@ -104,6 +112,7 @@ describe("server config", () => {
 
   it("falls back to scheduler defaults for invalid values", () => {
     const config = readConfig({
+      AUTH_ISSUER: testAuthIssuer,
       AUTH_SIGNING_SECRET: "test-secret",
       DATABASE_URL: "postgres://example.test/tether",
       EVENT_FANOUT_CATCH_UP_MS: "-1",
@@ -134,6 +143,7 @@ describe("server config", () => {
       ServerConfigService.pipe(
         Effect.provide(
           serverConfigLayerFromEnv({
+            AUTH_ISSUER: testAuthIssuer,
             AUTH_SIGNING_SECRET: "test-secret",
             DATABASE_URL: "postgres://example.test/effect",
             PORT: "4101",
@@ -151,14 +161,62 @@ describe("server config", () => {
   });
 
   it("defaults auth mode to required and fails without a signing secret", () => {
-    expect(() => readConfig({ RUNTIME_TOPOLOGY: "single" })).toThrow(
+    expect(() => readConfig({ AUTH_ISSUER: testAuthIssuer, RUNTIME_TOPOLOGY: "single" })).toThrow(
       "AUTH_SIGNING_SECRET is required",
     );
   });
 
+  it("requires an explicit auth issuer whenever authentication is required", async () => {
+    expect(() =>
+      readConfig({
+        AUTH_SIGNING_SECRET: "test-secret",
+        DATABASE_URL: "postgres://example.test/tether",
+        RUNTIME_TOPOLOGY: "single",
+      }),
+    ).toThrow("AUTH_ISSUER is required when AUTH_MODE=required");
+
+    await expect(
+      Effect.runPromise(
+        readConfigEffectFromEnv({
+          AUTH_SIGNING_SECRET: "test-secret",
+          DATABASE_URL: "postgres://example.test/tether",
+          RUNTIME_TOPOLOGY: "single",
+        }),
+      ),
+    ).rejects.toThrow("AUTH_ISSUER is required when AUTH_MODE=required");
+  });
+
+  it("rejects an issuer longer than the grant claim limit without echoing it", () => {
+    const oversizedIssuer = `https://${"secret-marker".repeat(50)}.example.test`;
+    expect(oversizedIssuer.length).toBeGreaterThan(512);
+
+    expect(() =>
+      readConfig({
+        AUTH_ISSUER: oversizedIssuer,
+        AUTH_SIGNING_SECRET: "test-secret",
+        DATABASE_URL: "postgres://example.test/tether",
+        RUNTIME_TOPOLOGY: "single",
+      }),
+    ).toThrow("AUTH_ISSUER exceeds maximum length 512");
+    try {
+      readConfig({
+        AUTH_ISSUER: oversizedIssuer,
+        AUTH_SIGNING_SECRET: "test-secret",
+        DATABASE_URL: "postgres://example.test/tether",
+        RUNTIME_TOPOLOGY: "single",
+      });
+    } catch (error) {
+      expect(String(error)).not.toContain(oversizedIssuer);
+    }
+  });
+
   it("fails closed when DATABASE_URL is missing", () => {
     expect(() =>
-      readConfig({ AUTH_SIGNING_SECRET: "test-secret", RUNTIME_TOPOLOGY: "single" }),
+      readConfig({
+        AUTH_ISSUER: testAuthIssuer,
+        AUTH_SIGNING_SECRET: "test-secret",
+        RUNTIME_TOPOLOGY: "single",
+      }),
     ).toThrow("DATABASE_URL is required");
   });
 
@@ -168,6 +226,7 @@ describe("server config", () => {
         ServerConfigService.pipe(
           Effect.provide(
             serverConfigLayerFromEnv({
+              AUTH_ISSUER: testAuthIssuer,
               AUTH_SIGNING_SECRET: "test-secret",
               RUNTIME_TOPOLOGY: "single",
             }),
@@ -210,6 +269,7 @@ describe("server config", () => {
   it("parses auth key id and accepted signing-secret rotation map", () => {
     expect(
       readConfig({
+        AUTH_ISSUER: testAuthIssuer,
         AUTH_ACCEPTED_SIGNING_SECRETS: JSON.stringify({
           previous: "old-secret",
         }),
@@ -220,6 +280,7 @@ describe("server config", () => {
       }),
     ).toMatchObject({
       authAcceptedSigningSecrets: { previous: "old-secret" },
+      authIssuer: testAuthIssuer,
       authMode: "required",
       authSigningKid: "current",
       authSigningSecret: "new-secret",
@@ -229,6 +290,7 @@ describe("server config", () => {
   it("defaults control epoch enforcement on and permits only an explicit false override", () => {
     expect(
       readConfig({
+        AUTH_ISSUER: testAuthIssuer,
         AUTH_SIGNING_SECRET: "test-secret",
         DATABASE_URL: "postgres://example.test/tether",
         RUNTIME_TOPOLOGY: "single",
@@ -236,6 +298,7 @@ describe("server config", () => {
     ).toBe(true);
     expect(
       readConfig({
+        AUTH_ISSUER: testAuthIssuer,
         AUTH_SIGNING_SECRET: "test-secret",
         CONTROL_EPOCH_ENFORCEMENT: "true",
         DATABASE_URL: "postgres://example.test/tether",
@@ -244,6 +307,7 @@ describe("server config", () => {
     ).toBe(true);
     expect(
       readConfig({
+        AUTH_ISSUER: testAuthIssuer,
         AUTH_SIGNING_SECRET: "test-secret",
         CONTROL_EPOCH_ENFORCEMENT: "false",
         DATABASE_URL: "postgres://example.test/tether",
@@ -252,6 +316,7 @@ describe("server config", () => {
     ).toBe(false);
     expect(() =>
       readConfig({
+        AUTH_ISSUER: testAuthIssuer,
         AUTH_SIGNING_SECRET: "test-secret",
         CONTROL_EPOCH_ENFORCEMENT: "nonsense",
         DATABASE_URL: "postgres://example.test/tether",
@@ -266,6 +331,7 @@ describe("server config", () => {
         ServerConfigService.pipe(
           Effect.provide(
             serverConfigLayerFromEnv({
+              AUTH_ISSUER: testAuthIssuer,
               AUTH_SIGNING_SECRET: "test-secret",
               CONTROL_EPOCH_ENFORCEMENT: "nonsense",
               DATABASE_URL: "postgres://example.test/tether",
@@ -280,6 +346,7 @@ describe("server config", () => {
   it("uses the default auth key id for blank config values", () => {
     expect(
       readConfig({
+        AUTH_ISSUER: testAuthIssuer,
         AUTH_SIGNING_KID: " ",
         AUTH_SIGNING_SECRET: "test-secret",
         DATABASE_URL: "postgres://example.test/tether",

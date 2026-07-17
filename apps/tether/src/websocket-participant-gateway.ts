@@ -11,7 +11,12 @@ import {
   authorizeParticipantIdentity,
   effectiveParticipantId,
 } from "./auth/authorize.js";
-import { type AuthRuntime, authErrorFromUnknown } from "./auth/enforcement.js";
+import {
+  authErrorFromUnknown,
+  type AuthenticatedWebSocketAuth,
+  type AuthRuntime,
+} from "./auth/enforcement.js";
+import type { AuthSocketRegistry, AuthSocketStreamKind } from "./auth/socket-registry.js";
 import type { AuthContext } from "./auth/token.js";
 import type { ControlEpochGuard } from "./db.js";
 import { sleepUnrefEffect } from "./effect-runtime.js";
@@ -56,6 +61,7 @@ import { findClientWebSocketCommandSpec } from "./websocket-command-spec.js";
 
 interface ParticipantWebSocketGatewayInput {
   readonly auth: AuthRuntime;
+  readonly authSocketRegistry: AuthSocketRegistry;
   readonly hostPresence: HostPresenceRuntime;
   readonly hub: SubscriptionHub;
   readonly replicaId: string;
@@ -133,7 +139,10 @@ export class ControlSocketRegistry {
         // this late, strictly-lower-epoch registration. Reject the stale socket
         // rather than overwriting the current higher-epoch entry with it.
         safeSendWebSocketEnvelope(socket, {
-          details: { currentEpoch: existing.epoch, reason: "control_epoch_superseded" },
+          details: {
+            currentEpoch: existing.epoch,
+            reason: "control_epoch_superseded",
+          },
           error: "WebSocket control epoch was superseded",
         });
         safeCloseWebSocket(socket, 1008, "control epoch superseded");
@@ -185,9 +194,10 @@ export function createParticipantWebSocketGateway(
   const heartbeat = startWebSocketHeartbeat(wsServer);
   const controlSocketRegistry = new ControlSocketRegistry();
   input.server.on("upgrade", (request, socket, head) => {
-    handleParticipantWebSocketUpgrade({
+    void handleParticipantWebSocketUpgrade({
       head,
       auth: input.auth,
+      authSocketRegistry: input.authSocketRegistry,
       controlSocketRegistry,
       hub: input.hub,
       hostPresence: input.hostPresence,
@@ -197,6 +207,8 @@ export function createParticipantWebSocketGateway(
       service: input.service,
       socket,
       wsServer,
+    }).catch(() => {
+      socket.destroy();
     });
   });
   const originalClose = wsServer.close.bind(wsServer);
@@ -209,6 +221,7 @@ export function createParticipantWebSocketGateway(
 
 interface ParticipantWebSocketUpgradeInput {
   readonly auth: AuthRuntime;
+  readonly authSocketRegistry: AuthSocketRegistry;
   readonly controlSocketRegistry: ControlSocketRegistry;
   readonly head: Buffer;
   readonly hostPresence: HostPresenceRuntime;
@@ -222,7 +235,9 @@ interface ParticipantWebSocketUpgradeInput {
 }
 
 /** Handles one participant stream upgrade request. */
-function handleParticipantWebSocketUpgrade(input: ParticipantWebSocketUpgradeInput): void {
+async function handleParticipantWebSocketUpgrade(
+  input: ParticipantWebSocketUpgradeInput,
+): Promise<void> {
   const url = input.request.url ? new URL(input.request.url, "http://localhost") : null;
   const match = url?.pathname.match(/^\/sessions\/([^/]+)\/stream$/u);
   const sessionId = match?.[1] ? decodeURIComponent(match[1]) : null;
@@ -230,11 +245,12 @@ function handleParticipantWebSocketUpgrade(input: ParticipantWebSocketUpgradeInp
     input.socket.destroy();
     return;
   }
-  let authContext: AuthContext | null;
+  let authenticated: AuthenticatedWebSocketAuth;
   try {
-    authContext = input.auth.authenticateWebSocketUpgrade(input.request, url);
+    authenticated = await input.auth.authenticateWebSocketUpgrade(input.request, url);
   } catch (error) {
     const reason = authErrorFromUnknown(error);
+    redactWebSocketCredentials(input.request, url);
     input.wsServer.handleUpgrade(input.request, input.socket, input.head, (webSocket) => {
       input.wsServer.emit("connection", webSocket, input.request);
       observeWebSocketPayloadErrors(webSocket, input.resourceLimitRuntime);
@@ -246,6 +262,7 @@ function handleParticipantWebSocketUpgrade(input: ParticipantWebSocketUpgradeInp
     });
     return;
   }
+  const streamSearchParams = redactWebSocketCredentials(input.request, url);
   input.wsServer.handleUpgrade(input.request, input.socket, input.head, (webSocket) => {
     input.wsServer.emit("connection", webSocket, input.request);
     observeWebSocketPayloadErrors(webSocket, input.resourceLimitRuntime);
@@ -255,12 +272,13 @@ function handleParticipantWebSocketUpgrade(input: ParticipantWebSocketUpgradeInp
         input.hub,
         input.resourceLimitRuntime,
         input.replicaId,
-        authContext,
+        authenticated,
         sessionId,
-        url.searchParams,
+        streamSearchParams,
         webSocket,
         input.hostPresence,
         input.controlSocketRegistry,
+        input.authSocketRegistry,
       ),
     ).catch((error: unknown) => {
       console.error(error);
@@ -269,21 +287,37 @@ function handleParticipantWebSocketUpgrade(input: ParticipantWebSocketUpgradeInp
   });
 }
 
+/** Removes captured credentials before request metadata enters long-lived socket surfaces. */
+export function redactWebSocketCredentials(request: IncomingMessage, url: URL): URLSearchParams {
+  const redactedUrl = new URL(url);
+  redactedUrl.searchParams.delete("access_token");
+  redactedUrl.searchParams.delete("ticket");
+  delete request.headers.authorization;
+  request.url = `${redactedUrl.pathname}${redactedUrl.search}`;
+  return new URLSearchParams(redactedUrl.searchParams);
+}
+
 /** Registers an upgraded WebSocket, replays historical events, and attaches live command handling. */
 function handleWebSocket(
   service: SessionServiceEffect,
   hub: SubscriptionHub,
   resourceLimitRuntime: ResourceLimitRuntime,
   replicaId: string,
-  authContext: AuthContext | null,
+  authenticated: AuthenticatedWebSocketAuth,
   sessionId: string,
   searchParams: URLSearchParams,
   socket: WebSocket,
   hostPresence: HostPresenceRuntime,
   controlSocketRegistry: ControlSocketRegistry,
+  authSocketRegistry: AuthSocketRegistry,
 ): Effect.Effect<void, unknown> {
   return Effect.gen(function* () {
-    const readDenied = authorize({ action: "read", context: authContext, sessionId });
+    const authContext = authenticated.context;
+    const readDenied = authorize({
+      action: "read",
+      context: authContext,
+      sessionId,
+    });
     if (readDenied) {
       socket.send(
         serializeErrorEnvelope({
@@ -295,6 +329,20 @@ function handleWebSocket(
       return;
     }
     const hostPresenceStream = classifyHostPresenceStream(searchParams.get("runtimeKind"));
+    const authStreamKind: AuthSocketStreamKind = hostPresenceStream ?? "participant";
+    const unregisterAuthSocket = authContext
+      ? authSocketRegistry.register({
+          context: authContext,
+          socket,
+          streamKind: authStreamKind,
+        })
+      : null;
+    if (unregisterAuthSocket !== null) {
+      socket.once("close", unregisterAuthSocket);
+    }
+    if (socket.readyState !== socket.OPEN) {
+      return;
+    }
     if (hostPresenceStream) {
       yield* handleHostPresenceWebSocket({
         hub,
@@ -381,7 +429,7 @@ function handleWebSocket(
           hub,
           sessionId,
           participantContext,
-          authContext,
+          authenticated,
           socket,
           data,
         ).pipe(
@@ -402,7 +450,9 @@ function handleWebSocket(
     // replay and buffered-live boundary, or the socket has been closed with a
     // typed replay_gap_unrepaired error.
     const replayLimit = resourceLimitRuntime.limits.wsReplayMaxEvents;
-    const events = yield* service.listEvents(sessionId, afterSeq, { limit: replayLimit + 1 });
+    const events = yield* service.listEvents(sessionId, afterSeq, {
+      limit: replayLimit + 1,
+    });
     if (events.length > replayLimit) {
       resourceLimitRuntime.recordReplayWindowExceeded();
       safeSendWebSocketEnvelope(socket, {
@@ -664,16 +714,28 @@ function registerWebSocketParticipant(
     if (authContext?.role === "observer") {
       return null;
     }
-    const denied = authorize({ action: "task-mutate", context: authContext, sessionId });
+    const denied = authorize({
+      action: "task-mutate",
+      context: authContext,
+      sessionId,
+    });
     if (denied) {
-      socket.send(serializeErrorEnvelope({ error: "WebSocket participant is not authorized" }));
+      socket.send(
+        serializeErrorEnvelope({
+          error: "WebSocket participant is not authorized",
+        }),
+      );
       socket.close(1008, "unauthorized");
       return null;
     }
     const requestedParticipantId = searchParams.get("participantId");
     const identityDenied = authorizeParticipantIdentity(authContext, requestedParticipantId);
     if (identityDenied) {
-      socket.send(serializeErrorEnvelope({ error: "WebSocket participant identity mismatch" }));
+      socket.send(
+        serializeErrorEnvelope({
+          error: "WebSocket participant identity mismatch",
+        }),
+      );
       socket.close(1008, "identity mismatch");
       return null;
     }
@@ -709,7 +771,10 @@ function registerWebSocketParticipant(
     if (result.status === "control_epoch_stale") {
       socket.send(
         serializeErrorEnvelope({
-          details: { currentEpoch: result.currentEpoch, reason: "control_epoch_stale" },
+          details: {
+            currentEpoch: result.currentEpoch,
+            reason: "control_epoch_stale",
+          },
           error: "WebSocket control epoch is stale",
         }),
       );
@@ -746,7 +811,7 @@ function handleWebSocketMessage(
   hub: SubscriptionHub,
   sessionId: string,
   participantContext: ParticipantControlContext | null,
-  authContext: AuthContext | null,
+  authenticated: AuthenticatedWebSocketAuth,
   socket: WebSocket,
   data: WebSocket.RawData,
 ): Effect.Effect<void, unknown> {
@@ -761,7 +826,7 @@ function handleWebSocketMessage(
       hub,
       sessionId,
       participantContext,
-      authContext,
+      authenticated,
       socket,
       raw,
       commandContext,
@@ -792,12 +857,13 @@ function handleParsedWebSocketMessage(
   hub: SubscriptionHub,
   sessionId: string,
   participantContext: ParticipantControlContext | null,
-  authContext: AuthContext | null,
+  authenticated: AuthenticatedWebSocketAuth,
   socket: WebSocket,
   raw: unknown,
   commandContext: WebSocketCommandContext | null,
 ): Effect.Effect<void, unknown> {
   return Effect.gen(function* () {
+    const authContext = authenticated.context;
     const op = commandContext?.op ?? readWebSocketOp(raw);
     const commandSpec = findClientWebSocketCommandSpec(op);
     if (!commandSpec) {
@@ -806,8 +872,26 @@ function handleParsedWebSocketMessage(
       });
       return;
     }
+    const commandAuthority = yield* Effect.either(
+      Effect.tryPromise({
+        catch: (error) => error,
+        try: authenticated.authorizeCommand,
+      }),
+    );
+    if (commandAuthority._tag === "Left") {
+      const reason = authErrorFromUnknown(commandAuthority.left);
+      sendCommandContextError(socket, commandContext, "WebSocket command is not authorized", {
+        category: "authorization_failed",
+        reason,
+      });
+      return;
+    }
     if (op === webSocketOperation.publish) {
-      const denied = authorize({ action: "publish", context: authContext, sessionId });
+      const denied = authorize({
+        action: "publish",
+        context: authContext,
+        sessionId,
+      });
       if (denied) {
         sendCommandContextError(socket, commandContext, "WebSocket publish is not authorized", {
           category: "authorization_failed",
@@ -888,7 +972,11 @@ function handleParsedWebSocketMessage(
     if (!context) {
       return;
     }
-    const commandDenied = authorize({ action: "task-mutate", context: authContext, sessionId });
+    const commandDenied = authorize({
+      action: "task-mutate",
+      context: authContext,
+      sessionId,
+    });
     if (commandDenied) {
       sendCommandContextError(socket, commandContext, "WebSocket command is not authorized", {
         category: "authorization_failed",
@@ -1097,7 +1185,10 @@ function webSocketControlLeaseRefreshLoop(
                 // apply protected commands.
                 closeForRefreshError(
                   "WebSocket control epoch was superseded",
-                  { currentEpoch: result.currentEpoch, reason: "control_epoch_stale" },
+                  {
+                    currentEpoch: result.currentEpoch,
+                    reason: "control_epoch_stale",
+                  },
                   1008,
                   "control epoch stale",
                 );
@@ -1263,7 +1354,10 @@ function safeCloseWebSocket(socket: WebSocket, code: number, reason: string): vo
 /** Sends an error envelope to a WebSocket, ignoring failures from already-closed sockets. */
 function safeSendWebSocketEnvelope(
   socket: WebSocket,
-  envelope: { readonly details?: Record<string, unknown>; readonly error: string },
+  envelope: {
+    readonly details?: Record<string, unknown>;
+    readonly error: string;
+  },
 ): void {
   if (socket.readyState !== socket.OPEN) {
     return;

@@ -4,6 +4,8 @@ import { URL } from "node:url";
 import type { SessionScalabilityHealthWarning } from "@dungle-scrubs/tether-protocol";
 import { Context, Effect, Layer } from "effect";
 import { authorize } from "./auth/authorize.js";
+import { createAuthGrantLifecycle, type AuthGrantLifecycle } from "./auth/grant-lifecycle.js";
+import { createAuthPersistenceStores } from "./auth/db-grant-stores.js";
 import {
   type AuthRuntime,
   type AuthRuntimeDebugInfo,
@@ -13,12 +15,20 @@ import {
   authRuntimeOptionsFromConfig,
   createAuthRuntime,
 } from "./auth/enforcement.js";
+import {
+  AuthGrantRevocationRuntime,
+  type AuthGrantRevocationDebugInfo,
+} from "./auth/grant-revocation-runtime.js";
+import { AuthSocketRegistry, type AuthSocketRegistryDebugInfo } from "./auth/socket-registry.js";
 import type { AuthContext } from "./auth/token.js";
+import { createAuthTicketLifecycle, type AuthTicketLifecycle } from "./auth/ticket-lifecycle.js";
 import { ServerConfigService } from "./config.js";
 import type { RuntimeTopology } from "./config.js";
 import { type DatabasePool, DatabaseService } from "./db.js";
 import { HostPresenceRuntime } from "./host-presence.js";
 import { handleClientBindingHttpRoute } from "./http-client-binding-route-handlers.js";
+import { handleAuthGrantHttpRoute } from "./http-auth-grant-route-handlers.js";
+import { handleAuthTicketHttpRoute } from "./http-auth-ticket-route-handlers.js";
 import { directHttpRoutes } from "./http-direct-routes.js";
 import {
   applyCorsResponseHeaders,
@@ -93,6 +103,10 @@ export interface AppServer {
 export interface AppServerDebugInfo {
   /** Authentication mode and accepted key diagnostics, without secrets. */
   readonly auth: AuthRuntimeDebugInfo;
+  /** Cross-replica parent-grant revocation propagation diagnostics. */
+  readonly authRevocation: AuthGrantRevocationDebugInfo;
+  /** Process-local authenticated socket counts and timer ownership. */
+  readonly authSockets: AuthSocketRegistryDebugInfo;
   /** Cross-replica event fanout listener and catch-up diagnostics. */
   readonly eventFanout: SessionEventFanoutDebugInfo;
   /** Process-local Host-presence stream diagnostics. */
@@ -117,6 +131,12 @@ export interface AppServerDebugInfo {
 export interface AppServerOptions {
   /** Authentication configuration for direct app-server construction. */
   readonly auth?: AuthRuntimeOptions;
+  /** Parent-grant notification and bounded polling configuration. */
+  readonly authRevocation?: {
+    readonly listenEnabled?: boolean;
+    readonly pollBatchLimit?: number;
+    readonly pollIntervalMs?: number;
+  };
   /** Cross-replica event fanout listener configuration. */
   readonly eventFanout?: {
     readonly catchUpPollIntervalMs?: number;
@@ -243,18 +263,44 @@ export function createAppServerWithSessionService(
     service,
   });
   const sessionSummaryStore = createSessionSummaryStore(pool.pool);
-  const auth = createAuthRuntime(
-    options.auth ?? {
-      activeKid: "disabled",
-      mode: "disabled",
-      secrets: {},
-    },
-  );
+  const authOptions = options.auth ?? {
+    activeKid: "disabled",
+    issuer: null,
+    mode: "disabled",
+    secrets: {},
+  };
+  const authPersistenceStores = createAuthPersistenceStores(pool);
+  const authGrantStore = authOptions.grantStore ?? authPersistenceStores.grants;
+  const auth = createAuthRuntime({
+    ...authOptions,
+    grantStore: authGrantStore,
+    ticketStore: authOptions.ticketStore ?? authPersistenceStores.tickets,
+  });
+  const authSocketRegistry = new AuthSocketRegistry();
+  const authRevocation = new AuthGrantRevocationRuntime({
+    database: pool,
+    ...(options.authRevocation ?? {}),
+    registry: authSocketRegistry,
+    store: authPersistenceStores.grants,
+  });
+  const authGrantLifecycle = createAuthGrantLifecycle({
+    activeKid: authOptions.activeKid,
+    issuer: authOptions.issuer ?? null,
+    issuanceEnabled: authOptions.preEnforcementGrantIssuanceEnabled ?? false,
+    secrets: authOptions.secrets,
+    stores: authPersistenceStores,
+  });
+  const authTicketLifecycle = createAuthTicketLifecycle({
+    replicaId: `replica_${replicaId}`,
+    store: authPersistenceStores.tickets,
+  });
   /**
    * Reads process-local diagnostics for the app server and its child modules.
    */
   const readDebugInfo = (): AppServerDebugInfo => ({
     auth: auth.debugInfo(),
+    authRevocation: authRevocation.debugInfo(),
+    authSockets: authSocketRegistry.debugInfo(),
     eventFanout: eventFanout.debugInfo(),
     hostPresence: hostPresence.debugInfo(),
     hub: hub.debugInfo(),
@@ -289,6 +335,8 @@ export function createAppServerWithSessionService(
           service,
           hub,
           auth,
+          authGrantLifecycle,
+          authTicketLifecycle,
           resourceLimitRuntime,
           sessionSummaryStore,
           readDebugInfo,
@@ -306,6 +354,7 @@ export function createAppServerWithSessionService(
   );
   const wsServer = createParticipantWebSocketGateway({
     auth,
+    authSocketRegistry,
     hostPresence,
     hub,
     replicaId,
@@ -318,6 +367,7 @@ export function createAppServerWithSessionService(
     close: async () => {
       await taskClaimSweeper.stop();
       await eventFanout.stop();
+      await authRevocation.stop();
       auth.close();
       await new Promise<void>((resolve, reject) => {
         wsServer.close((wsError) => {
@@ -337,6 +387,7 @@ export function createAppServerWithSessionService(
     },
     debugInfo: readDebugInfo,
     listen: async (port) => {
+      await authRevocation.start();
       await eventFanout.start();
       await new Promise<void>((resolve) => {
         server.listen(port, resolve);
@@ -364,6 +415,8 @@ function handleHttp(
   service: SessionServiceEffect,
   hub: SubscriptionHub,
   auth: AuthRuntime,
+  authGrantLifecycle: AuthGrantLifecycle,
+  authTicketLifecycle: AuthTicketLifecycle,
   resourceLimitRuntime: ResourceLimitRuntime,
   sessionSummaryStore: SessionSummaryStore,
   readAppServerDebugInfo: ReadAppServerDebugInfo,
@@ -380,6 +433,8 @@ function handleHttp(
     service,
     hub,
     auth,
+    authGrantLifecycle,
+    authTicketLifecycle,
     resourceLimitRuntime,
     sessionSummaryStore,
     readAppServerDebugInfo,
@@ -410,6 +465,8 @@ function handleHttpRequest(
   service: SessionServiceEffect,
   hub: SubscriptionHub,
   auth: AuthRuntime,
+  authGrantLifecycle: AuthGrantLifecycle,
+  authTicketLifecycle: AuthTicketLifecycle,
   resourceLimitRuntime: ResourceLimitRuntime,
   sessionSummaryStore: SessionSummaryStore,
   readAppServerDebugInfo: ReadAppServerDebugInfo,
@@ -445,8 +502,33 @@ function handleHttpRequest(
       sendJson(response, readiness.status, { ...readiness.body });
       return;
     }
-    const authContext = authenticateHttpRequest(auth, request, response, url);
+    const authContext = yield* Effect.promise(() =>
+      authenticateHttpRequest(auth, request, response, url),
+    );
     if (authContext === undefined) {
+      return;
+    }
+    if (
+      yield* handleAuthTicketHttpRoute({
+        authContext,
+        lifecycle: authTicketLifecycle,
+        request,
+        response,
+        url,
+      })
+    ) {
+      return;
+    }
+    if (
+      yield* handleAuthGrantHttpRoute({
+        authContext,
+        lifecycle: authGrantLifecycle,
+        maxBodyBytes: resourceLimitRuntime.limits.httpMaxBodyBytes,
+        request,
+        response,
+        url,
+      })
+    ) {
       return;
     }
     if (matchHttpRoute(directHttpRoutes.ui, request.method, url.pathname)) {
@@ -565,14 +647,14 @@ const defaultRestControlLogger = {
 };
 
 /** Authenticates a REST request and writes the rejection response on failure. */
-function authenticateHttpRequest(
+async function authenticateHttpRequest(
   auth: AuthRuntime,
   request: IncomingMessage,
   response: ServerResponse,
   url: URL,
-): AuthContext | null | undefined {
+): Promise<AuthContext | null | undefined> {
   try {
-    return auth.authenticateHttpRequest(request, url);
+    return await auth.authenticateHttpRequest(request, url);
   } catch (error) {
     sendAuthError(response, authErrorFromUnknown(error));
     return undefined;
