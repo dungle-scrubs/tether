@@ -72,17 +72,21 @@ describe("server config", () => {
         EVENT_LIST_MAX_LIMIT: "13",
         HTTP_MAX_BODY_BYTES: "14",
         PORT: "4100",
+        REST_EVENT_LIST_MAX_BYTES: "22",
         RUNTIME_TOPOLOGY: "single",
         TASK_CLAIM_SWEEP_BATCH_SIZE: "7",
         TASK_CLAIM_SWEEP_MS: "250",
         WS_BACKPRESSURE_BUFFERED_BYTES: "15",
+        WS_GAP_REPAIR_GRACE_MS: "20",
         WS_MAX_PAYLOAD_BYTES: "16",
         WS_MESSAGE_RATE_LIMIT: "17",
         WS_MESSAGE_RATE_WINDOW_MS: "18",
+        WS_REPLAY_MAX_BYTES: "21",
         WS_REPLAY_MAX_EVENTS: "19",
       }),
     ).toEqual({
       authAcceptedSigningSecrets: {},
+      authAllowLegacyTokens: false,
       authIssuer: testAuthIssuer,
       authMode: "required",
       authSigningKid: "default",
@@ -98,10 +102,13 @@ describe("server config", () => {
         eventListDefaultLimit: 12,
         eventListMaxLimit: 13,
         httpMaxBodyBytes: 14,
+        restEventListMaxBytes: 22,
         wsBackpressureBufferedBytes: 15,
+        wsGapRepairGraceMs: 20,
         wsMaxPayloadBytes: 16,
         wsMessageRateLimit: 17,
         wsMessageRateWindowMs: 18,
+        wsReplayMaxBytes: 21,
         wsReplayMaxEvents: 19,
       },
       runtimeTopology: "single",
@@ -121,13 +128,16 @@ describe("server config", () => {
       EVENT_LIST_DEFAULT_LIMIT: "-1",
       EVENT_LIST_MAX_LIMIT: "not-a-number",
       HTTP_MAX_BODY_BYTES: "0",
+      REST_EVENT_LIST_MAX_BYTES: "-1",
       RUNTIME_TOPOLOGY: "single",
       TASK_CLAIM_SWEEP_BATCH_SIZE: "0",
       TASK_CLAIM_SWEEP_MS: "-1",
       WS_BACKPRESSURE_BUFFERED_BYTES: "0",
+      WS_GAP_REPAIR_GRACE_MS: "0",
       WS_MAX_PAYLOAD_BYTES: "-1",
       WS_MESSAGE_RATE_LIMIT: "0",
       WS_MESSAGE_RATE_WINDOW_MS: "-1",
+      WS_REPLAY_MAX_BYTES: "-1",
       WS_REPLAY_MAX_EVENTS: "bad",
     });
 
@@ -323,6 +333,62 @@ describe("server config", () => {
         RUNTIME_TOPOLOGY: "single",
       }),
     ).toThrow("CONTROL_EPOCH_ENFORCEMENT must be a documented boolean");
+  });
+
+  it("defaults legacy token acceptance off and permits only an explicit true override", () => {
+    expect(
+      readConfig({
+        AUTH_ISSUER: testAuthIssuer,
+        AUTH_SIGNING_SECRET: "test-secret",
+        DATABASE_URL: "postgres://example.test/tether",
+        RUNTIME_TOPOLOGY: "single",
+      }).authAllowLegacyTokens,
+    ).toBe(false);
+    expect(
+      readConfig({
+        AUTH_ALLOW_LEGACY_TOKENS: "false",
+        AUTH_ISSUER: testAuthIssuer,
+        AUTH_SIGNING_SECRET: "test-secret",
+        DATABASE_URL: "postgres://example.test/tether",
+        RUNTIME_TOPOLOGY: "single",
+      }).authAllowLegacyTokens,
+    ).toBe(false);
+    expect(
+      readConfig({
+        AUTH_ALLOW_LEGACY_TOKENS: "true",
+        AUTH_ISSUER: testAuthIssuer,
+        AUTH_SIGNING_SECRET: "test-secret",
+        DATABASE_URL: "postgres://example.test/tether",
+        RUNTIME_TOPOLOGY: "single",
+      }).authAllowLegacyTokens,
+    ).toBe(true);
+    expect(() =>
+      readConfig({
+        AUTH_ALLOW_LEGACY_TOKENS: "nonsense",
+        AUTH_ISSUER: testAuthIssuer,
+        AUTH_SIGNING_SECRET: "test-secret",
+        DATABASE_URL: "postgres://example.test/tether",
+        RUNTIME_TOPOLOGY: "single",
+      }),
+    ).toThrow("AUTH_ALLOW_LEGACY_TOKENS must be a documented boolean");
+  });
+
+  it("rejects invalid explicit legacy token acceptance through Effect configuration", async () => {
+    await expect(
+      Effect.runPromise(
+        ServerConfigService.pipe(
+          Effect.provide(
+            serverConfigLayerFromEnv({
+              AUTH_ALLOW_LEGACY_TOKENS: "nonsense",
+              AUTH_ISSUER: testAuthIssuer,
+              AUTH_SIGNING_SECRET: "test-secret",
+              DATABASE_URL: "postgres://example.test/tether",
+              RUNTIME_TOPOLOGY: "single",
+            }),
+          ),
+        ),
+      ),
+    ).rejects.toThrow("AUTH_ALLOW_LEGACY_TOKENS must be a documented boolean");
   });
 
   it("rejects invalid explicit control enforcement through Effect configuration", async () => {
