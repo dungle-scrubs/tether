@@ -13,6 +13,12 @@ import {
   uniqueIndex,
 } from "drizzle-orm/pg-core";
 
+import type {
+  SessionProjectionActivity,
+  SessionProjectionForkLineage,
+  SessionProjectionTangentLineage,
+} from "./session-projection.js";
+
 /**
  * Durable session records. A session is the shared coordination object that
  * participants subscribe to; it is not an agent runtime by itself.
@@ -79,6 +85,34 @@ export const sessionEvents = pgTable(
     index("session_events_session_created_idx").on(table.sessionId, table.createdAt),
   ],
 );
+
+/**
+ * Durable current-state projection reduced from each Session Event stream.
+ * Exact events remain authoritative; this table owns no participant, task, or
+ * process-local Host Presence state.
+ */
+export const sessionProjections = pgTable("session_projections", {
+  activeRunId: text("active_run_id"),
+  activity: text("activity").$type<SessionProjectionActivity>().notNull(),
+  activityChangedAt: timestamp("activity_changed_at", { withTimezone: true }),
+  archivedAt: timestamp("archived_at", { withTimezone: true }),
+  coversSeqTo: bigint("covers_seq_to", { mode: "number" }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  eventCount: bigint("event_count", { mode: "number" }).notNull(),
+  forkedFrom: jsonb("forked_from").$type<SessionProjectionForkLineage>(),
+  hostMetadata: jsonb("host_metadata").$type<Record<string, unknown>>(),
+  hostMetadataSourceSeq: bigint("host_metadata_source_seq", { mode: "number" }),
+  lastEventAt: timestamp("last_event_at", { withTimezone: true }),
+  reducerVersion: integer("reducer_version").notNull(),
+  sessionId: text("session_id")
+    .primaryKey()
+    .references(() => sessions.sessionId, { onDelete: "cascade" }),
+  tangentOf: jsonb("tangent_of").$type<SessionProjectionTangentLineage>(),
+  title: text("title"),
+  titleSourceSeq: bigint("title_source_seq", { mode: "number" }),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
 
 /**
  * Runtime identities currently attached to a session. The actual Claude Code,

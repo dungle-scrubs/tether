@@ -7,6 +7,7 @@ import { approvalTargetKey } from "./approval-target-key.js";
 import { ServerConfigService } from "./config.js";
 import { ControlEpochStaleError, nextControlEpoch, parseControlEpoch } from "./control-epoch.js";
 import { migrateDatabase } from "./database-migration.js";
+import { createSessionProjectionStore } from "./db-session-projections.js";
 import {
   type AppendSessionEventInput,
   type ApprovalDecision,
@@ -58,6 +59,7 @@ import type {
 } from "./types.js";
 
 const { Pool } = pg;
+const sessionProjectionStore = createSessionProjectionStore();
 
 export type {
   DatabaseMigrationFailureContext,
@@ -3567,6 +3569,7 @@ async function appendEventWithClient(
     ],
   );
   const event = toSessionEvent(eventRows.rows[0]);
+  await sessionProjectionStore.updateForAppendedEvent(client, event);
   await notifySessionEventWithClient(client, event, sourceId);
   return event;
 }

@@ -125,6 +125,87 @@ describe("atomic control epoch fence in task mutations", () => {
     expect(sqls.at(-1)).toBe("COMMIT");
   });
 
+  it("preserves the fenced-mutation order through projection persistence", async () => {
+    const taskRow = {
+      cancelledAt: null,
+      claimExpiredAt: null,
+      claimExpiredBy: null,
+      claimExpiresAt: new Date("2026-07-16T12:01:00.000Z"),
+      claimedAt: new Date("2026-07-16T12:00:00.000Z"),
+      claimedBy: "part_1",
+      completedAt: null,
+      createdAt: new Date("2026-07-16T11:00:00.000Z"),
+      failedAt: null,
+      failure: null,
+      input: null,
+      kind: "projection-test",
+      mailboxAccountId: null,
+      mailboxProvider: null,
+      objective: "Preserve lock ordering",
+      releasedAt: null,
+      releasedBy: null,
+      result: null,
+      scheduleAlgorithmVersion: null,
+      scheduleIntervalMs: null,
+      scheduleWindowStart: null,
+      sessionId: "sess_1",
+      taskId: "task_1",
+    };
+    const eventRow = {
+      createdAt: new Date("2026-07-16T12:00:00.000Z"),
+      eventId: "evt_claim_projection",
+      payload: {},
+      producerId: "part_1",
+      seq: "1",
+      sessionId: "sess_1",
+      type: "task.claimed",
+    };
+    const client = new ScriptedClient((sql) => {
+      if (isControlLeaseGuardSelect(sql)) {
+        return [leaseRow("5")];
+      }
+      if (sql.includes("SELECT EXISTS")) {
+        return [{ exists: true }];
+      }
+      if (sql.includes("UPDATE tasks")) {
+        return [taskRow];
+      }
+      if (sql.includes("UPDATE session_event_sequences")) {
+        return [{ seq: "1" }];
+      }
+      if (sql.includes("INSERT INTO session_events")) {
+        return [eventRow];
+      }
+      return [];
+    });
+
+    const result = await claimTaskWithEvent(scriptedDatabase(client), {
+      claimLeaseTtlMs: 1_000,
+      controlGuard: guard,
+      eventSourceId: "src_atomic_test",
+      participantId: "part_1",
+      sessionId: "sess_1",
+      taskId: "task_1",
+    });
+
+    expect(result?.event.type).toBe("task.claimed");
+    const sqls = client.queries.map((query) => query.sql);
+    const guardIndex = sqls.findIndex(isControlLeaseGuardSelect);
+    const mutationIndex = sqls.findIndex((sql) => sql.includes("UPDATE tasks"));
+    const eventIndex = sqls.findIndex((sql) => sql.includes("INSERT INTO session_events"));
+    const projectionIndex = sqls.findIndex((sql) =>
+      sql.includes("INSERT INTO session_projections"),
+    );
+    const notifyIndex = sqls.findIndex((sql) => sql.includes("pg_notify"));
+    const commitIndex = sqls.indexOf("COMMIT");
+    expect(guardIndex).toBeGreaterThanOrEqual(0);
+    expect(mutationIndex).toBeGreaterThan(guardIndex);
+    expect(eventIndex).toBeGreaterThan(mutationIndex);
+    expect(projectionIndex).toBeGreaterThan(eventIndex);
+    expect(notifyIndex).toBeGreaterThan(projectionIndex);
+    expect(commitIndex).toBeGreaterThan(notifyIndex);
+  });
+
   it("skips the epoch fence entirely when no guard is supplied (legacy path)", async () => {
     const client = new ScriptedClient(() => []);
 
