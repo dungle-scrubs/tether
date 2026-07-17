@@ -1,456 +1,9 @@
 {
-  "id": "f19acbff-b7fb-405f-bf16-3b6acb1239d2",
+  "id": "51839b76-8ffb-40be-82e3-e3a5112bc2cf",
   "prevId": "6667bfe5-4009-484b-8776-6891cd0e99ab",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
-    "public.auth_grant_audit_events": {
-      "name": "auth_grant_audit_events",
-      "schema": "",
-      "columns": {
-        "action": {
-          "name": "action",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "actor_subject": {
-          "name": "actor_subject",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "audit_id": {
-          "name": "audit_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true
-        },
-        "grant_jti": {
-          "name": "grant_jti",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "metadata": {
-          "name": "metadata",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "occurred_at": {
-          "name": "occurred_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        },
-        "reason_code": {
-          "name": "reason_code",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        }
-      },
-      "indexes": {
-        "auth_grant_audit_grant_occurred_idx": {
-          "name": "auth_grant_audit_grant_occurred_idx",
-          "columns": [
-            {
-              "expression": "grant_jti",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "occurred_at",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "auth_grant_audit_occurred_idx": {
-          "name": "auth_grant_audit_occurred_idx",
-          "columns": [
-            {
-              "expression": "occurred_at",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
-      "foreignKeys": {
-        "auth_grant_audit_events_grant_jti_auth_grants_jti_fk": {
-          "name": "auth_grant_audit_events_grant_jti_auth_grants_jti_fk",
-          "tableFrom": "auth_grant_audit_events",
-          "tableTo": "auth_grants",
-          "columnsFrom": ["grant_jti"],
-          "columnsTo": ["jti"],
-          "onDelete": "no action",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {
-        "auth_grant_audit_action_length_check": {
-          "name": "auth_grant_audit_action_length_check",
-          "value": "char_length(\"auth_grant_audit_events\".\"action\") BETWEEN 1 AND 64"
-        },
-        "auth_grant_audit_actor_length_check": {
-          "name": "auth_grant_audit_actor_length_check",
-          "value": "char_length(\"auth_grant_audit_events\".\"actor_subject\") BETWEEN 1 AND 255"
-        },
-        "auth_grant_audit_id_length_check": {
-          "name": "auth_grant_audit_id_length_check",
-          "value": "char_length(\"auth_grant_audit_events\".\"audit_id\") BETWEEN 1 AND 128"
-        },
-        "auth_grant_audit_metadata_size_check": {
-          "name": "auth_grant_audit_metadata_size_check",
-          "value": "octet_length(\"auth_grant_audit_events\".\"metadata\"::text) <= 4096"
-        },
-        "auth_grant_audit_metadata_shape_check": {
-          "name": "auth_grant_audit_metadata_shape_check",
-          "value": "jsonb_typeof(\"auth_grant_audit_events\".\"metadata\") = 'object'\n        AND \"auth_grant_audit_events\".\"metadata\" ? 'requestId'\n        AND \"auth_grant_audit_events\".\"metadata\" - 'requestId' = '{}'::jsonb\n        AND (\n          jsonb_typeof(\"auth_grant_audit_events\".\"metadata\"->'requestId') = 'null'\n          OR (\n            jsonb_typeof(\"auth_grant_audit_events\".\"metadata\"->'requestId') = 'string'\n            AND \"auth_grant_audit_events\".\"metadata\"->>'requestId' ~ '^req_[A-Za-z0-9_-]{1,120}$'\n          )\n        )"
-        },
-        "auth_grant_audit_action_check": {
-          "name": "auth_grant_audit_action_check",
-          "value": "\"auth_grant_audit_events\".\"action\" IN ('grant.created', 'grant.revoked')"
-        },
-        "auth_grant_audit_reason_length_check": {
-          "name": "auth_grant_audit_reason_length_check",
-          "value": "char_length(\"auth_grant_audit_events\".\"reason_code\") BETWEEN 1 AND 64"
-        },
-        "auth_grant_audit_reason_check": {
-          "name": "auth_grant_audit_reason_check",
-          "value": "\"auth_grant_audit_events\".\"reason_code\" IN ('bootstrap', 'key-rotation', 'migration', 'operator-request', 'security-response')"
-        }
-      },
-      "isRLSEnabled": false
-    },
-    "public.auth_grants": {
-      "name": "auth_grants",
-      "schema": "",
-      "columns": {
-        "audience": {
-          "name": "audience",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "expires_at": {
-          "name": "expires_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "issued_at": {
-          "name": "issued_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "issuer": {
-          "name": "issuer",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "jti": {
-          "name": "jti",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true
-        },
-        "kid": {
-          "name": "kid",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "metadata": {
-          "name": "metadata",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "revoked_at": {
-          "name": "revoked_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "role": {
-          "name": "role",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "session_scope": {
-          "name": "session_scope",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "subject": {
-          "name": "subject",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        }
-      },
-      "indexes": {
-        "auth_grants_expiry_idx": {
-          "name": "auth_grants_expiry_idx",
-          "columns": [
-            {
-              "expression": "expires_at",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "auth_grants_revoked_expiry_idx": {
-          "name": "auth_grants_revoked_expiry_idx",
-          "columns": [
-            {
-              "expression": "revoked_at",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "expires_at",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {
-        "auth_grants_audience_check": {
-          "name": "auth_grants_audience_check",
-          "value": "\"auth_grants\".\"audience\" = 'tether-rest'"
-        },
-        "auth_grants_expiry_check": {
-          "name": "auth_grants_expiry_check",
-          "value": "\"auth_grants\".\"expires_at\" > \"auth_grants\".\"issued_at\""
-        },
-        "auth_grants_lifetime_check": {
-          "name": "auth_grants_lifetime_check",
-          "value": "\"auth_grants\".\"expires_at\" <= \"auth_grants\".\"issued_at\" + interval '7 days'"
-        },
-        "auth_grants_issuer_length_check": {
-          "name": "auth_grants_issuer_length_check",
-          "value": "char_length(\"auth_grants\".\"issuer\") BETWEEN 1 AND 512"
-        },
-        "auth_grants_jti_length_check": {
-          "name": "auth_grants_jti_length_check",
-          "value": "char_length(\"auth_grants\".\"jti\") BETWEEN 1 AND 128"
-        },
-        "auth_grants_kid_length_check": {
-          "name": "auth_grants_kid_length_check",
-          "value": "char_length(\"auth_grants\".\"kid\") BETWEEN 1 AND 128"
-        },
-        "auth_grants_metadata_size_check": {
-          "name": "auth_grants_metadata_size_check",
-          "value": "octet_length(\"auth_grants\".\"metadata\"::text) <= 4096"
-        },
-        "auth_grants_metadata_shape_check": {
-          "name": "auth_grants_metadata_shape_check",
-          "value": "jsonb_typeof(\"auth_grants\".\"metadata\") = 'object'\n        AND \"auth_grants\".\"metadata\" ? 'requestId'\n        AND \"auth_grants\".\"metadata\" ? 'source'\n        AND \"auth_grants\".\"metadata\" - ARRAY['requestId', 'source'] = '{}'::jsonb\n        AND jsonb_typeof(\"auth_grants\".\"metadata\"->'source') = 'string'\n        AND \"auth_grants\".\"metadata\"->>'source' IN ('admin', 'bootstrap', 'migration')\n        AND (\n          jsonb_typeof(\"auth_grants\".\"metadata\"->'requestId') = 'null'\n          OR (\n            jsonb_typeof(\"auth_grants\".\"metadata\"->'requestId') = 'string'\n            AND \"auth_grants\".\"metadata\"->>'requestId' ~ '^req_[A-Za-z0-9_-]{1,120}$'\n          )\n        )"
-        },
-        "auth_grants_revoked_check": {
-          "name": "auth_grants_revoked_check",
-          "value": "\"auth_grants\".\"revoked_at\" IS NULL OR \"auth_grants\".\"revoked_at\" >= \"auth_grants\".\"issued_at\""
-        },
-        "auth_grants_role_check": {
-          "name": "auth_grants_role_check",
-          "value": "\"auth_grants\".\"role\" IN ('observer', 'participant', 'admin')"
-        },
-        "auth_grants_session_scope_length_check": {
-          "name": "auth_grants_session_scope_length_check",
-          "value": "char_length(\"auth_grants\".\"session_scope\") BETWEEN 1 AND 255"
-        },
-        "auth_grants_subject_length_check": {
-          "name": "auth_grants_subject_length_check",
-          "value": "char_length(\"auth_grants\".\"subject\") BETWEEN 1 AND 255"
-        }
-      },
-      "isRLSEnabled": false
-    },
-    "public.auth_tickets": {
-      "name": "auth_tickets",
-      "schema": "",
-      "columns": {
-        "admission_metadata": {
-          "name": "admission_metadata",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "audience": {
-          "name": "audience",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "consumed_at": {
-          "name": "consumed_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "expires_at": {
-          "name": "expires_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "parent_grant_jti": {
-          "name": "parent_grant_jti",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "ticket_hash": {
-          "name": "ticket_hash",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true
-        }
-      },
-      "indexes": {
-        "auth_tickets_expiry_idx": {
-          "name": "auth_tickets_expiry_idx",
-          "columns": [
-            {
-              "expression": "expires_at",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "auth_tickets_parent_expiry_idx": {
-          "name": "auth_tickets_parent_expiry_idx",
-          "columns": [
-            {
-              "expression": "parent_grant_jti",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "expires_at",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "auth_tickets_consumed_idx": {
-          "name": "auth_tickets_consumed_idx",
-          "columns": [
-            {
-              "expression": "consumed_at",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
-      "foreignKeys": {
-        "auth_tickets_parent_grant_jti_auth_grants_jti_fk": {
-          "name": "auth_tickets_parent_grant_jti_auth_grants_jti_fk",
-          "tableFrom": "auth_tickets",
-          "tableTo": "auth_grants",
-          "columnsFrom": ["parent_grant_jti"],
-          "columnsTo": ["jti"],
-          "onDelete": "no action",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {
-        "auth_tickets_admission_metadata_size_check": {
-          "name": "auth_tickets_admission_metadata_size_check",
-          "value": "octet_length(\"auth_tickets\".\"admission_metadata\"::text) <= 4096"
-        },
-        "auth_tickets_admission_metadata_shape_check": {
-          "name": "auth_tickets_admission_metadata_shape_check",
-          "value": "jsonb_typeof(\"auth_tickets\".\"admission_metadata\") = 'object'\n        AND \"auth_tickets\".\"admission_metadata\" ? 'remoteAddressHash'\n        AND \"auth_tickets\".\"admission_metadata\" ? 'replicaId'\n        AND \"auth_tickets\".\"admission_metadata\" ? 'transport'\n        AND \"auth_tickets\".\"admission_metadata\" - ARRAY['remoteAddressHash', 'replicaId', 'transport'] = '{}'::jsonb\n        AND jsonb_typeof(\"auth_tickets\".\"admission_metadata\"->'replicaId') = 'string'\n        AND \"auth_tickets\".\"admission_metadata\"->>'replicaId' ~ '^replica_[A-Za-z0-9_-]{1,120}$'\n        AND jsonb_typeof(\"auth_tickets\".\"admission_metadata\"->'transport') = 'string'\n        AND \"auth_tickets\".\"admission_metadata\"->>'transport' = 'websocket'\n        AND (\n          jsonb_typeof(\"auth_tickets\".\"admission_metadata\"->'remoteAddressHash') = 'null'\n          OR (\n            jsonb_typeof(\"auth_tickets\".\"admission_metadata\"->'remoteAddressHash') = 'string'\n            AND \"auth_tickets\".\"admission_metadata\"->>'remoteAddressHash' ~ '^[0-9a-f]{64}$'\n          )\n        )"
-        },
-        "auth_tickets_audience_check": {
-          "name": "auth_tickets_audience_check",
-          "value": "\"auth_tickets\".\"audience\" = 'tether-websocket'"
-        },
-        "auth_tickets_expiry_check": {
-          "name": "auth_tickets_expiry_check",
-          "value": "\"auth_tickets\".\"expires_at\" > \"auth_tickets\".\"created_at\""
-        },
-        "auth_tickets_lifetime_check": {
-          "name": "auth_tickets_lifetime_check",
-          "value": "\"auth_tickets\".\"expires_at\" <= \"auth_tickets\".\"created_at\" + interval '30 seconds'"
-        },
-        "auth_tickets_consumed_check": {
-          "name": "auth_tickets_consumed_check",
-          "value": "\"auth_tickets\".\"consumed_at\" IS NULL OR (\"auth_tickets\".\"consumed_at\" >= \"auth_tickets\".\"created_at\" AND \"auth_tickets\".\"consumed_at\" <= \"auth_tickets\".\"expires_at\")"
-        },
-        "auth_tickets_hash_check": {
-          "name": "auth_tickets_hash_check",
-          "value": "\"auth_tickets\".\"ticket_hash\" ~ '^[0-9a-f]{64}$'"
-        }
-      },
-      "isRLSEnabled": false
-    },
     "public.client_session_bindings": {
       "name": "client_session_bindings",
       "schema": "",
@@ -934,6 +487,139 @@
           "columns": ["event_id"]
         }
       },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.session_projections": {
+      "name": "session_projections",
+      "schema": "",
+      "columns": {
+        "active_run_id": {
+          "name": "active_run_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "activity": {
+          "name": "activity",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "activity_changed_at": {
+          "name": "activity_changed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "archived_at": {
+          "name": "archived_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "covers_seq_to": {
+          "name": "covers_seq_to",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "deleted_at": {
+          "name": "deleted_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "event_count": {
+          "name": "event_count",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "forked_from": {
+          "name": "forked_from",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "host_metadata": {
+          "name": "host_metadata",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "host_metadata_source_seq": {
+          "name": "host_metadata_source_seq",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_event_at": {
+          "name": "last_event_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "reducer_version": {
+          "name": "reducer_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "tangent_of": {
+          "name": "tangent_of",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "title": {
+          "name": "title",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "title_source_seq": {
+          "name": "title_source_seq",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "session_projections_session_id_sessions_session_id_fk": {
+          "name": "session_projections_session_id_sessions_session_id_fk",
+          "tableFrom": "session_projections",
+          "tableTo": "sessions",
+          "columnsFrom": ["session_id"],
+          "columnsTo": ["session_id"],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
       "policies": {},
       "checkConstraints": {},
       "isRLSEnabled": false

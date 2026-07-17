@@ -27,6 +27,7 @@ import {
   listClientSessionBindings,
   listControlLeaseSnapshots,
   listEvents,
+  listContextEventSuffix,
   listParticipantRuntimeSnapshots,
   listParticipants,
   listSessions,
@@ -180,6 +181,10 @@ class DbSessionEventStore implements SessionEventStore {
 
   list(sessionId: string, afterSeq: number, options?: { readonly limit?: number | undefined }) {
     return listEvents(this.database, sessionId, afterSeq, options);
+  }
+
+  listContextSuffix(sessionId: string, afterSeq: number, limit: number) {
+    return listContextEventSuffix(this.database, sessionId, afterSeq, limit);
   }
 }
 

@@ -1,3 +1,4 @@
+import type { SessionSummaryContent, SessionSummaryFailure } from "@dungle-scrubs/tether-protocol";
 import { sql } from "drizzle-orm";
 import {
   bigint,
@@ -19,6 +20,11 @@ import type {
   AuthGrantMetadata,
   AuthTicketAdmissionMetadata,
 } from "./auth/grant-stores.js";
+import type {
+  SessionProjectionActivity,
+  SessionProjectionForkLineage,
+  SessionProjectionTangentLineage,
+} from "./session-projection.js";
 
 /** Durable authorization grants. Bearer values are intentionally absent. */
 export const authGrants = pgTable(
@@ -259,6 +265,34 @@ export const sessionEvents = pgTable(
 );
 
 /**
+ * Durable current-state projection reduced from each Session Event stream.
+ * Exact events remain authoritative; this table owns no participant, task, or
+ * process-local Host Presence state.
+ */
+export const sessionProjections = pgTable("session_projections", {
+  activeRunId: text("active_run_id"),
+  activity: text("activity").$type<SessionProjectionActivity>().notNull(),
+  activityChangedAt: timestamp("activity_changed_at", { withTimezone: true }),
+  archivedAt: timestamp("archived_at", { withTimezone: true }),
+  coversSeqTo: bigint("covers_seq_to", { mode: "number" }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  eventCount: bigint("event_count", { mode: "number" }).notNull(),
+  forkedFrom: jsonb("forked_from").$type<SessionProjectionForkLineage>(),
+  hostMetadata: jsonb("host_metadata").$type<Record<string, unknown>>(),
+  hostMetadataSourceSeq: bigint("host_metadata_source_seq", { mode: "number" }),
+  lastEventAt: timestamp("last_event_at", { withTimezone: true }),
+  reducerVersion: integer("reducer_version").notNull(),
+  sessionId: text("session_id")
+    .primaryKey()
+    .references(() => sessions.sessionId, { onDelete: "cascade" }),
+  tangentOf: jsonb("tangent_of").$type<SessionProjectionTangentLineage>(),
+  title: text("title"),
+  titleSourceSeq: bigint("title_source_seq", { mode: "number" }),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/**
  * Runtime identities currently attached to a session. The actual Claude Code,
  * Codex, pi-coding-agent, or generic runtime process usually runs outside
  * Docker and connects to Tether over REST/WebSocket.
@@ -380,6 +414,63 @@ export const tasks = pgTable(
       table.scheduleIntervalMs,
       table.scheduleWindowStart,
     ),
+  ],
+);
+
+/**
+ * Durable Session Summary candidates and publication lifecycle. This table
+ * owns persistence only; range and publication decisions belong to the
+ * Session Summary publication-policy module.
+ */
+export const sessionSummaries = pgTable(
+  "session_summaries",
+  {
+    budgetClass: text("budget_class").notNull(),
+    content: jsonb("content").$type<SessionSummaryContent>(),
+    coversSeqFrom: bigint("covers_seq_from", { mode: "number" }).notNull(),
+    coversSeqTo: bigint("covers_seq_to", { mode: "number" }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    failure: jsonb("failure").$type<SessionSummaryFailure>(),
+    generationTaskId: text("generation_task_id").notNull(),
+    integrityAlgorithm: text("integrity_algorithm"),
+    integrityHash: text("integrity_hash"),
+    ollamaContextSize: integer("ollama_context_size").notNull(),
+    ollamaModel: text("ollama_model").notNull(),
+    ollamaQuantization: text("ollama_quantization").notNull(),
+    ollamaRevision: text("ollama_revision").notNull(),
+    ollamaThinkingMode: text("ollama_thinking_mode").notNull(),
+    outputSchemaVersion: text("output_schema_version").notNull(),
+    producerId: text("producer_id").notNull(),
+    producerVersion: text("producer_version").notNull(),
+    promptVersion: text("prompt_version").notNull(),
+    publishedAt: timestamp("published_at", { withTimezone: true }),
+    quarantinedAt: timestamp("quarantined_at", { withTimezone: true }),
+    sessionId: text("session_id")
+      .notNull()
+      .references(() => sessions.sessionId, { onDelete: "cascade" }),
+    sourceEventCount: bigint("source_event_count", { mode: "number" }).notNull(),
+    sourceFirstEventId: text("source_first_event_id").notNull(),
+    sourceLastEventId: text("source_last_event_id").notNull(),
+    sourceRangeHash: text("source_range_hash").notNull(),
+    summaryId: text("summary_id").primaryKey(),
+    supersededAt: timestamp("superseded_at", { withTimezone: true }),
+    validatedAt: timestamp("validated_at", { withTimezone: true }),
+  },
+  (table) => [
+    check("session_summaries_range_check", sql`${table.coversSeqFrom} <= ${table.coversSeqTo}`),
+    check(
+      "session_summaries_integrity_pair_check",
+      sql`(${table.integrityAlgorithm} IS NULL) = (${table.integrityHash} IS NULL)`,
+    ),
+    unique("session_summaries_generation_task_unique").on(table.generationTaskId),
+    index("session_summaries_session_budget_created_idx").on(
+      table.sessionId,
+      table.budgetClass,
+      table.createdAt.desc(),
+    ),
+    uniqueIndex("session_summaries_active_unique")
+      .on(table.sessionId, table.budgetClass)
+      .where(sql`${table.publishedAt} IS NOT NULL AND ${table.supersededAt} IS NULL`),
   ],
 );
 

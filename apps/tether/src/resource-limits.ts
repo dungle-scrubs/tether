@@ -1,11 +1,13 @@
 /** Process-local resource limit policy and counters for HTTP/WebSocket boundaries. */
 
+import { webSocketRecoveryReason } from "@dungle-scrubs/tether-protocol";
+
 export const resourceLimitReason = {
   backpressure: "backpressure",
   bodyTooLarge: "body_too_large",
   rateLimited: "rate_limited",
   replayGapUnrepaired: "replay_gap_unrepaired",
-  replayWindowExceeded: "replay_window_exceeded",
+  replayWindowExceeded: webSocketRecoveryReason.replayWindowExceeded,
   wsPayloadTooLarge: "ws_payload_too_large",
 } as const;
 

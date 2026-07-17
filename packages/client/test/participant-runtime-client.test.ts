@@ -3,31 +3,30 @@ import { EventEmitter } from "node:events";
 import { Effect, Fiber } from "effect";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
-
-import { ParticipantCursorWriter } from "../src/participant-cursor-writer.js";
-
 import {
-  ParticipantRuntimeCursorPersistError,
-  ParticipantRuntimeShutdownError,
   buildParticipantRuntimeStreamUrl,
   ParticipantRuntimeClient,
   type ParticipantRuntimeClientConfig,
   ParticipantRuntimeClientConfigurationError,
   type ParticipantRuntimeCommandError,
   type ParticipantRuntimeCommandTimeoutError,
+  ParticipantRuntimeCursorPersistError,
   type ParticipantRuntimeCursorStore,
+  ParticipantRuntimeShutdownError,
+  type ParticipantRuntimeWebSocketFactory,
   type ParticipantTaskExecutor,
+  ParticipantTaskExecutionError,
   type RunParticipantRuntimeHooks,
   resolveCommandTimeoutMs,
   resolveResumeSeq,
   resolveServiceAuthToken,
-  type ParticipantRuntimeWebSocketFactory,
   runParticipantRuntime,
   type SessionEvent,
   TaskCancellationRegistry,
   type TaskRecord,
   taskFromClaimableEvent,
 } from "../src/index.js";
+import { ParticipantCursorWriter } from "../src/participant-cursor-writer.js";
 
 type RunTaskClaimFlowInput = Parameters<ParticipantRuntimeClient["runTaskClaimFlow"]>[0];
 
@@ -62,10 +61,12 @@ type PrivateCommandRuntimeClient = ParticipantRuntimeClient & {
 };
 
 type PrivateReplayRuntimeClient = ParticipantRuntimeClient & {
+  readonly currentControlEpoch: number | null;
   handleMessage(data: string): void;
 };
 
 type PrivateCursorRuntimeClient = ParticipantRuntimeClient & {
+  readonly currentControlEpoch: number | null;
   handleMessage(data: string): void;
   readonly recentEvents: readonly SessionEvent[];
   replaceDelivery(afterSeq: number): void;
@@ -692,6 +693,23 @@ describe("ParticipantRuntimeClient.runTaskClaimFlow", () => {
     expect(executorSeqs).toEqual([1]);
   });
 
+  it("passes the connection control epoch to the claimed task executor", async () => {
+    const runtime = createRuntimeClientFixture({ controlEpoch: 7 });
+    let executorControlEpoch: number | undefined;
+
+    await runtime.client.runTaskClaimFlow({
+      cancellation: createCancellationFixture().cancellation,
+      claimRefreshMs: 1_000,
+      executor: async (context) => {
+        executorControlEpoch = context.controlEpoch;
+        return { result: { ok: true } };
+      },
+      task: baseTask,
+    });
+
+    expect(executorControlEpoch).toBe(7);
+  });
+
   it("does not claim work that was cancelled before claim", async () => {
     const runtime = createRuntimeClientFixture();
     const cancellation = createCancellationFixture({ cancelled: true });
@@ -775,6 +793,25 @@ describe("ParticipantRuntimeClient.runTaskClaimFlow", () => {
     expect(runtime.actions).toEqual(["claim"]);
     expect(runtime.failures).toEqual([]);
     expect(runtime.diagnostics).toContain("task.claim_transport_unknown");
+  });
+
+  it("persists bounded structured executor failure metadata", async () => {
+    const runtime = createRuntimeClientFixture();
+
+    await runtime.client.runTaskClaimFlow({
+      cancellation: createCancellationFixture().cancellation,
+      claimRefreshMs: 1_000,
+      executor: async () => {
+        throw new ParticipantTaskExecutionError("Summary generation failed", {
+          attempt: 2,
+          code: "poison_range",
+          retryable: false,
+        });
+      },
+      task: baseTask,
+    });
+
+    expect(runtime.failures).toEqual([{ attempt: 2, code: "poison_range", retryable: false }]);
   });
 
   it("does not start a refresh loop or leave stale cancellation state when claim transport rejects", async () => {
@@ -1928,12 +1965,17 @@ describe("ParticipantRuntimeClient reconnect scheduling", () => {
       "message",
       JSON.stringify({
         error: "unsafe server detail",
+        limit: 2_000,
         op: "error",
         reason: "replay_window_exceeded",
+        secret: "must-not-cross-client-boundary",
       }),
     );
 
-    await expect(replay).rejects.toMatchObject({ reason: "replay_window_exceeded" });
+    await expect(replay).rejects.toMatchObject({
+      reason: "replay_window_exceeded",
+      safeDetails: { limit: 2_000 },
+    });
     await flushMicrotasks();
     expect(sockets).toHaveLength(1);
     expect(client.debugInfo().pausedReason).toBe("replay_window_exceeded");
@@ -2218,6 +2260,21 @@ describe("ParticipantRuntimeClient replay wait", () => {
 });
 
 describe("ParticipantRuntimeClient durable cursor", () => {
+  it("captures the fenced participant epoch from replay completion", () => {
+    const fixture = createCursorFixture();
+
+    fixture.client.handleMessage(
+      JSON.stringify({
+        controlEpoch: 9,
+        instanceId: baseConfig.instanceId,
+        op: "replay.complete",
+        participantId: baseConfig.participantId,
+      }),
+    );
+
+    expect(fixture.client.currentControlEpoch).toBe(9);
+  });
+
   it("keeps handled progress fixed when a synchronous event handler throws", async () => {
     const delivered: number[] = [];
     const fixture = createCursorFixture({ eventCount: 1, withHandler: false });
@@ -2919,6 +2976,7 @@ function createRuntimeClientFixture(
     readonly appendEvent?: () => Promise<void>;
     readonly claimTask?: () => Promise<TaskRecord | null>;
     readonly completeTask?: () => Promise<void>;
+    readonly controlEpoch?: number;
     readonly lastHandledSeq?: number;
     readonly recentEvents?: readonly SessionEvent[];
   } = {},
@@ -2949,6 +3007,7 @@ function createRuntimeClientFixture(
       await options.completeTask?.();
     },
     config: baseConfig,
+    currentControlEpoch: options.controlEpoch ?? null,
     failTask: async (_taskId: string, failure: Record<string, unknown>) => {
       actions.push("fail");
       failures.push(failure);
@@ -3174,6 +3233,7 @@ function createCursorFixture(
   const client = Object.assign(Object.create(ParticipantRuntimeClient.prototype), {
     config: { ...baseConfig, afterSeq, cursorStore },
     connectionGeneration: 0,
+    currentControlEpoch: null,
     cursorPersistEventCount: options.eventCount ?? 50,
     cursorPersistIntervalMs: options.intervalMs ?? 1_000,
     cursorPersistTimer: null,

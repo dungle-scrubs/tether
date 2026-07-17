@@ -18,9 +18,17 @@ import {
 } from "./auth/enforcement.js";
 import type { AuthSocketRegistry, AuthSocketStreamKind } from "./auth/socket-registry.js";
 import type { AuthContext } from "./auth/token.js";
+import type { ControlEpochGuard } from "./db.js";
 import { sleepUnrefEffect } from "./effect-runtime.js";
+import {
+  classifyHostPresenceStream,
+  type HostPresenceRuntime,
+  type HostPresenceStreamKind,
+  projectWebSocketPresenceEnvelope,
+} from "./host-presence.js";
 import { broadcastEvents, controlLeaseConflictError } from "./http-route-runtime.js";
 import type { SubscriptionHub } from "./hub.js";
+import type { LiveHostPresence, WebSocketPresenceEnvelope } from "./protocol.js";
 import {
   parseAfterSeq,
   participantRuntimeKindSchema,
@@ -37,26 +45,18 @@ import {
   wsTaskRefreshMessageSchema,
   wsTaskReleaseMessageSchema,
 } from "./protocol.js";
-import type { LiveHostPresence, WebSocketPresenceEnvelope } from "./protocol.js";
 import {
   createWebSocketMessageRateLimiter,
-  resourceLimitReason,
   type ResourceLimitRuntime,
+  resourceLimitReason,
 } from "./resource-limits.js";
 import { authorizeClientPublishedEvent } from "./session-event-publish-policy.js";
-import type { ControlEpochGuard } from "./db.js";
 import type {
   ParticipantControlContext,
   SessionServiceEffect,
   TaskClaimRefreshResult,
   TaskMutationResult,
 } from "./session-service.js";
-import {
-  classifyHostPresenceStream,
-  type HostPresenceRuntime,
-  type HostPresenceStreamKind,
-  projectWebSocketPresenceEnvelope,
-} from "./host-presence.js";
 import { findClientWebSocketCommandSpec } from "./websocket-command-spec.js";
 
 interface ParticipantWebSocketGatewayInput {
@@ -479,7 +479,7 @@ function handleWebSocket(
       return;
     }
     hub.completeReplay(sessionId, socket);
-    socket.send(serializeReplayCompleteEnvelope());
+    socket.send(serializeReplayCompleteEnvelope(participantContext ?? undefined));
   });
 }
 

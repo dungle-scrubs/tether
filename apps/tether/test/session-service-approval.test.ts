@@ -164,6 +164,9 @@ function createApprovalStores(
       list: async () => {
         throw new Error("approval service should not list events for duplicate detection");
       },
+      listContextSuffix: async () => {
+        throw new Error("approval service should not list context events");
+      },
     },
     participants: {
       heartbeat: async () => null,

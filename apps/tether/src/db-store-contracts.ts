@@ -164,6 +164,17 @@ export interface SessionEventStore {
     afterSeq: number,
     options?: SessionEventListOptions,
   ) => Promise<SessionEvent[]>;
+  /** Reads a bounded newest tail plus aggregate eligible-suffix accounting. */
+  readonly listContextSuffix: (
+    sessionId: string,
+    afterSeq: number,
+    limit: number,
+  ) => Promise<{
+    readonly eligibleEventCount: number;
+    readonly estimatedTokens: number;
+    readonly events: readonly SessionEvent[];
+    readonly truncated: boolean;
+  }>;
 }
 
 /** Persistence for participant presence and runtime diagnostics. */

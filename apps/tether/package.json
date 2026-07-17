@@ -9,6 +9,7 @@
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
     "dev": "tsx watch src/server.ts",
+    "eval:session-summary": "tsx evals/session-summary/run.ts",
     "format": "biome format --config-path=../../tooling/biome.json --write .",
     "format:check": "biome format --config-path=../../tooling/biome.json .",
     "lint": "biome lint --config-path=../../tooling/biome.json .",
@@ -28,16 +29,17 @@
     "drizzle-orm": "^0.45.2",
     "effect": "^3.21.2",
     "pg": "^8.21.0",
-    "ws": "^8.20.1",
+    "ws": "^8.21.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@dungle-scrubs/session-summary-worker": "workspace:*",
     "@types/node": "^25.9.1",
     "@types/pg": "^8.20.0",
     "@types/ws": "^8.18.1",
     "drizzle-kit": "^0.31.10",
     "tsx": "^4.22.3",
-    "vite": "^8.0.13",
+    "vite": "^8.0.16",
     "vitest": "^4.1.7",
     "yaml": "^2.9.0"
   }

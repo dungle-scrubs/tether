@@ -1,0 +1,62 @@
+{
+  "cases": [
+    {
+      "activeTaskCount": 2,
+      "budgetTokens": 2000,
+      "contractCount": 2,
+      "deterministic": true,
+      "estimatedTokens": 1962,
+      "latestRawSeq": 10001,
+      "omittedEventCount": 9974,
+      "summaryRetained": true,
+      "terminalTaskCount": 1,
+      "withinBudget": true
+    },
+    {
+      "activeTaskCount": 2,
+      "budgetTokens": 8000,
+      "contractCount": 2,
+      "deterministic": true,
+      "estimatedTokens": 7980,
+      "latestRawSeq": 10001,
+      "omittedEventCount": 9838,
+      "summaryRetained": true,
+      "terminalTaskCount": 1,
+      "withinBudget": true
+    },
+    {
+      "activeTaskCount": 2,
+      "budgetTokens": 16000,
+      "contractCount": 2,
+      "deterministic": true,
+      "estimatedTokens": 15990,
+      "latestRawSeq": 10001,
+      "omittedEventCount": 9657,
+      "summaryRetained": true,
+      "terminalTaskCount": 1,
+      "withinBudget": true
+    },
+    {
+      "activeTaskCount": 2,
+      "budgetTokens": 32000,
+      "contractCount": 2,
+      "deterministic": true,
+      "estimatedTokens": 31964,
+      "latestRawSeq": 10001,
+      "omittedEventCount": 9296,
+      "summaryRetained": true,
+      "terminalTaskCount": 1,
+      "withinBudget": true
+    }
+  ],
+  "modelCallsDuringRead": 0,
+  "reportVersion": "session-context-a004.v1",
+  "selectedPolicy": {
+    "2k": { "targetTokens": 2000, "triggerTokens": 3000 },
+    "8k": { "targetTokens": 8000, "triggerTokens": 12000 },
+    "16k": { "targetTokens": 16000, "triggerTokens": 24000 },
+    "32k": { "targetTokens": 32000, "triggerTokens": 48000 }
+  },
+  "status": "passed",
+  "supportedBudgets": [2000, 8000, 16000, 32000]
+}

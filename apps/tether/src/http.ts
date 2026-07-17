@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { URL } from "node:url";
 
+import type { SessionScalabilityHealthWarning } from "@dungle-scrubs/tether-protocol";
 import { Context, Effect, Layer } from "effect";
 import { authorize } from "./auth/authorize.js";
 import { createAuthGrantLifecycle, type AuthGrantLifecycle } from "./auth/grant-lifecycle.js";
@@ -29,7 +30,6 @@ import { handleClientBindingHttpRoute } from "./http-client-binding-route-handle
 import { handleAuthGrantHttpRoute } from "./http-auth-grant-route-handlers.js";
 import { handleAuthTicketHttpRoute } from "./http-auth-ticket-route-handlers.js";
 import { directHttpRoutes } from "./http-direct-routes.js";
-import { matchHttpRoute } from "./http-route-spec.js";
 import {
   applyCorsResponseHeaders,
   broadcastEvents,
@@ -41,8 +41,10 @@ import {
   sendAuthError,
   sendJson,
 } from "./http-route-runtime.js";
+import { matchHttpRoute } from "./http-route-spec.js";
 import { handleSessionDebugHttpRoute } from "./http-session-debug-route-handlers.js";
 import { handleSessionHttpRoute } from "./http-session-route-handlers.js";
+import { handleSessionSummaryHttpRoute } from "./http-session-summary-route-handlers.js";
 import { handleTaskHttpRoute } from "./http-task-route-handlers.js";
 import { handleUiHttpRoute } from "./http-ui-route-handlers.js";
 import { SubscriptionHub, type SubscriptionHubDebugInfo } from "./hub.js";
@@ -66,6 +68,8 @@ import {
   SessionServiceEffectService,
   type SessionServiceOptions,
 } from "./session-service.js";
+import { createSessionSummaryStore, type SessionSummaryStore } from "./session-summary-store.js";
+import { sessionScalabilityBaselineWarnings } from "./session-scalability-diagnostics.js";
 import {
   TaskClaimSweeper,
   type TaskClaimSweeperConfig,
@@ -258,6 +262,7 @@ export function createAppServerWithSessionService(
     onEvents: (events) => broadcastEvents(hub, events),
     service,
   });
+  const sessionSummaryStore = createSessionSummaryStore(pool.pool);
   const authOptions = options.auth ?? {
     activeKid: "disabled",
     issuer: null,
@@ -333,6 +338,7 @@ export function createAppServerWithSessionService(
           authGrantLifecycle,
           authTicketLifecycle,
           resourceLimitRuntime,
+          sessionSummaryStore,
           readDebugInfo,
           readReadiness,
           corsOptions,
@@ -412,6 +418,7 @@ function handleHttp(
   authGrantLifecycle: AuthGrantLifecycle,
   authTicketLifecycle: AuthTicketLifecycle,
   resourceLimitRuntime: ResourceLimitRuntime,
+  sessionSummaryStore: SessionSummaryStore,
   readAppServerDebugInfo: ReadAppServerDebugInfo,
   readAppReadiness: ReadAppReadiness,
   corsOptions: CorsOptions,
@@ -429,6 +436,7 @@ function handleHttp(
     authGrantLifecycle,
     authTicketLifecycle,
     resourceLimitRuntime,
+    sessionSummaryStore,
     readAppServerDebugInfo,
     readAppReadiness,
     corsOptions,
@@ -460,6 +468,7 @@ function handleHttpRequest(
   authGrantLifecycle: AuthGrantLifecycle,
   authTicketLifecycle: AuthTicketLifecycle,
   resourceLimitRuntime: ResourceLimitRuntime,
+  sessionSummaryStore: SessionSummaryStore,
   readAppServerDebugInfo: ReadAppServerDebugInfo,
   readAppReadiness: ReadAppReadiness,
   corsOptions: CorsOptions,
@@ -481,7 +490,11 @@ function handleHttpRequest(
     applyCorsResponseHeaders(request, response, corsOptions);
     if (matchHttpRoute(directHttpRoutes.health, request.method, url.pathname)) {
       const restControl = readAppServerDebugInfo().service.restControl;
-      sendJson(response, 200, projectHealthResponse(restControl));
+      const scalabilityWarnings =
+        typeof service.readScalabilityHealthWarnings === "function"
+          ? yield* service.readScalabilityHealthWarnings()
+          : sessionScalabilityBaselineWarnings;
+      sendJson(response, 200, projectHealthResponse(restControl, scalabilityWarnings));
       return;
     }
     if (matchHttpRoute(directHttpRoutes.readiness, request.method, url.pathname)) {
@@ -577,6 +590,19 @@ function handleHttpRequest(
     }
 
     if (
+      yield* handleSessionSummaryHttpRoute({
+        authContext,
+        request,
+        resourceLimits: resourceLimitRuntime.limits,
+        response,
+        store: sessionSummaryStore,
+        url,
+      })
+    ) {
+      return;
+    }
+
+    if (
       yield* handleTaskHttpRoute({
         authContext,
         hub,
@@ -597,12 +623,16 @@ function handleHttpRequest(
 /** Projects REST control mode into a ready health response with bounded warnings. */
 export function projectHealthResponse(
   restControl: RestControlPolicyDebugInfo | undefined,
+  scalabilityWarnings: readonly SessionScalabilityHealthWarning[] = sessionScalabilityBaselineWarnings,
 ): Record<string, unknown> {
   return {
     ok: true,
-    ...(restControl?.mode === "compatibility"
-      ? { warnings: ["REST_CONTROL_COMPATIBILITY_ENABLED"] }
-      : {}),
+    warnings: [
+      ...scalabilityWarnings,
+      ...(restControl?.mode === "compatibility"
+        ? (["REST_CONTROL_COMPATIBILITY_ENABLED"] as const)
+        : []),
+    ],
   };
 }
 

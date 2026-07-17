@@ -1,14 +1,14 @@
-import {
-  buildWebSocketPresenceEnvelope,
-  replicaPresenceScope,
-} from "@dungle-scrubs/tether-protocol";
 import type {
   HostPresenceInventory,
   LiveHostPresence,
   WebSocketPresenceEnvelope,
 } from "@dungle-scrubs/tether-protocol";
+import {
+  buildWebSocketPresenceEnvelope,
+  replicaPresenceScope,
+} from "@dungle-scrubs/tether-protocol";
 
-import type { SessionEvent, SessionLineage, SessionListItem, TangentAnchor } from "./types.js";
+import type { SessionListItem } from "./types.js";
 
 /**
  * Owns Host-presence session inventory projection and process-local passive
@@ -120,7 +120,6 @@ export class HostPresenceRuntime {
 
 /** Projects Tether operator inventory into the Host-presence superset. */
 export function projectSessionInventory(input: {
-  readonly eventsBySession: ReadonlyMap<string, readonly SessionEvent[]>;
   readonly replicaId: string;
   readonly runtime: HostPresenceRuntime;
   readonly sessions: readonly SessionListItem[];
@@ -130,7 +129,6 @@ export function projectSessionInventory(input: {
     scope: replicaPresenceScope,
     sessions: input.sessions.map((session) =>
       projectSession({
-        events: input.eventsBySession.get(session.sessionId) ?? [],
         liveHosts: input.runtime.hosts(session.sessionId),
         session,
       }),
@@ -152,13 +150,11 @@ export function projectWebSocketPresenceEnvelope(input: {
 
 /** Finds one projected session summary by id for delete eligibility checks. */
 export function findProjectedSession(input: {
-  readonly events: readonly SessionEvent[];
   readonly liveHosts: readonly LiveHostPresence[];
   readonly session: SessionListItem | null;
 }): SessionListItem | null {
   return input.session
     ? projectSession({
-        events: input.events,
         liveHosts: input.liveHosts,
         session: input.session,
       })
@@ -209,180 +205,11 @@ export function classifyHostPresenceStream(
 }
 
 function projectSession(input: {
-  readonly events: readonly SessionEvent[];
   readonly liveHosts: readonly LiveHostPresence[];
   readonly session: SessionListItem;
 }): SessionListItem {
-  const hostOnline = latestEvent(input.events, "host.online");
-  const firstUser = input.events.find((event) => event.type === "user.message") ?? null;
-  const titleEvent = latestEvent(input.events, "session.title");
-  const archivedEvent = latestEvent(input.events, "session.archived");
-  const deletedEvent = latestEvent(input.events, "session.deleted");
-  const forkedEvent = latestEvent(input.events, "session.forkedFrom");
-  const tangentEvent = latestEvent(input.events, "session.tangentOf");
-  const lifecycle = input.events.filter(
-    (event) =>
-      event.type === "assistant.started" ||
-      event.type === "assistant.completed" ||
-      event.type === "user.command",
-  );
-  const hostPayload = hostOnline?.payload ?? {};
-  const cwd = stringField(hostPayload, "cwd");
-  const workspace = stringField(hostPayload, "workspace");
   return {
     ...input.session,
-    activity: activityFromLog(lifecycle),
-    archived: booleanField(archivedEvent?.payload, "archived") ?? false,
-    branch: stringField(hostPayload, "branch"),
-    cwd,
-    deleted: booleanField(deletedEvent?.payload, "deleted") ?? false,
-    forkedFrom: forkedFromPayload(forkedEvent),
-    git: recordField(hostPayload, "git"),
-    host: hostPresence(input.liveHosts, hostOnline),
-    project: projectOf(workspace, cwd),
-    tangentOf: tangentOfPayload(tangentEvent, input.session.createdAt),
-    title: titleFrom(firstUser, titleEvent, input.session.sessionId),
-    updatedAt: input.session.lastEventAt ?? input.session.createdAt,
-    workspace,
+    host: input.liveHosts.length > 0 ? "live" : (input.session.host ?? "none"),
   };
-}
-
-function latestEvent(events: readonly SessionEvent[], type: string): SessionEvent | null {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-    if (event?.type === type) {
-      return event;
-    }
-  }
-  return null;
-}
-
-function titleFrom(
-  firstUser: SessionEvent | null,
-  titleEvent: SessionEvent | null,
-  sessionId: string,
-): string {
-  const explicitTitle = stringField(titleEvent?.payload, "title")?.trim().replace(/\s+/gu, " ");
-  if (explicitTitle) {
-    return truncateTitle(explicitTitle);
-  }
-  const userText =
-    stringField(firstUser?.payload, "text") ??
-    stringField(firstUser?.payload, "message") ??
-    stringField(recordField(firstUser?.payload, "message"), "text");
-  const normalized = userText?.trim().replace(/\s+/gu, " ");
-  return normalized ? truncateTitle(normalized) : sessionId;
-}
-
-function truncateTitle(value: string): string {
-  return value.length > 60 ? value.slice(0, 60) : value;
-}
-
-function activityFromLog(events: readonly SessionEvent[]): HostSessionActivity {
-  const completed = new Set<string>();
-  let lastStarted: string | null = null;
-  let everCompleted = false;
-  for (const event of events) {
-    if (event.type === "user.command" && stringField(event.payload, "command") === "/clear") {
-      completed.clear();
-      everCompleted = false;
-      lastStarted = null;
-      continue;
-    }
-    const runId = stringField(event.payload, "runId");
-    if (event.type === "assistant.started" && runId) {
-      lastStarted = runId;
-      continue;
-    }
-    if (event.type === "assistant.completed" && runId) {
-      completed.add(runId);
-      everCompleted = true;
-    }
-  }
-  return lastStarted !== null && !completed.has(lastStarted)
-    ? "running"
-    : everCompleted
-      ? "settled"
-      : "idle";
-}
-
-function hostPresence(
-  liveHosts: readonly LiveHostPresence[],
-  hostOnline: SessionEvent | null,
-): HostPresenceState {
-  if (liveHosts.length > 0) {
-    return "live";
-  }
-  return hostOnline ? "stale" : "none";
-}
-
-function forkedFromPayload(event: SessionEvent | null): SessionLineage | null {
-  const parentSessionId = stringField(event?.payload, "parentSessionId");
-  const forkSeq = numberField(event?.payload, "forkSeq");
-  return parentSessionId && forkSeq !== null ? { forkSeq, parentSessionId } : null;
-}
-
-function tangentOfPayload(
-  event: SessionEvent | null,
-  fallbackCreatedAt: string,
-): TangentAnchor | null {
-  const parentSessionId = stringField(event?.payload, "parentSessionId");
-  const sourceMessageId = stringField(event?.payload, "sourceMessageId");
-  const quote = stringField(event?.payload, "quote");
-  if (!parentSessionId || !sourceMessageId || !quote) {
-    return null;
-  }
-  return {
-    createdAt: event?.createdAt ?? fallbackCreatedAt,
-    label: stringField(event?.payload, "label"),
-    parentSessionId,
-    quote,
-    sourceMessageId,
-  };
-}
-
-function projectOf(workspace: string | null, cwd: string | null): string | null {
-  const path = workspace ?? cwd;
-  if (!path) {
-    return null;
-  }
-  const trimmed = path.replace(/\/+$/u, "");
-  const base = trimmed.split("/").at(-1);
-  return base && base.length > 0 ? base : trimmed;
-}
-
-function stringField(value: unknown, key: string): string | null {
-  if (!isRecord(value)) {
-    return null;
-  }
-  const field = value[key];
-  return typeof field === "string" ? field : null;
-}
-
-function booleanField(value: unknown, key: string): boolean | null {
-  if (!isRecord(value)) {
-    return null;
-  }
-  const field = value[key];
-  return typeof field === "boolean" ? field : null;
-}
-
-function numberField(value: unknown, key: string): number | null {
-  if (!isRecord(value)) {
-    return null;
-  }
-  const field = value[key];
-  return typeof field === "number" && Number.isSafeInteger(field) ? field : null;
-}
-
-function recordField(value: unknown, key: string): Record<string, unknown> | null {
-  if (!isRecord(value)) {
-    return null;
-  }
-  const field = value[key];
-  return isRecord(field) ? field : null;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

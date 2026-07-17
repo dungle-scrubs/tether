@@ -558,6 +558,12 @@ function createStores(
         throw new Error("unexpected idempotent append");
       },
       list: async () => [],
+      listContextSuffix: async () => ({
+        eligibleEventCount: 0,
+        estimatedTokens: 0,
+        events: [],
+        truncated: false,
+      }),
     },
     participants: {
       heartbeat: async () => null,
