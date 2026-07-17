@@ -220,13 +220,38 @@ export class SerialEventDelivery<TEvent extends SequencedDeliveryEvent> {
     void this.drain();
   }
 
-  /** Enqueues replay completion behind every event already received. */
+  /**
+   * Enqueues replay completion behind every event already received. The marker
+   * participates in both retained bounds so saturation surfaces as a typed
+   * overflow outcome instead of a broken internal invariant.
+   */
   enqueueReplayComplete(): void {
     if (this.halted || this.stopping) {
       return;
     }
+    const observedQueueSize = this.queue.length + 1;
+    if (observedQueueSize > this.options.maxQueueSize) {
+      this.halted = true;
+      this.options.onOutcome({
+        kind: "delivery-queue-overflow",
+        maxQueueSize: this.options.maxQueueSize,
+        observedQueueSize,
+      });
+      return;
+    }
+    const observedQueueBytes = this.queueBytes + replayMarkerByteCost;
+    if (observedQueueBytes > this.options.maxQueueBytes) {
+      this.halted = true;
+      this.options.onOutcome({
+        kind: "delivery-byte-overflow",
+        maxQueueBytes: this.options.maxQueueBytes,
+        observedQueueBytes,
+      });
+      return;
+    }
     this.queue.push({ byteCost: replayMarkerByteCost, kind: "replay-complete" });
-    this.queueBytes += replayMarkerByteCost;
+    this.queueBytes = observedQueueBytes;
+    this.assertInternalInvariants();
     void this.drain();
   }
 

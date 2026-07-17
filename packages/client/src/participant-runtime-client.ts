@@ -22,8 +22,9 @@ import {
   buildWsTaskCompleteMessage,
   buildWsTaskFailMessage,
   buildWsTaskRefreshMessage,
+  buildWsTaskReleaseMessage,
   type CommandResultEnvelope,
-  parseWebSocketServerEnvelope,
+  classifyWebSocketServerEnvelope,
   parseWebSocketRecoveryCondition,
   type WebSocketCommandMessage,
   webSocketOperation,
@@ -983,6 +984,17 @@ export class ParticipantRuntimeClient {
   }
 
   /**
+   * Releases the active task claim so the task returns to the claimable pool
+   * for another participant. The server-issued Claim ID fences the release
+   * against a superseded claim.
+   */
+  async releaseTask(taskId: string, claimId: string): Promise<void> {
+    await this.observability.traceBoundary("releaseTask", { taskId }, () =>
+      this.sendCommand((requestId) => buildWsTaskReleaseMessage({ claimId, requestId, taskId })),
+    );
+  }
+
+  /**
    * Processes claimable tasks from replay and live events until either the
    * one-shot replay work completes or the socket closes.
    */
@@ -1200,11 +1212,24 @@ export class ParticipantRuntimeClient {
     try {
       const frameByteLength = Buffer.byteLength(String(data));
       parsed = JSON.parse(String(data)) as unknown;
-      const envelope = parseWebSocketServerEnvelope(parsed);
-      if (!envelope) {
+      const classified = classifyWebSocketServerEnvelope(parsed);
+      if (classified.kind === "unknown-op") {
+        // Forward compatibility: a newer server operation carries no event
+        // delivery in the owned protocol, so skipping it preserves seq
+        // contiguity; a future delivery-bearing op would surface as a
+        // non-contiguous event and pause through the typed outcome.
+        this.observability.debug(
+          "handleMessage",
+          "participant_transport.unknown_envelope_op_skipped",
+          { generation, op: classified.op.slice(0, 64) },
+        );
+        return;
+      }
+      if (classified.kind === "malformed") {
         this.delivery.rejectInvalidEnvelope();
         return;
       }
+      const envelope = classified.envelope;
       if (envelope.op === webSocketOperation.event) {
         this.delivery.enqueueEvent(envelope.event, frameByteLength);
         return;
@@ -1436,11 +1461,18 @@ export class ParticipantRuntimeClient {
     });
     this.settleReplayCompleteError(error);
     this.rejectPendingCommandsAsUnknown(error);
+    // Await the delivery settlement barrier alongside socket closure so a
+    // timed-out handler that is still running can never overlap its own
+    // replayed invocation on the replacement transport.
+    const settlingDelivery = this.delivery;
     const socket = this.socket;
     const closePromise = this.closePromise;
     this.socket = null;
     socket?.close();
-    void closePromise.catch(() => undefined).then(() => this.requestReconnect(delayMs));
+    void Promise.all([
+      closePromise.catch(() => undefined),
+      settlingDelivery.waitForSettlement(),
+    ]).then(() => this.requestReconnect(delayMs));
   }
 
   /** Enters terminal Paused State without opening another socket. */

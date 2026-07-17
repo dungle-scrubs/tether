@@ -363,6 +363,59 @@ describe("SerialEventDelivery", () => {
     firstHandler.resolve();
   });
 
+  it("rejects a replay marker that would exceed the retained byte limit", () => {
+    const outcomes: SerialEventDeliveryByteOverflow[] = [];
+    const delivery = new SerialEventDelivery<TestEvent>({
+      handlerTimeoutMs: 1_000,
+      initialSeq: 0,
+      maxQueueBytes: 100,
+      maxQueueSize: 100,
+      onOutcome: (outcome) => {
+        if (outcome.kind === "delivery-byte-overflow") {
+          outcomes.push({
+            maxQueueBytes: outcome.maxQueueBytes,
+            observedQueueBytes: outcome.observedQueueBytes,
+          });
+        }
+      },
+    });
+    // No handler registered: the event stays buffered at exactly the byte cap,
+    // which admission allows, so only the marker can cross the limit.
+    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 }, 100);
+
+    delivery.enqueueReplayComplete();
+
+    expect(outcomes).toEqual([{ maxQueueBytes: 100, observedQueueBytes: 164 }]);
+    expect(delivery.debugInfo()).toMatchObject({
+      halted: true,
+      queueBytes: 100,
+      queueSize: 1,
+    });
+  });
+
+  it("rejects a replay marker that would exceed the queue count limit", () => {
+    const outcomes: string[] = [];
+    const delivery = new SerialEventDelivery<TestEvent>({
+      handlerTimeoutMs: 1_000,
+      initialSeq: 0,
+      maxQueueBytes: defaultMaxQueueBytes,
+      maxQueueSize: 1,
+      onOutcome: (outcome) => {
+        outcomes.push(outcome.kind);
+      },
+    });
+    // No handler registered: the buffered event fills the queue count bound.
+    delivery.enqueueEvent({ eventId: "evt_1", seq: 1 }, defaultFrameBytes);
+
+    delivery.enqueueReplayComplete();
+
+    expect(outcomes).toEqual(["delivery-queue-overflow"]);
+    expect(delivery.debugInfo()).toMatchObject({
+      halted: true,
+      queueSize: 1,
+    });
+  });
+
   it("passes an abort signal to handlers and aborts it on timeout", async () => {
     let deadline: (() => void) | undefined;
     const timedOut = createDeferred<void>();

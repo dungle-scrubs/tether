@@ -1725,17 +1725,88 @@ describe("ParticipantRuntimeClient reconnect scheduling", () => {
       expect(errors).toEqual([]);
 
       await vi.advanceTimersByTimeAsync(1);
-      await waitForMicrotasks(() => sockets.length === 2);
+      await waitForMicrotasks(() => errors.length === 1);
 
-      expect(errors).toHaveLength(1);
       expect(errors[0]).toMatchObject({
         reason: "event_handler_timeout",
         timeoutMs: 30_000,
       });
+      // The never-settling handler holds the settlement barrier, so no
+      // replacement transport may open behind the timed-out invocation.
+      await flushMicrotasks();
+      expect(sockets).toHaveLength(1);
     } finally {
       vi.useRealTimers();
       client.close();
     }
+  });
+
+  it("holds replay behind the settlement barrier so a timed-out handler never runs concurrently", async () => {
+    const sockets: ParticipantFakeWebSocket[] = [];
+    const errors: Error[] = [];
+    let releaseFirst: (() => void) | undefined;
+    const firstBlocked = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const invocations: number[] = [];
+    let inFlight = 0;
+    let sawOverlap = false;
+    const client = await ParticipantRuntimeClient.connect({
+      ...baseConfig,
+      eventDelivery: { handlerTimeoutMs: 10 },
+      reconnect: { baseDelayMs: 0, maxDelayMs: 0 },
+      webSocketFactory: createParticipantWebSocketFactory(sockets),
+    });
+    client.onError((error) => {
+      errors.push(error);
+    });
+    client.onEvent(async (event) => {
+      invocations.push(event.seq);
+      inFlight += 1;
+      if (inFlight > 1) {
+        sawOverlap = true;
+      }
+      try {
+        if (invocations.length === 1) {
+          await firstBlocked;
+        }
+      } finally {
+        inFlight -= 1;
+      }
+    });
+    const firstSocket = sockets[0];
+    if (!firstSocket) {
+      throw new Error("Missing first participant socket");
+    }
+
+    firstSocket.emitServerEvent(createTaskCreatedEvent(baseTask, 1));
+    await waitFor(() => errors.length === 1);
+    expect(errors[0]).toMatchObject({
+      reason: "event_handler_timeout",
+      timeoutMs: 10,
+    });
+    // The timed-out invocation is still running, so the settlement barrier
+    // must hold the replacement transport back.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(sockets).toHaveLength(1);
+
+    releaseFirst?.();
+    await waitFor(() => sockets.length === 2);
+    const replacementSocket = sockets[1];
+    if (!replacementSocket) {
+      throw new Error("Missing replacement participant socket");
+    }
+    replacementSocket.emitServerEvent(createTaskCreatedEvent(baseTask, 1));
+    replacementSocket.emitReplayComplete();
+    await waitFor(() => invocations.length === 2);
+
+    expect(sawOverlap).toBe(false);
+    expect(invocations).toEqual([1, 1]);
+    expect(client.debugInfo()).toMatchObject({
+      lastHandledSeq: 1,
+      pausedReason: null,
+    });
+    client.close();
   });
 
   it("honors an explicit participant handler deadline", async () => {
@@ -2488,6 +2559,26 @@ describe("ParticipantRuntimeClient durable cursor", () => {
     expect(fixture.client.debugInfo()).toMatchObject({
       lastHandledSeq: 0,
       lastReceivedSeq: 0,
+    });
+  });
+
+  it("skips unknown-op server frames without pausing participant delivery", async () => {
+    const delivered: number[] = [];
+    const fixture = createCursorFixture({ withHandler: false });
+    fixture.client.onEvent((event) => {
+      delivered.push(event.seq);
+    });
+
+    fixture.client.handleMessage(JSON.stringify({ op: "presence.v2", payload: { future: true } }));
+    emitCursorEvent(fixture.client, 1);
+    await flushMicrotasks();
+
+    expect(delivered).toEqual([1]);
+    expect(fixture.errors).toEqual([]);
+    expect(fixture.client.debugInfo()).toMatchObject({
+      lastHandledSeq: 1,
+      lastReceivedSeq: 1,
+      pausedReason: null,
     });
   });
 
