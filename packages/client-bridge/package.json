@@ -1,6 +1,6 @@
 {
   "name": "@dungle-scrubs/tether-client-bridge",
-  "version": "0.1.1",
+  "version": "1.0.0",
   "description": "Helpers for binding external client conversations to Tether sessions and task APIs.",
   "license": "MIT",
   "author": "Kevin Frilot",

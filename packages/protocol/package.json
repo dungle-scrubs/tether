@@ -1,6 +1,6 @@
 {
   "name": "@dungle-scrubs/tether-protocol",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Shared Tether protocol records, validators, and event builders.",
   "license": "MIT",
   "author": "Kevin Frilot",
