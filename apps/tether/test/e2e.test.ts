@@ -3083,6 +3083,7 @@ e2e("tether e2e", () => {
     const gatedApp = createAppServer(currentPool(), {
       auth: {
         activeKid: testAuthSigningKid,
+        allowLegacyTokens: true,
         issuer: "https://auth.e2e.tether.local",
         mode: "required",
         secrets: { [testAuthSigningKid]: testAuthSigningSecret },
