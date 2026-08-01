@@ -1,5 +1,13 @@
 # @dungle-scrubs/session-summary-worker
 
+## 0.1.2
+
+### Patch Changes
+
+- Updated dependencies [0c6025d]
+  - @dungle-scrubs/tether-protocol@0.3.0
+  - @dungle-scrubs/tether-client@1.0.1
+
 ## 0.1.1
 
 ### Patch Changes
