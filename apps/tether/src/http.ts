@@ -1,10 +1,19 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { URL } from "node:url";
 
-import type { SessionScalabilityHealthWarning } from "@dungle-scrubs/tether-protocol";
+import type {
+  ReadinessResponse,
+  SessionScalabilityHealthWarning,
+} from "@dungle-scrubs/tether-protocol";
 import { Context, Effect, Layer } from "effect";
 import { authorize } from "./auth/authorize.js";
-import { createAuthGrantLifecycle, type AuthGrantLifecycle } from "./auth/grant-lifecycle.js";
+import { createBrowserOperatorRuntime } from "./auth/browser-operator-runtime.js";
+import {
+  type BrowserPairingLifecycle,
+  type BrowserPairingLifecycleOptions,
+  createBrowserPairingLifecycle,
+} from "./auth/browser-pairing.js";
+import { createBrowserPairingStore } from "./auth/browser-pairing-stores.js";
 import { createAuthPersistenceStores } from "./auth/db-grant-stores.js";
 import {
   type AuthRuntime,
@@ -15,20 +24,27 @@ import {
   authRuntimeOptionsFromConfig,
   createAuthRuntime,
 } from "./auth/enforcement.js";
+import { type AuthGrantLifecycle, createAuthGrantLifecycle } from "./auth/grant-lifecycle.js";
 import {
-  AuthGrantRevocationRuntime,
   type AuthGrantRevocationDebugInfo,
+  AuthGrantRevocationRuntime,
 } from "./auth/grant-revocation-runtime.js";
 import { AuthSocketRegistry, type AuthSocketRegistryDebugInfo } from "./auth/socket-registry.js";
+import { type AuthTicketLifecycle, createAuthTicketLifecycle } from "./auth/ticket-lifecycle.js";
 import type { AuthContext } from "./auth/token.js";
-import { createAuthTicketLifecycle, type AuthTicketLifecycle } from "./auth/ticket-lifecycle.js";
-import { ServerConfigService } from "./config.js";
 import type { RuntimeTopology } from "./config.js";
+import { ServerConfigService } from "./config.js";
+import {
+  type DatabaseMigrationReadiness,
+  readDatabaseMigrationReadiness,
+} from "./database-migration.js";
 import { type DatabasePool, DatabaseService } from "./db.js";
 import { HostPresenceRuntime } from "./host-presence.js";
-import { handleClientBindingHttpRoute } from "./http-client-binding-route-handlers.js";
 import { handleAuthGrantHttpRoute } from "./http-auth-grant-route-handlers.js";
 import { handleAuthTicketHttpRoute } from "./http-auth-ticket-route-handlers.js";
+import { handleBrowserOperatorHttpRoute } from "./http-browser-operator-route-handlers.js";
+import { handleBrowserPairingHttpRoute } from "./http-browser-pairing-route-handlers.js";
+import { handleClientBindingHttpRoute } from "./http-client-binding-route-handlers.js";
 import { directHttpRoutes } from "./http-direct-routes.js";
 import {
   applyCorsResponseHeaders,
@@ -48,19 +64,20 @@ import { handleSessionSummaryHttpRoute } from "./http-session-summary-route-hand
 import { handleTaskHttpRoute } from "./http-task-route-handlers.js";
 import { handleUiHttpRoute } from "./http-ui-route-handlers.js";
 import { SubscriptionHub, type SubscriptionHubDebugInfo } from "./hub.js";
+import { projectReadiness, type ReadinessProjection } from "./readiness.js";
 import {
   defaultResourceLimits,
   type ResourceLimitDebugInfo,
   ResourceLimitRuntime,
   type ResourceLimits,
 } from "./resource-limits.js";
-import { projectReadiness, type ReadinessProjection } from "./readiness.js";
 import type { RestControlPolicyDebugInfo } from "./rest-control-policy.js";
 import {
   defaultEventFanoutCatchUpStaleMs,
   SessionEventFanout,
   type SessionEventFanoutDebugInfo,
 } from "./session-event-fanout.js";
+import { sessionScalabilityBaselineWarnings } from "./session-scalability-diagnostics.js";
 import {
   createSessionServiceEffect,
   type SessionServiceDebugInfo,
@@ -69,7 +86,6 @@ import {
   type SessionServiceOptions,
 } from "./session-service.js";
 import { createSessionSummaryStore, type SessionSummaryStore } from "./session-summary-store.js";
-import { sessionScalabilityBaselineWarnings } from "./session-scalability-diagnostics.js";
 import {
   TaskClaimSweeper,
   type TaskClaimSweeperConfig,
@@ -84,6 +100,14 @@ const consoleAuthRuntimeLogger: AuthRuntimeLogger = {
     console.warn(event, details);
   },
 };
+const consoleBrowserSecurityLogger = {
+  info: (event: string, details: Record<string, unknown>) => {
+    console.info(event, details);
+  },
+  warn: (event: string, details: Record<string, unknown>) => {
+    console.warn(event, details);
+  },
+};
 
 /**
  * Process-local HTTP/WebSocket server boundary.
@@ -94,7 +118,7 @@ export interface AppServer {
   /** Returns process-local diagnostics without mutating durable session state. */
   readonly debugInfo: () => AppServerDebugInfo;
   /** Starts Postgres fanout, HTTP/WebSocket serving, and task claim sweeping. */
-  readonly listen: (port: number) => Promise<void>;
+  readonly listen: (port: number) => Promise<number>;
 }
 
 /**
@@ -125,6 +149,16 @@ export interface AppServerDebugInfo {
   readonly taskClaimSweeper: TaskClaimSweeperDebugInfo;
 }
 
+/** Bounded startup rejection raised before any network or background work begins. */
+export class AppServerStartupReadinessError extends Error {
+  readonly code = "app_server_startup_not_ready";
+
+  constructor(readonly reason: Extract<ReadinessResponse, { ready: false }>["reason"]) {
+    super(`App server startup rejected: ${reason}`);
+    this.name = "AppServerStartupReadinessError";
+  }
+}
+
 /**
  * Optional app server configuration for process-local modules.
  */
@@ -136,6 +170,10 @@ export interface AppServerOptions {
     readonly listenEnabled?: boolean;
     readonly pollBatchLimit?: number;
     readonly pollIntervalMs?: number;
+  };
+  /** Optional browser pairing lifecycle override for deterministic route tests. */
+  readonly browserPairing?: {
+    readonly lifecycle: BrowserPairingLifecycle | null;
   };
   /** Cross-replica event fanout listener configuration. */
   readonly eventFanout?: {
@@ -150,7 +188,10 @@ export interface AppServerOptions {
   readonly resourceLimits?: ResourceLimits;
   /** Process readiness thresholds. */
   readonly readiness?: {
+    readonly configurationCompatible?: boolean;
+    readonly databaseMigrationReadiness?: () => Promise<DatabaseMigrationReadiness>;
     readonly fanoutStaleAfterMs?: number;
+    readonly signingAuthorityReady?: boolean;
   };
   /** Declared deployment topology; direct programmatic construction defaults to single. */
   readonly runtimeTopology?: RuntimeTopology;
@@ -228,6 +269,29 @@ export function createAppServer(pool: DatabasePool, options: AppServerOptions = 
   );
 }
 
+/** Creates browser grant issuance only for a fully configured required-auth deployment. */
+function createConfiguredBrowserPairingLifecycle(
+  authOptions: AuthRuntimeOptions,
+  store: ReturnType<typeof createBrowserPairingStore>,
+  logger: NonNullable<BrowserPairingLifecycleOptions["logger"]>,
+): BrowserPairingLifecycle | null {
+  if (
+    authOptions.mode !== "required" ||
+    authOptions.issuer === null ||
+    authOptions.issuer === undefined ||
+    authOptions.secrets[authOptions.activeKid] === undefined
+  ) {
+    return null;
+  }
+  return createBrowserPairingLifecycle({
+    activeKid: authOptions.activeKid,
+    issuer: authOptions.issuer,
+    logger,
+    secrets: authOptions.secrets,
+    store,
+  });
+}
+
 /**
  * Creates the HTTP and WebSocket server boundary around an already-constructed
  * durable session service. This is the Effect-layer seam for live wiring while
@@ -270,9 +334,11 @@ export function createAppServerWithSessionService(
     secrets: {},
   };
   const authPersistenceStores = createAuthPersistenceStores(pool);
+  const browserPairingStore = createBrowserPairingStore(pool);
   const authGrantStore = authOptions.grantStore ?? authPersistenceStores.grants;
   const auth = createAuthRuntime({
     ...authOptions,
+    browserSessionStore: browserPairingStore,
     grantStore: authGrantStore,
     ticketStore: authOptions.ticketStore ?? authPersistenceStores.tickets,
   });
@@ -294,6 +360,21 @@ export function createAppServerWithSessionService(
     replicaId: `replica_${replicaId}`,
     store: authPersistenceStores.tickets,
   });
+  const browserOperatorRuntime = createBrowserOperatorRuntime({
+    auth,
+    logger: consoleBrowserSecurityLogger,
+    store: browserPairingStore,
+  });
+  const browserPairingLifecycle =
+    options.browserPairing === undefined
+      ? createConfiguredBrowserPairingLifecycle(
+          authOptions,
+          browserPairingStore,
+          consoleBrowserSecurityLogger,
+        )
+      : options.browserPairing.lifecycle;
+  const databaseMigrationReadiness =
+    options.readiness?.databaseMigrationReadiness ?? (() => readDatabaseMigrationReadiness(pool));
   /**
    * Reads process-local diagnostics for the app server and its child modules.
    */
@@ -312,7 +393,18 @@ export function createAppServerWithSessionService(
   });
   const readReadiness: ReadAppReadiness = () =>
     projectReadiness({
-      database: pool,
+      deployment: {
+        configurationCompatible:
+          options.readiness?.configurationCompatible ??
+          (corsOptions.allowedOrigins.length === 0 || browserPairingLifecycle !== null),
+        databaseMigrationReadiness,
+        signingAuthorityReady:
+          options.readiness?.signingAuthorityReady ??
+          (authOptions.mode !== "required" ||
+            (typeof authOptions.issuer === "string" &&
+              authOptions.issuer.length > 0 &&
+              authOptions.secrets[authOptions.activeKid] !== undefined)),
+      },
       fanout: eventFanout,
       fanoutStaleAfterMs,
       replicaId,
@@ -337,6 +429,8 @@ export function createAppServerWithSessionService(
           auth,
           authGrantLifecycle,
           authTicketLifecycle,
+          browserPairingLifecycle,
+          browserOperatorRuntime,
           resourceLimitRuntime,
           sessionSummaryStore,
           readDebugInfo,
@@ -375,12 +469,29 @@ export function createAppServerWithSessionService(
       }),
     debugInfo: readDebugInfo,
     listen: async (port) => {
+      const startupReadiness = await readReadiness();
+      if (!startupReadiness.body.ready) {
+        throw new AppServerStartupReadinessError(startupReadiness.body.reason);
+      }
       await authRevocation.start();
       await eventFanout.start();
-      await new Promise<void>((resolve) => {
-        server.listen(port, resolve);
+      await new Promise<void>((resolve, reject) => {
+        const handleError = (error: Error): void => {
+          server.off("error", handleError);
+          reject(error);
+        };
+        server.once("error", handleError);
+        server.listen(port, () => {
+          server.off("error", handleError);
+          resolve();
+        });
       });
       taskClaimSweeper.start();
+      const address = server.address();
+      if (typeof address !== "object" || address === null) {
+        throw new Error("app_server_address_unavailable");
+      }
+      return address.port;
     },
   };
 }
@@ -399,7 +510,9 @@ export interface AppServerCloseResources {
   };
   readonly taskClaimSweeper: { readonly stop: () => Promise<void> };
   readonly wsServer: {
-    readonly clients: Iterable<{ readonly close: (code: number, reason: string) => void }>;
+    readonly clients: Iterable<{
+      readonly close: (code: number, reason: string) => void;
+    }>;
     readonly close: (callback?: (error?: Error) => void) => void;
   };
 }
@@ -473,6 +586,8 @@ function handleHttp(
   auth: AuthRuntime,
   authGrantLifecycle: AuthGrantLifecycle,
   authTicketLifecycle: AuthTicketLifecycle,
+  browserPairingLifecycle: BrowserPairingLifecycle | null,
+  browserOperatorRuntime: ReturnType<typeof createBrowserOperatorRuntime>,
   resourceLimitRuntime: ResourceLimitRuntime,
   sessionSummaryStore: SessionSummaryStore,
   readAppServerDebugInfo: ReadAppServerDebugInfo,
@@ -491,6 +606,8 @@ function handleHttp(
     auth,
     authGrantLifecycle,
     authTicketLifecycle,
+    browserPairingLifecycle,
+    browserOperatorRuntime,
     resourceLimitRuntime,
     sessionSummaryStore,
     readAppServerDebugInfo,
@@ -523,6 +640,8 @@ function handleHttpRequest(
   auth: AuthRuntime,
   authGrantLifecycle: AuthGrantLifecycle,
   authTicketLifecycle: AuthTicketLifecycle,
+  browserPairingLifecycle: BrowserPairingLifecycle | null,
+  browserOperatorRuntime: ReturnType<typeof createBrowserOperatorRuntime>,
   resourceLimitRuntime: ResourceLimitRuntime,
   sessionSummaryStore: SessionSummaryStore,
   readAppServerDebugInfo: ReadAppServerDebugInfo,
@@ -544,6 +663,33 @@ function handleHttpRequest(
       return;
     }
     applyCorsResponseHeaders(request, response, corsOptions);
+    if (
+      yield* handleBrowserPairingHttpRoute({
+        cors: corsOptions,
+        lifecycle: browserPairingLifecycle,
+        maxBodyBytes: resourceLimitRuntime.limits.httpMaxBodyBytes,
+        request,
+        response,
+        url,
+      })
+    ) {
+      return;
+    }
+    if (
+      yield* handleBrowserOperatorHttpRoute({
+        grantLifecycle: authGrantLifecycle,
+        hub,
+        request,
+        resourceLimits: resourceLimitRuntime.limits,
+        response,
+        runtime: browserOperatorRuntime,
+        service,
+        ticketLifecycle: authTicketLifecycle,
+        url,
+      })
+    ) {
+      return;
+    }
     if (matchHttpRoute(directHttpRoutes.health, request.method, url.pathname)) {
       const restControl = readAppServerDebugInfo().service.restControl;
       const scalabilityWarnings =

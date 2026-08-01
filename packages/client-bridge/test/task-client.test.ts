@@ -5,6 +5,7 @@ import {
   ClientBridgeRequestError,
   ClientBridgeTaskClient,
   computeScheduleWindow,
+  currentScheduledTaskIdentityVersion,
   deriveScheduledTaskId,
 } from "../src/index.js";
 
@@ -56,11 +57,12 @@ describe("ClientBridgeTaskClient", () => {
   it("ensures a deterministic scheduled run through the create idempotency seam", async () => {
     const requests: CapturedRequest[] = [];
     const scheduleWindow = computeScheduleWindow(1_700_000_123_456, 3_600_000);
-    const mailboxScope = { accountId: "acct_opaque_1", provider: "fastmail" };
+    const scopeKey = "scope_01JEMAIL";
     const expectedTaskId = deriveScheduledTaskId({
+      identityVersion: currentScheduledTaskIdentityVersion,
       kind: "email_organization",
-      mailboxScope,
       scheduleWindow,
+      scopeKey,
       sessionId: "sess_1",
     });
     const fetch = createJsonFetch(requests, [
@@ -68,7 +70,11 @@ describe("ClientBridgeTaskClient", () => {
         body: {
           task: createTaskFixture({
             objective: "organize mailbox",
-            schedule: { mailboxScope, scheduleWindow },
+            schedule: {
+              identityVersion: currentScheduledTaskIdentityVersion,
+              scheduleWindow,
+              scopeKey,
+            },
             sessionId: "sess_1",
             taskId: expectedTaskId,
           }),
@@ -81,12 +87,16 @@ describe("ClientBridgeTaskClient", () => {
     await expect(
       client.createScheduledTask("sess_1", {
         kind: "email_organization",
-        mailboxScope,
         objective: "organize mailbox",
         scheduleWindow,
+        scopeKey,
       }),
     ).resolves.toMatchObject({
-      schedule: { mailboxScope, scheduleWindow },
+      schedule: {
+        identityVersion: currentScheduledTaskIdentityVersion,
+        scheduleWindow,
+        scopeKey,
+      },
       taskId: expectedTaskId,
     });
 
@@ -96,11 +106,10 @@ describe("ClientBridgeTaskClient", () => {
           kind: "email_organization",
           objective: "organize mailbox",
           schedule: {
-            mailboxAccountId: "acct_opaque_1",
-            mailboxProvider: "fastmail",
             scheduleAlgorithmVersion: scheduleWindow.algorithmVersion,
             scheduleIntervalMs: scheduleWindow.intervalMs,
             scheduleWindowStart: scheduleWindow.startMs,
+            scopeKey,
           },
           taskId: expectedTaskId,
         },
@@ -337,6 +346,14 @@ describe("ClientBridgeTaskClient", () => {
 
   it("records task approval intent without mutating the task", async () => {
     const requests: CapturedRequest[] = [];
+    const target = {
+      action: "action_opaque_1",
+      digest: "digest_opaque_1",
+      scopeKey: "scope_opaque_1",
+      targetId: "target_opaque_1",
+      targetKind: "kind_opaque_1",
+      targetRevision: "revision_opaque_1",
+    };
     const task = createTaskFixture({
       objective: "handle request",
       sessionId: "sess_1",
@@ -349,6 +366,7 @@ describe("ClientBridgeTaskClient", () => {
       },
       {
         body: {
+          approval: createTaskApprovalFixture(task, "evt_approval"),
           decision: "approved",
           event: createSessionEventFixture({
             eventId: "evt_approval",
@@ -367,9 +385,11 @@ describe("ClientBridgeTaskClient", () => {
       client.recordTaskApproval("sess_1", {
         decision: "approved",
         reason: { chatId: "123", source: "external-chat" },
+        target,
         taskId: "task_1",
       }),
     ).resolves.toEqual({
+      approval: createTaskApprovalFixture(task, "evt_approval"),
       decision: "approved",
       event: createSessionEventFixture({
         eventId: "evt_approval",
@@ -402,6 +422,7 @@ describe("ClientBridgeTaskClient", () => {
           instanceId: "inst_bridge",
           participantId: "part_bridge",
           reason: { chatId: "123", source: "external-chat" },
+          target,
         },
         method: "POST",
         path: "/sessions/sess_1/tasks/task_1/approval",
@@ -423,6 +444,7 @@ describe("ClientBridgeTaskClient", () => {
       },
       {
         body: {
+          approval: createTaskApprovalFixture(task, "evt_existing_approval"),
           decision: "rejected",
           existingDecision: "approved",
           ignoredReason: "already_approved",
@@ -440,6 +462,7 @@ describe("ClientBridgeTaskClient", () => {
         taskId: "task_1",
       }),
     ).resolves.toEqual({
+      approval: createTaskApprovalFixture(task, "evt_existing_approval"),
       decision: "rejected",
       existingDecision: "approved",
       ignoredReason: "already_approved",
@@ -460,6 +483,7 @@ describe("ClientBridgeTaskClient", () => {
       { body: { task }, status: 200 },
       {
         body: {
+          approval: createTaskApprovalFixture(task, "evt_approval_reuse"),
           decision: "approved",
           event: createSessionEventFixture({
             eventId: "evt_approval_reuse",
@@ -529,6 +553,7 @@ describe("ClientBridgeTaskClient", () => {
         }
         return new Response(
           JSON.stringify({
+            approval: createTaskApprovalFixture(task, "evt_after_uncertain"),
             decision: "approved",
             event: createSessionEventFixture({
               eventId: "evt_after_uncertain",
@@ -604,6 +629,7 @@ describe("ClientBridgeTaskClient", () => {
         }
         return new Response(
           JSON.stringify({
+            approval: createTaskApprovalFixture(task, "evt_after_body_loss"),
             decision: "approved",
             event: createSessionEventFixture({
               eventId: "evt_after_body_loss",
@@ -647,6 +673,7 @@ describe("ClientBridgeTaskClient", () => {
       { body: createControlAcquisitionFixture(), status: 201 },
       {
         body: {
+          approval: createTaskApprovalFixture(task, "evt_after_conflict"),
           decision: "approved",
           event: createSessionEventFixture({
             eventId: "evt_after_conflict",
@@ -698,13 +725,14 @@ describe("ClientBridgeTaskClient", () => {
 
   it("maps malformed scheduled responses without exposing the raw payload", async () => {
     const scheduleWindow = computeScheduleWindow(1_700_000_123_456, 3_600_000);
-    const mailboxScope = {
-      accountId: "raw_payload_marker",
-      provider: "fastmail",
-    };
+    const scopeKey = "raw_payload_marker";
     const task = createTaskFixture({
       objective: "organize mailbox",
-      schedule: { mailboxScope, scheduleWindow },
+      schedule: {
+        identityVersion: currentScheduledTaskIdentityVersion,
+        scheduleWindow,
+        scopeKey,
+      },
       sessionId: "sess_1",
       taskId: "task_sched_invalid",
     });
@@ -718,11 +746,11 @@ describe("ClientBridgeTaskClient", () => {
               task: {
                 ...task,
                 schedule: {
-                  mailboxScope,
                   scheduleWindow: {
                     ...scheduleWindow,
                     endMs: scheduleWindow.endMs + 1,
                   },
+                  scopeKey,
                 },
               },
             }),
@@ -735,9 +763,9 @@ describe("ClientBridgeTaskClient", () => {
     try {
       await client.createScheduledTask("sess_1", {
         kind: "email_organization",
-        mailboxScope,
         objective: "organize mailbox",
         scheduleWindow,
+        scopeKey,
       });
     } catch (error) {
       caught = error;
@@ -864,6 +892,20 @@ function createTaskFixture(input: {
     ...(input.schedule !== undefined ? { schedule: input.schedule } : {}),
     sessionId: input.sessionId,
     taskId: input.taskId,
+  };
+}
+
+/** Builds the canonical approval row returned with an approval decision. */
+function createTaskApprovalFixture(task: ClientBridgeTaskRecord, eventId: string) {
+  return {
+    approvalEventId: eventId,
+    decidedAt: "2026-01-01T00:00:00.000Z",
+    decidedByParticipantId: "part_bridge",
+    decision: "approved" as const,
+    reason: {},
+    sessionId: task.sessionId,
+    targetKey: "task",
+    taskId: task.taskId,
   };
 }
 

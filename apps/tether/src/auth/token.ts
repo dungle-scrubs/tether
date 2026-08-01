@@ -2,6 +2,8 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 
 import { z } from "zod";
 
+import type { AuthGrantSource } from "./grant-stores.js";
+
 export const authRoles = ["observer", "participant", "admin"] as const;
 
 export type AuthRole = (typeof authRoles)[number];
@@ -18,6 +20,7 @@ export const AuthError = {
   Expired: "expired",
   Malformed: "malformed",
   Missing: "missing",
+  OriginDenied: "auth_origin_denied",
   RoleDenied: "role",
   ScopeDenied: "scope",
   UnknownKid: "unknown_kid",
@@ -26,6 +29,8 @@ export const AuthError = {
 export type AuthError = (typeof AuthError)[keyof typeof AuthError];
 
 export interface AuthContext {
+  /** Durable grant classification used to isolate browser authority, or null for legacy tokens. */
+  readonly grantSource: AuthGrantSource | null;
   /** Token expiration time as an ISO string for diagnostics, never authorization source data. */
   readonly expiresAt: string;
   /** Durable grant id, or null for a compatibility legacy token. */
@@ -113,6 +118,7 @@ export function createAuthContext(payload: AuthTokenPayload): AuthContext {
   return {
     expiresAt: new Date(payload.exp * 1_000).toISOString(),
     grantJti: null,
+    grantSource: null,
     issuer: null,
     kid: payload.kid,
     participantId: payload.participantId,

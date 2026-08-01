@@ -20,6 +20,7 @@ export { taskResponseSchema } from "./schemas.js";
 export {
   classifyScheduledSupersession,
   computeScheduleWindow,
+  currentScheduledTaskIdentityVersion,
   deriveScheduledTaskId,
   scheduledSupersessionResultSchema,
   scheduleWindowAlgorithmVersion,
@@ -27,7 +28,6 @@ export {
 } from "@dungle-scrubs/tether-protocol";
 export type {
   CandidateScheduleIdentity,
-  MailboxScope,
   ScheduledMaintenanceIdentity,
   ScheduledSupersessionRefusalReason,
   ScheduledSupersessionResultRecord,

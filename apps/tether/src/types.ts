@@ -12,12 +12,12 @@ import type {
 } from "@dungle-scrubs/tether-protocol";
 
 export type {
+  ApprovalTarget,
   CandidateScheduleIdentity,
   ClientSessionBindingRecord,
   ControlChannel,
   ControlLeaseSnapshot,
   ControlLeaseStatus,
-  MailboxScope,
   ParticipantRecord,
   ParticipantRuntimeKind,
   ParticipantRuntimeSnapshot,

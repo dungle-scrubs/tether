@@ -136,6 +136,7 @@ function adminContext(sessionScope: string): AuthContext {
   return {
     expiresAt: "2099-01-01T00:00:00.000Z",
     grantJti: "grant_admin_scope_test",
+    grantSource: "admin",
     issuer: "https://auth.scope.test",
     kid: "default",
     participantId: "part_admin_scope",

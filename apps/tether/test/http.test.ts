@@ -1,19 +1,27 @@
-import { createServer } from "node:net";
-
 import { Effect } from "effect";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 
 import type { DatabasePool } from "../src/db.js";
 import { HostPresenceRuntime, projectSessionInventory } from "../src/host-presence.js";
-import { createAppServerWithSessionService, type AppServer } from "../src/http.js";
+import {
+  type AppServer,
+  type AppServerStartupReadinessError,
+  createAppServerWithSessionService,
+} from "../src/http.js";
 import { hostPresenceInventorySchema } from "../src/protocol.js";
 import { defaultResourceLimits, sessionEventByteLength } from "../src/resource-limits.js";
-import type { SessionEvent } from "../src/types.js";
 import type {
   SessionServiceDebugInfo,
   SessionServiceEffect,
 } from "../src/session-service-contracts.js";
+import type { SessionEvent } from "../src/types.js";
+
+const healthyTestReadiness = {
+  configurationCompatible: true,
+  databaseMigrationReadiness: async (): Promise<"current"> => "current",
+  signingAuthorityReady: true,
+} as const;
 
 describe("HTTP app server error boundary", () => {
   const openApps: AppServer[] = [];
@@ -58,13 +66,13 @@ describe("HTTP app server error boundary", () => {
       {
         auth: { activeKid: "disabled", mode: "disabled", secrets: {} },
         eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+        readiness: healthyTestReadiness,
         runtimeTopology: "multi",
         taskClaimSweeper: { intervalMs: 0 },
       },
     );
     openApps.push(app);
-    const port = await findOpenPort();
-    await app.listen(port);
+    const port = await app.listen(0);
 
     const response = await fetch(`http://127.0.0.1:${port}/sessions/sess_remote_host/delete`, {
       method: "POST",
@@ -89,13 +97,13 @@ describe("HTTP app server error boundary", () => {
       {
         auth: { activeKid: "disabled", mode: "disabled", secrets: {} },
         eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+        readiness: healthyTestReadiness,
         runtimeTopology,
         taskClaimSweeper: { intervalMs: 0 },
       },
     );
     openApps.push(app);
-    const port = await findOpenPort();
-    await app.listen(port);
+    const port = await app.listen(0);
 
     const response = await fetch(`http://127.0.0.1:${port}/sessions`);
 
@@ -114,15 +122,22 @@ describe("HTTP app server error boundary", () => {
       } as unknown as DatabasePool,
       createPermanentDeleteSessionService(() => Effect.succeed([])),
       {
-        auth: { activeKid: "test", mode: "required", secrets: { test: "secret" } },
+        auth: {
+          activeKid: "test",
+          mode: "required",
+          secrets: { test: "secret" },
+        },
         eventFanout: { catchUpPollIntervalMs: 10, listenEnabled: false },
+        readiness: {
+          databaseMigrationReadiness: async (): Promise<"current"> => "current",
+          signingAuthorityReady: true,
+        },
         runtimeTopology: "multi",
         taskClaimSweeper: { intervalMs: 0 },
       },
     );
     openApps.push(app);
-    const port = await findOpenPort();
-    await app.listen(port);
+    const port = await app.listen(0);
 
     const readiness = await fetch(`http://127.0.0.1:${port}/ready`);
     const health = await fetch(`http://127.0.0.1:${port}/health`);
@@ -136,6 +151,65 @@ describe("HTTP app server error boundary", () => {
     });
     expect(health.status).toBe(200);
     expect(protectedSessions.status).toBe(401);
+  });
+
+  it.each([
+    {
+      expectedReason: "migration_incomplete",
+      options: {
+        auth: { activeKid: "disabled", mode: "disabled", secrets: {} },
+        readiness: {
+          databaseMigrationReadiness: async (): Promise<"incomplete"> => "incomplete",
+        },
+      },
+    },
+    {
+      expectedReason: "signing_authority_unavailable",
+      options: {
+        auth: {
+          activeKid: "test",
+          mode: "required",
+          secrets: { test: "secret" },
+        },
+        readiness: {
+          databaseMigrationReadiness: async (): Promise<"current"> => "current",
+        },
+      },
+    },
+    {
+      expectedReason: "configuration_incompatible",
+      options: {
+        auth: { activeKid: "disabled", mode: "disabled", secrets: {} },
+        browserPairing: { lifecycle: null },
+        cors: { allowedOrigins: ["https://hub.example.test"] },
+        readiness: {
+          databaseMigrationReadiness: async (): Promise<"current"> => "current",
+          signingAuthorityReady: true,
+        },
+      },
+    },
+  ] as const)("wires $expectedReason into unauthenticated startup readiness", async ({
+    expectedReason,
+    options,
+  }) => {
+    const app = createAppServerWithSessionService(
+      {
+        pool: { query: () => Promise.resolve({ rows: [] }) },
+      } as unknown as DatabasePool,
+      createPermanentDeleteSessionService(() => Effect.succeed([])),
+      {
+        ...options,
+        eventFanout: { catchUpPollIntervalMs: 10, listenEnabled: false },
+        taskClaimSweeper: { intervalMs: 0 },
+      },
+    );
+    await expect(app.listen(0)).rejects.toEqual(
+      expect.objectContaining({
+        code: "app_server_startup_not_ready",
+        name: "AppServerStartupReadinessError",
+        reason: expectedReason,
+      }) satisfies Partial<AppServerStartupReadinessError>,
+    );
   });
 
   it("redacts service failures that travel through the app-server catch boundary", async () => {
@@ -155,12 +229,12 @@ describe("HTTP app server error boundary", () => {
           },
           requestIdFactory: () => "req_app_boundary",
         },
+        readiness: healthyTestReadiness,
         taskClaimSweeper: { intervalMs: 0 },
       },
     );
     openApps.push(app);
-    const port = await findOpenPort();
-    await app.listen(port);
+    const port = await app.listen(0);
 
     const response = await fetch(`http://127.0.0.1:${port}/sessions`, {
       body: "{}",
@@ -198,12 +272,12 @@ describe("HTTP app server error boundary", () => {
       {
         auth: { activeKid: "disabled", mode: "disabled", secrets: {} },
         eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+        readiness: healthyTestReadiness,
         taskClaimSweeper: { intervalMs: 0 },
       },
     );
     openApps.push(app);
-    const port = await findOpenPort();
-    await app.listen(port);
+    const port = await app.listen(0);
     const socket = new WebSocket(`ws://127.0.0.1:${port}/sessions/sess_gateway/stream?after=0`);
     const messages: unknown[] = [];
     socket.on("message", (data) => {
@@ -259,19 +333,25 @@ describe("REST events-list byte budget", () => {
       {
         auth: { activeKid: "disabled", mode: "disabled", secrets: {} },
         eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
-        resourceLimits: { ...defaultResourceLimits, restEventListMaxBytes: maxBytes },
+        resourceLimits: {
+          ...defaultResourceLimits,
+          restEventListMaxBytes: maxBytes,
+        },
+        readiness: healthyTestReadiness,
         taskClaimSweeper: { intervalMs: 0 },
       },
     );
     openApps.push(app);
-    const port = await findOpenPort();
-    await app.listen(port);
+    const port = await app.listen(0);
 
     const response = await fetch(`http://127.0.0.1:${port}/sessions/${sessionId}/events`);
     expect(response.status).toBe(200);
     const body = (await response.json()) as {
       readonly events: SessionEvent[];
-      readonly pagination: { readonly hasMore: boolean; readonly nextAfterSeq: number };
+      readonly pagination: {
+        readonly hasMore: boolean;
+        readonly nextAfterSeq: number;
+      };
     };
 
     expect(body.events.length).toBeGreaterThan(0);
@@ -305,18 +385,21 @@ describe("REST events-list byte budget", () => {
       {
         auth: { activeKid: "disabled", mode: "disabled", secrets: {} },
         eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+        readiness: healthyTestReadiness,
         taskClaimSweeper: { intervalMs: 0 },
       },
     );
     openApps.push(app);
-    const port = await findOpenPort();
-    await app.listen(port);
+    const port = await app.listen(0);
 
     const response = await fetch(`http://127.0.0.1:${port}/sessions/${sessionId}/events`);
     expect(response.status).toBe(200);
     const body = (await response.json()) as {
       readonly events: SessionEvent[];
-      readonly pagination: { readonly hasMore: boolean; readonly returned: number };
+      readonly pagination: {
+        readonly hasMore: boolean;
+        readonly returned: number;
+      };
     };
 
     expect(body.events.map((event) => event.seq)).toEqual([1, 2, 3]);
@@ -438,30 +521,9 @@ function createSessionServiceDebugInfo(): SessionServiceDebugInfo {
 }
 
 function createUnusedDatabasePool(): DatabasePool {
-  return {} as unknown as DatabasePool;
-}
-
-async function findOpenPort(): Promise<number> {
-  const server = createServer();
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, resolve);
-  });
-  const address = server.address();
-  if (typeof address !== "object" || address === null) {
-    throw new Error("Expected TCP server address");
-  }
-  const port = address.port;
-  await new Promise<void>((resolve, reject) => {
-    server.close((error) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve();
-    });
-  });
-  return port;
+  return {
+    pool: { query: () => Promise.resolve({ rows: [] }) },
+  } as unknown as DatabasePool;
 }
 
 interface Deferred<TValue> {
@@ -498,7 +560,12 @@ function createSessionEvent(
 function readEventSeqs(messages: readonly unknown[]): number[] {
   return messages
     .filter(
-      (message): message is { readonly event: { readonly seq: number }; readonly op: "event" } =>
+      (
+        message,
+      ): message is {
+        readonly event: { readonly seq: number };
+        readonly op: "event";
+      } =>
         typeof message === "object" &&
         message !== null &&
         "op" in message &&

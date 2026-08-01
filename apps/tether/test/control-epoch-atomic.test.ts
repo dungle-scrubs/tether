@@ -94,14 +94,14 @@ function unclaimedTaskLockRow(overrides: Record<string, unknown> = {}) {
     failure: null,
     input: null,
     kind: "projection-test",
-    mailboxAccountId: null,
-    mailboxProvider: null,
     objective: "Preserve lock ordering",
     releasedAt: null,
     releasedBy: null,
     result: null,
     scheduleAlgorithmVersion: null,
+    scheduleIdentityVersion: null,
     scheduleIntervalMs: null,
+    scheduleScopeKey: null,
     scheduleWindowStart: null,
     sessionId: "sess_1",
     taskId: "task_1",
@@ -275,12 +275,13 @@ describe("atomic control epoch fence in task mutations", () => {
   });
 });
 
-const mailboxScope = { accountId: "acct_1", provider: "fastmail" };
+const scopeKey = "scope_1";
 const currentWindow = computeScheduleWindow(1_700_003_600_000, 3_600_000);
 const identity: ScheduledMaintenanceIdentity = {
+  identityVersion: 2,
   kind: "email_organization",
-  mailboxScope,
   scheduleWindow: currentWindow,
+  scopeKey,
   sessionId: "sess_mailbox_1",
 };
 
@@ -289,12 +290,12 @@ function ensureInput(overrides: Partial<Parameters<typeof ensureScheduledRunWith
     eventSourceId: "src_ensure_test",
     input: null,
     kind: identity.kind,
-    mailboxAccountId: mailboxScope.accountId,
-    mailboxProvider: mailboxScope.provider,
     objective: "Organize the mailbox",
     participantId: "system",
     scheduleAlgorithmVersion: currentWindow.algorithmVersion,
+    scheduleIdentityVersion: identity.identityVersion,
     scheduleIntervalMs: currentWindow.intervalMs,
+    scheduleScopeKey: identity.scopeKey,
     scheduleWindowStart: currentWindow.startMs,
     sessionId: identity.sessionId,
     ...overrides,
@@ -354,11 +355,11 @@ describe("ensureScheduledRunWithEvents identity and ordering", () => {
     const existingTaskRow = {
       createdAt: new Date("2026-07-12T00:00:00.000Z"),
       kind: identity.kind,
-      mailboxAccountId: mailboxScope.accountId,
-      mailboxProvider: mailboxScope.provider,
       objective: "Organize the mailbox",
       scheduleAlgorithmVersion: currentWindow.algorithmVersion,
+      scheduleIdentityVersion: identity.identityVersion,
       scheduleIntervalMs: currentWindow.intervalMs,
+      scheduleScopeKey: identity.scopeKey,
       scheduleWindowStart: currentWindow.startMs,
       sessionId: identity.sessionId,
       taskId,
@@ -398,11 +399,11 @@ describe("ensureScheduledRunWithEvents identity and ordering", () => {
     const scheduledRow = (windowStart: number) => ({
       createdAt: new Date("2026-07-12T00:00:00.000Z"),
       kind: identity.kind,
-      mailboxAccountId: mailboxScope.accountId,
-      mailboxProvider: mailboxScope.provider,
       objective: "Organize the mailbox",
       scheduleAlgorithmVersion: currentWindow.algorithmVersion,
+      scheduleIdentityVersion: identity.identityVersion,
       scheduleIntervalMs: currentWindow.intervalMs,
+      scheduleScopeKey: identity.scopeKey,
       scheduleWindowStart: windowStart,
       sessionId: identity.sessionId,
       taskId: deriveScheduledTaskId({
@@ -453,11 +454,11 @@ describe("ensureScheduledRunWithEvents identity and ordering", () => {
     const newerRow = {
       createdAt: new Date("2026-07-12T01:00:00.000Z"),
       kind: identity.kind,
-      mailboxAccountId: mailboxScope.accountId,
-      mailboxProvider: mailboxScope.provider,
       objective: "Organize the mailbox",
       scheduleAlgorithmVersion: newerWindow.algorithmVersion,
+      scheduleIdentityVersion: identity.identityVersion,
       scheduleIntervalMs: newerWindow.intervalMs,
+      scheduleScopeKey: identity.scopeKey,
       scheduleWindowStart: newerWindow.startMs,
       sessionId: identity.sessionId,
       taskId: newerTaskId,

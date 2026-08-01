@@ -281,6 +281,11 @@ async function startObserverApp(
       secrets: { [testAuthSigningKid]: testAuthSigningSecret },
     },
     eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+    readiness: {
+      configurationCompatible: true,
+      databaseMigrationReadiness: async () => "current",
+      signingAuthorityReady: true,
+    },
     taskClaimSweeper: { intervalMs: 0 },
   });
   const port = await findOpenPort();

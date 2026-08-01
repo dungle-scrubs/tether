@@ -75,6 +75,7 @@ function authContext(role: AuthContext["role"], participantId: string): AuthCont
   return {
     expiresAt: "2099-01-01T00:00:00.000Z",
     grantJti: null,
+    grantSource: null,
     issuer: null,
     kid: "default",
     participantId,
@@ -83,18 +84,17 @@ function authContext(role: AuthContext["role"], participantId: string): AuthCont
   };
 }
 
-const mailboxScope = { accountId: "acct_1", provider: "fastmail" };
+const scopeKey = "scope_01JEMAIL";
 const window = computeScheduleWindow(1_700_003_600_000, 3_600_000);
 
 const supersedeBody = {
   candidateTaskIds: ["task_old_window"],
   kind: "email_organization",
   schedule: {
-    mailboxAccountId: mailboxScope.accountId,
-    mailboxProvider: mailboxScope.provider,
     scheduleAlgorithmVersion: window.algorithmVersion,
     scheduleIntervalMs: window.intervalMs,
     scheduleWindowStart: window.startMs,
+    scopeKey,
   },
 };
 
@@ -225,7 +225,7 @@ describe("scheduled-run supersession REST authorization", () => {
     // The recorded actor comes from the authenticated operator identity, not the body.
     expect(request.participantId).toBe("operator_1");
     expect(request.identity.kind).toBe("email_organization");
-    expect(request.identity.mailboxScope).toEqual(mailboxScope);
+    expect(request.identity.scopeKey).toBe(scopeKey);
     expect(request.identity.scheduleWindow.startMs).toBe(window.startMs);
     expect(request.candidateTaskIds).toEqual(["task_old_window"]);
     expect(response.statusCode).toBe(200);
@@ -260,11 +260,10 @@ describe("scheduled-run supersession REST authorization", () => {
         kind: "email_organization",
         objective: "Organize the mailbox",
         schedule: {
-          mailboxAccountId: mailboxScope.accountId,
-          mailboxProvider: mailboxScope.provider,
           scheduleAlgorithmVersion: window.algorithmVersion,
           scheduleIntervalMs: window.intervalMs,
           scheduleWindowStart: window.startMs,
+          scopeKey,
         },
       },
       hub: hub as unknown as SubscriptionHub,

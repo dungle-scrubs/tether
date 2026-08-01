@@ -21,6 +21,8 @@
     "test:e2e": "pnpm --filter tether test:e2e",
     "typecheck": "turbo run typecheck",
     "ui": "pnpm --filter tether ui",
+    "verify:package": "pnpm --filter @dungle-scrubs/tether-browser verify:package",
+    "verify:package:prepared": "pnpm --filter @dungle-scrubs/tether-browser verify:package:prepared",
     "version-packages": "changeset version"
   },
   "devDependencies": {

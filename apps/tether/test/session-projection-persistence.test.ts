@@ -212,10 +212,10 @@ describe("Session Projection persistence", () => {
     const client = new TaskEventTransactionClient([
       taskDatabaseRow({
         cancelledAt: new Date(2),
-        mailboxAccountId: "mailbox_projection",
-        mailboxProvider: "gmail",
         scheduleAlgorithmVersion: 1,
+        scheduleIdentityVersion: 2,
         scheduleIntervalMs: "60000",
+        scheduleScopeKey: "scope_projection",
         scheduleWindowStart: new Date(1),
       }),
     ]);
@@ -223,11 +223,11 @@ describe("Session Projection persistence", () => {
     const result = await supersedeScheduledRunsWithEvent(client.database, {
       eventSourceId: "src_projection_persistence_test",
       kind: "projection-test",
-      mailboxAccountId: "mailbox_projection",
-      mailboxProvider: "gmail",
       participantId: "part_projection",
       scheduleAlgorithmVersion: 1,
+      scheduleIdentityVersion: 2,
       scheduleIntervalMs: 60_000,
+      scheduleScopeKey: "scope_projection",
       scheduleWindowStart: 2,
       sessionId: "sess_projection_persistence",
     });

@@ -10,6 +10,7 @@ import { canFlipRestControlDefault } from "../src/rest-control-rollout.js";
 const testDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(testDir, "../../..");
 const appPortBinding = "$" + "{APP_HOST_BIND:-127.0.0.1}:$" + "{APP_HOST_PORT:-3025}:3025";
+const browserAllowedOriginsPassThrough = "$" + "{BROWSER_ALLOWED_ORIGINS:-}";
 const databaseUrlRequirement = "$" + "{DATABASE_URL:?DATABASE_URL is required}";
 const githubTokenExpression = "GITHUB_TOKEN: $" + "{{ secrets.GITHUB_TOKEN }}";
 const postgresDbDefault = "$" + "{POSTGRES_DB:-tether}";
@@ -134,6 +135,15 @@ describe("deployment hardening contract", () => {
     const app = getService(compose, "app");
 
     expect(getEnvironmentValue(app, "DATABASE_URL")).toBe(databaseUrlRequirement);
+  });
+
+  it("passes configured exact browser origins into the Tether container", async () => {
+    const compose = await readRootCompose();
+    const app = getService(compose, "app");
+
+    expect(getEnvironmentValue(app, "BROWSER_ALLOWED_ORIGINS")).toBe(
+      browserAllowedOriginsPassThrough,
+    );
   });
 
   it("keeps Drizzle from silently using the weak database credential", async () => {

@@ -14,6 +14,8 @@
     "format:check": "biome format --config-path=../../tooling/biome.json .",
     "lint": "biome lint --config-path=../../tooling/biome.json .",
     "mint": "tsx src/auth/mint-cli.ts",
+    "pair-browser": "tsx src/auth/browser-pairing-cli.ts",
+    "ensure-session": "tsx src/session-bootstrap-cli.ts",
     "start": "node dist/server.js",
     "test": "vitest run",
     "test:e2e": "tsx scripts/test-e2e.ts",

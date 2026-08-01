@@ -6,7 +6,7 @@ import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
 const repoRoot = resolve(import.meta.dirname, "../../..");
-const protocolOwnerFile = "packages/protocol/src/rest-schemas.ts";
+const protocolOwnerFile = "packages/protocol/src/approval-targets.ts";
 const approvalSchemaConsumerFiles = ["packages/client-bridge/src/schemas.ts"] as const;
 
 describe("approval schema ownership", () => {

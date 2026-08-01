@@ -17,6 +17,7 @@ import { ParticipantCursorWriter } from "./participant-cursor-writer.js";
 import { runParticipantTaskClaimFlow } from "./participant-task-claim-flow.js";
 import {
   type AppendSessionEventInput,
+  boundedExponentialRetryDelayMs,
   buildWsPublishMessage,
   buildWsTaskClaimMessage,
   buildWsTaskCompleteMessage,
@@ -1823,7 +1824,7 @@ export function buildParticipantRuntimeStreamUrl(config: ParticipantRuntimeClien
 function reconnectDelayMs(attempt: number, config: ParticipantRuntimeClientConfig): number {
   const baseDelayMs = config.reconnect?.baseDelayMs ?? defaultReconnectBaseDelayMs;
   const maxDelayMs = config.reconnect?.maxDelayMs ?? defaultReconnectMaxDelayMs;
-  return Math.min(maxDelayMs, baseDelayMs * 2 ** attempt);
+  return boundedExponentialRetryDelayMs(attempt, baseDelayMs, maxDelayMs);
 }
 
 /** Applies one overall deadline to graceful participant shutdown settlement. */

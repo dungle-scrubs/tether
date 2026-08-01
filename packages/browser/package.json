@@ -1,0 +1,48 @@
+{
+  "name": "@dungle-scrubs/tether-browser",
+  "version": "0.1.0",
+  "description": "Browser-only operator client for Tether snapshots, replay, commands, and approvals.",
+  "license": "MIT",
+  "author": "Kevin Frilot",
+  "homepage": "https://github.com/dungle-scrubs/tether/tree/main/packages/browser#readme",
+  "bugs": "https://github.com/dungle-scrubs/tether/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dungle-scrubs/tether.git",
+    "directory": "packages/browser"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "format": "biome format --config-path=../../tooling/biome.json --write .",
+    "format:check": "biome format --config-path=../../tooling/biome.json .",
+    "lint": "biome lint --config-path=../../tooling/biome.json .",
+    "prepublishOnly": "pnpm run build",
+    "pretest": "node scripts/ensure-test-build.mjs",
+    "preverify:package": "pnpm --filter @dungle-scrubs/tether-protocol build && pnpm run build",
+    "test": "vitest run --config vitest.config.ts",
+    "verify:package": "node scripts/verify-package.mjs",
+    "verify:package:prepared": "node scripts/verify-package.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json"
+  },
+  "dependencies": {
+    "@dungle-scrubs/tether-protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@vitest/browser-playwright": "4.1.7",
+    "playwright": "1.62.1",
+    "vitest": "^4.1.7"
+  }
+}

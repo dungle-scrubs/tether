@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { approvalDecisionSchema, taskResultSchema } from "./approval-targets.js";
 import type { CandidateScheduleIdentity } from "./task-contracts.js";
 import { candidateScheduleIdentitySchema } from "./task-contracts.js";
 
@@ -48,9 +49,9 @@ export interface TaskRecord {
   /** Structured result payload, when the task completed with details. */
   readonly result: Record<string, unknown> | null;
   /**
-   * Deterministic schedule and Mailbox Scope identity for scheduled maintenance
+   * Deterministic schedule and opaque scope identity for recurring work
    * runs; null for manual tasks. Present only when the durable row carries a
-   * complete Schedule Window and Mailbox Scope.
+   * complete Schedule Window and scope key.
    */
   readonly schedule?: CandidateScheduleIdentity | null | undefined;
   /** Durable Tether session that owns the task. */
@@ -230,7 +231,7 @@ export interface TaskApprovalRecord {
   readonly decidedByParticipantId: string;
   /** Winning approval decision for the target. */
   readonly decision: "approved" | "rejected";
-  /** Original approval reason used to derive the target key. */
+  /** Original approval reason submitted with the winning decision. */
   readonly reason: Record<string, unknown>;
   /** Session that owns the task. */
   readonly sessionId: string;
@@ -239,6 +240,18 @@ export interface TaskApprovalRecord {
   /** Approved task id. */
   readonly taskId: string;
 }
+
+/** Runtime validator for one canonical durable task approval record. */
+export const taskApprovalRecordSchema = z.object({
+  approvalEventId: z.string().min(1),
+  decidedAt: z.string().datetime({ offset: true }),
+  decidedByParticipantId: z.string().min(1),
+  decision: approvalDecisionSchema,
+  reason: z.record(z.string(), z.unknown()),
+  sessionId: z.string().min(1),
+  targetKey: z.string().min(1),
+  taskId: z.string().min(1),
+});
 
 /** Read-only diagnostic view of one task with derived lifecycle state. */
 export interface TaskSnapshot extends TaskRecord {
@@ -497,7 +510,7 @@ export const taskRecordSchema = z.object({
   objective: z.string().min(1),
   releasedAt: z.string().nullable(),
   releasedBy: z.string().nullable(),
-  result: z.record(z.string(), z.unknown()).nullable(),
+  result: taskResultSchema.nullable(),
   schedule: candidateScheduleIdentitySchema.nullable().optional(),
   sessionId: z.string().min(1),
   taskId: z.string().min(1),

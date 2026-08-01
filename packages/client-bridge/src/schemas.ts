@@ -1,6 +1,7 @@
 import {
   approvalDecisionSchema,
   sessionEventSchema,
+  taskApprovalRecordSchema,
   taskContractSummarySchema,
   taskRecordSchema,
 } from "@dungle-scrubs/tether-protocol";
@@ -56,12 +57,14 @@ export const taskInspectionResponseSchema = z.object({
 /** Response schema for recording task approval intent. */
 export const taskApprovalResponseSchema = z.discriminatedUnion("status", [
   z.object({
+    approval: taskApprovalRecordSchema,
     decision: approvalDecisionSchema,
     event: sessionEventSchema,
     status: z.literal("recorded"),
     task: taskRecordSchema,
   }),
   z.object({
+    approval: taskApprovalRecordSchema,
     decision: approvalDecisionSchema,
     existingDecision: approvalDecisionSchema,
     ignoredReason: z.union([z.literal("already_approved"), z.literal("already_rejected")]),

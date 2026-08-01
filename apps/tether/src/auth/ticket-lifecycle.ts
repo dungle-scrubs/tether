@@ -1,10 +1,9 @@
-import { createHash, randomBytes } from "node:crypto";
-
 import {
   maximumAuthTicketAdmissionLifetimeMilliseconds,
   type AuthTicketStore,
 } from "./grant-stores.js";
 import type { AuthContext } from "./token.js";
+import { hashOpaqueCredential, randomOpaqueCredential } from "./opaque-credential.js";
 
 /** One-time browser-compatible WebSocket admission credential. */
 export interface CreatedAuthTicket {
@@ -37,7 +36,7 @@ export function createAuthTicketLifecycle(
   options: AuthTicketLifecycleOptions,
 ): AuthTicketLifecycle {
   const now = options.now ?? (() => new Date());
-  const randomTicket = options.randomTicket ?? (() => randomBytes(32).toString("base64url"));
+  const randomTicket = options.randomTicket ?? randomOpaqueCredential;
   return {
     mint: async (context) => {
       if (context.grantJti === null) throw new Error("auth_ticket_parent_required");
@@ -69,5 +68,5 @@ export function createAuthTicketLifecycle(
 
 /** Hashes an opaque ticket before it crosses a durable persistence boundary. */
 export function hashAuthTicket(ticket: string): string {
-  return createHash("sha256").update(ticket).digest("hex");
+  return hashOpaqueCredential(ticket);
 }

@@ -2,7 +2,7 @@ import type { ReadinessResponse } from "@dungle-scrubs/tether-protocol";
 import { readinessFailureReason } from "@dungle-scrubs/tether-protocol";
 
 import type { RuntimeTopology } from "./config.js";
-import type { DatabasePool } from "./db.js";
+import type { DatabaseMigrationReadiness } from "./database-migration.js";
 import type { SessionEventFanout } from "./session-event-fanout.js";
 
 /** HTTP status plus the bounded protocol-owned readiness response. */
@@ -13,7 +13,11 @@ export interface ReadinessProjection {
 
 /** Dependencies required to evaluate process readiness. */
 export interface ReadinessInput {
-  readonly database: DatabasePool;
+  readonly deployment: {
+    readonly configurationCompatible: boolean;
+    readonly databaseMigrationReadiness: () => Promise<DatabaseMigrationReadiness>;
+    readonly signingAuthorityReady: boolean;
+  };
   readonly fanout: Pick<SessionEventFanout, "debugInfo">;
   readonly fanoutStaleAfterMs: number;
   readonly replicaId: string;
@@ -22,10 +26,23 @@ export interface ReadinessInput {
 
 /** Evaluates database reachability and local subscriber catch-up health. */
 export async function projectReadiness(input: ReadinessInput): Promise<ReadinessProjection> {
+  let databaseMigrationReadiness: DatabaseMigrationReadiness;
   try {
-    await input.database.pool.query("SELECT 1");
+    databaseMigrationReadiness = await input.deployment.databaseMigrationReadiness();
   } catch {
     return unavailable(input, readinessFailureReason.databaseUnavailable);
+  }
+  if (databaseMigrationReadiness === "unavailable") {
+    return unavailable(input, readinessFailureReason.databaseUnavailable);
+  }
+  if (databaseMigrationReadiness === "incomplete") {
+    return unavailable(input, readinessFailureReason.migrationIncomplete);
+  }
+  if (!input.deployment.signingAuthorityReady) {
+    return unavailable(input, readinessFailureReason.signingAuthorityUnavailable);
+  }
+  if (!input.deployment.configurationCompatible) {
+    return unavailable(input, readinessFailureReason.configurationIncompatible);
   }
   const fanout = input.fanout.debugInfo();
   const repairDisabled =

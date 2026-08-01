@@ -44,6 +44,9 @@ describe("session event retention cutoff", () => {
       ),
     ).toEqual([]);
     expect(collectDeleteCallInventory(sources)).toEqual([
+      // Reviewed: bounded TTL cleanup for browser pairing abuse counters;
+      // never touches session events or retention boundaries.
+      "apps/tether/src/auth/browser-pairing-stores.ts:browserPairingExchangeFailures",
       "apps/tether/src/auth/grant-authority.ts:key",
       "apps/tether/src/auth/grant-authority.ts:key",
       "apps/tether/src/auth/grant-authority.ts:oldestKey",

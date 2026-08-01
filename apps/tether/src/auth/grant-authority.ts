@@ -172,6 +172,7 @@ function contextFromGrant(record: AuthGrantRecord): AuthContext {
   return {
     expiresAt: record.expiresAt.toISOString(),
     grantJti: record.jti,
+    grantSource: record.metadata.source,
     issuer: record.issuer,
     kid: record.kid,
     participantId: record.subject,

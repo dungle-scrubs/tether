@@ -6,6 +6,8 @@ import type {
   SessionPersistenceStores,
 } from "./db-store-contracts.js";
 import {
+  ApprovalTargetManifestError,
+  OperatorGrantAuthorityError,
   type EnsureScheduledRunResult,
   ScheduledRunIdentityConflictError,
   ScheduledTaskIdentityMismatchError,
@@ -20,6 +22,7 @@ import {
   type ClaimOwnedTaskInput,
   type CompleteTaskInput,
   type CreateTaskInput,
+  type StandardCreateTaskInput,
   type EnsureScheduledRunRequest,
   type FailTaskInput,
   type RecordedTaskApprovalResult,
@@ -47,6 +50,7 @@ import {
 } from "./session-service-contracts.js";
 import { trySessionPromise } from "./session-service-runtime.js";
 import type {
+  ApprovalTarget,
   CandidateScheduleIdentity,
   ScheduledMaintenanceIdentity,
   SessionEvent,
@@ -228,9 +232,30 @@ export function createSessionTaskEffects(input: SessionTaskEffectsInput): Sessio
         // id that would evade schedule-identity uniqueness and atomic supersession
         // of older windows. A supplied id must equal the derived identity or the
         // create is rejected.
+        if (taskInput.operatorAuthority !== undefined) {
+          const taskId = taskInput.taskId ?? newTaskId();
+          const operatorSessionId = taskInput.operatorAuthority.request.sessionId;
+          const persisted = yield* trySessionPromise(() =>
+            input.stores.tasks.createOperatorWithEvent({
+              authority: taskInput.operatorAuthority,
+              eventSourceId: input.eventSourceId,
+              taskId,
+            }),
+          );
+          yield* Effect.sync(() =>
+            input.assertBroadcastEvents(
+              input.observability,
+              "createTask",
+              operatorSessionId,
+              persisted.events,
+            ),
+          );
+          return persisted;
+        }
         if (taskInput.schedule !== undefined) {
           return yield* createScheduledTaskEffect(input, taskInput, taskInput.schedule);
         }
+        const taskId = taskInput.taskId ?? newTaskId();
         const persisted = yield* trySessionPromise(() =>
           input.stores.tasks.createWithEvent({
             eventSourceId: input.eventSourceId,
@@ -238,7 +263,7 @@ export function createSessionTaskEffects(input: SessionTaskEffectsInput): Sessio
             kind: taskInput.kind,
             objective: taskInput.objective,
             sessionId: taskInput.sessionId,
-            taskId: taskInput.taskId ?? newTaskId(),
+            taskId,
             taskIdSource: taskInput.taskId === undefined ? "generated" : "caller",
           }),
         );
@@ -297,22 +322,49 @@ export function createSessionTaskEffects(input: SessionTaskEffectsInput): Sessio
         const rejectionReason = approvalRejectionReasonFromValidators(
           input.approvalValidators,
           task,
+          taskInput.target,
         );
         if (rejectionReason) {
           return yield* Effect.fail(
             new TaskApprovalRejectedError(taskInput.decision, rejectionReason, task),
           );
         }
-        const targetKey = approvalTargetKey(taskInput.reason);
-        const persisted = yield* trySessionPromise(() =>
+        const targetKey = approvalTargetKey(taskInput.reason, taskInput.target);
+        const persisted: PersistedTaskApprovalResult | null = yield* trySessionPromise(() =>
           input.stores.tasks.recordApproval({
             controlGuard: taskInput.controlGuard,
             decision: taskInput.decision,
             eventSourceId: input.eventSourceId,
+            operatorGrantJti: taskInput.operatorGrantJti,
             participantId: taskInput.participantId,
             reason: taskInput.reason,
             sessionId: taskInput.sessionId,
+            ...(taskInput.target === undefined ? {} : { target: taskInput.target }),
             taskId: taskInput.taskId,
+          }),
+        ).pipe(
+          Effect.catchAll((error): Effect.Effect<never, SessionServiceFailure> => {
+            if (error.cause instanceof ApprovalTargetManifestError) {
+              input.observability.debug(operation, "approval.target_manifest.rejected", {
+                reason: error.cause.reason,
+                sessionId: taskInput.sessionId,
+                taskId: taskInput.taskId,
+              });
+              return Effect.fail(
+                new TaskApprovalRejectedError(taskInput.decision, error.cause.reason, task),
+              );
+            }
+            if (error.cause instanceof OperatorGrantAuthorityError) {
+              input.observability.debug(operation, "approval.operator_authority.rejected", {
+                reason: error.cause.reason,
+                sessionId: taskInput.sessionId,
+                taskId: taskInput.taskId,
+              });
+              return Effect.fail(
+                new TaskApprovalRejectedError(taskInput.decision, error.cause.reason, task),
+              );
+            }
+            return Effect.fail(error);
           }),
         );
         if (!persisted) {
@@ -333,6 +385,7 @@ export function createSessionTaskEffects(input: SessionTaskEffectsInput): Sessio
         if (persisted.status === "ignored") {
           return yield* Effect.fail(
             new TaskApprovalIgnoredError(
+              persisted.approval,
               taskInput.decision,
               persisted.existingDecision,
               persisted.existingDecision === "approved" ? "already_approved" : "already_rejected",
@@ -341,6 +394,7 @@ export function createSessionTaskEffects(input: SessionTaskEffectsInput): Sessio
           );
         }
         const result = {
+          approval: persisted.approval,
           decision: taskInput.decision,
           event: persisted.event,
           events: persisted.events,
@@ -377,12 +431,12 @@ export function createSessionTaskEffects(input: SessionTaskEffectsInput): Sessio
                 : {}),
               eventSourceId: input.eventSourceId,
               kind: identity.kind,
-              mailboxAccountId: identity.mailboxScope.accountId,
-              mailboxProvider: identity.mailboxScope.provider,
               participantId: request.participantId ?? scheduledSupersessionActorId,
               ...(request.reason === undefined ? {} : { reason: request.reason }),
               scheduleAlgorithmVersion: identity.scheduleWindow.algorithmVersion,
+              scheduleIdentityVersion: identity.identityVersion,
               scheduleIntervalMs: identity.scheduleWindow.intervalMs,
+              scheduleScopeKey: identity.scopeKey,
               scheduleWindowStart: identity.scheduleWindow.startMs,
               sessionId: identity.sessionId,
             }),
@@ -433,13 +487,13 @@ function ensureScheduledRunStoreEffect(
         ...(request.expectedTaskId !== undefined ? { expectedTaskId: request.expectedTaskId } : {}),
         input: request.input ?? null,
         kind: identity.kind,
-        mailboxAccountId: identity.mailboxScope.accountId,
-        mailboxProvider: identity.mailboxScope.provider,
         objective: request.objective,
         participantId: request.participantId ?? scheduledSupersessionActorId,
         ...(request.reason === undefined ? {} : { reason: request.reason }),
         scheduleAlgorithmVersion: identity.scheduleWindow.algorithmVersion,
+        scheduleIdentityVersion: identity.identityVersion,
         scheduleIntervalMs: identity.scheduleWindow.intervalMs,
+        scheduleScopeKey: identity.scopeKey,
         scheduleWindowStart: identity.scheduleWindow.startMs,
         sessionId: identity.sessionId,
       }),
@@ -458,22 +512,20 @@ function ensureScheduledRunStoreEffect(
  */
 function createScheduledTaskEffect(
   input: SessionTaskEffectsInput,
-  taskInput: CreateTaskInput,
+  taskInput: StandardCreateTaskInput,
   schedule: NonNullable<CreateTaskInput["schedule"]>,
 ): Effect.Effect<TaskCreatedResult, SessionServiceFailure> {
   return Effect.gen(function* () {
     const identity: ScheduledMaintenanceIdentity = {
+      identityVersion: schedule.scheduleIdentityVersion,
       kind: taskInput.kind,
-      mailboxScope: {
-        accountId: schedule.mailboxAccountId,
-        provider: schedule.mailboxProvider,
-      },
       scheduleWindow: {
         algorithmVersion: schedule.scheduleAlgorithmVersion,
         endMs: schedule.scheduleWindowStart + schedule.scheduleIntervalMs,
         intervalMs: schedule.scheduleIntervalMs,
         startMs: schedule.scheduleWindowStart,
       },
+      scopeKey: schedule.scheduleScopeKey,
       sessionId: taskInput.sessionId,
     };
     const derivedTaskId = deriveScheduledTaskId(identity);
@@ -652,6 +704,7 @@ export function mapTaskApprovalRejection(
     }
     if (error instanceof TaskApprovalIgnoredError) {
       const result: TaskApprovalResult = {
+        approval: error.approval,
         decision: error.decision,
         events: [],
         existingDecision: error.existingDecision,
@@ -677,6 +730,15 @@ export function taskParticipantTraceInput(input: TaskParticipantInput): Record<s
     participantId: input.participantId,
     sessionId: input.sessionId,
     taskId: input.taskId,
+  };
+}
+
+/** Builds trace correlation fields for one approval request. */
+export function taskApprovalTraceInput(input: RecordTaskApprovalInput): Record<string, unknown> {
+  return {
+    ...taskParticipantTraceInput(input),
+    decision: input.decision,
+    targetKey: approvalTargetKey(input.reason, input.target),
   };
 }
 
@@ -859,11 +921,18 @@ function assertTaskApprovalResultWithObservability(
 function approvalRejectionReasonFromValidators(
   approvalValidators: ReadonlyMap<string, TaskApprovalValidator>,
   task: TaskRecord,
+  target: ApprovalTarget | undefined,
 ): TaskApprovalRejectionReason | null {
-  const validator = approvalValidators.get(task.kind);
   if (task.completedAt === null) {
     return "task_not_completed";
   }
+  if (target !== undefined) {
+    return null;
+  }
+  if (isRecord(task.result) && "targetManifest" in task.result) {
+    return null;
+  }
+  const validator = approvalValidators.get(task.kind);
   if (!validator) {
     return isGenericApprovableTaskResult(task.kind, task.result) ? null : "unsupported_task_kind";
   }

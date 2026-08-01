@@ -1123,13 +1123,14 @@ describe("ParticipantRuntimeClient.runClaimableTasks", () => {
     const scheduledTask: TaskRecord = {
       ...baseTask,
       schedule: {
-        mailboxScope: { accountId: "acct_opaque_1", provider: "fastmail" },
+        identityVersion: 2,
         scheduleWindow: {
           algorithmVersion: 1,
           endMs: 1_700_002_800_000,
           intervalMs: 3_600_000,
           startMs: 1_699_999_200_000,
         },
+        scopeKey: "scope_01JEMAIL",
       },
     };
     let receivedSchedule: TaskRecord["schedule"];
@@ -2090,6 +2091,7 @@ describe("ParticipantRuntimeClient reconnect scheduling", () => {
 
   it("uses configured reconnect backoff for delivery recovery", async () => {
     const sockets: ParticipantFakeWebSocket[] = [];
+    const random = vi.spyOn(Math, "random").mockReturnValue(1);
     const client = await ParticipantRuntimeClient.connect({
       ...baseConfig,
       reconnect: { baseDelayMs: 10, maxDelayMs: 10 },
@@ -2114,6 +2116,7 @@ describe("ParticipantRuntimeClient reconnect scheduling", () => {
       expect(sockets).toHaveLength(2);
     } finally {
       vi.useRealTimers();
+      random.mockRestore();
       client.close();
     }
   });
@@ -2391,6 +2394,44 @@ describe("ParticipantRuntimeClient durable cursor", () => {
       lastHandledSeq: 0,
       lastObservedSeq: 0,
       lastReceivedSeq: 2,
+    });
+  });
+
+  it("does not advance an approval cursor before the awaited projection transaction commits", async () => {
+    const transaction = createDeferred<void>();
+    const projection = { approvalId: null as string | null, handledSeq: 0 };
+    const fixture = createCursorFixture({ eventCount: 1, withHandler: false });
+    fixture.client.onEvent(async (event) => {
+      if (event.type !== "approval.recorded") {
+        return;
+      }
+      await transaction.promise;
+      projection.approvalId = event.eventId;
+      projection.handledSeq = event.seq;
+    });
+
+    fixture.client.handleMessage(
+      JSON.stringify({ event: createApprovalRecordedEvent(1), op: "event" }),
+    );
+    await flushMicrotasks();
+
+    expect(projection).toEqual({ approvalId: null, handledSeq: 0 });
+    expect(fixture.writes).toEqual([]);
+    expect(fixture.client.debugInfo()).toMatchObject({
+      lastHandledSeq: 0,
+      lastObservedSeq: 0,
+      lastReceivedSeq: 1,
+    });
+
+    transaction.resolve();
+    await flushMicrotasks();
+
+    expect(projection).toEqual({ approvalId: "evt_approval_recorded_1", handledSeq: 1 });
+    expect(fixture.writes).toEqual([1]);
+    expect(fixture.client.debugInfo()).toMatchObject({
+      lastHandledSeq: 1,
+      lastObservedSeq: 1,
+      lastReceivedSeq: 1,
     });
   });
 
@@ -3190,6 +3231,19 @@ function createTaskCreatedEvent(task: TaskRecord, seq: number): SessionEvent {
     seq,
     sessionId: task.sessionId,
     type: "task.created",
+  };
+}
+
+/** Builds an approval event used to guard awaited private projection commits. */
+function createApprovalRecordedEvent(seq: number): SessionEvent {
+  return {
+    createdAt: "2026-06-05T00:00:00.000Z",
+    eventId: `evt_approval_recorded_${seq}`,
+    payload: { approvalId: `approval_${seq}` },
+    producerId: "tether",
+    seq,
+    sessionId: baseTask.sessionId,
+    type: "approval.recorded",
   };
 }
 

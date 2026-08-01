@@ -1,11 +1,34 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
-import { and, desc, eq, isNotNull, isNull, notInArray, or, type SQL, sql } from "drizzle-orm";
+import {
+  type OperatorCommandRequest,
+  type OperatorGrantScope,
+  operatorCommandPermission,
+  operatorGrantScopeSchema,
+} from "@dungle-scrubs/tether-protocol";
+import {
+  and,
+  desc,
+  eq,
+  gt,
+  isNotNull,
+  isNull,
+  lt,
+  notInArray,
+  or,
+  type SQL,
+  sql,
+} from "drizzle-orm";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { Context, Effect, Layer } from "effect";
 import pg from "pg";
 
 import { approvalTargetKey } from "./approval-target-key.js";
+import {
+  authorizeOperator,
+  type OperatorAuthorityDenialReason,
+  type OperatorAuthorityRequest,
+} from "./auth/operator-authority.js";
 import { ServerConfigService } from "./config.js";
 import { ControlEpochStaleError, nextControlEpoch, parseControlEpoch } from "./control-epoch.js";
 import { migrateDatabase } from "./database-migration.js";
@@ -27,8 +50,10 @@ import {
   buildTaskFailedEventInput,
   buildTaskReleasedEventInput,
   deriveScheduledTaskId,
+  newEventId,
   newSessionId,
   parsePositiveSafeInteger,
+  targetManifestSchema,
 } from "./protocol.js";
 import * as schema from "./schema.js";
 import {
@@ -41,6 +66,7 @@ import {
   tasks,
 } from "./schema.js";
 import type {
+  ApprovalTarget,
   CandidateScheduleIdentity,
   ClientSessionBindingRecord,
   ControlChannel,
@@ -290,15 +316,15 @@ interface ExpiredTaskClaimRow {
   readonly failure: Record<string, unknown> | null;
   readonly input: Record<string, unknown> | null;
   readonly kind: string;
-  readonly mailboxAccountId: string | null;
-  readonly mailboxProvider: string | null;
   readonly objective: string;
   readonly previousClaimedBy: string;
   readonly releasedAt: Date | null;
   readonly releasedBy: string | null;
   readonly result: Record<string, unknown> | null;
   readonly scheduleAlgorithmVersion: number | string | null;
+  readonly scheduleIdentityVersion: number | string | null;
   readonly scheduleIntervalMs: number | string | null;
+  readonly scheduleScopeKey: string | null;
   readonly scheduleWindowStart: number | string | null;
   readonly sessionId: string;
   readonly taskId: string;
@@ -318,15 +344,15 @@ interface PgTaskRow {
   readonly failure: Record<string, unknown> | null;
   readonly input: Record<string, unknown> | null;
   readonly kind: string;
-  readonly mailboxAccountId: string | null;
-  readonly mailboxProvider: string | null;
   readonly objective: string;
   readonly releasedAt: Date | null;
   readonly releasedBy: string | null;
   readonly result: Record<string, unknown> | null;
   // bigint/integer columns arrive as numeric strings over the raw pg driver.
   readonly scheduleAlgorithmVersion: number | string | null;
+  readonly scheduleIdentityVersion: number | string | null;
   readonly scheduleIntervalMs: number | string | null;
+  readonly scheduleScopeKey: string | null;
   readonly scheduleWindowStart: number | string | null;
   readonly sessionId: string;
   readonly taskId: string;
@@ -334,19 +360,19 @@ interface PgTaskRow {
 
 /** Structural read of the durable schedule-identity task columns. */
 interface ScheduleIdentityColumns {
-  readonly mailboxAccountId?: string | null;
-  readonly mailboxProvider?: string | null;
   readonly scheduleAlgorithmVersion?: number | string | null;
+  readonly scheduleIdentityVersion?: number | string | null;
   readonly scheduleIntervalMs?: number | string | null;
+  readonly scheduleScopeKey?: string | null;
   readonly scheduleWindowStart?: number | string | null;
 }
 
-/** Caller-supplied schedule and Mailbox Scope identity for a scheduled task. */
+/** Caller-supplied provider-neutral identity for a scheduled task. */
 export interface ScheduledTaskIdentityInput {
-  readonly mailboxAccountId: string;
-  readonly mailboxProvider: string;
   readonly scheduleAlgorithmVersion: number;
+  readonly scheduleIdentityVersion: number;
   readonly scheduleIntervalMs: number;
+  readonly scheduleScopeKey: string;
   readonly scheduleWindowStart: number;
 }
 
@@ -417,6 +443,23 @@ interface PgParticipantRow {
 export type CreateSessionResult =
   | { readonly created: false; readonly session: SessionRecord }
   | { readonly created: true; readonly session: SessionRecord };
+
+/** Result of resolving one durable deployment bootstrap identity. */
+export interface BootstrapSessionResult {
+  readonly created: boolean;
+  readonly identityKey: string;
+  readonly session: SessionRecord;
+}
+
+/** Stable fail-closed error for a one-to-one bootstrap identity conflict. */
+export class SessionBootstrapIdentityConflictError extends Error {
+  readonly code = "session_bootstrap_identity_conflict";
+
+  constructor() {
+    super("Session bootstrap identity conflicts with durable state");
+    this.name = "SessionBootstrapIdentityConflictError";
+  }
+}
 
 /** Error raised when a session-scoped write targets a missing durable session. */
 export class SessionNotFoundError extends Error {
@@ -671,6 +714,7 @@ export class SessionEventSequenceRangeError extends Error {
 
 export type PersistedTaskApprovalResult =
   | {
+      readonly approval: TaskApprovalRecord;
       readonly decision: ApprovalDecision;
       readonly event: SessionEvent;
       readonly events: readonly [SessionEvent];
@@ -687,6 +731,41 @@ export type PersistedTaskApprovalResult =
       readonly task: TaskRecord;
       readonly targetKey: string;
     };
+
+export type ApprovalTargetManifestErrorReason =
+  | "action_mismatch"
+  | "digest_mismatch"
+  | "scope_mismatch"
+  | "target_absent"
+  | "target_kind_mismatch"
+  | "target_required"
+  | "target_revision_mismatch"
+  | "task_not_completed";
+
+/** Typed refusal raised before an approval target can enter durable history. */
+export class ApprovalTargetManifestError extends Error {
+  readonly name = "ApprovalTargetManifestError";
+
+  constructor(readonly reason: ApprovalTargetManifestErrorReason) {
+    super(`Approval target manifest validation failed: ${reason}`);
+  }
+}
+
+export type OperatorGrantAuthorityErrorReason =
+  | OperatorAuthorityDenialReason
+  | "operator_grant_denied"
+  | "operator_grant_expired"
+  | "operator_grant_revoked"
+  | "operator_target_required";
+
+/** Typed atomic refusal when browser authority no longer covers an approval target. */
+export class OperatorGrantAuthorityError extends Error {
+  readonly name = "OperatorGrantAuthorityError";
+
+  constructor(readonly reason: OperatorGrantAuthorityErrorReason) {
+    super(`Operator grant authority validation failed: ${reason}`);
+  }
+}
 
 const controlLeaseReturningColumns = `
   acquisition_id AS "acquisitionId",
@@ -716,14 +795,14 @@ const taskReturningColumns = `
   failure,
   input,
   kind,
-  mailbox_account_id AS "mailboxAccountId",
-  mailbox_provider AS "mailboxProvider",
   objective,
   released_at AS "releasedAt",
   released_by AS "releasedBy",
   result,
   schedule_algorithm_version AS "scheduleAlgorithmVersion",
+  schedule_identity_version AS "scheduleIdentityVersion",
   schedule_interval_ms AS "scheduleIntervalMs",
+  schedule_scope_key AS "scheduleScopeKey",
   schedule_window_start AS "scheduleWindowStart",
   session_id AS "sessionId",
   task_id AS "taskId"
@@ -1654,6 +1733,68 @@ export async function createSession(
 }
 
 /**
+ * Ensures one stable durable session for an opaque deployment bootstrap identity.
+ * Both unique identities are locked before inspection so concurrent bootstrap
+ * processes either replay the exact mapping or fail with one bounded code.
+ */
+export async function ensureBootstrapSession(
+  database: DatabasePool,
+  input: { readonly identityKey: string; readonly sessionId: string },
+): Promise<BootstrapSessionResult> {
+  const client = await database.pool.connect();
+  try {
+    await client.query("BEGIN");
+    await acquireTransactionAdvisoryLock(client, "session-bootstrap-identity", input.identityKey);
+    await acquireTransactionAdvisoryLock(client, "session-bootstrap-session", input.sessionId);
+    const mappings = await client.query<{
+      readonly identityKey: string;
+      readonly sessionId: string;
+    }>(
+      `
+        SELECT identity_key AS "identityKey", session_id AS "sessionId"
+        FROM session_bootstrap_identities
+        WHERE identity_key = $1 OR session_id = $2
+        FOR UPDATE
+      `,
+      [input.identityKey, input.sessionId],
+    );
+    const exact = mappings.rows.find(
+      (row) => row.identityKey === input.identityKey && row.sessionId === input.sessionId,
+    );
+    if (exact) {
+      const session = await readSessionWithClient(client, input.sessionId);
+      await client.query("COMMIT");
+      return { created: false, identityKey: input.identityKey, session };
+    }
+    if (mappings.rows.length > 0) {
+      throw new SessionBootstrapIdentityConflictError();
+    }
+    const session = await createSessionWithClient(client, input.sessionId);
+    await client.query(
+      `INSERT INTO session_bootstrap_identities (identity_key, session_id) VALUES ($1, $2)`,
+      [input.identityKey, input.sessionId],
+    );
+    await client.query("COMMIT");
+    return {
+      created: session.created,
+      identityKey: input.identityKey,
+      session: session.session,
+    };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    if (
+      isPgUniqueViolation(error, "session_bootstrap_identities_pkey") ||
+      isPgUniqueViolation(error, "session_bootstrap_identities_session_id_unique")
+    ) {
+      throw new SessionBootstrapIdentityConflictError();
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
  * Permanently deletes one durable session and all session-owned rows, with the
  * eligibility re-check fenced inside the delete transaction.
  *
@@ -1690,6 +1831,23 @@ export async function deleteSession(
     if (!sessionRows.rows[0]) {
       await client.query("ROLLBACK");
       return { status: "not_found" };
+    }
+    const bootstrapIdentityRows = await client.query<{ readonly identityKey: string }>(
+      `
+        SELECT identity_key AS "identityKey"
+        FROM session_bootstrap_identities
+        WHERE session_id = $1
+        FOR UPDATE
+      `,
+      [sessionId],
+    );
+    if (bootstrapIdentityRows.rows[0]) {
+      await client.query("ROLLBACK");
+      return {
+        detail: "session has a durable bootstrap identity",
+        reason: "protected",
+        status: "refused",
+      };
     }
     // D-009 lock order: lease rows first, ordered per participant the same way
     // the control-lease transactions order their current-row scans.
@@ -1753,11 +1911,19 @@ export async function deleteSession(
     }
     if (projection.activity === "running" || projection.activity === "queued") {
       await client.query("ROLLBACK");
-      return { detail: "a turn is active on this session", reason: "protected", status: "refused" };
+      return {
+        detail: "a turn is active on this session",
+        reason: "protected",
+        status: "refused",
+      };
     }
     if (options.hasLiveHost?.() === true) {
       await client.query("ROLLBACK");
-      return { detail: "a host is live on this session", reason: "protected", status: "refused" };
+      return {
+        detail: "a host is live on this session",
+        reason: "protected",
+        status: "refused",
+      };
     }
     const rawNextSeq = seqRows.rows[0]?.seq;
     const nextSeq =
@@ -1935,15 +2101,15 @@ export async function expireTaskClaims(
           tasks.failure,
           tasks.input,
           tasks.kind,
-          tasks.mailbox_account_id AS "mailboxAccountId",
-          tasks.mailbox_provider AS "mailboxProvider",
           tasks.objective,
           expired.previous_claimed_by AS "previousClaimedBy",
           tasks.released_at AS "releasedAt",
           tasks.released_by AS "releasedBy",
           tasks.result,
           tasks.schedule_algorithm_version AS "scheduleAlgorithmVersion",
+          tasks.schedule_identity_version AS "scheduleIdentityVersion",
           tasks.schedule_interval_ms AS "scheduleIntervalMs",
+          tasks.schedule_scope_key AS "scheduleScopeKey",
           tasks.schedule_window_start AS "scheduleWindowStart",
           tasks.session_id AS "sessionId",
           tasks.task_id AS "taskId"
@@ -2342,12 +2508,34 @@ export async function heartbeatParticipantWithEvent(
 export async function listParticipants(
   database: DatabasePool,
   sessionId: string,
+  options: {
+    readonly before?: Pick<ParticipantRecord, "lastSeenAt" | "participantId"> | undefined;
+    readonly limit?: number | undefined;
+  } = {},
 ): Promise<ParticipantRecord[]> {
-  const rows = await database.db
+  const beforeDate = options.before === undefined ? null : new Date(options.before.lastSeenAt);
+  const query = database.db
     .select()
     .from(participants)
-    .where(eq(participants.sessionId, sessionId))
+    .where(
+      and(
+        eq(participants.sessionId, sessionId),
+        beforeDate === null
+          ? undefined
+          : or(
+              lt(participants.lastSeenAt, beforeDate),
+              and(
+                eq(participants.lastSeenAt, beforeDate),
+                gt(participants.participantId, options.before?.participantId ?? ""),
+              ),
+            ),
+      ),
+    )
     .orderBy(desc(participants.lastSeenAt), participants.participantId);
+  const rows =
+    options.limit === undefined || options.limit <= 0
+      ? await query
+      : await query.limit(options.limit);
   return rows.map(toParticipantRecord);
 }
 
@@ -2497,6 +2685,148 @@ export async function createTaskWithEvent(
   });
 }
 
+/** Browser operator authority carried into one transaction-owning command admission. */
+export interface OperatorCommandTaskAuthority {
+  readonly grantJti: string;
+  readonly request: OperatorCommandRequest & {
+    readonly sessionId: string;
+  };
+}
+
+/** Stable operator command admission failures rendered by the dedicated browser route. */
+export class OperatorCommandAdmissionError extends Error {
+  readonly name = "OperatorCommandAdmissionError";
+
+  constructor(
+    readonly reason:
+      | OperatorGrantAuthorityErrorReason
+      | "operator_command_queue_full"
+      | "operator_command_rate_limited",
+  ) {
+    super(reason);
+  }
+}
+
+const maximumPendingOperatorCommands = 100;
+const maximumOperatorCommandsPerGrantPerMinute = 20;
+
+/** Atomically revalidates browser authority, coalesces duplicates, and creates one command task. */
+export async function createOperatorCommandTaskWithEvent(
+  database: DatabasePool,
+  input: {
+    readonly authority: OperatorCommandTaskAuthority;
+    readonly eventSourceId: string;
+    readonly taskId: string;
+  },
+): Promise<PersistedTaskCreateResult> {
+  const client = await database.pool.connect();
+  try {
+    await client.query("BEGIN");
+    let operatorSubject: string;
+    try {
+      operatorSubject = await assertOperatorGrantAuthorityWithClient(client, {
+        grantJti: input.authority.grantJti,
+        request: {
+          command: input.authority.request.command,
+          permission: operatorCommandPermission(input.authority.request.command),
+          scopeKey: input.authority.request.scopeKey,
+          sessionId: input.authority.request.sessionId,
+        },
+        sessionId: input.authority.request.sessionId,
+      });
+    } catch (error) {
+      if (error instanceof OperatorGrantAuthorityError) {
+        throw new OperatorCommandAdmissionError(error.reason);
+      }
+      throw error;
+    }
+    await acquireTransactionAdvisoryLock(client, "operator-command-admission", "global");
+    const commandKey = createHash("sha256")
+      .update(
+        JSON.stringify({
+          command: input.authority.request.command,
+          grantJti: input.authority.grantJti,
+          scopeKey: input.authority.request.scopeKey,
+          targetId: input.authority.request.targetId ?? null,
+        }),
+      )
+      .digest("hex");
+    const existing = await client.query<PgTaskRow>(
+      `SELECT ${taskReturningColumns}
+       FROM tasks
+       WHERE session_id = $1
+         AND operator_command_key = $2
+         AND cancelled_at IS NULL
+         AND completed_at IS NULL
+         AND failed_at IS NULL
+       ORDER BY created_at, task_id
+       LIMIT 1
+       FOR UPDATE`,
+      [input.authority.request.sessionId, commandKey],
+    );
+    if (existing.rows[0] !== undefined) {
+      await client.query("COMMIT");
+      return {
+        events: [],
+        status: "replayed",
+        task: toTaskRecord(existing.rows[0]),
+      };
+    }
+    const grantRate = await client.query<{ readonly count: number }>(
+      `SELECT count(*)::int AS count
+       FROM tasks
+       WHERE operator_grant_jti = $1
+         AND created_at >= transaction_timestamp() - interval '1 minute'`,
+      [input.authority.grantJti],
+    );
+    if ((grantRate.rows[0]?.count ?? 0) >= maximumOperatorCommandsPerGrantPerMinute) {
+      throw new OperatorCommandAdmissionError("operator_command_rate_limited");
+    }
+    const pending = await client.query<{ readonly count: number }>(
+      `SELECT count(*)::int AS count
+       FROM tasks
+       WHERE operator_command_key IS NOT NULL
+         AND cancelled_at IS NULL
+         AND completed_at IS NULL
+         AND failed_at IS NULL`,
+    );
+    if ((pending.rows[0]?.count ?? 0) >= maximumPendingOperatorCommands) {
+      throw new OperatorCommandAdmissionError("operator_command_queue_full");
+    }
+    const task = await insertTaskWithClient(client, {
+      input: {
+        command: input.authority.request.command,
+        operatorGrantJti: input.authority.grantJti,
+        requestedBy: operatorSubject,
+        scopeKey: input.authority.request.scopeKey,
+        ...(input.authority.request.targetId === undefined
+          ? {}
+          : { targetId: input.authority.request.targetId }),
+      },
+      kind: `operator.${input.authority.request.command}`,
+      objective: `Process operator command ${input.authority.request.command}`,
+      operatorCommand: { commandKey, grantJti: input.authority.grantJti },
+      sessionId: input.authority.request.sessionId,
+      taskId: input.taskId,
+    });
+    const event = await appendEventWithClient(
+      client,
+      buildTaskCreatedEventInput({
+        sessionId: input.authority.request.sessionId,
+        task,
+      }),
+      input.eventSourceId,
+    );
+    await client.query("COMMIT");
+    return { event, events: [event], status: "created", task };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 /**
  * Creates a task and its canonical event on an existing transaction client.
  * The caller owns commit and rollback so adjacent durable state can be atomic.
@@ -2615,12 +2945,32 @@ export async function listTasks(
   database: DatabasePool,
   sessionId: string,
   status: TaskListStatus = "active",
+  options: {
+    readonly before?: Pick<TaskRecord, "createdAt" | "taskId"> | undefined;
+    readonly limit?: number | undefined;
+  } = {},
 ): Promise<TaskRecord[]> {
-  const rows = await database.db
+  const beforeDate = options.before === undefined ? null : new Date(options.before.createdAt);
+  const query = database.db
     .select()
     .from(tasks)
-    .where(and(eq(tasks.sessionId, sessionId), taskListStatusWhere(status)))
+    .where(
+      and(
+        eq(tasks.sessionId, sessionId),
+        taskListStatusWhere(status),
+        beforeDate === null
+          ? undefined
+          : or(
+              lt(tasks.createdAt, beforeDate),
+              and(eq(tasks.createdAt, beforeDate), gt(tasks.taskId, options.before?.taskId ?? "")),
+            ),
+      ),
+    )
     .orderBy(desc(tasks.createdAt), tasks.taskId);
+  const rows =
+    options.limit === undefined || options.limit <= 0
+      ? await query
+      : await query.limit(options.limit);
   return rows.map(toTaskRecord);
 }
 
@@ -2719,13 +3069,15 @@ export async function recordTaskApproval(
     readonly controlGuard?: ControlEpochGuard | undefined;
     readonly decision: ApprovalDecision;
     readonly eventSourceId: string;
+    readonly operatorGrantJti?: string | undefined;
     readonly participantId: string;
     readonly reason: Record<string, unknown>;
     readonly sessionId: string;
+    readonly target?: ApprovalTarget | undefined;
     readonly taskId: string;
   },
 ): Promise<PersistedTaskApprovalResult | null> {
-  const targetKey = approvalTargetKey(input.reason);
+  const targetKey = approvalTargetKey(input.reason, input.target);
   const client = await database.pool.connect();
   try {
     await client.query("BEGIN");
@@ -2737,13 +3089,24 @@ export async function recordTaskApproval(
       await client.query("COMMIT");
       return null;
     }
-    const eventInput = buildTaskApprovalRecordedEventInput({
-      decision: input.decision,
-      participantId: input.participantId,
-      reason: input.reason,
-      sessionId: input.sessionId,
-      task,
-    });
+    if (input.operatorGrantJti !== undefined) {
+      if (input.target === undefined) {
+        throw new OperatorGrantAuthorityError("operator_target_required");
+      }
+      await assertOperatorGrantAuthorityWithClient(client, {
+        grantJti: input.operatorGrantJti,
+        request: {
+          action: input.target.action,
+          permission: "approval.submit",
+          scopeKey: input.target.scopeKey,
+          sessionId: input.sessionId,
+          targetKind: input.target.targetKind,
+        },
+        sessionId: input.sessionId,
+      });
+    }
+    assertApprovalTargetManifest(task, input.target);
+    const approvalEventId = newEventId();
     const insertedRows = await client.query<PgTaskApprovalRow>(
       `
         INSERT INTO task_approvals (
@@ -2760,7 +3123,7 @@ export async function recordTaskApproval(
         RETURNING ${taskApprovalReturningColumns}
       `,
       [
-        eventInput.eventId,
+        approvalEventId,
         input.participantId,
         input.decision,
         JSON.stringify(input.reason),
@@ -2789,9 +3152,23 @@ export async function recordTaskApproval(
         targetKey,
       };
     }
-    const event = await appendEventWithClient(client, eventInput, input.eventSourceId);
+    const approval = toTaskApprovalRecord(insertedRows.rows[0]);
+    const event = await appendEventWithClient(
+      client,
+      buildTaskApprovalRecordedEventInput({
+        approval,
+        decision: input.decision,
+        eventId: approvalEventId,
+        participantId: input.participantId,
+        reason: input.reason,
+        sessionId: input.sessionId,
+        task,
+      }),
+      input.eventSourceId,
+    );
     await client.query("COMMIT");
     return {
+      approval,
       decision: input.decision,
       event,
       events: [event] as const,
@@ -2805,6 +3182,115 @@ export async function recordTaskApproval(
   } finally {
     client.release();
   }
+}
+
+interface OperatorGrantAuthorityRow {
+  readonly expired: boolean;
+  readonly revoked: boolean;
+  readonly role: string;
+  readonly scope: OperatorGrantScope;
+  readonly sessionScope: string;
+  readonly subject: string;
+}
+
+/** Revalidates the browser grant under the same transaction lock as approval commit. */
+async function assertOperatorGrantAuthorityWithClient(
+  client: pg.PoolClient,
+  input: {
+    readonly grantJti: string;
+    readonly request: OperatorAuthorityRequest;
+    readonly sessionId: string;
+  },
+): Promise<string> {
+  const result = await client.query<OperatorGrantAuthorityRow>(
+    `SELECT
+      auth_grants.expires_at <= transaction_timestamp() AS expired,
+      auth_grants.revoked_at IS NOT NULL AS revoked,
+      auth_grants.role,
+      operator_grant_scopes.scope,
+      auth_grants.session_scope AS "sessionScope",
+      auth_grants.subject
+    FROM auth_grants
+    JOIN operator_grant_scopes ON operator_grant_scopes.grant_jti = auth_grants.jti
+    WHERE auth_grants.jti = $1
+    FOR SHARE OF auth_grants`,
+    [input.grantJti],
+  );
+  const row = result.rows[0];
+  if (row === undefined || row.role !== "observer") {
+    throw new OperatorGrantAuthorityError("operator_grant_denied");
+  }
+  if (row.revoked) throw new OperatorGrantAuthorityError("operator_grant_revoked");
+  if (row.expired) throw new OperatorGrantAuthorityError("operator_grant_expired");
+  const scope = operatorGrantScopeSchema.safeParse(row.scope);
+  if (!scope.success || row.sessionScope !== input.sessionId) {
+    throw new OperatorGrantAuthorityError("operator_session_denied");
+  }
+  const denial = authorizeOperator(scope.data, input.request);
+  if (denial !== null) throw new OperatorGrantAuthorityError(denial);
+  return row.subject;
+}
+
+/** Verifies one submitted target against the completed result inside the commit transaction. */
+function assertApprovalTargetManifest(task: TaskRecord, target: ApprovalTarget | undefined): void {
+  if (target === undefined) {
+    if (task.result !== null && "targetManifest" in task.result) {
+      const manifest = targetManifestSchema.safeParse(task.result.targetManifest);
+      if (!manifest.success || manifest.data.length > 0) {
+        throw new ApprovalTargetManifestError("target_required");
+      }
+    }
+    return;
+  }
+  if (task.completedAt === null) {
+    throw new ApprovalTargetManifestError("task_not_completed");
+  }
+  const manifest = targetManifestSchema.safeParse(task.result?.targetManifest);
+  if (!manifest.success) {
+    throw new ApprovalTargetManifestError("target_absent");
+  }
+  let deepestMatch = 0;
+  for (const entry of manifest.data) {
+    if (entry.targetId !== target.targetId) {
+      continue;
+    }
+    deepestMatch = Math.max(deepestMatch, 1);
+    if (entry.targetKind !== target.targetKind) {
+      continue;
+    }
+    deepestMatch = Math.max(deepestMatch, 2);
+    if (entry.scopeKey !== target.scopeKey) {
+      continue;
+    }
+    deepestMatch = Math.max(deepestMatch, 3);
+    if (entry.targetRevision !== target.targetRevision) {
+      continue;
+    }
+    deepestMatch = Math.max(deepestMatch, 4);
+    if (entry.action !== target.action) {
+      continue;
+    }
+    deepestMatch = Math.max(deepestMatch, 5);
+    if (entry.digest === target.digest) {
+      return;
+    }
+  }
+  if (deepestMatch === 0) {
+    throw new ApprovalTargetManifestError("target_absent");
+  }
+  if (deepestMatch === 1) {
+    throw new ApprovalTargetManifestError("target_kind_mismatch");
+  }
+  if (deepestMatch === 2) {
+    throw new ApprovalTargetManifestError("scope_mismatch");
+  }
+  if (deepestMatch === 3) {
+    throw new ApprovalTargetManifestError("target_revision_mismatch");
+  }
+  if (deepestMatch === 4) {
+    throw new ApprovalTargetManifestError("action_mismatch");
+  }
+  throw new ApprovalTargetManifestError("digest_mismatch");
 }
 
 /**
@@ -3112,13 +3598,13 @@ export interface SupersedeScheduledRunsInput {
   readonly candidateTaskIds?: readonly string[] | undefined;
   readonly eventSourceId: string;
   readonly kind: string;
-  readonly mailboxAccountId: string;
-  readonly mailboxProvider: string;
   /** Actor recorded on each supersession cancellation event. */
   readonly participantId: string;
   readonly reason?: Record<string, unknown> | undefined;
   readonly scheduleAlgorithmVersion: number;
+  readonly scheduleIdentityVersion: number;
   readonly scheduleIntervalMs: number;
+  readonly scheduleScopeKey: string;
   /** Start of the current window; only strictly older runs are superseded. */
   readonly scheduleWindowStart: number;
   readonly sessionId: string;
@@ -3136,8 +3622,8 @@ export interface SupersededScheduledRunsResult {
  * This is the single service-owned mutation the RFC's `pending(old) -> cancelled`
  * transition requires. A list-then-generic-cancel sequence is forbidden because
  * it races a worker claim: the predicate below is the atomic fence. It cancels
- * only rows that match the exact schedule identity (session, kind, Mailbox
- * Scope, algorithm version, interval), carry a strictly older Schedule Window,
+ * only rows that match the exact schedule identity (session, kind, identity
+ * version, opaque scope key, algorithm version, interval), carry a strictly older Schedule Window,
  * and are still unclaimed and nonterminal. A claim that lands before this
  * transaction sets `claimed_by`, so the row no longer matches and cannot be
  * cancelled; manual tasks (null schedule columns), terminal tasks, and tasks
@@ -3164,8 +3650,8 @@ export async function supersedeScheduledRunsWithEvent(
     const params: unknown[] = [
       input.sessionId,
       input.kind,
-      input.mailboxProvider,
-      input.mailboxAccountId,
+      input.scheduleIdentityVersion,
+      input.scheduleScopeKey,
       input.scheduleAlgorithmVersion,
       input.scheduleIntervalMs,
       input.scheduleWindowStart,
@@ -3181,8 +3667,8 @@ export async function supersedeScheduledRunsWithEvent(
           claim_expires_at = NULL
         WHERE session_id = $1
           AND kind = $2
-          AND mailbox_provider = $3
-          AND mailbox_account_id = $4
+          AND schedule_identity_version = $3
+          AND schedule_scope_key = $4
           AND schedule_algorithm_version = $5
           AND schedule_interval_ms = $6
           AND schedule_window_start IS NOT NULL
@@ -3276,14 +3762,14 @@ export interface EnsureScheduledRunInput {
   readonly expectedTaskId?: string | undefined;
   readonly input?: Record<string, unknown> | null;
   readonly kind: string;
-  readonly mailboxAccountId: string;
-  readonly mailboxProvider: string;
   readonly objective: string;
   /** Actor recorded on each supersession cancellation event. */
   readonly participantId: string;
   readonly reason?: Record<string, unknown> | undefined;
   readonly scheduleAlgorithmVersion: number;
+  readonly scheduleIdentityVersion: number;
   readonly scheduleIntervalMs: number;
+  readonly scheduleScopeKey: string;
   /** Start of the current window; only strictly older runs are superseded. */
   readonly scheduleWindowStart: number;
   readonly sessionId: string;
@@ -3316,19 +3802,19 @@ export interface EnsureScheduledRunResult {
  */
 function scheduleIdentityLockKey(input: {
   readonly kind: string;
-  readonly mailboxAccountId: string;
-  readonly mailboxProvider: string;
   readonly scheduleAlgorithmVersion: number;
+  readonly scheduleIdentityVersion: number;
   readonly scheduleIntervalMs: number;
+  readonly scheduleScopeKey: string;
   readonly sessionId: string;
 }): string {
   return JSON.stringify([
     "scheduled_run",
+    input.scheduleIdentityVersion,
     input.scheduleAlgorithmVersion,
     input.sessionId,
     input.kind,
-    input.mailboxProvider,
-    input.mailboxAccountId,
+    input.scheduleScopeKey,
     input.scheduleIntervalMs,
   ]);
 }
@@ -3343,10 +3829,10 @@ async function readNewerScheduledRunWithClient(
   client: TransactionClient,
   input: {
     readonly kind: string;
-    readonly mailboxAccountId: string;
-    readonly mailboxProvider: string;
     readonly scheduleAlgorithmVersion: number;
+    readonly scheduleIdentityVersion: number;
     readonly scheduleIntervalMs: number;
+    readonly scheduleScopeKey: string;
     readonly scheduleWindowStart: number;
     readonly sessionId: string;
   },
@@ -3357,8 +3843,8 @@ async function readNewerScheduledRunWithClient(
       FROM tasks
       WHERE session_id = $1
         AND kind = $2
-        AND mailbox_provider = $3
-        AND mailbox_account_id = $4
+        AND schedule_identity_version = $3
+        AND schedule_scope_key = $4
         AND schedule_algorithm_version = $5
         AND schedule_interval_ms = $6
         AND schedule_window_start IS NOT NULL
@@ -3370,8 +3856,8 @@ async function readNewerScheduledRunWithClient(
     [
       input.sessionId,
       input.kind,
-      input.mailboxProvider,
-      input.mailboxAccountId,
+      input.scheduleIdentityVersion,
+      input.scheduleScopeKey,
       input.scheduleAlgorithmVersion,
       input.scheduleIntervalMs,
       input.scheduleWindowStart,
@@ -3405,17 +3891,15 @@ export async function ensureScheduledRunWithEvents(
   input: EnsureScheduledRunInput,
 ): Promise<EnsureScheduledRunResult> {
   const identity: ScheduledMaintenanceIdentity = {
+    identityVersion: input.scheduleIdentityVersion,
     kind: input.kind,
-    mailboxScope: {
-      accountId: input.mailboxAccountId,
-      provider: input.mailboxProvider,
-    },
     scheduleWindow: {
       algorithmVersion: input.scheduleAlgorithmVersion,
       endMs: input.scheduleWindowStart + input.scheduleIntervalMs,
       intervalMs: input.scheduleIntervalMs,
       startMs: input.scheduleWindowStart,
     },
+    scopeKey: input.scheduleScopeKey,
     sessionId: input.sessionId,
   };
   const taskId = deriveScheduledTaskId(identity);
@@ -3448,8 +3932,8 @@ export async function ensureScheduledRunWithEvents(
           claim_expires_at = NULL
         WHERE session_id = $1
           AND kind = $2
-          AND mailbox_provider = $3
-          AND mailbox_account_id = $4
+          AND schedule_identity_version = $3
+          AND schedule_scope_key = $4
           AND schedule_algorithm_version = $5
           AND schedule_interval_ms = $6
           AND schedule_window_start IS NOT NULL
@@ -3463,8 +3947,8 @@ export async function ensureScheduledRunWithEvents(
       [
         input.sessionId,
         input.kind,
-        input.mailboxProvider,
-        input.mailboxAccountId,
+        input.scheduleIdentityVersion,
+        input.scheduleScopeKey,
         input.scheduleAlgorithmVersion,
         input.scheduleIntervalMs,
         input.scheduleWindowStart,
@@ -3503,10 +3987,10 @@ export async function ensureScheduledRunWithEvents(
       const conflictingFields = [
         ...(existing.kind === input.kind ? [] : ["kind"]),
         ...compareScheduleIdentity(existing.schedule ?? null, {
-          mailboxAccountId: input.mailboxAccountId,
-          mailboxProvider: input.mailboxProvider,
           scheduleAlgorithmVersion: input.scheduleAlgorithmVersion,
+          scheduleIdentityVersion: input.scheduleIdentityVersion,
           scheduleIntervalMs: input.scheduleIntervalMs,
+          scheduleScopeKey: input.scheduleScopeKey,
           scheduleWindowStart: input.scheduleWindowStart,
         }),
       ];
@@ -3533,10 +4017,10 @@ export async function ensureScheduledRunWithEvents(
           kind: input.kind,
           objective: input.objective,
           schedule: {
-            mailboxAccountId: input.mailboxAccountId,
-            mailboxProvider: input.mailboxProvider,
             scheduleAlgorithmVersion: input.scheduleAlgorithmVersion,
+            scheduleIdentityVersion: input.scheduleIdentityVersion,
             scheduleIntervalMs: input.scheduleIntervalMs,
+            scheduleScopeKey: input.scheduleScopeKey,
             scheduleWindowStart: input.scheduleWindowStart,
           },
           sessionId: input.sessionId,
@@ -3825,6 +4309,9 @@ async function insertTaskWithClient(
     readonly input?: Record<string, unknown> | null;
     readonly kind: string;
     readonly objective: string;
+    readonly operatorCommand?:
+      | { readonly commandKey: string; readonly grantJti: string }
+      | undefined;
     readonly schedule?: ScheduledTaskIdentityInput | undefined;
     readonly sessionId: string;
     readonly taskId: string;
@@ -3836,26 +4323,30 @@ async function insertTaskWithClient(
       INSERT INTO tasks (
         input,
         kind,
-        mailbox_account_id,
-        mailbox_provider,
         objective,
+        operator_command_key,
+        operator_grant_jti,
         schedule_algorithm_version,
+        schedule_identity_version,
         schedule_interval_ms,
+        schedule_scope_key,
         schedule_window_start,
         session_id,
         task_id
       )
-      VALUES ($1::jsonb, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      VALUES ($1::jsonb, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
       RETURNING ${taskReturningColumns}
     `,
     [
       input.input === undefined || input.input === null ? null : JSON.stringify(input.input),
       input.kind,
-      schedule?.mailboxAccountId ?? null,
-      schedule?.mailboxProvider ?? null,
       input.objective,
+      input.operatorCommand?.commandKey ?? null,
+      input.operatorCommand?.grantJti ?? null,
       schedule?.scheduleAlgorithmVersion ?? null,
+      schedule?.scheduleIdentityVersion ?? null,
       schedule?.scheduleIntervalMs ?? null,
+      schedule?.scheduleScopeKey ?? null,
       schedule?.scheduleWindowStart ?? null,
       input.sessionId,
       input.taskId,
@@ -3944,7 +4435,7 @@ function compareTaskCreateInput(
   return conflicts;
 }
 
-/** Compares the immutable schedule and Mailbox Scope identity of a replayed create. */
+/** Compares the immutable recurring-work identity of a replayed create. */
 function compareScheduleIdentity(
   existing: CandidateScheduleIdentity | null,
   input: ScheduledTaskIdentityInput | undefined,
@@ -3957,11 +4448,11 @@ function compareScheduleIdentity(
   if (existing === null || input === undefined) {
     return conflicts;
   }
-  if (existing.mailboxScope.provider !== input.mailboxProvider) {
-    conflicts.push("mailboxProvider");
+  if (existing.identityVersion !== input.scheduleIdentityVersion) {
+    conflicts.push("scheduleIdentityVersion");
   }
-  if (existing.mailboxScope.accountId !== input.mailboxAccountId) {
-    conflicts.push("mailboxAccountId");
+  if (existing.scopeKey !== input.scheduleScopeKey) {
+    conflicts.push("scheduleScopeKey");
   }
   if (existing.scheduleWindow.algorithmVersion !== input.scheduleAlgorithmVersion) {
     conflicts.push("scheduleAlgorithmVersion");
@@ -4026,7 +4517,10 @@ async function appendEventWithClient(
     // session-delete cascade, so a missing row here means the session was
     // permanently deleted after the existence check above. Surface the typed
     // missing-session failure instead of an opaque allocation error.
-    throw new SessionNotFoundError({ operation: "appendEvent", sessionId: input.sessionId });
+    throw new SessionNotFoundError({
+      operation: "appendEvent",
+      sessionId: input.sessionId,
+    });
   }
   const seq = parseEventSequence(rawSeq, input.sessionId);
   const eventRows = await client.query<PgSessionEventRow>(
@@ -4176,6 +4670,18 @@ async function requireSessionWithClient(
   if (rows.rows[0]?.exists !== true) {
     throw new SessionNotFoundError({ operation, sessionId });
   }
+}
+
+/** Reads one existing session through a caller-owned transaction. */
+async function readSessionWithClient(
+  client: TransactionClient,
+  sessionId: string,
+): Promise<SessionRecord> {
+  const rows = await client.query<Pick<PgSessionRow, "createdAt" | "sessionId">>(
+    `SELECT created_at AS "createdAt", session_id AS "sessionId" FROM sessions WHERE session_id = $1`,
+    [sessionId],
+  );
+  return toSessionRecord(rows.rows[0]);
 }
 
 /**
@@ -4414,19 +4920,19 @@ function toTaskRecord(row: DbTaskRow | ExpiredTaskClaimRow | PgTaskRow | undefin
 }
 
 /**
- * Builds the schedule and Mailbox Scope identity from durable task columns.
+ * Builds the provider-neutral schedule identity from durable task columns.
  * Returns null unless every schedule-identity column is present, so a manual
  * task or a partially populated legacy row is treated as unscheduled.
  */
 function toTaskScheduleIdentity(row: ScheduleIdentityColumns): CandidateScheduleIdentity | null {
-  const provider = row.mailboxProvider ?? null;
-  const accountId = row.mailboxAccountId ?? null;
+  const identityVersion = coerceNullableInteger(row.scheduleIdentityVersion);
+  const scopeKey = row.scheduleScopeKey ?? null;
   const startMs = coerceNullableInteger(row.scheduleWindowStart);
   const intervalMs = coerceNullableInteger(row.scheduleIntervalMs);
   const algorithmVersion = coerceNullableInteger(row.scheduleAlgorithmVersion);
   if (
-    provider === null ||
-    accountId === null ||
+    identityVersion === null ||
+    scopeKey === null ||
     startMs === null ||
     intervalMs === null ||
     algorithmVersion === null
@@ -4434,13 +4940,14 @@ function toTaskScheduleIdentity(row: ScheduleIdentityColumns): CandidateSchedule
     return null;
   }
   return {
-    mailboxScope: { accountId, provider },
+    identityVersion,
     scheduleWindow: {
       algorithmVersion,
       endMs: startMs + intervalMs,
       intervalMs,
       startMs,
     },
+    scopeKey,
   };
 }
 

@@ -9,6 +9,7 @@ import {
 } from "./grant-authority.js";
 import type { AuthGrantStore } from "./grant-stores.js";
 import type { AuthTicketStore } from "./grant-stores.js";
+import type { BrowserSessionRecord } from "./browser-pairing-stores.js";
 import {
   AuthTicketAuthorityError,
   createAuthTicketAuthority,
@@ -48,6 +49,10 @@ export interface AuthRuntimeOptions {
    * the default rejects them; enable only while rotating a fleet onto tgr2.
    */
   readonly allowLegacyTokens?: boolean;
+  /** Browser-session reader used to keep operator grants off generic bearer routes. */
+  readonly browserSessionStore?: {
+    readonly findBrowserSession: (grantJti: string) => Promise<BrowserSessionRecord | null>;
+  };
   /** Durable grant issuer used by lifecycle operations, when configured. */
   readonly issuer?: string | null;
   /** PostgreSQL grant reader required for tgr2 acceptance. */
@@ -72,6 +77,8 @@ export interface AuthRuntimeLogger {
 }
 
 export interface AuthRuntime {
+  /** Authenticates one dedicated browser-session cookie token outside generic REST routing. */
+  readonly authenticateBrowserSessionToken: (token: string) => Promise<AuthContext>;
   /** Stops auth-owned background diagnostics. */
   readonly close: () => void;
   /** Returns auth diagnostics without exposing secrets. */
@@ -109,11 +116,27 @@ export function createAuthRuntime(options: AuthRuntimeOptions): AuthRuntime {
   const ticketAuthority = createConfiguredTicketAuthority(options, authority);
   const allowLegacyTokens = options.allowLegacyTokens ?? false;
   return {
+    authenticateBrowserSessionToken: async (token) => {
+      if (options.mode === "disabled") {
+        throw new Error(AuthError.ClaimInvalid);
+      }
+      return authenticateBearerToken({
+        allowLegacyTokens: false,
+        authority,
+        logger,
+        method: "COOKIE",
+        now: options.now,
+        route: "/operator",
+        secrets: options.secrets,
+        token,
+        type: "browser-cookie",
+      });
+    },
     authenticateHttpRequest: async (request, url) => {
       if (options.mode === "disabled") {
         return null;
       }
-      return authenticateBearerToken({
+      const authentication = {
         allowLegacyTokens,
         authority,
         method: request.method,
@@ -123,7 +146,10 @@ export function createAuthRuntime(options: AuthRuntimeOptions): AuthRuntime {
         type: "http",
         logger,
         secrets: options.secrets,
-      });
+      } as const;
+      const context = await authenticateBearerToken(authentication);
+      rejectBrowserGrantOnGenericBoundary(authentication, context);
+      return context;
     },
     authenticateWebSocketUpgrade: async (request, url) => {
       if (options.mode === "disabled") {
@@ -153,13 +179,22 @@ export function createAuthRuntime(options: AuthRuntimeOptions): AuthRuntime {
         throw new Error(AuthError.ClaimInvalid);
       }
       if (ticket !== null) {
-        return authenticateWebSocketTicket({
+        const authenticated = await authenticateWebSocketTicket({
           logger,
           method: request.method,
           route,
           ticket,
           ticketAuthority,
         });
+        await authorizeBrowserTicketOrigin({
+          authenticated,
+          browserSessionStore: options.browserSessionStore,
+          logger,
+          method: request.method,
+          origin: request.headers.origin,
+          route,
+        });
+        return authenticated;
       }
       const token = headerToken ?? queryToken;
       const context = await authenticateBearerToken({
@@ -173,6 +208,20 @@ export function createAuthRuntime(options: AuthRuntimeOptions): AuthRuntime {
         logger,
         secrets: options.secrets,
       });
+      rejectBrowserGrantOnGenericBoundary(
+        {
+          allowLegacyTokens,
+          authority,
+          logger,
+          method: request.method,
+          now: options.now,
+          route,
+          secrets: options.secrets,
+          token,
+          type: "ws",
+        },
+        context,
+      );
       return {
         authorizeCommand: async () => {
           await authenticateBearerToken({
@@ -255,11 +304,22 @@ interface AuthenticateBearerTokenInput {
   readonly route: string;
   readonly secrets: AuthSigningSecrets;
   readonly token: string | null;
-  readonly type: "http" | "ws" | "ws-command";
+  readonly type: "browser-cookie" | "http" | "ws" | "ws-command";
 }
 
 interface DisabledWarning {
   readonly stop: () => void;
+}
+
+/** Rejects durable browser grants before they can enter generic REST or bearer WebSocket routes. */
+function rejectBrowserGrantOnGenericBoundary(
+  authentication: AuthenticateBearerTokenInput,
+  context: AuthContext,
+): void {
+  if (context.grantSource === "browser") {
+    logAuthReject(authentication, AuthError.RoleDenied);
+    throw new Error(AuthError.RoleDenied);
+  }
 }
 
 /** Verifies one bearer-style token and logs redacted rejection context. */
@@ -314,6 +374,52 @@ function createConfiguredTicketAuthority(
         store: options.ticketStore,
       })
     : null;
+}
+
+/** Applies exact WebSocket Origin only when the ticket belongs to a browser grant. */
+async function authorizeBrowserTicketOrigin(input: {
+  readonly authenticated: AuthenticatedWebSocketAuth;
+  readonly browserSessionStore: AuthRuntimeOptions["browserSessionStore"];
+  readonly logger: AuthRuntimeLogger;
+  readonly method: string | undefined;
+  readonly origin: string | undefined;
+  readonly route: string;
+}): Promise<void> {
+  const grantJti = input.authenticated.context?.grantJti;
+  if (input.authenticated.context?.grantSource !== "browser") return;
+  if (grantJti === null || grantJti === undefined || input.browserSessionStore === undefined) {
+    throw new Error(AuthError.StoreUnavailable);
+  }
+  let session: BrowserSessionRecord | null;
+  try {
+    session = await input.browserSessionStore.findBrowserSession(grantJti);
+  } catch {
+    input.logger.warn("auth.reject", {
+      method: input.method ?? null,
+      reason: AuthError.StoreUnavailable,
+      route: input.route,
+      transport: "ws",
+    });
+    throw new Error(AuthError.StoreUnavailable);
+  }
+  if (session === null) {
+    input.logger.warn("auth.reject", {
+      method: input.method ?? null,
+      reason: AuthError.RoleDenied,
+      route: input.route,
+      transport: "ws",
+    });
+    throw new Error(AuthError.RoleDenied);
+  }
+  if (input.origin !== session.origin) {
+    input.logger.warn("auth.reject", {
+      method: input.method ?? null,
+      reason: AuthError.OriginDenied,
+      route: input.route,
+      transport: "ws",
+    });
+    throw new Error(AuthError.OriginDenied);
+  }
 }
 
 async function authenticateWebSocketTicket(input: {

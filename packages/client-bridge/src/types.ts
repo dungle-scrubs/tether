@@ -1,8 +1,9 @@
 import type {
-  MailboxScope,
+  ApprovalTarget,
   ScheduleWindow,
   SessionEvent as ProtocolSessionEvent,
   TaskListStatus as ProtocolTaskListStatus,
+  TaskApprovalRecord,
   TaskRecord as ProtocolTaskRecord,
 } from "@dungle-scrubs/tether-protocol";
 import type {
@@ -142,7 +143,7 @@ export interface ClientBridgeCreateTaskInput {
 
 /**
  * Input for ensuring one deterministic scheduled maintenance run. The bridge
- * supplies the current Schedule Window and Mailbox Scope; the client derives the
+ * supplies the current Schedule Window and opaque scope key; the client derives the
  * stable task id and drives the existing task-creation idempotency seam so a
  * repeated tick returns the existing run rather than racing a read-then-create.
  */
@@ -151,12 +152,12 @@ export interface ClientBridgeCreateScheduledTaskInput {
   readonly input?: Record<string, unknown> | null;
   /** Task kind used by participant runtimes to decide claimability. */
   readonly kind: string;
-  /** Mailbox Scope the scheduled run is restricted to. */
-  readonly mailboxScope: MailboxScope;
   /** User-visible task objective. */
   readonly objective: string;
   /** Current deterministic Schedule Window the run belongs to. */
   readonly scheduleWindow: ScheduleWindow;
+  /** Opaque participant-owned recurring-work scope key. */
+  readonly scopeKey: string;
 }
 
 /** Input for cancelling one Tether task from an external client bridge. */
@@ -173,12 +174,16 @@ export interface ClientBridgeRecordTaskApprovalInput {
   readonly decision: "approved" | "rejected";
   /** Optional bridge-specific approval context. */
   readonly reason?: Record<string, unknown>;
+  /** Opaque target that must exactly match the completed task manifest. */
+  readonly target?: ApprovalTarget;
   /** Durable task id to approve or reject. */
   readonly taskId: string;
 }
 
 /** Result returned after recording new approval intent. */
 export interface ClientBridgeTaskApprovalRecorded {
+  /** Canonical first-committer-wins approval row. */
+  readonly approval: TaskApprovalRecord;
   /** Approval decision recorded by Tether. */
   readonly decision: "approved" | "rejected";
   /** Durable approval event returned by Tether. */
@@ -193,6 +198,8 @@ export interface ClientBridgeTaskApprovalRecorded {
 
 /** Result returned when approval intent already exists. */
 export interface ClientBridgeTaskApprovalIgnored {
+  /** Canonical first-committer-wins approval row. */
+  readonly approval: TaskApprovalRecord;
   /** Approval decision requested by the bridge. */
   readonly decision: "approved" | "rejected";
   /** Existing durable decision for this task. */

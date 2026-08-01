@@ -14,22 +14,23 @@ interface CapturedQuery {
 }
 
 const schedule = {
-  mailboxAccountId: "acct_1",
-  mailboxProvider: "fastmail",
   scheduleAlgorithmVersion: 1,
+  scheduleIdentityVersion: 2,
   scheduleIntervalMs: 3_600_000,
+  scheduleScopeKey: "scope_1",
   scheduleWindowStart: 1_700_000_000_000,
 } as const;
 
 const derivedTaskId = deriveScheduledTaskId({
+  identityVersion: schedule.scheduleIdentityVersion,
   kind: "email_organization",
-  mailboxScope: { accountId: schedule.mailboxAccountId, provider: schedule.mailboxProvider },
   scheduleWindow: {
     algorithmVersion: schedule.scheduleAlgorithmVersion,
     endMs: schedule.scheduleWindowStart + schedule.scheduleIntervalMs,
     intervalMs: schedule.scheduleIntervalMs,
     startMs: schedule.scheduleWindowStart,
   },
+  scopeKey: schedule.scheduleScopeKey,
   sessionId: "sess_sched",
 });
 
@@ -37,12 +38,12 @@ const ensureInput = {
   eventSourceId: "src_test",
   input: null,
   kind: "email_organization",
-  mailboxAccountId: schedule.mailboxAccountId,
-  mailboxProvider: schedule.mailboxProvider,
   objective: "Organize the mailbox",
   participantId: "system",
   scheduleAlgorithmVersion: schedule.scheduleAlgorithmVersion,
+  scheduleIdentityVersion: schedule.scheduleIdentityVersion,
   scheduleIntervalMs: schedule.scheduleIntervalMs,
+  scheduleScopeKey: schedule.scheduleScopeKey,
   scheduleWindowStart: schedule.scheduleWindowStart,
   sessionId: "sess_sched",
 } as const;
@@ -63,14 +64,14 @@ function taskDbRow(overrides: Record<string, unknown> = {}) {
     failure: null,
     input: null,
     kind: "email_organization",
-    mailboxAccountId: schedule.mailboxAccountId,
-    mailboxProvider: schedule.mailboxProvider,
     objective: "Organize the mailbox",
     releasedAt: null,
     releasedBy: null,
     result: null,
     scheduleAlgorithmVersion: schedule.scheduleAlgorithmVersion,
+    scheduleIdentityVersion: schedule.scheduleIdentityVersion,
     scheduleIntervalMs: schedule.scheduleIntervalMs,
+    scheduleScopeKey: schedule.scheduleScopeKey,
     scheduleWindowStart: schedule.scheduleWindowStart,
     sessionId: "sess_sched",
     taskId: derivedTaskId,
@@ -131,10 +132,10 @@ describe("ensureScheduledRunWithEvents occupant identity verification", () => {
     // the window's maintenance work behind a success response.
     const client = new ScriptedEnsureClient(
       taskDbRow({
-        mailboxAccountId: null,
-        mailboxProvider: null,
         scheduleAlgorithmVersion: null,
+        scheduleIdentityVersion: null,
         scheduleIntervalMs: null,
+        scheduleScopeKey: null,
         scheduleWindowStart: null,
       }),
     );

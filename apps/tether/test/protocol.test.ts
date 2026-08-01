@@ -61,13 +61,14 @@ const baseTask: TaskRecord = {
 const scheduledTask: TaskRecord = {
   ...baseTask,
   schedule: {
-    mailboxScope: { accountId: "acct_opaque_1", provider: "fastmail" },
+    identityVersion: 2,
     scheduleWindow: {
       algorithmVersion: 1,
       endMs: 1_700_002_800_000,
       intervalMs: 3_600_000,
       startMs: 1_699_999_200_000,
     },
+    scopeKey: "scope_01JEMAIL",
   },
 };
 
@@ -328,7 +329,18 @@ describe("protocol event builders and envelopes", () => {
   it("builds task approval recorded events", () => {
     expect(approvalDecisionSchema.parse("approved")).toBe("approved");
     const eventInput = buildTaskApprovalRecordedEventInput({
+      approval: {
+        approvalEventId: "evt_approval_test",
+        decidedAt: "2026-05-21T00:01:00.000Z",
+        decidedByParticipantId: "part_external_bridge",
+        decision: "approved",
+        reason: { source: "external-chat" },
+        sessionId: "sess_test",
+        targetKey: "task",
+        taskId: "task_test",
+      },
       decision: "approved",
+      eventId: "evt_approval_test",
       participantId: "part_external_bridge",
       reason: { source: "external-chat" },
       sessionId: "sess_test",

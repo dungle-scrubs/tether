@@ -134,6 +134,62 @@
       "when": 1784292693180,
       "tag": "0018_complex_elektra",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1785594210843,
+      "tag": "0019_hesitant_jazinda",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1785596837319,
+      "tag": "0020_busy_maria_hill",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1785597844585,
+      "tag": "0021_warm_doctor_octopus",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1785598286215,
+      "tag": "0022_lonely_infant_terrible",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1785601631927,
+      "tag": "0023_nosy_robbie_robertson",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1785601829849,
+      "tag": "0024_eminent_lizard",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1785604292390,
+      "tag": "0025_strange_dakota_north",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1785608647560,
+      "tag": "0026_blushing_mole_man",
+      "breakpoints": true
     }
   ]
 }

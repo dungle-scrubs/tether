@@ -25,7 +25,7 @@ import type {
   RevokeAuthGrantWithAuditInput,
 } from "./grant-stores.js";
 import { AuthPersistenceError, type AuthPersistenceErrorCode } from "./grant-stores.js";
-import { authGrantAuditReasonCodes } from "./grant-stores.js";
+import { authGrantAuditReasonCodes, authGrantSources } from "./grant-stores.js";
 import { maximumAuthTicketAdmissionLifetimeMilliseconds } from "./grant-stores.js";
 import { type AuthAudience, maximumAuthGrantLifetimeSeconds } from "./grant-token.js";
 import type { AuthRole } from "./token.js";
@@ -54,19 +54,62 @@ async function createGrantWithAudit(
   database: DatabasePool,
   input: CreateAuthGrantWithAuditInput,
 ): Promise<void> {
+  await runAuthStoreOperation(async () => {
+    const client = await database.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await insertAuthGrantWithAuditOnClient(client, input);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }, "auth_grant_create_failed");
+}
+
+/** Inserts a validated grant and its creation audit on a caller-owned transaction. */
+export async function insertAuthGrantWithAuditOnClient(
+  client: PoolClient,
+  input: CreateAuthGrantWithAuditInput,
+): Promise<void> {
+  validateAuthGrantCreationInput(input);
+  await client.query(
+    `INSERT INTO auth_grants (audience, expires_at, issued_at, issuer, jti, kid, metadata, revoked_at, role, session_scope, subject)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, NULL, $8, $9, $10)`,
+    [
+      input.grant.audience,
+      input.grant.expiresAt,
+      input.grant.issuedAt,
+      input.grant.issuer,
+      input.grant.jti,
+      input.grant.kid,
+      JSON.stringify(input.grant.metadata),
+      input.grant.role,
+      input.grant.sessionScope,
+      input.grant.subject,
+    ],
+  );
+  await client.query(
+    `INSERT INTO auth_grant_audit_events (action, actor_subject, audit_id, grant_jti, metadata, occurred_at, reason_code)
+     VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)`,
+    [
+      input.audit.action,
+      input.audit.actorSubject,
+      input.audit.auditId,
+      input.grant.jti,
+      JSON.stringify(input.audit.metadata),
+      input.audit.occurredAt,
+      input.audit.reasonCode,
+    ],
+  );
+}
+
+/** Validates one grant-and-audit creation before any persistence adapter serializes it. */
+export function validateAuthGrantCreationInput(input: CreateAuthGrantWithAuditInput): void {
   validateGrantRecord(input.grant);
   validateAuditInput(input.audit, "grant.created");
-  await runAuthStoreOperation(
-    () =>
-      database.db.transaction(async (transaction) => {
-        await transaction.insert(authGrants).values(input.grant);
-        await transaction.insert(authGrantAuditEvents).values({
-          ...input.audit,
-          grantJti: input.grant.jti,
-        });
-      }),
-    "auth_grant_create_failed",
-  );
 }
 
 /** Atomically revokes one grant and appends one audit only for the first revocation. */
@@ -358,7 +401,7 @@ function validateGrantMetadata(metadata: AuthGrantMetadata): void {
   if (
     !isRecord(metadata) ||
     !hasExactKeys(metadata, ["requestId", "source"]) ||
-    !["admin", "bootstrap", "migration"].includes(metadata.source) ||
+    !authGrantSources.includes(metadata.source) ||
     !isValidRequestId(metadata.requestId)
   ) {
     throw new AuthPersistenceError("auth_metadata_invalid");

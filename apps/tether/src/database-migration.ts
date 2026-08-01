@@ -15,25 +15,98 @@ import type pg from "pg";
 
 const MIGRATION_ADVISORY_LOCK_KEY = "8387255305985817959";
 const migrationsFolder = "drizzle";
+const generatedMigrations = readMigrationFiles({ migrationsFolder });
 const tetherTableNames = [
   "auth_grant_audit_events",
   "auth_grants",
   "auth_tickets",
+  "browser_pairing_exchange_failures",
+  "browser_pairing_requests",
+  "browser_sessions",
   "client_session_bindings",
+  "operator_grant_scopes",
   "participant_control_leases",
   "participants",
   "session_event_sequences",
   "session_events",
+  "session_bootstrap_identities",
   "session_projections",
   "session_summaries",
+  "session_tombstones",
   "sessions",
   "task_approvals",
   "tasks",
 ] as const;
 
+const legacyScheduleIdentityIndex: IndexSignature = {
+  columnNames: [
+    "session_id",
+    "kind",
+    "mailbox_provider",
+    "mailbox_account_id",
+    "schedule_algorithm_version",
+    "schedule_interval_ms",
+    "schedule_window_start",
+  ],
+  predicate: null,
+  tableName: "tasks",
+  unique: true,
+};
+
+const providerNeutralScheduleIdentityIndex: IndexSignature = {
+  columnNames: [
+    "session_id",
+    "kind",
+    "schedule_identity_version",
+    "schedule_scope_key",
+    "schedule_algorithm_version",
+    "schedule_interval_ms",
+    "schedule_window_start",
+  ],
+  predicate: null,
+  tableName: "tasks",
+  unique: true,
+};
+
 /** Minimal database Interface accepted by startup migration orchestration. */
 export interface MigrationDatabase {
   readonly pool: pg.Pool;
+}
+
+/** Bounded migration state shared by startup and steady-state readiness. */
+export type DatabaseMigrationReadiness = "current" | "incomplete" | "unavailable";
+
+/** Reads complete durable journal readiness in one database round trip. */
+export async function readDatabaseMigrationReadiness(
+  database: MigrationDatabase,
+): Promise<DatabaseMigrationReadiness> {
+  let client: pg.PoolClient;
+  try {
+    client = await database.pool.connect();
+  } catch {
+    return "unavailable";
+  }
+  try {
+    const inspection = await inspectMigrationJournal(client, generatedMigrations);
+    return inspection.status === "valid" && inspection.appliedCount === generatedMigrations.length
+      ? "current"
+      : "incomplete";
+  } catch (error) {
+    return isMissingMigrationJournalError(error) ? "incomplete" : "unavailable";
+  } finally {
+    client.release();
+  }
+}
+
+/** Distinguishes an absent migration catalog from transport and query outages. */
+function isMissingMigrationJournalError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("code" in error)) return false;
+  return error.code === "42P01" || error.code === "3F000";
+}
+
+/** Checks whether the complete durable migration journal matches generated state. */
+export async function isDatabaseMigrationCurrent(database: MigrationDatabase): Promise<boolean> {
+  return (await readDatabaseMigrationReadiness(database)) === "current";
 }
 
 interface LegacyMigrationProbe {
@@ -69,7 +142,10 @@ export interface DatabaseMigrationFailureContext {
 type MigrationJournalInspection =
   | { readonly status: "empty" }
   | { readonly appliedCount: number; readonly status: "valid" }
-  | { readonly context: DatabaseMigrationFailureContext; readonly status: "invalid" };
+  | {
+      readonly context: DatabaseMigrationFailureContext;
+      readonly status: "invalid";
+    };
 
 interface ConstraintSignature {
   readonly columnNames: readonly string[];
@@ -126,6 +202,13 @@ interface AuthColumnRow {
   readonly dataType: string;
   readonly isNullable: string;
   readonly tableName: string;
+}
+
+interface ColumnDefinitionExpectation {
+  readonly columnDefault: string | null;
+  readonly columnName: string;
+  readonly dataType: string;
+  readonly isNullable: "NO" | "YES";
 }
 
 interface UnlockRow {
@@ -385,6 +468,182 @@ async function inspectMigrationJournal(
   return { appliedCount: matchingRows, status: "valid" };
 }
 
+/** Detects any partial browser-operator foundation artifact. */
+async function hasAnyBrowserOperatorAuthorityArtifact(client: pg.PoolClient): Promise<boolean> {
+  return (
+    (await hasTable(client, "browser_pairing_requests")) ||
+    (await hasTable(client, "browser_sessions")) ||
+    (await hasTable(client, "operator_grant_scopes"))
+  );
+}
+
+/** Recognizes the complete initial browser-operator schema migration. */
+async function hasBrowserOperatorAuthorityFoundation(client: pg.PoolClient): Promise<boolean> {
+  return (
+    (await hasColumns(client, "browser_pairing_requests", [
+      "confirmed_at",
+      "created_at",
+      "exchange_secret_hash",
+      "exchanged_at",
+      "expires_at",
+      "failed_attempts",
+      "invalidated_at",
+      "operator_subject",
+      "origin",
+      "public_nonce",
+      "request_id",
+      "requested_scope",
+      "source_address_hash",
+      "verification_phrase",
+    ])) &&
+    (await hasColumns(client, "browser_sessions", [
+      "created_at",
+      "csrf_token_hash",
+      "grant_jti",
+      "origin",
+    ])) &&
+    (await hasColumns(client, "operator_grant_scopes", ["created_at", "grant_jti", "scope"])) &&
+    (await hasIndexSignature(client, "browser_pairing_requests_source_created_idx", {
+      columnNames: ["source_address_hash", "created_at"],
+      predicate: null,
+      tableName: "browser_pairing_requests",
+      unique: false,
+    })) &&
+    (await hasConstraintSignature(client, {
+      columnNames: ["grant_jti"],
+      constraintType: "f",
+      tableName: "browser_sessions",
+    })) &&
+    (await hasConstraintSignature(client, {
+      columnNames: ["grant_jti"],
+      constraintType: "f",
+      tableName: "operator_grant_scopes",
+    }))
+  );
+}
+
+/** Recognizes the complete confirmation and integrity hardening migration. */
+async function hasConfirmedBrowserPairingAuthority(client: pg.PoolClient): Promise<boolean> {
+  const checks = [
+    "browser_pairing_requests_confirmation_check",
+    "browser_pairing_requests_exchange_check",
+    "browser_pairing_requests_identity_check",
+    "browser_pairing_requests_invalidation_check",
+    "operator_grant_scopes_shape_check",
+  ] as const;
+  if (!(await hasColumn(client, "browser_pairing_requests", "confirmed_by_subject"))) {
+    return false;
+  }
+  for (const constraintName of checks) {
+    const tableName = constraintName.startsWith("operator_")
+      ? "operator_grant_scopes"
+      : "browser_pairing_requests";
+    if (!(await hasNamedConstraint(client, tableName, constraintName))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Recognizes durable browser classification in the grant metadata contract. */
+async function hasBrowserGrantClassification(client: pg.PoolClient): Promise<boolean> {
+  return hasNamedCheckConstraint(client, {
+    constraintName: "auth_grants_metadata_shape_check",
+    requiredDefinitionFragments: ["'admin'", "'bootstrap'", "'browser'", "'migration'"],
+    tableName: "auth_grants",
+  });
+}
+
+/** Recognizes durable redacted counters for source-scoped exchange limits. */
+async function hasBrowserPairingExchangeFailureCounters(client: pg.PoolClient): Promise<boolean> {
+  return (
+    (await hasColumns(client, "browser_pairing_exchange_failures", [
+      "created_at",
+      "failure_id",
+      "source_address_hash",
+    ])) &&
+    (await hasIndexSignature(client, "browser_pairing_exchange_failures_source_created_idx", {
+      columnNames: ["source_address_hash", "created_at"],
+      predicate: null,
+      tableName: "browser_pairing_exchange_failures",
+      unique: false,
+    }))
+  );
+}
+
+/** Recognizes indexed server-owned operator admission and bounded snapshot rows. */
+async function hasOperatorCommandAdmissionHardening(client: pg.PoolClient): Promise<boolean> {
+  return (
+    (await hasColumns(client, "tasks", ["operator_command_key", "operator_grant_jti"])) &&
+    (await hasIndexSignature(client, "tasks_session_created_idx", {
+      columnNames: ["session_id", "created_at", "task_id"],
+      predicate: null,
+      tableName: "tasks",
+      unique: false,
+    })) &&
+    (await hasIndexSignature(client, "participants_session_last_seen_idx", {
+      columnNames: ["session_id", "last_seen_at", "participant_id"],
+      predicate: null,
+      tableName: "participants",
+      unique: false,
+    })) &&
+    (await hasIndexSignature(client, "tasks_operator_grant_created_idx", {
+      columnNames: ["operator_grant_jti", "created_at"],
+      predicate: "operator_grant_jti IS NOT NULL",
+      tableName: "tasks",
+      unique: false,
+    })) &&
+    (await hasIndexSignature(client, "tasks_operator_pending_idx", {
+      columnNames: ["created_at"],
+      predicate:
+        "operator_command_key IS NOT NULL AND cancelled_at IS NULL AND completed_at IS NULL AND failed_at IS NULL",
+      tableName: "tasks",
+      unique: false,
+    })) &&
+    (await hasIndexSignature(client, "tasks_operator_command_active_unique", {
+      columnNames: ["session_id", "operator_command_key"],
+      predicate:
+        "operator_command_key IS NOT NULL AND cancelled_at IS NULL AND completed_at IS NULL AND failed_at IS NULL",
+      tableName: "tasks",
+      unique: true,
+    })) &&
+    (await hasNamedCheckConstraint(client, {
+      constraintName: "tasks_operator_command_shape_check",
+      requiredDefinitionFragments: ["operator_command_key", "operator_grant_jti", "operator.%"],
+      tableName: "tasks",
+    })) &&
+    (await hasNamedCheckConstraint(client, {
+      constraintName: "tasks_snapshot_size_check",
+      requiredDefinitionFragments: ["octet_length", "2097152"],
+      tableName: "tasks",
+    })) &&
+    (await hasNamedCheckConstraint(client, {
+      constraintName: "participants_snapshot_size_check",
+      requiredDefinitionFragments: ["octet_length", "2097152"],
+      tableName: "participants",
+    })) &&
+    (await hasIndexSignature(client, "browser_pairing_exchange_failures_created_idx", {
+      columnNames: ["created_at"],
+      predicate: null,
+      tableName: "browser_pairing_exchange_failures",
+      unique: false,
+    }))
+  );
+}
+
+/** Detects any partially applied indexed operator-admission hardening artifact. */
+async function hasAnyOperatorCommandAdmissionHardeningArtifact(
+  client: pg.PoolClient,
+): Promise<boolean> {
+  return (
+    (await hasColumn(client, "tasks", "operator_command_key")) ||
+    (await hasColumn(client, "tasks", "operator_grant_jti")) ||
+    (await hasIndex(client, "tasks_operator_command_active_unique")) ||
+    (await hasNamedConstraint(client, "tasks", "tasks_operator_command_shape_check")) ||
+    (await hasNamedConstraint(client, "participants", "participants_snapshot_size_check"))
+  );
+}
+
 /** Ordered probes for generated migrations that can be represented by schema shape alone. */
 function legacyMigrationProbes(): readonly LegacyMigrationProbe[] {
   return [
@@ -505,21 +764,18 @@ function legacyMigrationProbes(): readonly LegacyMigrationProbe[] {
     },
     {
       label: "0011 task schedule and mailbox scope identity with unique schedule index",
-      contradictionObserved: (client) =>
-        hasNamedIndexContradiction(client, "tasks_schedule_identity_idx", {
-          columnNames: [
-            "session_id",
-            "kind",
-            "mailbox_provider",
-            "mailbox_account_id",
-            "schedule_algorithm_version",
-            "schedule_interval_ms",
-            "schedule_window_start",
-          ],
-          predicate: null,
-          tableName: "tasks",
-          unique: true,
-        }),
+      contradictionObserved: async (client) =>
+        (await hasIndex(client, "tasks_schedule_identity_idx")) &&
+        !(await hasIndexSignature(
+          client,
+          "tasks_schedule_identity_idx",
+          legacyScheduleIdentityIndex,
+        )) &&
+        !(await hasIndexSignature(
+          client,
+          "tasks_schedule_identity_idx",
+          providerNeutralScheduleIdentityIndex,
+        )),
       represented: async (client) =>
         (await hasColumns(client, "tasks", [
           "mailbox_account_id",
@@ -528,20 +784,16 @@ function legacyMigrationProbes(): readonly LegacyMigrationProbe[] {
           "schedule_interval_ms",
           "schedule_window_start",
         ])) &&
-        (await hasIndexSignature(client, "tasks_schedule_identity_idx", {
-          columnNames: [
-            "session_id",
-            "kind",
-            "mailbox_provider",
-            "mailbox_account_id",
-            "schedule_algorithm_version",
-            "schedule_interval_ms",
-            "schedule_window_start",
-          ],
-          predicate: null,
-          tableName: "tasks",
-          unique: true,
-        })),
+        ((await hasIndexSignature(
+          client,
+          "tasks_schedule_identity_idx",
+          legacyScheduleIdentityIndex,
+        )) ||
+          (await hasIndexSignature(
+            client,
+            "tasks_schedule_identity_idx",
+            providerNeutralScheduleIdentityIndex,
+          ))),
     },
     {
       label: "0012 control lease generation history primary key including epoch",
@@ -643,7 +895,153 @@ function legacyMigrationProbes(): readonly LegacyMigrationProbe[] {
       label: "0017 task claim id",
       represented: async (client) => hasColumn(client, "tasks", "claim_id"),
     },
+    {
+      label: "0018 session tombstones",
+      represented: (client) => hasTable(client, "session_tombstones"),
+    },
+    {
+      label: "0019 provider-neutral recurring-work identity",
+      contradictionObserved: async (client) => {
+        const hasIdentityVersion = await hasColumn(client, "tasks", "schedule_identity_version");
+        const hasScopeKey = await hasColumn(client, "tasks", "schedule_scope_key");
+        if (!hasIdentityVersion && !hasScopeKey) {
+          return false;
+        }
+        return (
+          !hasIdentityVersion ||
+          !hasScopeKey ||
+          !(await hasIndexSignature(
+            client,
+            "tasks_schedule_identity_idx",
+            providerNeutralScheduleIdentityIndex,
+          ))
+        );
+      },
+      represented: async (client) =>
+        (await hasColumns(client, "tasks", ["schedule_identity_version", "schedule_scope_key"])) &&
+        (await hasIndexSignature(
+          client,
+          "tasks_schedule_identity_idx",
+          providerNeutralScheduleIdentityIndex,
+        )),
+    },
+    {
+      label: "0020 recurring-work scope size constraint",
+      contradictionObserved: async (client) =>
+        (await hasNamedConstraint(client, "tasks", "tasks_schedule_scope_key_size_check")) &&
+        !(await hasNamedCheckConstraint(client, {
+          constraintName: "tasks_schedule_scope_key_size_check",
+          requiredDefinitionFragments: [
+            "schedule_scope_key IS NULL",
+            "octet_length(schedule_scope_key) >= 1",
+            "octet_length(schedule_scope_key) <= 512",
+          ],
+          tableName: "tasks",
+        })),
+      represented: (client) =>
+        hasNamedCheckConstraint(client, {
+          constraintName: "tasks_schedule_scope_key_size_check",
+          requiredDefinitionFragments: [
+            "schedule_scope_key IS NULL",
+            "octet_length(schedule_scope_key) >= 1",
+            "octet_length(schedule_scope_key) <= 512",
+          ],
+          tableName: "tasks",
+        }),
+    },
+    {
+      label: "0021 browser operator authority foundation",
+      contradictionObserved: async (client) =>
+        (await hasAnyBrowserOperatorAuthorityArtifact(client)) &&
+        !(await hasBrowserOperatorAuthorityFoundation(client)),
+      represented: hasBrowserOperatorAuthorityFoundation,
+    },
+    {
+      label: "0022 confirmed browser pairing authority",
+      contradictionObserved: async (client) =>
+        (await hasColumn(client, "browser_pairing_requests", "confirmed_by_subject")) &&
+        !(await hasConfirmedBrowserPairingAuthority(client)),
+      represented: hasConfirmedBrowserPairingAuthority,
+    },
+    {
+      label: "0023 browser grant classification",
+      represented: hasBrowserGrantClassification,
+    },
+    {
+      label: "0024 browser pairing exchange source counters",
+      contradictionObserved: async (client) =>
+        (await hasTable(client, "browser_pairing_exchange_failures")) &&
+        !(await hasBrowserPairingExchangeFailureCounters(client)),
+      represented: hasBrowserPairingExchangeFailureCounters,
+    },
+    {
+      label: "0025 indexed operator admission and bounded snapshot rows",
+      contradictionObserved: async (client) =>
+        (await hasAnyOperatorCommandAdmissionHardeningArtifact(client)) &&
+        !(await hasOperatorCommandAdmissionHardening(client)),
+      represented: hasOperatorCommandAdmissionHardening,
+    },
+    {
+      label: "0026 stable session bootstrap identities",
+      contradictionObserved: async (client) =>
+        (await hasTable(client, "session_bootstrap_identities")) &&
+        !(await hasStableSessionBootstrapIdentities(client)),
+      represented: hasStableSessionBootstrapIdentities,
+    },
   ];
+}
+
+/** Recognizes the one-to-one durable deployment bootstrap identity mapping. */
+async function hasStableSessionBootstrapIdentities(client: pg.PoolClient): Promise<boolean> {
+  return (
+    (await hasExactColumnDefinitions(client, "session_bootstrap_identities", [
+      {
+        columnDefault: "now()",
+        columnName: "created_at",
+        dataType: "timestamp with time zone",
+        isNullable: "NO",
+      },
+      {
+        columnDefault: null,
+        columnName: "identity_key",
+        dataType: "text",
+        isNullable: "NO",
+      },
+      {
+        columnDefault: null,
+        columnName: "session_id",
+        dataType: "text",
+        isNullable: "NO",
+      },
+    ])) &&
+    (await hasNamedCheckConstraint(client, {
+      constraintName: "session_bootstrap_identities_identity_key_size_check",
+      requiredDefinitionFragments: [
+        "octet_length(identity_key) >= 1",
+        "octet_length(identity_key) <= 512",
+      ],
+      tableName: "session_bootstrap_identities",
+    })) &&
+    (await hasConstraintSignature(client, {
+      columnNames: ["identity_key"],
+      constraintType: "p",
+      tableName: "session_bootstrap_identities",
+    })) &&
+    (await hasConstraintSignature(client, {
+      columnNames: ["session_id"],
+      constraintType: "u",
+      tableName: "session_bootstrap_identities",
+    })) &&
+    (await hasExactForeignKey(client, {
+      constraintName: "session_bootstrap_identities_session_id_sessions_session_id_fk",
+      deleteAction: "r",
+      localColumnNames: ["session_id"],
+      referencedColumnNames: ["session_id"],
+      referencedTableName: "sessions",
+      tableName: "session_bootstrap_identities",
+      updateAction: "a",
+    }))
+  );
 }
 
 const authFoundationColumns: readonly AuthColumnExpectation[] = [
@@ -674,7 +1072,9 @@ const authFoundationColumns: readonly AuthColumnExpectation[] = [
   authColumn("auth_tickets", "ticket_hash", "text", "NO"),
 ];
 
-const authFoundationIndexes: readonly (IndexSignature & { readonly indexName: string })[] = [
+const authFoundationIndexes: readonly (IndexSignature & {
+  readonly indexName: string;
+})[] = [
   {
     columnNames: ["grant_jti", "occurred_at"],
     indexName: "auth_grant_audit_grant_occurred_idx",
@@ -774,9 +1174,6 @@ const authFoundationConstraints: readonly NamedConstraintExpectation[] = [
   ]),
   constraint("auth_grants_metadata_shape_check", "c", "auth_grants", [
     "jsonb_typeof(metadata) = 'object'",
-    "jsonb_typeof(metadata->'source') = 'string'",
-    "metadata->>'source' = ANY (ARRAY['admin', 'bootstrap', 'migration'])",
-    "metadata->>'requestId' ~ '^req_[A-Za-z0-9_-]{1,120}$'",
   ]),
   constraint("auth_grants_revoked_check", "c", "auth_grants", [
     "revoked_at IS NULL OR revoked_at >= issued_at",
@@ -841,9 +1238,10 @@ const authFoundationConstraints: readonly NamedConstraintExpectation[] = [
   constraint("auth_tickets_hash_check", "c", "auth_tickets", ["ticket_hash ~ '^[0-9a-f]{64}$'"]),
 ];
 
-/** Exact normalized 0014 constraints; regenerate only with its schema and migration. */
-const authFoundationConstraintFingerprint =
-  "c5a21e2a79a5e62a2025c70eb95f998d9e3480afffcf4341545655898455f31b";
+const authFoundationConstraintFingerprints = new Set([
+  "c5a21e2a79a5e62a2025c70eb95f998d9e3480afffcf4341545655898455f31b",
+  "4915df2b217194414393739addbeab2126bd6c09a1e5b5444b5db9f3def257d9",
+]);
 
 /** Creates one named constraint expectation without exposing mutable arrays. */
 function constraint(
@@ -852,7 +1250,12 @@ function constraint(
   tableName: string,
   requiredDefinitionFragments: readonly string[],
 ): NamedConstraintExpectation {
-  return { constraintName, constraintType, requiredDefinitionFragments, tableName };
+  return {
+    constraintName,
+    constraintType,
+    requiredDefinitionFragments,
+    tableName,
+  };
 }
 
 /** Recognizes only the complete security-relevant auth foundation migration. */
@@ -911,6 +1314,40 @@ async function hasColumns(
     }
   }
   return true;
+}
+
+/** Requires one table's exact column set, types, nullability, and defaults. */
+async function hasExactColumnDefinitions(
+  client: pg.PoolClient,
+  tableName: string,
+  expectations: readonly ColumnDefinitionExpectation[],
+): Promise<boolean> {
+  const result = await client.query<AuthColumnRow>(
+    `
+      SELECT
+        column_default AS "columnDefault",
+        column_name AS "columnName",
+        data_type AS "dataType",
+        is_nullable AS "isNullable",
+        table_name AS "tableName"
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = $1
+    `,
+    [tableName],
+  );
+  return (
+    result.rows.length === expectations.length &&
+    expectations.every((expected) =>
+      result.rows.some(
+        (row) =>
+          row.columnDefault === expected.columnDefault &&
+          row.columnName === expected.columnName &&
+          row.dataType === expected.dataType &&
+          row.isNullable === expected.isNullable &&
+          row.tableName === tableName,
+      ),
+    )
+  );
 }
 
 /** Requires the exact generated auth column set, types, nullability, and defaults. */
@@ -1098,6 +1535,125 @@ async function hasConstraintSignature(
   );
 }
 
+/** Verifies one exact validated foreign key, including referenced columns and actions. */
+async function hasExactForeignKey(
+  client: pg.PoolClient,
+  expected: {
+    readonly constraintName: string;
+    readonly deleteAction: "a" | "c" | "n" | "r";
+    readonly localColumnNames: readonly string[];
+    readonly referencedColumnNames: readonly string[];
+    readonly referencedTableName: string;
+    readonly tableName: string;
+    readonly updateAction: "a" | "c" | "n" | "r";
+  },
+): Promise<boolean> {
+  const result = await client.query<SchemaObjectExistsRow>(
+    `
+      SELECT EXISTS (
+        SELECT 1
+        FROM pg_constraint constraint_record
+        JOIN pg_class table_record ON table_record.oid = constraint_record.conrelid
+        JOIN pg_class referenced_table ON referenced_table.oid = constraint_record.confrelid
+        JOIN pg_namespace namespace_record ON namespace_record.oid = table_record.relnamespace
+        JOIN pg_namespace referenced_namespace
+          ON referenced_namespace.oid = referenced_table.relnamespace
+        WHERE namespace_record.nspname = 'public'
+          AND referenced_namespace.nspname = 'public'
+          AND table_record.relname = $1
+          AND constraint_record.conname = $2
+          AND constraint_record.contype = 'f'
+          AND referenced_table.relname = $3
+          AND constraint_record.confdeltype = $4
+          AND constraint_record.confupdtype = $5
+          AND constraint_record.convalidated
+          AND (
+            SELECT jsonb_agg(attribute.attname ORDER BY key_column.position)
+            FROM unnest(constraint_record.conkey) WITH ORDINALITY AS key_column(attnum, position)
+            JOIN pg_attribute attribute
+              ON attribute.attrelid = constraint_record.conrelid
+              AND attribute.attnum = key_column.attnum
+          ) = $6::jsonb
+          AND (
+            SELECT jsonb_agg(attribute.attname ORDER BY key_column.position)
+            FROM unnest(constraint_record.confkey) WITH ORDINALITY AS key_column(attnum, position)
+            JOIN pg_attribute attribute
+              ON attribute.attrelid = constraint_record.confrelid
+              AND attribute.attnum = key_column.attnum
+          ) = $7::jsonb
+      ) AS exists
+    `,
+    [
+      expected.tableName,
+      expected.constraintName,
+      expected.referencedTableName,
+      expected.deleteAction,
+      expected.updateAction,
+      JSON.stringify(expected.localColumnNames),
+      JSON.stringify(expected.referencedColumnNames),
+    ],
+  );
+  return result.rows[0]?.exists === true;
+}
+
+/** Returns whether a named public-table constraint exists. */
+async function hasNamedConstraint(
+  client: pg.PoolClient,
+  tableName: string,
+  constraintName: string,
+): Promise<boolean> {
+  const result = await client.query<SchemaObjectExistsRow>(
+    `
+      SELECT EXISTS (
+        SELECT 1
+        FROM pg_constraint constraint_record
+        JOIN pg_class table_record ON table_record.oid = constraint_record.conrelid
+        JOIN pg_namespace namespace_record ON namespace_record.oid = table_record.relnamespace
+        WHERE namespace_record.nspname = 'public'
+          AND table_record.relname = $1
+          AND constraint_record.conname = $2
+      ) AS exists
+    `,
+    [tableName, constraintName],
+  );
+  return result.rows[0]?.exists === true;
+}
+
+/** Verifies one named check constraint by owner and normalized definition fragments. */
+async function hasNamedCheckConstraint(
+  client: pg.PoolClient,
+  expectation: Omit<NamedConstraintExpectation, "constraintType">,
+): Promise<boolean> {
+  const result = await client.query<NamedConstraintRow>(
+    `
+      SELECT
+        constraint_record.conname AS "constraintName",
+        constraint_record.contype::text AS "constraintType",
+        NULL::text AS "deleteAction",
+        pg_get_constraintdef(constraint_record.oid, true) AS definition,
+        table_record.relname AS "tableName",
+        NULL::text AS "updateAction",
+        constraint_record.convalidated AS validated
+      FROM pg_constraint constraint_record
+      JOIN pg_class table_record ON table_record.oid = constraint_record.conrelid
+      JOIN pg_namespace namespace_record ON namespace_record.oid = table_record.relnamespace
+      WHERE namespace_record.nspname = 'public'
+        AND table_record.relname = $1
+        AND constraint_record.conname = $2
+        AND constraint_record.contype = 'c'
+    `,
+    [expectation.tableName, expectation.constraintName],
+  );
+  const row = result.rows[0];
+  if (row === undefined || row.validated !== true) {
+    return false;
+  }
+  const normalizedDefinition = normalizeConstraintDefinition(row.definition);
+  return expectation.requiredDefinitionFragments.every((fragment) =>
+    normalizedDefinition.includes(normalizeConstraintDefinition(fragment)),
+  );
+}
+
 /** Verifies named constraints by type, owning table, and normalized definition fragments. */
 async function hasNamedConstraintExpectations(
   client: pg.PoolClient,
@@ -1134,7 +1690,13 @@ async function hasNamedConstraintExpectations(
         candidate.constraintType === expectation.constraintType &&
         candidate.tableName === expectation.tableName,
     );
-    if (row === undefined) {
+    if (
+      row === undefined ||
+      row.validated !== true ||
+      (expectation.constraintType === "f"
+        ? row.deleteAction !== "a" || row.updateAction !== "a"
+        : row.deleteAction !== null || row.updateAction !== null)
+    ) {
       return false;
     }
     const normalizedDefinition = normalizeConstraintDefinition(row.definition);
@@ -1142,10 +1704,11 @@ async function hasNamedConstraintExpectations(
       normalizedDefinition.includes(normalizeConstraintDefinition(fragment)),
     );
   });
+  const fingerprint = fingerprintAuthConstraints(result.rows);
   return (
     expectedConstraintsPresent &&
     result.rows.length === expectations.length &&
-    fingerprintAuthConstraints(result.rows) === authFoundationConstraintFingerprint
+    authFoundationConstraintFingerprints.has(fingerprint)
   );
 }
 

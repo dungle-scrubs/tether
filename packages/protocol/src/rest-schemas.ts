@@ -1,12 +1,21 @@
 import { z } from "zod";
 
+import {
+  approvalDecisionSchema,
+  approvalTargetSchema,
+  taskResultSchema,
+} from "./approval-targets.js";
 import { sessionEventSchema } from "./event-builders.js";
 import { controlChannelSchema, participantRuntimeKindSchema } from "./records.js";
+import { recurringWorkScopeKeySchema } from "./task-contracts.js";
 
 /** Bounded readiness failure reasons safe for unauthenticated responses. */
 export const readinessFailureReason = {
+  configurationIncompatible: "configuration_incompatible",
   databaseUnavailable: "database_unavailable",
   fanoutCatchUpStale: "fanout_catchup_stale",
+  migrationIncomplete: "migration_incomplete",
+  signingAuthorityUnavailable: "signing_authority_unavailable",
 } as const;
 
 /** Protocol-owned readiness response schema. */
@@ -19,8 +28,11 @@ export const readinessResponseSchema = z.discriminatedUnion("ready", [
   z.object({
     ready: z.literal(false),
     reason: z.union([
+      z.literal(readinessFailureReason.configurationIncompatible),
       z.literal(readinessFailureReason.databaseUnavailable),
       z.literal(readinessFailureReason.fanoutCatchUpStale),
+      z.literal(readinessFailureReason.migrationIncomplete),
+      z.literal(readinessFailureReason.signingAuthorityUnavailable),
     ]),
     replicaId: z.string().min(1),
     runtimeTopology: z.union([z.literal("single"), z.literal("multi")]),
@@ -153,17 +165,17 @@ export const releaseParticipantControlResponseSchema = z.object({
 });
 
 /**
- * Deterministic schedule and Mailbox Scope identity a scheduled maintenance run
+ * Deterministic schedule and opaque scope identity a recurring-work run
  * carries at creation. Interval and algorithm version are part of task identity.
  */
 export const scheduledTaskIdentitySchema = z
   .object({
-    mailboxAccountId: z.string().min(1),
-    mailboxProvider: z.string().min(1),
     scheduleAlgorithmVersion: z.number().int().positive(),
     scheduleIntervalMs: z.number().int().positive(),
     scheduleWindowStart: z.number().int().nonnegative(),
+    scopeKey: recurringWorkScopeKeySchema,
   })
+  .strict()
   .refine(
     (identity) => Number.isSafeInteger(identity.scheduleWindowStart + identity.scheduleIntervalMs),
     {
@@ -175,7 +187,12 @@ export const scheduledTaskIdentitySchema = z
 /** HTTP body schema for task creation. */
 export const createTaskSchema = z.object({
   input: z.record(z.string(), z.unknown()).nullable().optional(),
-  kind: z.string().min(1),
+  kind: z
+    .string()
+    .min(1)
+    .refine((kind) => !kind.startsWith("operator."), {
+      message: "The operator task namespace is reserved",
+    }),
   objective: z.string().min(1),
   requireContract: z.boolean().optional(),
   schedule: scheduledTaskIdentitySchema.optional(),
@@ -211,7 +228,7 @@ export const completeTaskSchema = z.object({
   controlEpoch: controlEpochSchema.optional(),
   instanceId: z.string().min(1).optional(),
   participantId: z.string().min(1),
-  result: z.record(z.string(), z.unknown()).default({}),
+  result: taskResultSchema.default({}),
 });
 
 /** HTTP body schema for task failure. */
@@ -231,12 +248,6 @@ export const releaseTaskSchema = z.object({
   participantId: z.string().min(1),
 });
 
-/** Schema for durable task approval decisions. */
-export const approvalDecisionSchema = z.union([z.literal("approved"), z.literal("rejected")]);
-
-/** Durable approval decision values recorded in session events. */
-export type ApprovalDecision = z.infer<typeof approvalDecisionSchema>;
-
 /** HTTP payload schema for recording approval intent for a task. */
 export const recordTaskApprovalSchema = z.object({
   controlEpoch: controlEpochSchema.optional(),
@@ -244,4 +255,5 @@ export const recordTaskApprovalSchema = z.object({
   instanceId: z.string().min(1).optional(),
   participantId: z.string().min(1),
   reason: z.record(z.string(), z.unknown()).default({}),
+  target: approvalTargetSchema.optional(),
 });

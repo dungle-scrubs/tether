@@ -1,13 +1,65 @@
+import { createHash } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 
 import { describe, expect, it, vi } from "vitest";
 
 import { createAuthRuntime, type AuthRuntimeLogger } from "../src/auth/enforcement.js";
-import type { AuthGrantRecord, AuthGrantStore } from "../src/auth/grant-stores.js";
+import type { AuthGrantRecord, AuthGrantStore, AuthTicketStore } from "../src/auth/grant-stores.js";
 import { mintAuthGrantToken } from "../src/auth/grant-token.js";
 import { AuthError, mintAuthToken } from "../src/auth/token.js";
 
 describe("auth enforcement runtime", () => {
+  it("authenticates a browser cookie token only through the dedicated operator seam", async () => {
+    const issuedAt = new Date("2026-07-17T00:00:00.000Z");
+    const grant = createGrant({
+      issuedAt,
+      jti: "grant_browser",
+      metadata: { requestId: null, source: "browser" },
+      role: "observer",
+    });
+    const store: AuthGrantStore = {
+      findByJti: vi.fn(async () => grant),
+      list: async () => [],
+    };
+    const runtime = createAuthRuntime({
+      activeKid: "current",
+      browserSessionStore: {
+        findBrowserSession: vi.fn(async () => null),
+      },
+      grantStore: store,
+      issuer: grant.issuer,
+      mode: "required",
+      now: () => new Date("2026-07-17T01:00:00.000Z"),
+      secrets: { current: "runtime-secret" },
+    });
+    const bearer = mintAuthGrantToken(
+      {
+        issuer: grant.issuer,
+        jti: grant.jti,
+        kid: grant.kid,
+        role: grant.role,
+        sessionScope: grant.sessionScope,
+        subject: grant.subject,
+      },
+      { current: "runtime-secret" },
+      { now: issuedAt },
+    );
+
+    await expect(runtime.authenticateBrowserSessionToken(bearer)).resolves.toMatchObject({
+      grantJti: "grant_browser",
+      role: "observer",
+    });
+    await expect(
+      runtime.authenticateHttpRequest(
+        {
+          headers: { authorization: `Bearer ${bearer}` },
+          method: "GET",
+        } as IncomingMessage,
+        new URL("http://localhost/sessions"),
+      ),
+    ).rejects.toThrow(AuthError.RoleDenied);
+  });
+
   it("authenticates tgr2 through PostgreSQL and retains a private command revalidator", async () => {
     const issuedAt = new Date("2026-07-17T00:00:00.000Z");
     const store: AuthGrantStore = {
@@ -61,6 +113,77 @@ describe("auth enforcement runtime", () => {
     await expect(authenticated?.authorizeCommand()).resolves.toBeUndefined();
     expect(store.findByJti).toHaveBeenCalledTimes(2);
     expect(JSON.stringify(runtime.debugInfo())).not.toContain(bearer);
+  });
+
+  it("requires the browser session's exact Origin when admitting its one-time WebSocket ticket", async () => {
+    const issuedAt = new Date("2026-07-17T00:00:00.000Z");
+    const grant = createGrant({
+      issuedAt,
+      jti: "grant_browser_ticket",
+      metadata: { requestId: null, source: "browser" },
+      role: "observer",
+    });
+    const ticket = "T".repeat(43);
+    const ticketStore: AuthTicketStore = {
+      consume: vi.fn<AuthTicketStore["consume"]>(async () => ({
+        admissionMetadata: {
+          remoteAddressHash: null,
+          replicaId: "replica_browser_ticket",
+          transport: "websocket",
+        },
+        audience: "tether-websocket",
+        consumedAt: new Date("2026-07-17T01:00:00.000Z"),
+        createdAt: new Date("2026-07-17T00:59:50.000Z"),
+        expiresAt: new Date("2026-07-17T01:00:20.000Z"),
+        parentGrantJti: grant.jti,
+        ticketHash: createHash("sha256").update(ticket).digest("hex"),
+      })),
+      create: vi.fn(async () => undefined),
+      findByHash: vi.fn(async () => null),
+    };
+    const findBrowserSession = vi
+      .fn()
+      .mockResolvedValueOnce({
+        createdAt: issuedAt,
+        csrfTokenHash: "a".repeat(64),
+        grantJti: grant.jti,
+        origin: "https://hub.example.test",
+      })
+      .mockResolvedValueOnce(null);
+    const runtime = createAuthRuntime({
+      activeKid: "current",
+      browserSessionStore: {
+        findBrowserSession,
+      },
+      grantStore: { findByJti: vi.fn(async () => grant), list: async () => [] },
+      issuer: grant.issuer,
+      mode: "required",
+      now: () => new Date("2026-07-17T01:00:00.000Z"),
+      secrets: { current: "runtime-secret" },
+      ticketStore,
+    });
+    const url = new URL(`http://localhost/sessions/sess_runtime/stream?ticket=${ticket}`);
+
+    await expect(
+      runtime.authenticateWebSocketUpgrade(
+        {
+          headers: { origin: "https://evil.example.test" },
+          method: "GET",
+          url: `${url.pathname}${url.search}`,
+        } as IncomingMessage,
+        url,
+      ),
+    ).rejects.toThrow(AuthError.OriginDenied);
+    await expect(
+      runtime.authenticateWebSocketUpgrade(
+        {
+          headers: { origin: "https://hub.example.test" },
+          method: "GET",
+          url: `${url.pathname}${url.search}`,
+        } as IncomingMessage,
+        url,
+      ),
+    ).rejects.toThrow(AuthError.RoleDenied);
   });
 
   it.each([
@@ -368,6 +491,23 @@ describe("auth enforcement runtime", () => {
 interface AuthWarning {
   readonly details: Record<string, unknown>;
   readonly event: string;
+}
+
+function createGrant(
+  overrides: Partial<AuthGrantRecord> & Pick<AuthGrantRecord, "issuedAt" | "jti">,
+): AuthGrantRecord {
+  return {
+    audience: "tether-rest",
+    expiresAt: new Date("2026-07-18T00:00:00.000Z"),
+    issuer: "https://auth.runtime.test",
+    kid: "current",
+    metadata: { requestId: null, source: "admin" },
+    revokedAt: null,
+    role: "admin",
+    sessionScope: "sess_runtime",
+    subject: "part_runtime",
+    ...overrides,
+  };
 }
 
 /** Mints a compatibility legacy stateless bearer for escape-hatch tests. */

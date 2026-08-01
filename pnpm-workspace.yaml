@@ -1,5 +1,6 @@
 packages:
   - "apps/*"
+  - "packages/browser"
   - "packages/client"
   - "packages/client-bridge"
   - "packages/protocol"

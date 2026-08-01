@@ -26,15 +26,13 @@ describe("schedule identity uniqueness", () => {
     expect(schema).toContain('uniqueIndex("tasks_schedule_identity_idx")');
   });
 
-  it("requires a unique schedule-identity index in the 0011 legacy baseline probe", () => {
+  it("requires unique legacy and provider-neutral schedule indexes in baseline probes", () => {
     const migrationModule = readFileSync(
       fileURLToPath(new URL("../src/database-migration.ts", import.meta.url)),
       "utf8",
     );
-    expect(migrationModule).toContain('hasIndexSignature(client, "tasks_schedule_identity_idx", {');
     expect(migrationModule).toContain("AND index_record.indisunique = $3");
-    expect(migrationModule).toMatch(
-      /hasIndexSignature\(client, "tasks_schedule_identity_idx", \{[\s\S]*?tableName: "tasks",[\s\S]*?unique: true,/u,
-    );
+    expect(migrationModule).toMatch(/legacyScheduleIdentityIndex[\s\S]*?unique: true/u);
+    expect(migrationModule).toMatch(/providerNeutralScheduleIdentityIndex[\s\S]*?unique: true/u);
   });
 });

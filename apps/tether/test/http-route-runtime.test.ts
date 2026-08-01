@@ -11,12 +11,38 @@ import {
   type HttpRouteErrorLogDetails,
   type HttpRouteErrorLogger,
   handleHttpRouteError,
+  readCorsOptionsFromEnv,
   sendAuthError,
   sendControlEpochRequired,
 } from "../src/http-route-runtime.js";
 import { RestControlPolicy } from "../src/rest-control-policy.js";
 
 describe("handleHttpRouteError", () => {
+  it("accepts only canonical HTTP origins in browser authority configuration", () => {
+    expect(
+      readCorsOptionsFromEnv({
+        BROWSER_ALLOWED_ORIGINS: "https://Hub.Example.Test, http://127.0.0.1:17445/",
+      }),
+    ).toEqual({
+      allowedOrigins: ["https://hub.example.test", "http://127.0.0.1:17445"],
+    });
+
+    for (const value of [
+      "null",
+      "*",
+      "file:///tmp/hub",
+      "https://user@example.test",
+      "https://example.test/path",
+      "https://example.test?query=1",
+      "https://example.test#fragment",
+      "not-an-origin",
+    ]) {
+      expect(() => readCorsOptionsFromEnv({ BROWSER_ALLOWED_ORIGINS: value })).toThrowError(
+        "browser_allowed_origin_invalid",
+      );
+    }
+  });
+
   it("classifies every declared route and inventories participant-owned mutations", () => {
     expect(httpRouteInventory.every((route) => route.control.length > 0)).toBe(true);
     expect(

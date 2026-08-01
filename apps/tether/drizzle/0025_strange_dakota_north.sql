@@ -1,0 +1,12 @@
+DROP INDEX "participants_session_last_seen_idx";--> statement-breakpoint
+ALTER TABLE "tasks" ADD COLUMN "operator_command_key" text;--> statement-breakpoint
+ALTER TABLE "tasks" ADD COLUMN "operator_grant_jti" text;--> statement-breakpoint
+CREATE INDEX "browser_pairing_exchange_failures_created_idx" ON "browser_pairing_exchange_failures" USING btree ("created_at");--> statement-breakpoint
+CREATE INDEX "tasks_session_created_idx" ON "tasks" USING btree ("session_id","created_at" DESC NULLS LAST,"task_id");--> statement-breakpoint
+CREATE INDEX "tasks_operator_grant_created_idx" ON "tasks" USING btree ("operator_grant_jti","created_at") WHERE "tasks"."operator_grant_jti" IS NOT NULL;--> statement-breakpoint
+CREATE INDEX "tasks_operator_pending_idx" ON "tasks" USING btree ("created_at") WHERE "tasks"."operator_command_key" IS NOT NULL AND "tasks"."cancelled_at" IS NULL AND "tasks"."completed_at" IS NULL AND "tasks"."failed_at" IS NULL;--> statement-breakpoint
+CREATE UNIQUE INDEX "tasks_operator_command_active_unique" ON "tasks" USING btree ("session_id","operator_command_key") WHERE "tasks"."operator_command_key" IS NOT NULL AND "tasks"."cancelled_at" IS NULL AND "tasks"."completed_at" IS NULL AND "tasks"."failed_at" IS NULL;--> statement-breakpoint
+CREATE INDEX "participants_session_last_seen_idx" ON "participants" USING btree ("session_id","last_seen_at" DESC NULLS LAST,"participant_id");--> statement-breakpoint
+ALTER TABLE "participants" ADD CONSTRAINT "participants_snapshot_size_check" CHECK (octet_length("participants"."capabilities"::text) + octet_length("participants"."display_name") <= 2097152);--> statement-breakpoint
+ALTER TABLE "tasks" ADD CONSTRAINT "tasks_operator_command_shape_check" CHECK (("tasks"."operator_command_key" IS NULL AND "tasks"."operator_grant_jti" IS NULL AND "tasks"."kind" NOT LIKE 'operator.%') OR ("tasks"."operator_command_key" ~ '^[0-9a-f]{64}$' AND char_length("tasks"."operator_grant_jti") BETWEEN 1 AND 128 AND "tasks"."kind" LIKE 'operator.%'));--> statement-breakpoint
+ALTER TABLE "tasks" ADD CONSTRAINT "tasks_snapshot_size_check" CHECK (octet_length(coalesce("tasks"."input"::text, '')) + octet_length(coalesce("tasks"."failure"::text, '')) + octet_length(coalesce("tasks"."result"::text, '')) + octet_length("tasks"."kind") + octet_length("tasks"."objective") <= 2097152);

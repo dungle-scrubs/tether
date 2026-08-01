@@ -1,0 +1,14 @@
+title = "Tether secret scanning"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+  [[rules.allowlists]]
+  description = "Opaque scope identifiers in protocol identity tests are public fixtures"
+  condition = "AND"
+  regexTarget = "line"
+  regexes = ['''scopeKey\s*:''']
+  paths = ['''packages/protocol/test/(recurring-work-identity|scheduled-maintenance-identity)\.test\.ts''']
