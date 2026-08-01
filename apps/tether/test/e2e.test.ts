@@ -159,7 +159,12 @@ const generatedMigrationNames = [
   "0015_conscious_toad.sql",
   "0016_daffy_surge.sql",
   "0017_skinny_lockheed.sql",
+  "0018_complex_elektra.sql",
+  "0019_hesitant_jazinda.sql",
+  "0020_busy_maria_hill.sql",
 ] as const;
+const authFoundationMigrationIndex = 16;
+const preAuthFoundationMigrationIndex = authFoundationMigrationIndex - 1;
 
 interface JsonResponse {
   readonly [key: string]: unknown;
@@ -301,6 +306,16 @@ function requireClaimId(task: { readonly claimId: string | null }): string {
 }
 
 interface TaskApprovalResponse extends JsonResponse {
+  readonly approval: {
+    readonly approvalEventId: string;
+    readonly decidedAt: string;
+    readonly decidedByParticipantId: string;
+    readonly decision: "approved" | "rejected";
+    readonly reason: Record<string, unknown>;
+    readonly sessionId: string;
+    readonly targetKey: string;
+    readonly taskId: string;
+  };
   readonly decision: "approved" | "rejected";
   readonly event?: SessionEvent;
   readonly existingDecision?: "approved" | "rejected";
@@ -1540,7 +1555,7 @@ e2e("tether e2e", () => {
     const database = createPool(buildDatabaseUrl(databaseName));
     try {
       await createDatabase(databaseName);
-      await applyLegacyMigrationPrefix(database, generatedMigrationNames.length - 2);
+      await applyLegacyMigrationPrefix(database, authFoundationMigrationIndex);
       await database.pool.query(`
         ALTER TABLE auth_grants DROP CONSTRAINT auth_grants_lifetime_check;
         ALTER TABLE auth_grants ADD CONSTRAINT auth_grants_lifetime_check
@@ -1550,7 +1565,7 @@ e2e("tether e2e", () => {
       await expect(migrate(database)).rejects.toMatchObject({
         name: "DatabaseMigrationError",
         reason: "unsupported_schema",
-        recognizedPrefix: generatedMigrationNames.length - 3,
+        recognizedPrefix: preAuthFoundationMigrationIndex,
       });
 
       const journal = await database.pool.query<{ readonly count: number }>(
@@ -1568,13 +1583,13 @@ e2e("tether e2e", () => {
     const database = createPool(buildDatabaseUrl(databaseName));
     try {
       await createDatabase(databaseName);
-      await applyLegacyMigrationPrefix(database, generatedMigrationNames.length - 3);
+      await applyLegacyMigrationPrefix(database, preAuthFoundationMigrationIndex);
       await database.pool.query(`CREATE TABLE auth_grants (jti text PRIMARY KEY NOT NULL)`);
 
       await expect(migrate(database)).rejects.toMatchObject({
         name: "DatabaseMigrationError",
         reason: "unsupported_schema",
-        recognizedPrefix: generatedMigrationNames.length - 3,
+        recognizedPrefix: preAuthFoundationMigrationIndex,
       });
 
       const journal = await database.pool.query<{ readonly count: number }>(
@@ -1640,13 +1655,13 @@ e2e("tether e2e", () => {
     const database = createPool(buildDatabaseUrl(databaseName));
     try {
       await createDatabase(databaseName);
-      await applyLegacyMigrationPrefix(database, generatedMigrationNames.length - 2);
+      await applyLegacyMigrationPrefix(database, authFoundationMigrationIndex);
       await database.pool.query(mutationSql);
 
       await expect(migrate(database)).rejects.toMatchObject({
         name: "DatabaseMigrationError",
         reason: "unsupported_schema",
-        recognizedPrefix: generatedMigrationNames.length - 3,
+        recognizedPrefix: preAuthFoundationMigrationIndex,
       });
       const journal = await database.pool.query<{ readonly count: number }>(
         `SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`,
@@ -6861,6 +6876,96 @@ e2e("tether e2e", () => {
       task: { taskId: task.task.taskId },
     });
     expect(events.events.filter((event) => event.type === "approval.recorded")).toHaveLength(1);
+  });
+
+  it("atomically binds manifest targets and returns the canonical duplicate decision", async () => {
+    const session = await createSession();
+    const target = {
+      action: "action_opaque_1",
+      digest: "digest_opaque_1",
+      scopeKey: "scope_opaque_1",
+      targetId: "target_opaque_1",
+      targetKind: "kind_opaque_1",
+      targetRevision: "revision_opaque_1",
+    };
+    const task = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
+      body: { kind: "opaque_manifest_review", objective: "review opaque targets" },
+      method: "POST",
+    });
+    const controller = {
+      instanceId: "inst_manifest_e2e",
+      participantId: "part_manifest_e2e",
+    };
+    const claimed = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim`,
+      { body: controller, method: "POST" },
+    );
+    await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${task.task.taskId}/complete`,
+      {
+        body: {
+          ...controller,
+          claimId: requireClaimId(claimed.task),
+          result: { targetManifest: [target] },
+        },
+        method: "POST",
+      },
+    );
+    const targetless = await requestStatus(
+      `/sessions/${session.sessionId}/tasks/${task.task.taskId}/approval`,
+      {
+        body: { decision: "approved", participantId: "operator_missing_target" },
+        method: "POST",
+      },
+    );
+    const first = await request<TaskApprovalResponse>(
+      `/sessions/${session.sessionId}/tasks/${task.task.taskId}/approval`,
+      {
+        body: { decision: "approved", participantId: "operator_first", target },
+        method: "POST",
+      },
+    );
+    const identical = await request<TaskApprovalResponse>(
+      `/sessions/${session.sessionId}/tasks/${task.task.taskId}/approval`,
+      {
+        body: { decision: "approved", participantId: "operator_second", target },
+        method: "POST",
+      },
+    );
+    const contradictory = await request<TaskApprovalResponse>(
+      `/sessions/${session.sessionId}/tasks/${task.task.taskId}/approval`,
+      {
+        body: { decision: "rejected", participantId: "operator_third", target },
+        method: "POST",
+      },
+    );
+    const events = await request<EventsResponse>(`/sessions/${session.sessionId}/events?after=0`);
+
+    expect(targetless).toMatchObject({
+      body: { rejectionReason: "target_required" },
+      status: 409,
+    });
+    expect(first).toMatchObject({
+      approval: {
+        decidedByParticipantId: "operator_first",
+        decision: "approved",
+        targetKey: expect.stringMatching(/^approvalTarget:v2:sha256:[0-9a-f]{64}$/),
+      },
+      status: "recorded",
+    });
+    expect(identical).toMatchObject({ status: "ignored" });
+    expect(contradictory).toMatchObject({
+      decision: "rejected",
+      existingDecision: "approved",
+      status: "ignored",
+    });
+    expect(identical.approval).toEqual(first.approval);
+    expect(contradictory.approval).toEqual(first.approval);
+    expect(identical.task).toEqual(first.task);
+    expect(contradictory.task).toEqual(first.task);
+    const approvalEvents = events.events.filter((event) => event.type === "approval.recorded");
+    expect(approvalEvents).toHaveLength(1);
+    expect(approvalEvents[0]?.payload).toMatchObject({ approval: first.approval });
   });
 
   it("records only one approval for concurrent REST approval requests", async () => {

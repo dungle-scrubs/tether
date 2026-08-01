@@ -433,6 +433,10 @@ export const tasks = pgTable(
       table.scheduleIntervalMs,
       table.scheduleWindowStart,
     ),
+    check(
+      "tasks_schedule_scope_key_size_check",
+      sql`${table.scheduleScopeKey} IS NULL OR octet_length(${table.scheduleScopeKey}) BETWEEN 1 AND 512`,
+    ),
   ],
 );
 

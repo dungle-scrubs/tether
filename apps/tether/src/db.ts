@@ -27,6 +27,7 @@ import {
   buildTaskFailedEventInput,
   buildTaskReleasedEventInput,
   deriveScheduledTaskId,
+  newEventId,
   newSessionId,
   parsePositiveSafeInteger,
   targetManifestSchema,
@@ -697,6 +698,7 @@ export type ApprovalTargetManifestErrorReason =
   | "scope_mismatch"
   | "target_absent"
   | "target_kind_mismatch"
+  | "target_required"
   | "target_revision_mismatch"
   | "task_not_completed";
 
@@ -2759,16 +2761,8 @@ export async function recordTaskApproval(
       await client.query("COMMIT");
       return null;
     }
-    if (input.target !== undefined) {
-      assertApprovalTargetManifest(task, input.target);
-    }
-    const eventInput = buildTaskApprovalRecordedEventInput({
-      decision: input.decision,
-      participantId: input.participantId,
-      reason: input.reason,
-      sessionId: input.sessionId,
-      task,
-    });
+    assertApprovalTargetManifest(task, input.target);
+    const approvalEventId = newEventId();
     const insertedRows = await client.query<PgTaskApprovalRow>(
       `
         INSERT INTO task_approvals (
@@ -2785,7 +2779,7 @@ export async function recordTaskApproval(
         RETURNING ${taskApprovalReturningColumns}
       `,
       [
-        eventInput.eventId,
+        approvalEventId,
         input.participantId,
         input.decision,
         JSON.stringify(input.reason),
@@ -2814,10 +2808,23 @@ export async function recordTaskApproval(
         targetKey,
       };
     }
-    const event = await appendEventWithClient(client, eventInput, input.eventSourceId);
+    const approval = toTaskApprovalRecord(insertedRows.rows[0]);
+    const event = await appendEventWithClient(
+      client,
+      buildTaskApprovalRecordedEventInput({
+        approval,
+        decision: input.decision,
+        eventId: approvalEventId,
+        participantId: input.participantId,
+        reason: input.reason,
+        sessionId: input.sessionId,
+        task,
+      }),
+      input.eventSourceId,
+    );
     await client.query("COMMIT");
     return {
-      approval: toTaskApprovalRecord(insertedRows.rows[0]),
+      approval,
       decision: input.decision,
       event,
       events: [event] as const,
@@ -2834,7 +2841,16 @@ export async function recordTaskApproval(
 }
 
 /** Verifies one submitted target against the completed result inside the commit transaction. */
-function assertApprovalTargetManifest(task: TaskRecord, target: ApprovalTarget): void {
+function assertApprovalTargetManifest(task: TaskRecord, target: ApprovalTarget | undefined): void {
+  if (target === undefined) {
+    if (task.result !== null && "targetManifest" in task.result) {
+      const manifest = targetManifestSchema.safeParse(task.result.targetManifest);
+      if (!manifest.success || manifest.data.length > 0) {
+        throw new ApprovalTargetManifestError("target_required");
+      }
+    }
+    return;
+  }
   if (task.completedAt === null) {
     throw new ApprovalTargetManifestError("task_not_completed");
   }
@@ -2842,29 +2858,48 @@ function assertApprovalTargetManifest(task: TaskRecord, target: ApprovalTarget):
   if (!manifest.success) {
     throw new ApprovalTargetManifestError("target_absent");
   }
-  const sameId = manifest.data.filter((entry) => entry.targetId === target.targetId);
-  if (sameId.length === 0) {
+  let deepestMatch = 0;
+  for (const entry of manifest.data) {
+    if (entry.targetId !== target.targetId) {
+      continue;
+    }
+    deepestMatch = Math.max(deepestMatch, 1);
+    if (entry.targetKind !== target.targetKind) {
+      continue;
+    }
+    deepestMatch = Math.max(deepestMatch, 2);
+    if (entry.scopeKey !== target.scopeKey) {
+      continue;
+    }
+    deepestMatch = Math.max(deepestMatch, 3);
+    if (entry.targetRevision !== target.targetRevision) {
+      continue;
+    }
+    deepestMatch = Math.max(deepestMatch, 4);
+    if (entry.action !== target.action) {
+      continue;
+    }
+    deepestMatch = Math.max(deepestMatch, 5);
+    if (entry.digest === target.digest) {
+      return;
+    }
+  }
+  if (deepestMatch === 0) {
     throw new ApprovalTargetManifestError("target_absent");
   }
-  const sameKind = sameId.filter((entry) => entry.targetKind === target.targetKind);
-  if (sameKind.length === 0) {
+  if (deepestMatch === 1) {
     throw new ApprovalTargetManifestError("target_kind_mismatch");
   }
-  const sameScope = sameKind.filter((entry) => entry.scopeKey === target.scopeKey);
-  if (sameScope.length === 0) {
+  if (deepestMatch === 2) {
     throw new ApprovalTargetManifestError("scope_mismatch");
   }
-  const sameRevision = sameScope.filter((entry) => entry.targetRevision === target.targetRevision);
-  if (sameRevision.length === 0) {
+  if (deepestMatch === 3) {
     throw new ApprovalTargetManifestError("target_revision_mismatch");
   }
-  const sameAction = sameRevision.filter((entry) => entry.action === target.action);
-  if (sameAction.length === 0) {
+  if (deepestMatch === 4) {
     throw new ApprovalTargetManifestError("action_mismatch");
   }
-  if (!sameAction.some((entry) => entry.digest === target.digest)) {
-    throw new ApprovalTargetManifestError("digest_mismatch");
-  }
+  throw new ApprovalTargetManifestError("digest_mismatch");
 }
 
 /**

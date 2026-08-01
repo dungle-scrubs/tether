@@ -329,7 +329,18 @@ describe("protocol event builders and envelopes", () => {
   it("builds task approval recorded events", () => {
     expect(approvalDecisionSchema.parse("approved")).toBe("approved");
     const eventInput = buildTaskApprovalRecordedEventInput({
+      approval: {
+        approvalEventId: "evt_approval_test",
+        decidedAt: "2026-05-21T00:01:00.000Z",
+        decidedByParticipantId: "part_external_bridge",
+        decision: "approved",
+        reason: { source: "external-chat" },
+        sessionId: "sess_test",
+        targetKey: "task",
+        taskId: "task_test",
+      },
       decision: "approved",
+      eventId: "evt_approval_test",
       participantId: "part_external_bridge",
       reason: { source: "external-chat" },
       sessionId: "sess_test",

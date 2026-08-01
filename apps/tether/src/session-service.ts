@@ -1,6 +1,5 @@
 import { Context, Effect, Layer } from "effect";
 
-import { approvalTargetKey } from "./approval-target-key.js";
 import { ServerConfigService } from "./config.js";
 import { type DatabasePool, DatabaseService } from "./db.js";
 import { createSessionPersistenceStores } from "./db-stores.js";
@@ -47,6 +46,7 @@ import {
   summarizeRestTaskMutationResult,
   summarizeTaskClaimRefreshResult,
   summarizeTaskMutationResult,
+  taskApprovalTraceInput,
   taskParticipantTraceInput,
 } from "./session-service-task-effects.js";
 import type { SessionEvent } from "./types.js";
@@ -672,11 +672,7 @@ function makeSessionServiceEffect(
     recordTaskApprovalOverRest: (input) =>
       traceEffect(
         "recordTaskApprovalOverRest",
-        {
-          ...taskParticipantTraceInput(input),
-          decision: input.decision,
-          targetKey: approvalTargetKey(input.reason),
-        },
+        taskApprovalTraceInput(input),
         withRestControlOutcome(
           "task.approval",
           Effect.gen(function* () {

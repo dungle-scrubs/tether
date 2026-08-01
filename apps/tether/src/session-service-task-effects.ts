@@ -48,6 +48,7 @@ import {
 } from "./session-service-contracts.js";
 import { trySessionPromise } from "./session-service-runtime.js";
 import type {
+  ApprovalTarget,
   CandidateScheduleIdentity,
   ScheduledMaintenanceIdentity,
   SessionEvent,
@@ -298,6 +299,7 @@ export function createSessionTaskEffects(input: SessionTaskEffectsInput): Sessio
         const rejectionReason = approvalRejectionReasonFromValidators(
           input.approvalValidators,
           task,
+          taskInput.target,
         );
         if (rejectionReason) {
           return yield* Effect.fail(
@@ -697,6 +699,15 @@ export function taskParticipantTraceInput(input: TaskParticipantInput): Record<s
   };
 }
 
+/** Builds trace correlation fields for one approval request. */
+export function taskApprovalTraceInput(input: RecordTaskApprovalInput): Record<string, unknown> {
+  return {
+    ...taskParticipantTraceInput(input),
+    decision: input.decision,
+    targetKey: approvalTargetKey(input.reason, input.target),
+  };
+}
+
 /**
  * Summarizes task mutation results for boundary logs and spans.
  */
@@ -876,11 +887,18 @@ function assertTaskApprovalResultWithObservability(
 function approvalRejectionReasonFromValidators(
   approvalValidators: ReadonlyMap<string, TaskApprovalValidator>,
   task: TaskRecord,
+  target: ApprovalTarget | undefined,
 ): TaskApprovalRejectionReason | null {
-  const validator = approvalValidators.get(task.kind);
   if (task.completedAt === null) {
     return "task_not_completed";
   }
+  if (target !== undefined) {
+    return null;
+  }
+  if (isRecord(task.result) && "targetManifest" in task.result) {
+    return null;
+  }
+  const validator = approvalValidators.get(task.kind);
   if (!validator) {
     return isGenericApprovableTaskResult(task.kind, task.result) ? null : "unsupported_task_kind";
   }

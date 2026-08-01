@@ -7,6 +7,7 @@ import {
 } from "./approval-targets.js";
 import { sessionEventSchema } from "./event-builders.js";
 import { controlChannelSchema, participantRuntimeKindSchema } from "./records.js";
+import { recurringWorkScopeKeySchema } from "./task-contracts.js";
 
 /** Bounded readiness failure reasons safe for unauthenticated responses. */
 export const readinessFailureReason = {
@@ -166,7 +167,7 @@ export const scheduledTaskIdentitySchema = z
     scheduleAlgorithmVersion: z.number().int().positive(),
     scheduleIntervalMs: z.number().int().positive(),
     scheduleWindowStart: z.number().int().nonnegative(),
-    scopeKey: z.string().min(1),
+    scopeKey: recurringWorkScopeKeySchema,
   })
   .strict()
   .refine(

@@ -192,10 +192,23 @@ export const scheduleWindowAlgorithmVersion = 1;
 /** Current durable scheduled-task identity format written by Tether. */
 export const currentScheduledTaskIdentityVersion = 2;
 
+/** Maximum encoded size of one provider-neutral recurring-work scope key. */
+export const recurringWorkScopeKeyMaxBytes = 512;
+
+const utf8Encoder = new TextEncoder();
+
+/** Runtime validator for one bounded opaque recurring-work scope key. */
+export const recurringWorkScopeKeySchema = z
+  .string()
+  .min(1)
+  .refine((value) => utf8Encoder.encode(value).byteLength <= recurringWorkScopeKeyMaxBytes, {
+    message: `Scope key must not exceed ${recurringWorkScopeKeyMaxBytes} UTF-8 bytes`,
+  });
+
 /** Runtime validator for an opaque recurring-work scope. */
 export const recurringWorkScopeSchema = z
   .object({
-    scopeKey: z.string().min(1),
+    scopeKey: recurringWorkScopeKeySchema,
   })
   .strict();
 
@@ -408,7 +421,7 @@ export const candidateScheduleIdentitySchema = z
   .object({
     identityVersion: z.number().int().positive(),
     scheduleWindow: scheduleWindowSchema,
-    scopeKey: z.string().min(1),
+    scopeKey: recurringWorkScopeKeySchema,
   })
   .strict();
 

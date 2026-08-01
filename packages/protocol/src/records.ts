@@ -231,7 +231,7 @@ export interface TaskApprovalRecord {
   readonly decidedByParticipantId: string;
   /** Winning approval decision for the target. */
   readonly decision: "approved" | "rejected";
-  /** Original approval reason used to derive the target key. */
+  /** Original approval reason submitted with the winning decision. */
   readonly reason: Record<string, unknown>;
   /** Session that owns the task. */
   readonly sessionId: string;

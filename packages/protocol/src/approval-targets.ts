@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { recurringWorkScopeKeySchema } from "./task-contracts.js";
+
 const opaqueTargetValueSchema = z.string().min(1).max(512);
 
 /** Durable approval decision values recorded in task approval history. */
@@ -13,7 +15,7 @@ export const approvalTargetSchema = z
   .object({
     action: opaqueTargetValueSchema,
     digest: opaqueTargetValueSchema,
-    scopeKey: opaqueTargetValueSchema,
+    scopeKey: recurringWorkScopeKeySchema,
     targetId: opaqueTargetValueSchema,
     targetKind: opaqueTargetValueSchema,
     targetRevision: opaqueTargetValueSchema,
@@ -23,6 +25,16 @@ export const approvalTargetSchema = z
 /** Public provider-neutral approval target. Every field is opaque to Tether. */
 export type ApprovalTarget = z.infer<typeof approvalTargetSchema>;
 
+/** Collision-free canonical encoding of one opaque target identity tuple. */
+export function approvalTargetIdentityKey(target: ApprovalTarget): string {
+  return JSON.stringify([
+    target.targetKind,
+    target.scopeKey,
+    target.targetId,
+    target.targetRevision,
+  ]);
+}
+
 /** Bounded target manifest persisted inside a completed task result. */
 export const targetManifestSchema = z
   .array(approvalTargetSchema)
@@ -30,12 +42,7 @@ export const targetManifestSchema = z
   .superRefine((entries, context) => {
     const identities = new Set<string>();
     for (const [index, entry] of entries.entries()) {
-      const identity = JSON.stringify([
-        entry.targetKind,
-        entry.scopeKey,
-        entry.targetId,
-        entry.targetRevision,
-      ]);
+      const identity = approvalTargetIdentityKey(entry);
       if (identities.has(identity)) {
         context.addIssue({
           code: "custom",

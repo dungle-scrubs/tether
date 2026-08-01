@@ -8,6 +8,12 @@ import {
 } from "../src/index.js";
 
 describe("recurring work scope", () => {
+  it("rejects scope keys larger than the durable UTF-8 byte limit", () => {
+    expect(recurringWorkScopeSchema.safeParse({ scopeKey: "a".repeat(512) }).success).toBe(true);
+    expect(recurringWorkScopeSchema.safeParse({ scopeKey: "a".repeat(513) }).success).toBe(false);
+    expect(recurringWorkScopeSchema.safeParse({ scopeKey: "🧪".repeat(129) }).success).toBe(false);
+  });
+
   it("accepts an opaque scope key and rejects provider-specific fields", () => {
     expect(recurringWorkScopeSchema.parse({ scopeKey: "scope_01JEMAIL" })).toEqual({
       scopeKey: "scope_01JEMAIL",

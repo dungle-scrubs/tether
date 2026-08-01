@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import type { CandidateScheduleIdentity, SessionEvent, TaskRecord } from "../src/index.js";
 import {
+  buildTaskApprovalRecordedEventInput,
   parseAfterSeq,
+  taskApprovalRecordedPayloadSchema,
   taskClaimExpiredPayloadSchema,
   taskCreatedPayloadSchema,
   taskFromClaimableEvent,
@@ -22,6 +24,32 @@ describe("parseAfterSeq", () => {
 });
 
 describe("task-bearing event payloads", () => {
+  it("carries the canonical approval record in new approval events", () => {
+    const task = createScheduledTaskFixture();
+    const approval = {
+      approvalEventId: "evt_approval_1",
+      decidedAt: "2026-01-01T00:01:00.000Z",
+      decidedByParticipantId: "operator_1",
+      decision: "approved" as const,
+      reason: {},
+      sessionId: task.sessionId,
+      targetKey: "approvalTarget:v2:sha256:opaque",
+      taskId: task.taskId,
+    };
+    const event = buildTaskApprovalRecordedEventInput({
+      approval,
+      decision: approval.decision,
+      eventId: approval.approvalEventId,
+      participantId: approval.decidedByParticipantId,
+      reason: approval.reason,
+      sessionId: task.sessionId,
+      task,
+    });
+
+    expect(taskApprovalRecordedPayloadSchema.parse(event.payload).approval).toEqual(approval);
+    expect(event.eventId).toBe(approval.approvalEventId);
+  });
+
   it("preserves scheduled task identity in task-created validation and extraction", () => {
     const task = createScheduledTaskFixture();
     const event = createTaskEvent("task.created", { task });

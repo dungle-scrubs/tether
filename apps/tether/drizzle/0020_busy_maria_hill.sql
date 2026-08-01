@@ -1,0 +1,1 @@
+ALTER TABLE "tasks" ADD CONSTRAINT "tasks_schedule_scope_key_size_check" CHECK ("tasks"."schedule_scope_key" IS NULL OR octet_length("tasks"."schedule_scope_key") BETWEEN 1 AND 512);

@@ -1,7 +1,18 @@
 import { z } from "zod";
 import { approvalDecisionSchema } from "./approval-targets.js";
-import type { ParticipantRecord, SessionEvent, SessionEventType, TaskRecord } from "./records.js";
-import { sessionEventType, systemProducerId, taskRecordSchema } from "./records.js";
+import type {
+  ParticipantRecord,
+  SessionEvent,
+  SessionEventType,
+  TaskApprovalRecord,
+  TaskRecord,
+} from "./records.js";
+import {
+  sessionEventType,
+  systemProducerId,
+  taskApprovalRecordSchema,
+  taskRecordSchema,
+} from "./records.js";
 
 const sessionEventTypeSchema = z
   .string()
@@ -34,6 +45,7 @@ export const taskCancelledPayloadSchema = z.object({
 
 /** Event payload schema for task approval decisions. */
 export const taskApprovalRecordedPayloadSchema = z.object({
+  approval: taskApprovalRecordSchema.optional(),
   decision: approvalDecisionSchema,
   participantId: z.string().min(1),
   reason: z.record(z.string(), z.unknown()).default({}),
@@ -84,7 +96,9 @@ interface BuildTaskCancelledEventInput extends BuildTaskParticipantEventInput {
 }
 
 interface BuildTaskApprovalRecordedEventInput extends BuildTaskParticipantEventInput {
+  readonly approval: TaskApprovalRecord;
   readonly decision: z.infer<typeof approvalDecisionSchema>;
+  readonly eventId: string;
   readonly reason: Record<string, unknown>;
 }
 
@@ -240,8 +254,9 @@ export function buildTaskApprovalRecordedEventInput(
   input: BuildTaskApprovalRecordedEventInput,
 ): AppendSessionEventInput {
   return {
-    eventId: newEventId(),
+    eventId: input.eventId,
     payload: {
+      approval: input.approval,
       decision: input.decision,
       participantId: input.participantId,
       reason: input.reason,

@@ -86,6 +86,25 @@ function database(client: ManifestApprovalClient): DatabasePool {
 }
 
 describe("target-manifest approval commit", () => {
+  it("rejects a targetless approval when the completed result declares targets", async () => {
+    const client = new ManifestApprovalClient({ result: { targetManifest: [target] } });
+
+    await expect(
+      recordTaskApproval(database(client), {
+        decision: "approved",
+        eventSourceId: "src_manifest_test",
+        participantId: "operator_1",
+        reason: {},
+        sessionId: "sess_manifest",
+        taskId: "task_manifest",
+      }),
+    ).rejects.toMatchObject({
+      name: "ApprovalTargetManifestError",
+      reason: "target_required",
+    });
+    expect(client.queries.some((sql) => sql.includes("INSERT INTO task_approvals"))).toBe(false);
+  });
+
   it("rejects a target absent from the completed result manifest before insert", async () => {
     const client = new ManifestApprovalClient();
 

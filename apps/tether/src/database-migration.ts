@@ -673,13 +673,22 @@ function legacyMigrationProbes(): readonly LegacyMigrationProbe[] {
     },
     {
       label: "0019 provider-neutral recurring-work identity",
-      contradictionObserved: async (client) =>
-        (await hasIndex(client, "tasks_schedule_identity_idx")) &&
-        !(await hasIndexSignature(
-          client,
-          "tasks_schedule_identity_idx",
-          providerNeutralScheduleIdentityIndex,
-        )),
+      contradictionObserved: async (client) => {
+        const hasIdentityVersion = await hasColumn(client, "tasks", "schedule_identity_version");
+        const hasScopeKey = await hasColumn(client, "tasks", "schedule_scope_key");
+        if (!hasIdentityVersion && !hasScopeKey) {
+          return false;
+        }
+        return (
+          !hasIdentityVersion ||
+          !hasScopeKey ||
+          !(await hasIndexSignature(
+            client,
+            "tasks_schedule_identity_idx",
+            providerNeutralScheduleIdentityIndex,
+          ))
+        );
+      },
       represented: async (client) =>
         (await hasColumns(client, "tasks", ["schedule_identity_version", "schedule_scope_key"])) &&
         (await hasIndexSignature(
@@ -687,6 +696,30 @@ function legacyMigrationProbes(): readonly LegacyMigrationProbe[] {
           "tasks_schedule_identity_idx",
           providerNeutralScheduleIdentityIndex,
         )),
+    },
+    {
+      label: "0020 recurring-work scope size constraint",
+      contradictionObserved: async (client) =>
+        (await hasNamedConstraint(client, "tasks", "tasks_schedule_scope_key_size_check")) &&
+        !(await hasNamedCheckConstraint(client, {
+          constraintName: "tasks_schedule_scope_key_size_check",
+          requiredDefinitionFragments: [
+            "schedule_scope_key IS NULL",
+            "octet_length(schedule_scope_key) >= 1",
+            "octet_length(schedule_scope_key) <= 512",
+          ],
+          tableName: "tasks",
+        })),
+      represented: (client) =>
+        hasNamedCheckConstraint(client, {
+          constraintName: "tasks_schedule_scope_key_size_check",
+          requiredDefinitionFragments: [
+            "schedule_scope_key IS NULL",
+            "octet_length(schedule_scope_key) >= 1",
+            "octet_length(schedule_scope_key) <= 512",
+          ],
+          tableName: "tasks",
+        }),
     },
   ];
 }
@@ -1140,6 +1173,64 @@ async function hasConstraintSignature(
       row.constraintType === expected.constraintType &&
       row.columnNames.length === expected.columnNames.length &&
       row.columnNames.every((columnName, index) => columnName === expected.columnNames[index]),
+  );
+}
+
+/** Returns whether a named public-table constraint exists. */
+async function hasNamedConstraint(
+  client: pg.PoolClient,
+  tableName: string,
+  constraintName: string,
+): Promise<boolean> {
+  const result = await client.query<SchemaObjectExistsRow>(
+    `
+      SELECT EXISTS (
+        SELECT 1
+        FROM pg_constraint constraint_record
+        JOIN pg_class table_record ON table_record.oid = constraint_record.conrelid
+        JOIN pg_namespace namespace_record ON namespace_record.oid = table_record.relnamespace
+        WHERE namespace_record.nspname = 'public'
+          AND table_record.relname = $1
+          AND constraint_record.conname = $2
+      ) AS exists
+    `,
+    [tableName, constraintName],
+  );
+  return result.rows[0]?.exists === true;
+}
+
+/** Verifies one named check constraint by owner and normalized definition fragments. */
+async function hasNamedCheckConstraint(
+  client: pg.PoolClient,
+  expectation: Omit<NamedConstraintExpectation, "constraintType">,
+): Promise<boolean> {
+  const result = await client.query<NamedConstraintRow>(
+    `
+      SELECT
+        constraint_record.conname AS "constraintName",
+        constraint_record.contype::text AS "constraintType",
+        NULL::text AS "deleteAction",
+        pg_get_constraintdef(constraint_record.oid, true) AS definition,
+        table_record.relname AS "tableName",
+        NULL::text AS "updateAction",
+        constraint_record.convalidated AS validated
+      FROM pg_constraint constraint_record
+      JOIN pg_class table_record ON table_record.oid = constraint_record.conrelid
+      JOIN pg_namespace namespace_record ON namespace_record.oid = table_record.relnamespace
+      WHERE namespace_record.nspname = 'public'
+        AND table_record.relname = $1
+        AND constraint_record.conname = $2
+        AND constraint_record.contype = 'c'
+    `,
+    [expectation.tableName, expectation.constraintName],
+  );
+  const row = result.rows[0];
+  if (row === undefined || row.validated !== true) {
+    return false;
+  }
+  const normalizedDefinition = normalizeConstraintDefinition(row.definition);
+  return expectation.requiredDefinitionFragments.every((fragment) =>
+    normalizedDefinition.includes(normalizeConstraintDefinition(fragment)),
   );
 }
 

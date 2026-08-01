@@ -4,6 +4,10 @@
  * different provider-specific semantics.
  */
 
+import { createHash } from "node:crypto";
+
+import { approvalTargetIdentityKey } from "@dungle-scrubs/tether-protocol";
+
 import type { ApprovalTarget } from "./types.js";
 
 /** Reserved key used when an approval applies to the whole task. */
@@ -14,7 +18,8 @@ export const wholeTaskApprovalTargetKey = "task";
  */
 export function approvalTargetKey(reason: unknown, target?: ApprovalTarget | undefined): string {
   if (target !== undefined) {
-    return `approvalTarget:v1:${encodePart(target.targetKind)}${encodePart(target.scopeKey)}${encodePart(target.targetId)}${encodePart(target.targetRevision)}`;
+    const digest = createHash("sha256").update(approvalTargetIdentityKey(target)).digest("hex");
+    return `approvalTarget:v2:sha256:${digest}`;
   }
   if (typeof reason !== "object" || reason === null) {
     return wholeTaskApprovalTargetKey;
@@ -33,9 +38,4 @@ export function approvalTargetKey(reason: unknown, target?: ApprovalTarget | und
   return typeof action === "string" && action.length > 0
     ? `approvalTarget:${action}:${key}`
     : `approvalTarget:${key}`;
-}
-
-/** Collision-free length-prefixed encoding for one opaque target identity part. */
-function encodePart(value: string): string {
-  return `${value.length}:${value}`;
 }

@@ -10,10 +10,35 @@ import { ModuleObservability, type StructuredLogEntry } from "../src/observabili
 import {
   createSessionTaskEffects,
   mapTaskApprovalRejection,
+  taskApprovalTraceInput,
 } from "../src/session-service-task-effects.js";
 import type { ApprovalTarget, SessionEvent, TaskRecord } from "../src/types.js";
 
 describe("session service approval recording", () => {
+  it("correlates target-backed REST traces with the durable approval key", () => {
+    const target: ApprovalTarget = {
+      action: "action_opaque_1",
+      digest: "digest_opaque_1",
+      scopeKey: "scope_opaque_1",
+      targetId: "target_opaque_1",
+      targetKind: "kind_opaque_1",
+      targetRevision: "revision_opaque_1",
+    };
+
+    expect(
+      taskApprovalTraceInput({
+        decision: "approved",
+        participantId: "operator_1",
+        reason: {},
+        sessionId: "sess_manifest",
+        target,
+        taskId: "task_manifest",
+      }),
+    ).toMatchObject({
+      targetKey: expect.stringMatching(/^approvalTarget:v2:sha256:[0-9a-f]{64}$/),
+    });
+  });
+
   it("delegates duplicate detection to TaskStore.recordApproval without listing events", async () => {
     const task = createCompletedApprovalTask();
     const event = createApprovalEvent(task);
@@ -180,6 +205,60 @@ describe("session service approval recording", () => {
       }),
     );
 
+    expect(persistedTarget).toEqual(target);
+  });
+
+  it("routes a manifest-only completed task through atomic target validation", async () => {
+    const target: ApprovalTarget = {
+      action: "action_opaque_1",
+      digest: "digest_opaque_1",
+      scopeKey: "scope_opaque_1",
+      targetId: "target_opaque_1",
+      targetKind: "kind_opaque_1",
+      targetRevision: "revision_opaque_1",
+    };
+    const task: TaskRecord = {
+      ...createCompletedApprovalTask(),
+      result: { targetManifest: [target] },
+    };
+    const event = createApprovalEvent(task);
+    let persistedTarget: ApprovalTarget | undefined;
+    const stores = createApprovalStores(
+      task,
+      {
+        approval: createApprovalRecord(task),
+        decision: "approved",
+        event,
+        events: [event],
+        status: "recorded",
+        targetKey: "target_key",
+        task,
+      },
+      (recordedTarget) => {
+        persistedTarget = recordedTarget;
+      },
+    );
+    const effects = createSessionTaskEffects({
+      approvalValidators: new Map(),
+      assertBroadcastEvents: () => undefined,
+      eventSourceId: "src_service_approval_test",
+      observability: new ModuleObservability({ moduleName: "SessionServiceApprovalTest" }),
+      stores,
+      taskClaimLeaseTtlMs: 1_000,
+    });
+
+    const result = await Effect.runPromise(
+      effects.recordTaskApprovalEffect({
+        decision: "approved",
+        participantId: "part_service_approval_test",
+        reason: {},
+        sessionId: task.sessionId,
+        target,
+        taskId: task.taskId,
+      }),
+    );
+
+    expect(result.status).toBe("recorded");
     expect(persistedTarget).toEqual(target);
   });
 
