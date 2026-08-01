@@ -597,7 +597,7 @@ const unknownLockWaitState: CoordinatorLockWaitState = {
   waitEventType: null,
 };
 
-/** Polls bounded control-plane state until PostgreSQL reports a lock wait. */
+/** Polls bounded control-plane state until PostgreSQL classifies the wait as a lock. */
 async function waitForActorLockWait<TActor extends string>(
   controlClient: pg.PoolClient,
   actor: ActorClient<TActor>,
@@ -607,7 +607,10 @@ async function waitForActorLockWait<TActor extends string>(
   while (Date.now() - startedAt < timeoutMs) {
     const lockWait = await inspectActorLockWait(controlClient, actor);
     actor.lockWait = lockWait;
-    if (lockWait.blocked) {
+    // pg_blocking_pids can report the blocker one sample before
+    // pg_stat_activity exposes wait_event_type. Returning that transitional
+    // sample makes callers observe blocked=true with no lock classification.
+    if (lockWait.blocked && lockWait.waitEventType === "Lock") {
       return lockWait;
     }
     await waitForPoll();
