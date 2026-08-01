@@ -3,44 +3,43 @@ import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { fileURLToPath } from "node:url";
-
-import { readMigrationFiles } from "drizzle-orm/migrator";
-import { Effect } from "effect";
-import pg from "pg";
-import { afterAll, beforeAll, describe, expect, it, onTestFinished } from "vitest";
-import WebSocket from "ws";
-import type { ParticipantTaskExecutorContext } from "@dungle-scrubs/tether-client";
 import {
   createSessionSummaryExecutor,
   OllamaClient,
   TetherApiClient,
 } from "@dungle-scrubs/session-summary-worker";
+import type { ParticipantTaskExecutorContext } from "@dungle-scrubs/tether-client";
 import type {
+  BrowserOperatorCommandResponse,
+  OperatorGrantScope,
   SessionScalabilityDebugRecord,
   SessionSummaryContent,
   SessionSummaryGenerationJob,
   SessionSummaryOllamaIdentity,
-  OperatorGrantScope,
-  BrowserOperatorCommandResponse,
   TaskRecord,
 } from "@dungle-scrubs/tether-protocol";
-import {
-  mintTestAuthToken,
-  testAuthSigningKid,
-  testAuthSigningSecret,
-} from "../src/auth/test-tokens.js";
-import type { AuthRole } from "../src/auth/token.js";
-import { createAuthPersistenceStores } from "../src/auth/db-grant-stores.js";
+import { readMigrationFiles } from "drizzle-orm/migrator";
+import { Effect } from "effect";
+import pg from "pg";
+import { afterAll, beforeAll, describe, expect, it, onTestFinished } from "vitest";
+import WebSocket from "ws";
 import { runBootstrapAdminCli } from "../src/auth/bootstrap-cli.js";
-import { executeBrowserPairingCli } from "../src/auth/browser-pairing-cli.js";
 import { createBrowserPairingLifecycle } from "../src/auth/browser-pairing.js";
+import { executeBrowserPairingCli } from "../src/auth/browser-pairing-cli.js";
 import { createBrowserPairingStore } from "../src/auth/browser-pairing-stores.js";
-import { hashAuthTicket } from "../src/auth/ticket-lifecycle.js";
+import { createAuthPersistenceStores } from "../src/auth/db-grant-stores.js";
 import type {
   AuthGrantAuditMetadata,
   AuthGrantMetadata,
   AuthTicketAdmissionMetadata,
 } from "../src/auth/grant-stores.js";
+import {
+  mintTestAuthToken,
+  testAuthSigningKid,
+  testAuthSigningSecret,
+} from "../src/auth/test-tokens.js";
+import { hashAuthTicket } from "../src/auth/ticket-lifecycle.js";
+import type { AuthRole } from "../src/auth/token.js";
 import { ParticipantRuntimeClient } from "../src/client.js";
 import {
   DatabaseMigrationError,
@@ -53,10 +52,12 @@ import {
   archiveClientSessionBinding,
   claimTaskWithEvent,
   completeTaskWithEvent,
-  createOperatorCommandTaskWithEvent,
   createSession as createDbSession,
+  createOperatorCommandTaskWithEvent,
   createPool,
   createTaskWithEvent,
+  deleteSession,
+  ensureBootstrapSession,
   expireTaskClaims,
   failTaskWithEvent,
   getTask,
@@ -69,6 +70,7 @@ import {
   refreshTaskClaim,
   releaseControlLease,
   releaseTaskWithEvent,
+  SessionBootstrapIdentityConflictError,
   taskClaimLockQuery,
   upsertClientSessionBinding,
   upsertParticipant,
@@ -173,6 +175,7 @@ const generatedMigrationNames = [
   "0023_nosy_robbie_robertson.sql",
   "0024_eminent_lizard.sql",
   "0025_strange_dakota_north.sql",
+  "0026_blushing_mole_man.sql",
 ] as const;
 const authFoundationMigrationIndex = 16;
 const preAuthFoundationMigrationIndex = authFoundationMigrationIndex - 1;
@@ -665,7 +668,9 @@ e2e("tether e2e", () => {
     });
 
     expect(response.session.sessionId).toMatch(/^sess_/u);
-    const scalabilityTables = await currentPool().pool.query<{ readonly tableName: string }>(
+    const scalabilityTables = await currentPool().pool.query<{
+      readonly tableName: string;
+    }>(
       `
         SELECT table_name AS "tableName"
         FROM information_schema.tables
@@ -678,6 +683,84 @@ e2e("tether e2e", () => {
       "session_projections",
       "session_summaries",
     ]);
+  });
+
+  it("ensures one stable durable session for a deployment bootstrap identity", async () => {
+    const identityKey = `deployment-email-${randomUUID()}`;
+    const sessionId = `sess_email_${randomUUID()}`;
+
+    await expect(
+      ensureBootstrapSession(currentPool(), { identityKey, sessionId }),
+    ).resolves.toMatchObject({
+      created: true,
+      identityKey,
+      session: { sessionId },
+    });
+    await expect(
+      ensureBootstrapSession(currentPool(), { identityKey, sessionId }),
+    ).resolves.toMatchObject({
+      created: false,
+      identityKey,
+      session: { sessionId },
+    });
+
+    await expect(
+      ensureBootstrapSession(currentPool(), {
+        identityKey,
+        sessionId: `sess_email_conflict_${randomUUID()}`,
+      }),
+    ).rejects.toMatchObject({
+      code: "session_bootstrap_identity_conflict",
+      name: "SessionBootstrapIdentityConflictError",
+    });
+    await expect(
+      ensureBootstrapSession(currentPool(), {
+        identityKey: `${identityKey}-conflict`,
+        sessionId,
+      }),
+    ).rejects.toBeInstanceOf(SessionBootstrapIdentityConflictError);
+
+    const mappings = await currentPool().pool.query(
+      `SELECT identity_key, session_id FROM session_bootstrap_identities WHERE identity_key = $1`,
+      [identityKey],
+    );
+    expect(mappings.rows).toEqual([{ identity_key: identityKey, session_id: sessionId }]);
+
+    const existingSessionId = `sess_email_existing_${randomUUID()}`;
+    await createDbSession(currentPool(), existingSessionId);
+    await expect(
+      ensureBootstrapSession(currentPool(), {
+        identityKey: `${identityKey}-existing`,
+        sessionId: existingSessionId,
+      }),
+    ).resolves.toMatchObject({ created: false, session: { sessionId: existingSessionId } });
+
+    const concurrentIdentityKey = `${identityKey}-concurrent`;
+    const concurrentSessionId = `sess_email_concurrent_${randomUUID()}`;
+    const concurrent = await Promise.all([
+      ensureBootstrapSession(currentPool(), {
+        identityKey: concurrentIdentityKey,
+        sessionId: concurrentSessionId,
+      }),
+      ensureBootstrapSession(currentPool(), {
+        identityKey: concurrentIdentityKey,
+        sessionId: concurrentSessionId,
+      }),
+    ]);
+    expect(concurrent.map((result) => result.created).sort()).toEqual([false, true]);
+
+    await currentPool().pool.query(
+      `UPDATE session_projections SET archived_at = now() WHERE session_id = $1`,
+      [sessionId],
+    );
+    await expect(deleteSession(currentPool(), sessionId)).resolves.toEqual({
+      detail: "session has a durable bootstrap identity",
+      reason: "protected",
+      status: "refused",
+    });
+    await expect(
+      currentPool().pool.query(`SELECT 1 FROM sessions WHERE session_id = $1`, [sessionId]),
+    ).resolves.toMatchObject({ rowCount: 1 });
   });
 
   it("serializes competing Session Summary publications to exactly one active row", async () => {
@@ -929,7 +1012,10 @@ e2e("tether e2e", () => {
           lifecycle.exchange(
             created.request.requestId,
             { exchangeSecret: "Z".repeat(43), publicNonce: nonce },
-            { origin: "https://hub.example.test", sourceAddress: exchangeSource },
+            {
+              origin: "https://hub.example.test",
+              sourceAddress: exchangeSource,
+            },
           ),
         ).rejects.toEqual(expect.objectContaining({ code: "pairing_secret_invalid" }));
       }
@@ -957,7 +1043,10 @@ e2e("tether e2e", () => {
         unknownRequestLifecycle.exchange(
           `pair_missing_${attempt}`,
           { exchangeSecret: "Z".repeat(43), publicNonce: nonce },
-          { origin: "https://hub.example.test", sourceAddress: unknownRequestSource },
+          {
+            origin: "https://hub.example.test",
+            sourceAddress: unknownRequestSource,
+          },
         ),
       ).rejects.toEqual(expect.objectContaining({ code: "pairing_not_found" }));
     }
@@ -965,7 +1054,10 @@ e2e("tether e2e", () => {
       unknownRequestLifecycle.exchange(
         "pair_missing_rate_limited",
         { exchangeSecret: "Z".repeat(43), publicNonce: nonce },
-        { origin: "https://hub.example.test", sourceAddress: unknownRequestSource },
+        {
+          origin: "https://hub.example.test",
+          sourceAddress: unknownRequestSource,
+        },
       ),
     ).rejects.toEqual(expect.objectContaining({ code: "pairing_rate_limited" }));
   });
@@ -1023,7 +1115,10 @@ e2e("tether e2e", () => {
       auth: e2eAuthOptions,
       cors: { allowedOrigins: [origin] },
       eventFanout: { catchUpPollIntervalMs: 0 },
-      resourceLimits: { ...defaultResourceLimits, restEventListMaxBytes: 4_096 },
+      resourceLimits: {
+        ...defaultResourceLimits,
+        restEventListMaxBytes: 4_096,
+      },
       sessionService: { controlEpochEnforcement: false },
       taskClaimSweeper: { intervalMs: 0 },
     });
@@ -1075,7 +1170,10 @@ e2e("tether e2e", () => {
         `/browser/pairing-requests/${created.body.request.requestId}/exchange`,
         {
           authToken: null,
-          body: { exchangeSecret: created.body.exchangeSecret, publicNonce: nonce },
+          body: {
+            exchangeSecret: created.body.exchangeSecret,
+            publicNonce: nonce,
+          },
           headers: { origin },
           method: "POST",
         },
@@ -1096,7 +1194,11 @@ e2e("tether e2e", () => {
         headers,
       });
       expect(self).toMatchObject({
-        body: { grantJti: exchanged.body.grantJti, status: "active" },
+        body: {
+          grantJti: exchanged.body.grantJti,
+          sessionIds: [sessionId],
+          status: "active",
+        },
         status: 200,
       });
       expect(self.headers.get("cache-control")).toBe("no-store");
@@ -1162,7 +1264,10 @@ e2e("tether e2e", () => {
         },
       );
       expect(duplicateCommand).toMatchObject({
-        body: { status: "replayed", task: { taskId: command.body.task.taskId } },
+        body: {
+          status: "replayed",
+          task: { taskId: command.body.task.taskId },
+        },
         status: 200,
       });
       const snapshot = await requestStatusFrom(
@@ -1201,7 +1306,10 @@ e2e("tether e2e", () => {
         targetRevision: "revision_browser_operator",
       };
       const task = await request<TaskResponse>(`/sessions/${sessionId}/tasks`, {
-        body: { kind: "opaque_manifest_review", objective: "review browser target" },
+        body: {
+          kind: "opaque_manifest_review",
+          objective: "review browser target",
+        },
         method: "POST",
       });
       const controller = {
@@ -1227,7 +1335,11 @@ e2e("tether e2e", () => {
       };
       const scopeDenied = await requestStatusFrom(operatorUrl, approvalPath, {
         authToken: null,
-        body: { decision: "approved", reason: {}, target: { ...target, scopeKey: "other" } },
+        body: {
+          decision: "approved",
+          reason: {},
+          target: { ...target, scopeKey: "other" },
+        },
         headers: operatorMutationHeaders,
         method: "POST",
       });
@@ -1237,7 +1349,11 @@ e2e("tether e2e", () => {
       });
       const actionDenied = await requestStatusFrom(operatorUrl, approvalPath, {
         authToken: null,
-        body: { decision: "approved", reason: {}, target: { ...target, action: "trash" } },
+        body: {
+          decision: "approved",
+          reason: {},
+          target: { ...target, action: "trash" },
+        },
         headers: operatorMutationHeaders,
         method: "POST",
       });
@@ -1273,14 +1389,20 @@ e2e("tether e2e", () => {
       });
       expect(approval).toMatchObject({
         body: {
-          approval: { decidedByParticipantId: "operator@example.test", decision: "approved" },
+          approval: {
+            decidedByParticipantId: "operator@example.test",
+            decision: "approved",
+          },
           status: "recorded",
         },
         status: 200,
       });
       expect(duplicate).toMatchObject({
         body: {
-          approval: { decidedByParticipantId: "operator@example.test", decision: "approved" },
+          approval: {
+            decidedByParticipantId: "operator@example.test",
+            decision: "approved",
+          },
           existingDecision: "approved",
           status: "ignored",
         },
@@ -1324,7 +1446,10 @@ e2e("tether e2e", () => {
         headers: { ...headers, "x-tether-csrf": exchanged.body.csrfToken },
         method: "POST",
       });
-      expect(revoked).toMatchObject({ body: { status: "revoked" }, status: 200 });
+      expect(revoked).toMatchObject({
+        body: { status: "revoked" },
+        status: 200,
+      });
       const revokedCommandTaskId = `task_revoked_operator_${randomUUID()}`;
       await expect(
         createOperatorCommandTaskWithEvent(currentPool(), {
@@ -1372,7 +1497,10 @@ e2e("tether e2e", () => {
           method: "POST",
         },
       );
-      expect(rePair).toMatchObject({ body: { status: "created" }, status: 201 });
+      expect(rePair).toMatchObject({
+        body: { status: "created" },
+        status: 201,
+      });
       expect(rePair.body.request.requestId).not.toBe(created.body.request.requestId);
     } finally {
       if (operatorSocket && operatorSocket.readyState !== WebSocket.CLOSED) {
@@ -1909,7 +2037,9 @@ e2e("tether e2e", () => {
       const migrationRows = await legacyDatabase.pool.query<{
         readonly count: number;
       }>(`SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`);
-      const scalabilityTables = await legacyDatabase.pool.query<{ readonly count: number }>(
+      const scalabilityTables = await legacyDatabase.pool.query<{
+        readonly count: number;
+      }>(
         `
           SELECT count(*)::int AS count
           FROM information_schema.tables
@@ -2001,6 +2131,63 @@ e2e("tether e2e", () => {
       );
       expect(journal.rows[0]?.count).toBe(0);
       expect(applicationMutation.rows[0]?.count).toBe(0);
+    } finally {
+      await database.end();
+      await dropDatabase(legacyDatabaseName);
+    }
+  });
+
+  it("rejects a malformed journal-less stable bootstrap identity migration", async () => {
+    const legacyDatabaseName = `tether_e2e_partial_0026_${randomUUID().replaceAll("-", "_")}`;
+    const database = createPool(buildDatabaseUrl(legacyDatabaseName));
+    try {
+      await createDatabase(legacyDatabaseName);
+      await applyLegacyMigrations(database, generatedMigrationNames.slice(0, -1));
+      await database.pool.query(`
+        CREATE TABLE session_bootstrap_identities (
+          created_at timestamp with time zone DEFAULT now() NOT NULL,
+          identity_key text PRIMARY KEY NOT NULL,
+          session_id text NOT NULL
+        )
+      `);
+
+      await expect(migrate(database)).rejects.toMatchObject({
+        name: "DatabaseMigrationError",
+        reason: "unsupported_schema",
+        recognizedPrefix: 25,
+      });
+    } finally {
+      await database.end();
+      await dropDatabase(legacyDatabaseName);
+    }
+  });
+
+  it("rejects a bootstrap identity foreign key that targets a spoofed sessions schema", async () => {
+    const legacyDatabaseName = `tether_e2e_spoofed_0026_${randomUUID().replaceAll("-", "_")}`;
+    const database = createPool(buildDatabaseUrl(legacyDatabaseName));
+    try {
+      await createDatabase(legacyDatabaseName);
+      await applyLegacyMigrations(database, generatedMigrationNames.slice(0, -1));
+      await database.pool.query(`
+        CREATE SCHEMA spoofed;
+        CREATE TABLE spoofed.sessions (session_id text PRIMARY KEY NOT NULL);
+        CREATE TABLE session_bootstrap_identities (
+          created_at timestamp with time zone DEFAULT now() NOT NULL,
+          identity_key text PRIMARY KEY NOT NULL,
+          session_id text NOT NULL,
+          CONSTRAINT session_bootstrap_identities_session_id_unique UNIQUE (session_id),
+          CONSTRAINT session_bootstrap_identities_identity_key_size_check
+            CHECK (octet_length(identity_key) BETWEEN 1 AND 512),
+          CONSTRAINT session_bootstrap_identities_session_id_sessions_session_id_fk
+            FOREIGN KEY (session_id) REFERENCES spoofed.sessions(session_id) ON DELETE RESTRICT
+        )
+      `);
+
+      await expect(migrate(database)).rejects.toMatchObject({
+        name: "DatabaseMigrationError",
+        reason: "unsupported_schema",
+        recognizedPrefix: 25,
+      });
     } finally {
       await database.end();
       await dropDatabase(legacyDatabaseName);
@@ -4059,7 +4246,10 @@ e2e("tether e2e", () => {
     const rawClient = await currentPool().pool.connect();
     const pausedClient = new PausedProjectionBackfillClient(rawClient);
     try {
-      const backfill = backfillSessionProjection(pausedClient, { batchSize: 2, sessionId });
+      const backfill = backfillSessionProjection(pausedClient, {
+        batchSize: 2,
+        sessionId,
+      });
       await pausedClient.candidateReady.promise;
       const live = await appendEvent(
         currentPool(),
@@ -4181,7 +4371,10 @@ e2e("tether e2e", () => {
         await seedProjectionBenchmarkSession(sessionId, eventCount);
         const measured = new MeasuredProjectionBackfillClient(currentPool().pool);
         const startedAt = performance.now();
-        const result = await backfillSessionProjection(measured, { batchSize, sessionId });
+        const result = await backfillSessionProjection(measured, {
+          batchSize,
+          sessionId,
+        });
         const totalMs = performance.now() - startedAt;
         const verification = await verifySessionProjection(currentPool().pool, {
           batchSize,
@@ -4189,7 +4382,11 @@ e2e("tether e2e", () => {
         });
         const maxBatchQueryMs = Math.max(...measured.queryDurationsMs);
 
-        expect(result).toMatchObject({ coversSeqTo: eventCount, eventCount, outcome: "written" });
+        expect(result).toMatchObject({
+          coversSeqTo: eventCount,
+          eventCount,
+          outcome: "written",
+        });
         expect(verification).toMatchObject({
           freshCoversSeqTo: eventCount,
           freshEventCount: eventCount,
@@ -6285,6 +6482,9 @@ e2e("tether e2e", () => {
         const mutationApp = createAppServer(databaseFor("mutation"), {
           auth: e2eAuthOptions,
           eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+          readiness: {
+            databaseMigrationReadiness: async () => "current",
+          },
           sessionService: {
             controlEpochEnforcement: true,
             taskClaimLeaseTtlMs: 120_000,
@@ -6295,6 +6495,9 @@ e2e("tether e2e", () => {
         const supersessionApp = createAppServer(databaseFor("supersession"), {
           auth: e2eAuthOptions,
           eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+          readiness: {
+            databaseMigrationReadiness: async () => "current",
+          },
           sessionService: {
             controlEpochEnforcement: true,
             taskClaimLeaseTtlMs: 60_000,
@@ -6314,7 +6517,12 @@ e2e("tether e2e", () => {
             mutationBaseUrl,
             `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim/refresh`,
             {
-              body: { claimId: claimed.task.claimId, controlEpoch, instanceId, participantId },
+              body: {
+                claimId: claimed.task.claimId,
+                controlEpoch,
+                instanceId,
+                participantId,
+              },
               method: "POST",
             },
           );
@@ -6416,7 +6624,12 @@ e2e("tether e2e", () => {
           mutationBaseUrl,
           `/sessions/${session.sessionId}/tasks/${task.task.taskId}/claim/refresh`,
           {
-            body: { claimId: claimed.task.claimId, controlEpoch, instanceId, participantId },
+            body: {
+              claimId: claimed.task.claimId,
+              controlEpoch,
+              instanceId,
+              participantId,
+            },
             method: "POST",
           },
         );
@@ -6950,7 +7163,11 @@ e2e("tether e2e", () => {
     const completion = await request<TaskResponse>(
       `/sessions/${sessionId}/tasks/${completed.task.taskId}/complete`,
       {
-        body: { ...controller, claimId: completed.task.claimId, result: { summary: "done" } },
+        body: {
+          ...controller,
+          claimId: completed.task.claimId,
+          result: { summary: "done" },
+        },
         method: "POST",
       },
     );
@@ -6958,7 +7175,11 @@ e2e("tether e2e", () => {
     const failure = await request<TaskResponse>(
       `/sessions/${sessionId}/tasks/${failed.task.taskId}/fail`,
       {
-        body: { ...controller, claimId: failed.task.claimId, failure: { reason: "expected" } },
+        body: {
+          ...controller,
+          claimId: failed.task.claimId,
+          failure: { reason: "expected" },
+        },
         method: "POST",
       },
     );
@@ -7508,7 +7729,10 @@ e2e("tether e2e", () => {
       targetRevision: "revision_opaque_1",
     };
     const task = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
-      body: { kind: "opaque_manifest_review", objective: "review opaque targets" },
+      body: {
+        kind: "opaque_manifest_review",
+        objective: "review opaque targets",
+      },
       method: "POST",
     });
     const controller = {
@@ -7533,7 +7757,10 @@ e2e("tether e2e", () => {
     const targetless = await requestStatus(
       `/sessions/${session.sessionId}/tasks/${task.task.taskId}/approval`,
       {
-        body: { decision: "approved", participantId: "operator_missing_target" },
+        body: {
+          decision: "approved",
+          participantId: "operator_missing_target",
+        },
         method: "POST",
       },
     );
@@ -7547,7 +7774,11 @@ e2e("tether e2e", () => {
     const identical = await request<TaskApprovalResponse>(
       `/sessions/${session.sessionId}/tasks/${task.task.taskId}/approval`,
       {
-        body: { decision: "approved", participantId: "operator_second", target },
+        body: {
+          decision: "approved",
+          participantId: "operator_second",
+          target,
+        },
         method: "POST",
       },
     );
@@ -7584,7 +7815,9 @@ e2e("tether e2e", () => {
     expect(contradictory.task).toEqual(first.task);
     const approvalEvents = events.events.filter((event) => event.type === "approval.recorded");
     expect(approvalEvents).toHaveLength(1);
-    expect(approvalEvents[0]?.payload).toMatchObject({ approval: first.approval });
+    expect(approvalEvents[0]?.payload).toMatchObject({
+      approval: first.approval,
+    });
   });
 
   it("records only one approval for concurrent REST approval requests", async () => {
@@ -8606,7 +8839,10 @@ e2e("tether e2e", () => {
       `/sessions/${fixture.job.sessionId}/events?after=0&limit=100`,
     );
 
-    expect(context.context).toMatchObject({ latestSummary: null, mode: "raw_only" });
+    expect(context.context).toMatchObject({
+      latestSummary: null,
+      mode: "raw_only",
+    });
     expect(after.events).toEqual(before.events);
   });
 
@@ -8614,7 +8850,11 @@ e2e("tether e2e", () => {
     const session = await createSession();
     for (const text of ["covered one", "covered two", "exact tail"]) {
       await request(`/sessions/${session.sessionId}/events`, {
-        body: { payload: { text }, producerId: "external-client", type: "user.message" },
+        body: {
+          payload: { text },
+          producerId: "external-client",
+          type: "user.message",
+        },
         method: "POST",
       });
     }
@@ -8681,7 +8921,10 @@ e2e("tether e2e", () => {
         summaryId: activeSummaryId,
       },
       mode: "summary_with_raw_tail",
-      recentEventRange: { startSeq: Number(suffix.seq), endSeq: Number(suffix.seq) },
+      recentEventRange: {
+        startSeq: Number(suffix.seq),
+        endSeq: Number(suffix.seq),
+      },
     });
     expect(context.context.recentEvents.map((event) => event.seq)).toEqual([Number(suffix.seq)]);
     expect(exactEvents.events.map((event) => event.seq)).toEqual(
@@ -9546,7 +9789,10 @@ e2e("tether e2e", () => {
       unclaimed: 1,
     });
     expect(scalability.scalability).toMatchObject({
-      context: { rawOnlyCount: expect.any(Number), summaryBackedCount: expect.any(Number) },
+      context: {
+        rawOnlyCount: expect.any(Number),
+        summaryBackedCount: expect.any(Number),
+      },
       projection: {
         activeReducerVersion: 1,
         coverage: { coversSeqTo: eventsBeforeDebug.events.length },
@@ -9866,7 +10112,10 @@ e2e("tether e2e", () => {
             release: "manual",
           },
         ],
-        transactionTimeouts: { lockTimeoutMs: 5_000, statementTimeoutMs: 10_000 },
+        transactionTimeouts: {
+          lockTimeoutMs: 5_000,
+          statementTimeoutMs: 10_000,
+        },
       });
 
       const { loserResult, lockWait, winnerResult } = await coordinator.run(
@@ -9926,7 +10175,10 @@ e2e("tether e2e", () => {
             release: "manual",
           },
         ],
-        transactionTimeouts: { lockTimeoutMs: 5_000, statementTimeoutMs: 10_000 },
+        transactionTimeouts: {
+          lockTimeoutMs: 5_000,
+          statementTimeoutMs: 10_000,
+        },
       });
 
       const { claimResult, sweepEvents } = await coordinator.run(
@@ -11066,7 +11318,11 @@ e2e("tether e2e", () => {
       { sourceId: "src_summary_worker_tail_e2e" },
     );
     return {
-      authToken: mintE2eToken({ participantId, role: "participant", sessionId: session.sessionId }),
+      authToken: mintE2eToken({
+        participantId,
+        role: "participant",
+        sessionId: session.sessionId,
+      }),
       context: {
         controlEpoch,
         instanceId,
@@ -11174,6 +11430,9 @@ e2e("tether e2e", () => {
     return createAppServer(database, {
       auth: e2eAuthOptions,
       eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+      readiness: {
+        databaseMigrationReadiness: async () => "current",
+      },
       sessionService: {
         controlEpochEnforcement: true,
         taskClaimLeaseTtlMs,
@@ -11188,6 +11447,9 @@ e2e("tether e2e", () => {
     return createAppServer(database, {
       auth: e2eAuthOptions,
       eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+      readiness: {
+        databaseMigrationReadiness: async () => "current",
+      },
       sessionService: {
         controlEpochEnforcement: false,
         taskClaimLeaseTtlMs: 60_000,

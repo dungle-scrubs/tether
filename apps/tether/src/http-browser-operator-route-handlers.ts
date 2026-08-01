@@ -137,6 +137,7 @@ function handleBrowserOperatorHttpRouteEffect(
           expiresAt: authorized.context.expiresAt,
           grantJti: authorized.context.grantJti,
           scope: authorized.scope,
+          sessionIds: authorized.scope.sessionIds,
           status: "active",
           subject: authorized.context.participantId,
         }),

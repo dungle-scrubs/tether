@@ -11,8 +11,11 @@ import { recurringWorkScopeKeySchema } from "./task-contracts.js";
 
 /** Bounded readiness failure reasons safe for unauthenticated responses. */
 export const readinessFailureReason = {
+  configurationIncompatible: "configuration_incompatible",
   databaseUnavailable: "database_unavailable",
   fanoutCatchUpStale: "fanout_catchup_stale",
+  migrationIncomplete: "migration_incomplete",
+  signingAuthorityUnavailable: "signing_authority_unavailable",
 } as const;
 
 /** Protocol-owned readiness response schema. */
@@ -25,8 +28,11 @@ export const readinessResponseSchema = z.discriminatedUnion("ready", [
   z.object({
     ready: z.literal(false),
     reason: z.union([
+      z.literal(readinessFailureReason.configurationIncompatible),
       z.literal(readinessFailureReason.databaseUnavailable),
       z.literal(readinessFailureReason.fanoutCatchUpStale),
+      z.literal(readinessFailureReason.migrationIncomplete),
+      z.literal(readinessFailureReason.signingAuthorityUnavailable),
     ]),
     replicaId: z.string().min(1),
     runtimeTopology: z.union([z.literal("single"), z.literal("multi")]),

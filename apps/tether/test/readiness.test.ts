@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { DatabasePool } from "../src/db.js";
-import { projectReadiness } from "../src/readiness.js";
 import type { ReadinessInput } from "../src/readiness.js";
+import { projectReadiness } from "../src/readiness.js";
 import type { SessionEventFanoutDebugInfo } from "../src/session-event-fanout.js";
 
 describe("readiness", () => {
@@ -94,6 +94,34 @@ describe("readiness", () => {
       status: 200,
     });
   });
+
+  it.each([
+    [
+      "migration_incomplete",
+      { databaseMigrationReadiness: async (): Promise<"incomplete"> => "incomplete" },
+    ],
+    [
+      "database_unavailable",
+      {
+        databaseMigrationReadiness: async (): Promise<"current"> => {
+          throw new Error("secret migration detail");
+        },
+      },
+    ],
+    ["signing_authority_unavailable", { signingAuthorityReady: false }],
+    ["configuration_incompatible", { configurationCompatible: false }],
+  ] as const)("fails closed with %s before serving traffic", async (reason, override) => {
+    const input = createReadinessInput(
+      createDatabase(() => Promise.resolve({ rows: [] })),
+      createFanoutDebug(),
+      override,
+    );
+
+    await expect(projectReadiness(input)).resolves.toMatchObject({
+      body: { ready: false, reason },
+      status: 503,
+    });
+  });
 });
 
 /** Builds the database query seam used by readiness probes. */
@@ -107,9 +135,22 @@ function createDatabase(query: () => Promise<{ readonly rows: readonly unknown[]
 function createReadinessInput(
   database: DatabasePool,
   debugInfo: SessionEventFanoutDebugInfo,
+  deployment: Partial<ReadinessInput["deployment"]> = {},
 ): ReadinessInput {
   return {
-    database,
+    deployment: {
+      configurationCompatible: true,
+      databaseMigrationReadiness: async () => {
+        try {
+          await database.pool.query("SELECT 1");
+          return "current" as const;
+        } catch {
+          return "unavailable" as const;
+        }
+      },
+      signingAuthorityReady: true,
+      ...deployment,
+    },
     fanout: { debugInfo: () => debugInfo },
     fanoutStaleAfterMs: 100,
     replicaId: "replica_ready",

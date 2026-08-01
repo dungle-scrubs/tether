@@ -225,6 +225,11 @@ async function startGatewayApp(
     },
     eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
     ...(resourceLimits ? { resourceLimits } : {}),
+    readiness: {
+      configurationCompatible: true,
+      databaseMigrationReadiness: async () => "current",
+      signingAuthorityReady: true,
+    },
     taskClaimSweeper: { intervalMs: 0 },
   });
   openApps.push(app);

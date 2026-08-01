@@ -183,6 +183,13 @@
       "when": 1785604292390,
       "tag": "0025_strange_dakota_north",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1785608647560,
+      "tag": "0026_blushing_mole_man",
+      "breakpoints": true
     }
   ]
 }

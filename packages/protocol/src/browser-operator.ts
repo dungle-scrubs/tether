@@ -72,10 +72,24 @@ export const browserOperatorSessionSchema = z
     expiresAt: z.string().datetime({ offset: true }),
     grantJti: z.string().min(1).max(128),
     scope: operatorGrantScopeSchema,
+    sessionIds: operatorGrantScopeSchema.shape.sessionIds,
     status: z.literal("active"),
     subject: z.string().min(1).max(255),
   })
-  .strict();
+  .strict()
+  .superRefine((session, context) => {
+    const allowed = new Set(session.scope.sessionIds);
+    if (
+      session.sessionIds.length !== allowed.size ||
+      session.sessionIds.some((sessionId) => !allowed.has(sessionId))
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Session discovery must exactly match grant scope",
+        path: ["sessionIds"],
+      });
+    }
+  });
 
 /** Provider-neutral non-participant snapshot used before WebSocket replay begins. */
 export const browserSessionSnapshotSchema = z

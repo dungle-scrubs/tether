@@ -366,6 +366,25 @@ export const sessions = pgTable("sessions", {
   sessionId: text("session_id").primaryKey(),
 });
 
+/** Stable one-to-one deployment identity for idempotent session bootstrapping. */
+export const sessionBootstrapIdentities = pgTable(
+  "session_bootstrap_identities",
+  {
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    identityKey: text("identity_key").primaryKey(),
+    sessionId: text("session_id")
+      .notNull()
+      .references(() => sessions.sessionId, { onDelete: "restrict" }),
+  },
+  (table) => [
+    check(
+      "session_bootstrap_identities_identity_key_size_check",
+      sql`octet_length(${table.identityKey}) BETWEEN 1 AND 512`,
+    ),
+    unique("session_bootstrap_identities_session_id_unique").on(table.sessionId),
+  ],
+);
+
 /**
  * Permanent tombstones for permanently deleted sessions. A tombstone fences a
  * deleted session id forever: sanctioned creator paths refuse to recreate the
@@ -518,7 +537,9 @@ export const participantControlLeases = pgTable(
     epoch: bigint("epoch", { mode: "number" }).notNull().default(1),
     instanceId: text("instance_id").notNull(),
     lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),
-    leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }).notNull(),
+    leaseExpiresAt: timestamp("lease_expires_at", {
+      withTimezone: true,
+    }).notNull(),
     participantId: text("participant_id").notNull(),
     releasedAt: timestamp("released_at", { withTimezone: true }),
     sessionId: text("session_id")
@@ -663,7 +684,9 @@ export const sessionSummaries = pgTable(
     sessionId: text("session_id")
       .notNull()
       .references(() => sessions.sessionId, { onDelete: "cascade" }),
-    sourceEventCount: bigint("source_event_count", { mode: "number" }).notNull(),
+    sourceEventCount: bigint("source_event_count", {
+      mode: "number",
+    }).notNull(),
     sourceFirstEventId: text("source_first_event_id").notNull(),
     sourceLastEventId: text("source_last_event_id").notNull(),
     sourceRangeHash: text("source_range_hash").notNull(),

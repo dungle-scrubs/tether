@@ -39,22 +39,43 @@ describe("browser operator protocol", () => {
   });
 
   it("validates the bounded non-participant bootstrap and snapshot responses", () => {
+    const scope = {
+      actions: [],
+      commands: [],
+      permissions: ["session.read"],
+      scopeKeys: ["scope"],
+      sessionIds: ["sess_email"],
+      targetKinds: [],
+    };
     expect(
       browserOperatorSessionSchema.safeParse({
         expiresAt: "2026-08-02T00:00:00.000Z",
         grantJti: "grant_browser",
-        scope: {
-          actions: [],
-          commands: [],
-          permissions: ["session.read"],
-          scopeKeys: ["scope"],
-          sessionIds: ["sess_email"],
-          targetKinds: [],
-        },
+        scope,
+        status: "active",
+        subject: "operator@example.test",
+      }).success,
+    ).toBe(false);
+    expect(
+      browserOperatorSessionSchema.safeParse({
+        expiresAt: "2026-08-02T00:00:00.000Z",
+        grantJti: "grant_browser",
+        scope,
+        sessionIds: ["sess_email"],
         status: "active",
         subject: "operator@example.test",
       }).success,
     ).toBe(true);
+    expect(
+      browserOperatorSessionSchema.safeParse({
+        expiresAt: "2026-08-02T00:00:00.000Z",
+        grantJti: "grant_browser",
+        scope,
+        sessionIds: ["sess_other"],
+        status: "active",
+        subject: "operator@example.test",
+      }).success,
+    ).toBe(false);
     expect(
       browserSessionSnapshotSchema.safeParse({
         cursor: 0,

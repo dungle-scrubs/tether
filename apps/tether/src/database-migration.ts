@@ -15,6 +15,7 @@ import type pg from "pg";
 
 const MIGRATION_ADVISORY_LOCK_KEY = "8387255305985817959";
 const migrationsFolder = "drizzle";
+const generatedMigrations = readMigrationFiles({ migrationsFolder });
 const tetherTableNames = [
   "auth_grant_audit_events",
   "auth_grants",
@@ -28,6 +29,7 @@ const tetherTableNames = [
   "participants",
   "session_event_sequences",
   "session_events",
+  "session_bootstrap_identities",
   "session_projections",
   "session_summaries",
   "session_tombstones",
@@ -71,6 +73,42 @@ export interface MigrationDatabase {
   readonly pool: pg.Pool;
 }
 
+/** Bounded migration state shared by startup and steady-state readiness. */
+export type DatabaseMigrationReadiness = "current" | "incomplete" | "unavailable";
+
+/** Reads complete durable journal readiness in one database round trip. */
+export async function readDatabaseMigrationReadiness(
+  database: MigrationDatabase,
+): Promise<DatabaseMigrationReadiness> {
+  let client: pg.PoolClient;
+  try {
+    client = await database.pool.connect();
+  } catch {
+    return "unavailable";
+  }
+  try {
+    const inspection = await inspectMigrationJournal(client, generatedMigrations);
+    return inspection.status === "valid" && inspection.appliedCount === generatedMigrations.length
+      ? "current"
+      : "incomplete";
+  } catch (error) {
+    return isMissingMigrationJournalError(error) ? "incomplete" : "unavailable";
+  } finally {
+    client.release();
+  }
+}
+
+/** Distinguishes an absent migration catalog from transport and query outages. */
+function isMissingMigrationJournalError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("code" in error)) return false;
+  return error.code === "42P01" || error.code === "3F000";
+}
+
+/** Checks whether the complete durable migration journal matches generated state. */
+export async function isDatabaseMigrationCurrent(database: MigrationDatabase): Promise<boolean> {
+  return (await readDatabaseMigrationReadiness(database)) === "current";
+}
+
 interface LegacyMigrationProbe {
   readonly contradictionObserved?: (client: pg.PoolClient) => Promise<boolean>;
   readonly label: string;
@@ -104,7 +142,10 @@ export interface DatabaseMigrationFailureContext {
 type MigrationJournalInspection =
   | { readonly status: "empty" }
   | { readonly appliedCount: number; readonly status: "valid" }
-  | { readonly context: DatabaseMigrationFailureContext; readonly status: "invalid" };
+  | {
+      readonly context: DatabaseMigrationFailureContext;
+      readonly status: "invalid";
+    };
 
 interface ConstraintSignature {
   readonly columnNames: readonly string[];
@@ -161,6 +202,13 @@ interface AuthColumnRow {
   readonly dataType: string;
   readonly isNullable: string;
   readonly tableName: string;
+}
+
+interface ColumnDefinitionExpectation {
+  readonly columnDefault: string | null;
+  readonly columnName: string;
+  readonly dataType: string;
+  readonly isNullable: "NO" | "YES";
 }
 
 interface UnlockRow {
@@ -933,7 +981,67 @@ function legacyMigrationProbes(): readonly LegacyMigrationProbe[] {
         !(await hasOperatorCommandAdmissionHardening(client)),
       represented: hasOperatorCommandAdmissionHardening,
     },
+    {
+      label: "0026 stable session bootstrap identities",
+      contradictionObserved: async (client) =>
+        (await hasTable(client, "session_bootstrap_identities")) &&
+        !(await hasStableSessionBootstrapIdentities(client)),
+      represented: hasStableSessionBootstrapIdentities,
+    },
   ];
+}
+
+/** Recognizes the one-to-one durable deployment bootstrap identity mapping. */
+async function hasStableSessionBootstrapIdentities(client: pg.PoolClient): Promise<boolean> {
+  return (
+    (await hasExactColumnDefinitions(client, "session_bootstrap_identities", [
+      {
+        columnDefault: "now()",
+        columnName: "created_at",
+        dataType: "timestamp with time zone",
+        isNullable: "NO",
+      },
+      {
+        columnDefault: null,
+        columnName: "identity_key",
+        dataType: "text",
+        isNullable: "NO",
+      },
+      {
+        columnDefault: null,
+        columnName: "session_id",
+        dataType: "text",
+        isNullable: "NO",
+      },
+    ])) &&
+    (await hasNamedCheckConstraint(client, {
+      constraintName: "session_bootstrap_identities_identity_key_size_check",
+      requiredDefinitionFragments: [
+        "octet_length(identity_key) >= 1",
+        "octet_length(identity_key) <= 512",
+      ],
+      tableName: "session_bootstrap_identities",
+    })) &&
+    (await hasConstraintSignature(client, {
+      columnNames: ["identity_key"],
+      constraintType: "p",
+      tableName: "session_bootstrap_identities",
+    })) &&
+    (await hasConstraintSignature(client, {
+      columnNames: ["session_id"],
+      constraintType: "u",
+      tableName: "session_bootstrap_identities",
+    })) &&
+    (await hasExactForeignKey(client, {
+      constraintName: "session_bootstrap_identities_session_id_sessions_session_id_fk",
+      deleteAction: "r",
+      localColumnNames: ["session_id"],
+      referencedColumnNames: ["session_id"],
+      referencedTableName: "sessions",
+      tableName: "session_bootstrap_identities",
+      updateAction: "a",
+    }))
+  );
 }
 
 const authFoundationColumns: readonly AuthColumnExpectation[] = [
@@ -964,7 +1072,9 @@ const authFoundationColumns: readonly AuthColumnExpectation[] = [
   authColumn("auth_tickets", "ticket_hash", "text", "NO"),
 ];
 
-const authFoundationIndexes: readonly (IndexSignature & { readonly indexName: string })[] = [
+const authFoundationIndexes: readonly (IndexSignature & {
+  readonly indexName: string;
+})[] = [
   {
     columnNames: ["grant_jti", "occurred_at"],
     indexName: "auth_grant_audit_grant_occurred_idx",
@@ -1140,7 +1250,12 @@ function constraint(
   tableName: string,
   requiredDefinitionFragments: readonly string[],
 ): NamedConstraintExpectation {
-  return { constraintName, constraintType, requiredDefinitionFragments, tableName };
+  return {
+    constraintName,
+    constraintType,
+    requiredDefinitionFragments,
+    tableName,
+  };
 }
 
 /** Recognizes only the complete security-relevant auth foundation migration. */
@@ -1199,6 +1314,40 @@ async function hasColumns(
     }
   }
   return true;
+}
+
+/** Requires one table's exact column set, types, nullability, and defaults. */
+async function hasExactColumnDefinitions(
+  client: pg.PoolClient,
+  tableName: string,
+  expectations: readonly ColumnDefinitionExpectation[],
+): Promise<boolean> {
+  const result = await client.query<AuthColumnRow>(
+    `
+      SELECT
+        column_default AS "columnDefault",
+        column_name AS "columnName",
+        data_type AS "dataType",
+        is_nullable AS "isNullable",
+        table_name AS "tableName"
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = $1
+    `,
+    [tableName],
+  );
+  return (
+    result.rows.length === expectations.length &&
+    expectations.every((expected) =>
+      result.rows.some(
+        (row) =>
+          row.columnDefault === expected.columnDefault &&
+          row.columnName === expected.columnName &&
+          row.dataType === expected.dataType &&
+          row.isNullable === expected.isNullable &&
+          row.tableName === tableName,
+      ),
+    )
+  );
 }
 
 /** Requires the exact generated auth column set, types, nullability, and defaults. */
@@ -1384,6 +1533,67 @@ async function hasConstraintSignature(
       row.columnNames.length === expected.columnNames.length &&
       row.columnNames.every((columnName, index) => columnName === expected.columnNames[index]),
   );
+}
+
+/** Verifies one exact validated foreign key, including referenced columns and actions. */
+async function hasExactForeignKey(
+  client: pg.PoolClient,
+  expected: {
+    readonly constraintName: string;
+    readonly deleteAction: "a" | "c" | "n" | "r";
+    readonly localColumnNames: readonly string[];
+    readonly referencedColumnNames: readonly string[];
+    readonly referencedTableName: string;
+    readonly tableName: string;
+    readonly updateAction: "a" | "c" | "n" | "r";
+  },
+): Promise<boolean> {
+  const result = await client.query<SchemaObjectExistsRow>(
+    `
+      SELECT EXISTS (
+        SELECT 1
+        FROM pg_constraint constraint_record
+        JOIN pg_class table_record ON table_record.oid = constraint_record.conrelid
+        JOIN pg_class referenced_table ON referenced_table.oid = constraint_record.confrelid
+        JOIN pg_namespace namespace_record ON namespace_record.oid = table_record.relnamespace
+        JOIN pg_namespace referenced_namespace
+          ON referenced_namespace.oid = referenced_table.relnamespace
+        WHERE namespace_record.nspname = 'public'
+          AND referenced_namespace.nspname = 'public'
+          AND table_record.relname = $1
+          AND constraint_record.conname = $2
+          AND constraint_record.contype = 'f'
+          AND referenced_table.relname = $3
+          AND constraint_record.confdeltype = $4
+          AND constraint_record.confupdtype = $5
+          AND constraint_record.convalidated
+          AND (
+            SELECT jsonb_agg(attribute.attname ORDER BY key_column.position)
+            FROM unnest(constraint_record.conkey) WITH ORDINALITY AS key_column(attnum, position)
+            JOIN pg_attribute attribute
+              ON attribute.attrelid = constraint_record.conrelid
+              AND attribute.attnum = key_column.attnum
+          ) = $6::jsonb
+          AND (
+            SELECT jsonb_agg(attribute.attname ORDER BY key_column.position)
+            FROM unnest(constraint_record.confkey) WITH ORDINALITY AS key_column(attnum, position)
+            JOIN pg_attribute attribute
+              ON attribute.attrelid = constraint_record.confrelid
+              AND attribute.attnum = key_column.attnum
+          ) = $7::jsonb
+      ) AS exists
+    `,
+    [
+      expected.tableName,
+      expected.constraintName,
+      expected.referencedTableName,
+      expected.deleteAction,
+      expected.updateAction,
+      JSON.stringify(expected.localColumnNames),
+      JSON.stringify(expected.referencedColumnNames),
+    ],
+  );
+  return result.rows[0]?.exists === true;
 }
 
 /** Returns whether a named public-table constraint exists. */

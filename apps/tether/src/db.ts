@@ -2,8 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 
 import {
   type OperatorCommandRequest,
-  operatorCommandPermission,
   type OperatorGrantScope,
+  operatorCommandPermission,
   operatorGrantScopeSchema,
 } from "@dungle-scrubs/tether-protocol";
 import {
@@ -443,6 +443,23 @@ interface PgParticipantRow {
 export type CreateSessionResult =
   | { readonly created: false; readonly session: SessionRecord }
   | { readonly created: true; readonly session: SessionRecord };
+
+/** Result of resolving one durable deployment bootstrap identity. */
+export interface BootstrapSessionResult {
+  readonly created: boolean;
+  readonly identityKey: string;
+  readonly session: SessionRecord;
+}
+
+/** Stable fail-closed error for a one-to-one bootstrap identity conflict. */
+export class SessionBootstrapIdentityConflictError extends Error {
+  readonly code = "session_bootstrap_identity_conflict";
+
+  constructor() {
+    super("Session bootstrap identity conflicts with durable state");
+    this.name = "SessionBootstrapIdentityConflictError";
+  }
+}
 
 /** Error raised when a session-scoped write targets a missing durable session. */
 export class SessionNotFoundError extends Error {
@@ -1716,6 +1733,68 @@ export async function createSession(
 }
 
 /**
+ * Ensures one stable durable session for an opaque deployment bootstrap identity.
+ * Both unique identities are locked before inspection so concurrent bootstrap
+ * processes either replay the exact mapping or fail with one bounded code.
+ */
+export async function ensureBootstrapSession(
+  database: DatabasePool,
+  input: { readonly identityKey: string; readonly sessionId: string },
+): Promise<BootstrapSessionResult> {
+  const client = await database.pool.connect();
+  try {
+    await client.query("BEGIN");
+    await acquireTransactionAdvisoryLock(client, "session-bootstrap-identity", input.identityKey);
+    await acquireTransactionAdvisoryLock(client, "session-bootstrap-session", input.sessionId);
+    const mappings = await client.query<{
+      readonly identityKey: string;
+      readonly sessionId: string;
+    }>(
+      `
+        SELECT identity_key AS "identityKey", session_id AS "sessionId"
+        FROM session_bootstrap_identities
+        WHERE identity_key = $1 OR session_id = $2
+        FOR UPDATE
+      `,
+      [input.identityKey, input.sessionId],
+    );
+    const exact = mappings.rows.find(
+      (row) => row.identityKey === input.identityKey && row.sessionId === input.sessionId,
+    );
+    if (exact) {
+      const session = await readSessionWithClient(client, input.sessionId);
+      await client.query("COMMIT");
+      return { created: false, identityKey: input.identityKey, session };
+    }
+    if (mappings.rows.length > 0) {
+      throw new SessionBootstrapIdentityConflictError();
+    }
+    const session = await createSessionWithClient(client, input.sessionId);
+    await client.query(
+      `INSERT INTO session_bootstrap_identities (identity_key, session_id) VALUES ($1, $2)`,
+      [input.identityKey, input.sessionId],
+    );
+    await client.query("COMMIT");
+    return {
+      created: session.created,
+      identityKey: input.identityKey,
+      session: session.session,
+    };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    if (
+      isPgUniqueViolation(error, "session_bootstrap_identities_pkey") ||
+      isPgUniqueViolation(error, "session_bootstrap_identities_session_id_unique")
+    ) {
+      throw new SessionBootstrapIdentityConflictError();
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
  * Permanently deletes one durable session and all session-owned rows, with the
  * eligibility re-check fenced inside the delete transaction.
  *
@@ -1752,6 +1831,23 @@ export async function deleteSession(
     if (!sessionRows.rows[0]) {
       await client.query("ROLLBACK");
       return { status: "not_found" };
+    }
+    const bootstrapIdentityRows = await client.query<{ readonly identityKey: string }>(
+      `
+        SELECT identity_key AS "identityKey"
+        FROM session_bootstrap_identities
+        WHERE session_id = $1
+        FOR UPDATE
+      `,
+      [sessionId],
+    );
+    if (bootstrapIdentityRows.rows[0]) {
+      await client.query("ROLLBACK");
+      return {
+        detail: "session has a durable bootstrap identity",
+        reason: "protected",
+        status: "refused",
+      };
     }
     // D-009 lock order: lease rows first, ordered per participant the same way
     // the control-lease transactions order their current-row scans.
@@ -1815,11 +1911,19 @@ export async function deleteSession(
     }
     if (projection.activity === "running" || projection.activity === "queued") {
       await client.query("ROLLBACK");
-      return { detail: "a turn is active on this session", reason: "protected", status: "refused" };
+      return {
+        detail: "a turn is active on this session",
+        reason: "protected",
+        status: "refused",
+      };
     }
     if (options.hasLiveHost?.() === true) {
       await client.query("ROLLBACK");
-      return { detail: "a host is live on this session", reason: "protected", status: "refused" };
+      return {
+        detail: "a host is live on this session",
+        reason: "protected",
+        status: "refused",
+      };
     }
     const rawNextSeq = seqRows.rows[0]?.seq;
     const nextSeq =
@@ -2662,7 +2766,11 @@ export async function createOperatorCommandTaskWithEvent(
     );
     if (existing.rows[0] !== undefined) {
       await client.query("COMMIT");
-      return { events: [], status: "replayed", task: toTaskRecord(existing.rows[0]) };
+      return {
+        events: [],
+        status: "replayed",
+        task: toTaskRecord(existing.rows[0]),
+      };
     }
     const grantRate = await client.query<{ readonly count: number }>(
       `SELECT count(*)::int AS count
@@ -2703,7 +2811,10 @@ export async function createOperatorCommandTaskWithEvent(
     });
     const event = await appendEventWithClient(
       client,
-      buildTaskCreatedEventInput({ sessionId: input.authority.request.sessionId, task }),
+      buildTaskCreatedEventInput({
+        sessionId: input.authority.request.sessionId,
+        task,
+      }),
       input.eventSourceId,
     );
     await client.query("COMMIT");
@@ -4406,7 +4517,10 @@ async function appendEventWithClient(
     // session-delete cascade, so a missing row here means the session was
     // permanently deleted after the existence check above. Surface the typed
     // missing-session failure instead of an opaque allocation error.
-    throw new SessionNotFoundError({ operation: "appendEvent", sessionId: input.sessionId });
+    throw new SessionNotFoundError({
+      operation: "appendEvent",
+      sessionId: input.sessionId,
+    });
   }
   const seq = parseEventSequence(rawSeq, input.sessionId);
   const eventRows = await client.query<PgSessionEventRow>(
@@ -4556,6 +4670,18 @@ async function requireSessionWithClient(
   if (rows.rows[0]?.exists !== true) {
     throw new SessionNotFoundError({ operation, sessionId });
   }
+}
+
+/** Reads one existing session through a caller-owned transaction. */
+async function readSessionWithClient(
+  client: TransactionClient,
+  sessionId: string,
+): Promise<SessionRecord> {
+  const rows = await client.query<Pick<PgSessionRow, "createdAt" | "sessionId">>(
+    `SELECT created_at AS "createdAt", session_id AS "sessionId" FROM sessions WHERE session_id = $1`,
+    [sessionId],
+  );
+  return toSessionRecord(rows.rows[0]);
 }
 
 /**

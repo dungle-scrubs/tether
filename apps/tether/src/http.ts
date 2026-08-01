@@ -1,15 +1,17 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { URL } from "node:url";
 
-import type { SessionScalabilityHealthWarning } from "@dungle-scrubs/tether-protocol";
+import type {
+  ReadinessResponse,
+  SessionScalabilityHealthWarning,
+} from "@dungle-scrubs/tether-protocol";
 import { Context, Effect, Layer } from "effect";
 import { authorize } from "./auth/authorize.js";
-import { createAuthGrantLifecycle, type AuthGrantLifecycle } from "./auth/grant-lifecycle.js";
 import { createBrowserOperatorRuntime } from "./auth/browser-operator-runtime.js";
 import {
-  createBrowserPairingLifecycle,
   type BrowserPairingLifecycle,
   type BrowserPairingLifecycleOptions,
+  createBrowserPairingLifecycle,
 } from "./auth/browser-pairing.js";
 import { createBrowserPairingStore } from "./auth/browser-pairing-stores.js";
 import { createAuthPersistenceStores } from "./auth/db-grant-stores.js";
@@ -22,22 +24,27 @@ import {
   authRuntimeOptionsFromConfig,
   createAuthRuntime,
 } from "./auth/enforcement.js";
+import { type AuthGrantLifecycle, createAuthGrantLifecycle } from "./auth/grant-lifecycle.js";
 import {
-  AuthGrantRevocationRuntime,
   type AuthGrantRevocationDebugInfo,
+  AuthGrantRevocationRuntime,
 } from "./auth/grant-revocation-runtime.js";
 import { AuthSocketRegistry, type AuthSocketRegistryDebugInfo } from "./auth/socket-registry.js";
+import { type AuthTicketLifecycle, createAuthTicketLifecycle } from "./auth/ticket-lifecycle.js";
 import type { AuthContext } from "./auth/token.js";
-import { createAuthTicketLifecycle, type AuthTicketLifecycle } from "./auth/ticket-lifecycle.js";
-import { ServerConfigService } from "./config.js";
 import type { RuntimeTopology } from "./config.js";
+import { ServerConfigService } from "./config.js";
+import {
+  type DatabaseMigrationReadiness,
+  readDatabaseMigrationReadiness,
+} from "./database-migration.js";
 import { type DatabasePool, DatabaseService } from "./db.js";
 import { HostPresenceRuntime } from "./host-presence.js";
-import { handleClientBindingHttpRoute } from "./http-client-binding-route-handlers.js";
-import { handleBrowserOperatorHttpRoute } from "./http-browser-operator-route-handlers.js";
-import { handleBrowserPairingHttpRoute } from "./http-browser-pairing-route-handlers.js";
 import { handleAuthGrantHttpRoute } from "./http-auth-grant-route-handlers.js";
 import { handleAuthTicketHttpRoute } from "./http-auth-ticket-route-handlers.js";
+import { handleBrowserOperatorHttpRoute } from "./http-browser-operator-route-handlers.js";
+import { handleBrowserPairingHttpRoute } from "./http-browser-pairing-route-handlers.js";
+import { handleClientBindingHttpRoute } from "./http-client-binding-route-handlers.js";
 import { directHttpRoutes } from "./http-direct-routes.js";
 import {
   applyCorsResponseHeaders,
@@ -57,19 +64,20 @@ import { handleSessionSummaryHttpRoute } from "./http-session-summary-route-hand
 import { handleTaskHttpRoute } from "./http-task-route-handlers.js";
 import { handleUiHttpRoute } from "./http-ui-route-handlers.js";
 import { SubscriptionHub, type SubscriptionHubDebugInfo } from "./hub.js";
+import { projectReadiness, type ReadinessProjection } from "./readiness.js";
 import {
   defaultResourceLimits,
   type ResourceLimitDebugInfo,
   ResourceLimitRuntime,
   type ResourceLimits,
 } from "./resource-limits.js";
-import { projectReadiness, type ReadinessProjection } from "./readiness.js";
 import type { RestControlPolicyDebugInfo } from "./rest-control-policy.js";
 import {
   defaultEventFanoutCatchUpStaleMs,
   SessionEventFanout,
   type SessionEventFanoutDebugInfo,
 } from "./session-event-fanout.js";
+import { sessionScalabilityBaselineWarnings } from "./session-scalability-diagnostics.js";
 import {
   createSessionServiceEffect,
   type SessionServiceDebugInfo,
@@ -78,7 +86,6 @@ import {
   type SessionServiceOptions,
 } from "./session-service.js";
 import { createSessionSummaryStore, type SessionSummaryStore } from "./session-summary-store.js";
-import { sessionScalabilityBaselineWarnings } from "./session-scalability-diagnostics.js";
 import {
   TaskClaimSweeper,
   type TaskClaimSweeperConfig,
@@ -142,6 +149,16 @@ export interface AppServerDebugInfo {
   readonly taskClaimSweeper: TaskClaimSweeperDebugInfo;
 }
 
+/** Bounded startup rejection raised before any network or background work begins. */
+export class AppServerStartupReadinessError extends Error {
+  readonly code = "app_server_startup_not_ready";
+
+  constructor(readonly reason: Extract<ReadinessResponse, { ready: false }>["reason"]) {
+    super(`App server startup rejected: ${reason}`);
+    this.name = "AppServerStartupReadinessError";
+  }
+}
+
 /**
  * Optional app server configuration for process-local modules.
  */
@@ -171,7 +188,10 @@ export interface AppServerOptions {
   readonly resourceLimits?: ResourceLimits;
   /** Process readiness thresholds. */
   readonly readiness?: {
+    readonly configurationCompatible?: boolean;
+    readonly databaseMigrationReadiness?: () => Promise<DatabaseMigrationReadiness>;
     readonly fanoutStaleAfterMs?: number;
+    readonly signingAuthorityReady?: boolean;
   };
   /** Declared deployment topology; direct programmatic construction defaults to single. */
   readonly runtimeTopology?: RuntimeTopology;
@@ -353,6 +373,8 @@ export function createAppServerWithSessionService(
           consoleBrowserSecurityLogger,
         )
       : options.browserPairing.lifecycle;
+  const databaseMigrationReadiness =
+    options.readiness?.databaseMigrationReadiness ?? (() => readDatabaseMigrationReadiness(pool));
   /**
    * Reads process-local diagnostics for the app server and its child modules.
    */
@@ -371,7 +393,18 @@ export function createAppServerWithSessionService(
   });
   const readReadiness: ReadAppReadiness = () =>
     projectReadiness({
-      database: pool,
+      deployment: {
+        configurationCompatible:
+          options.readiness?.configurationCompatible ??
+          (corsOptions.allowedOrigins.length === 0 || browserPairingLifecycle !== null),
+        databaseMigrationReadiness,
+        signingAuthorityReady:
+          options.readiness?.signingAuthorityReady ??
+          (authOptions.mode !== "required" ||
+            (typeof authOptions.issuer === "string" &&
+              authOptions.issuer.length > 0 &&
+              authOptions.secrets[authOptions.activeKid] !== undefined)),
+      },
       fanout: eventFanout,
       fanoutStaleAfterMs,
       replicaId,
@@ -436,6 +469,10 @@ export function createAppServerWithSessionService(
       }),
     debugInfo: readDebugInfo,
     listen: async (port) => {
+      const startupReadiness = await readReadiness();
+      if (!startupReadiness.body.ready) {
+        throw new AppServerStartupReadinessError(startupReadiness.body.reason);
+      }
       await authRevocation.start();
       await eventFanout.start();
       await new Promise<void>((resolve, reject) => {
@@ -473,7 +510,9 @@ export interface AppServerCloseResources {
   };
   readonly taskClaimSweeper: { readonly stop: () => Promise<void> };
   readonly wsServer: {
-    readonly clients: Iterable<{ readonly close: (code: number, reason: string) => void }>;
+    readonly clients: Iterable<{
+      readonly close: (code: number, reason: string) => void;
+    }>;
     readonly close: (callback?: (error?: Error) => void) => void;
   };
 }

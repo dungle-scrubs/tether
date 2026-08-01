@@ -45,6 +45,7 @@ describe("BrowserOperatorClient HTTP boundary", () => {
             expiresAt: "2026-08-02T00:00:00.000Z",
             grantJti: "grant_browser",
             scope,
+            sessionIds: ["sess_email"],
             status: "active",
             subject: "operator@example.test",
           });

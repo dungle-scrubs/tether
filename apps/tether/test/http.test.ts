@@ -4,14 +4,24 @@ import WebSocket from "ws";
 
 import type { DatabasePool } from "../src/db.js";
 import { HostPresenceRuntime, projectSessionInventory } from "../src/host-presence.js";
-import { createAppServerWithSessionService, type AppServer } from "../src/http.js";
+import {
+  type AppServer,
+  type AppServerStartupReadinessError,
+  createAppServerWithSessionService,
+} from "../src/http.js";
 import { hostPresenceInventorySchema } from "../src/protocol.js";
 import { defaultResourceLimits, sessionEventByteLength } from "../src/resource-limits.js";
-import type { SessionEvent } from "../src/types.js";
 import type {
   SessionServiceDebugInfo,
   SessionServiceEffect,
 } from "../src/session-service-contracts.js";
+import type { SessionEvent } from "../src/types.js";
+
+const healthyTestReadiness = {
+  configurationCompatible: true,
+  databaseMigrationReadiness: async (): Promise<"current"> => "current",
+  signingAuthorityReady: true,
+} as const;
 
 describe("HTTP app server error boundary", () => {
   const openApps: AppServer[] = [];
@@ -56,6 +66,7 @@ describe("HTTP app server error boundary", () => {
       {
         auth: { activeKid: "disabled", mode: "disabled", secrets: {} },
         eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+        readiness: healthyTestReadiness,
         runtimeTopology: "multi",
         taskClaimSweeper: { intervalMs: 0 },
       },
@@ -86,6 +97,7 @@ describe("HTTP app server error boundary", () => {
       {
         auth: { activeKid: "disabled", mode: "disabled", secrets: {} },
         eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+        readiness: healthyTestReadiness,
         runtimeTopology,
         taskClaimSweeper: { intervalMs: 0 },
       },
@@ -110,8 +122,16 @@ describe("HTTP app server error boundary", () => {
       } as unknown as DatabasePool,
       createPermanentDeleteSessionService(() => Effect.succeed([])),
       {
-        auth: { activeKid: "test", mode: "required", secrets: { test: "secret" } },
+        auth: {
+          activeKid: "test",
+          mode: "required",
+          secrets: { test: "secret" },
+        },
         eventFanout: { catchUpPollIntervalMs: 10, listenEnabled: false },
+        readiness: {
+          databaseMigrationReadiness: async (): Promise<"current"> => "current",
+          signingAuthorityReady: true,
+        },
         runtimeTopology: "multi",
         taskClaimSweeper: { intervalMs: 0 },
       },
@@ -133,6 +153,65 @@ describe("HTTP app server error boundary", () => {
     expect(protectedSessions.status).toBe(401);
   });
 
+  it.each([
+    {
+      expectedReason: "migration_incomplete",
+      options: {
+        auth: { activeKid: "disabled", mode: "disabled", secrets: {} },
+        readiness: {
+          databaseMigrationReadiness: async (): Promise<"incomplete"> => "incomplete",
+        },
+      },
+    },
+    {
+      expectedReason: "signing_authority_unavailable",
+      options: {
+        auth: {
+          activeKid: "test",
+          mode: "required",
+          secrets: { test: "secret" },
+        },
+        readiness: {
+          databaseMigrationReadiness: async (): Promise<"current"> => "current",
+        },
+      },
+    },
+    {
+      expectedReason: "configuration_incompatible",
+      options: {
+        auth: { activeKid: "disabled", mode: "disabled", secrets: {} },
+        browserPairing: { lifecycle: null },
+        cors: { allowedOrigins: ["https://hub.example.test"] },
+        readiness: {
+          databaseMigrationReadiness: async (): Promise<"current"> => "current",
+          signingAuthorityReady: true,
+        },
+      },
+    },
+  ] as const)("wires $expectedReason into unauthenticated startup readiness", async ({
+    expectedReason,
+    options,
+  }) => {
+    const app = createAppServerWithSessionService(
+      {
+        pool: { query: () => Promise.resolve({ rows: [] }) },
+      } as unknown as DatabasePool,
+      createPermanentDeleteSessionService(() => Effect.succeed([])),
+      {
+        ...options,
+        eventFanout: { catchUpPollIntervalMs: 10, listenEnabled: false },
+        taskClaimSweeper: { intervalMs: 0 },
+      },
+    );
+    await expect(app.listen(0)).rejects.toEqual(
+      expect.objectContaining({
+        code: "app_server_startup_not_ready",
+        name: "AppServerStartupReadinessError",
+        reason: expectedReason,
+      }) satisfies Partial<AppServerStartupReadinessError>,
+    );
+  });
+
   it("redacts service failures that travel through the app-server catch boundary", async () => {
     const logs: RouteErrorLog[] = [];
     const secret = "secret db detail: unique constraint sessions_session_id_key";
@@ -150,6 +229,7 @@ describe("HTTP app server error boundary", () => {
           },
           requestIdFactory: () => "req_app_boundary",
         },
+        readiness: healthyTestReadiness,
         taskClaimSweeper: { intervalMs: 0 },
       },
     );
@@ -192,6 +272,7 @@ describe("HTTP app server error boundary", () => {
       {
         auth: { activeKid: "disabled", mode: "disabled", secrets: {} },
         eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+        readiness: healthyTestReadiness,
         taskClaimSweeper: { intervalMs: 0 },
       },
     );
@@ -252,7 +333,11 @@ describe("REST events-list byte budget", () => {
       {
         auth: { activeKid: "disabled", mode: "disabled", secrets: {} },
         eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
-        resourceLimits: { ...defaultResourceLimits, restEventListMaxBytes: maxBytes },
+        resourceLimits: {
+          ...defaultResourceLimits,
+          restEventListMaxBytes: maxBytes,
+        },
+        readiness: healthyTestReadiness,
         taskClaimSweeper: { intervalMs: 0 },
       },
     );
@@ -263,7 +348,10 @@ describe("REST events-list byte budget", () => {
     expect(response.status).toBe(200);
     const body = (await response.json()) as {
       readonly events: SessionEvent[];
-      readonly pagination: { readonly hasMore: boolean; readonly nextAfterSeq: number };
+      readonly pagination: {
+        readonly hasMore: boolean;
+        readonly nextAfterSeq: number;
+      };
     };
 
     expect(body.events.length).toBeGreaterThan(0);
@@ -297,6 +385,7 @@ describe("REST events-list byte budget", () => {
       {
         auth: { activeKid: "disabled", mode: "disabled", secrets: {} },
         eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+        readiness: healthyTestReadiness,
         taskClaimSweeper: { intervalMs: 0 },
       },
     );
@@ -307,7 +396,10 @@ describe("REST events-list byte budget", () => {
     expect(response.status).toBe(200);
     const body = (await response.json()) as {
       readonly events: SessionEvent[];
-      readonly pagination: { readonly hasMore: boolean; readonly returned: number };
+      readonly pagination: {
+        readonly hasMore: boolean;
+        readonly returned: number;
+      };
     };
 
     expect(body.events.map((event) => event.seq)).toEqual([1, 2, 3]);
@@ -429,7 +521,9 @@ function createSessionServiceDebugInfo(): SessionServiceDebugInfo {
 }
 
 function createUnusedDatabasePool(): DatabasePool {
-  return {} as unknown as DatabasePool;
+  return {
+    pool: { query: () => Promise.resolve({ rows: [] }) },
+  } as unknown as DatabasePool;
 }
 
 interface Deferred<TValue> {
@@ -466,7 +560,12 @@ function createSessionEvent(
 function readEventSeqs(messages: readonly unknown[]): number[] {
   return messages
     .filter(
-      (message): message is { readonly event: { readonly seq: number }; readonly op: "event" } =>
+      (
+        message,
+      ): message is {
+        readonly event: { readonly seq: number };
+        readonly op: "event";
+      } =>
         typeof message === "object" &&
         message !== null &&
         "op" in message &&
