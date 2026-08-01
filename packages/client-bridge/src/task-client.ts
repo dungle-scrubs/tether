@@ -185,6 +185,7 @@ export class ClientBridgeTaskClient {
           instanceId: context.instanceId,
           participantId: context.participantId,
           ...(input.reason === undefined ? {} : { reason: input.reason }),
+          ...(input.target === undefined ? {} : { target: input.target }),
         },
         path: clientBridgeRoutes.taskApproval(sessionId, input.taskId),
       });
@@ -194,6 +195,7 @@ export class ClientBridgeTaskClient {
     }
     return body.status === "recorded"
       ? {
+          approval: body.approval,
           decision: body.decision,
           event: body.event,
           eventId: body.event.eventId,
@@ -201,6 +203,7 @@ export class ClientBridgeTaskClient {
           task: body.task,
         }
       : {
+          approval: body.approval,
           decision: body.decision,
           existingDecision: body.existingDecision,
           ignoredReason: body.ignoredReason,

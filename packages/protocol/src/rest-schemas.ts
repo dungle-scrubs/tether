@@ -1,5 +1,10 @@
 import { z } from "zod";
 
+import {
+  approvalDecisionSchema,
+  approvalTargetSchema,
+  taskResultSchema,
+} from "./approval-targets.js";
 import { sessionEventSchema } from "./event-builders.js";
 import { controlChannelSchema, participantRuntimeKindSchema } from "./records.js";
 
@@ -211,7 +216,7 @@ export const completeTaskSchema = z.object({
   controlEpoch: controlEpochSchema.optional(),
   instanceId: z.string().min(1).optional(),
   participantId: z.string().min(1),
-  result: z.record(z.string(), z.unknown()).default({}),
+  result: taskResultSchema.default({}),
 });
 
 /** HTTP body schema for task failure. */
@@ -231,12 +236,6 @@ export const releaseTaskSchema = z.object({
   participantId: z.string().min(1),
 });
 
-/** Schema for durable task approval decisions. */
-export const approvalDecisionSchema = z.union([z.literal("approved"), z.literal("rejected")]);
-
-/** Durable approval decision values recorded in session events. */
-export type ApprovalDecision = z.infer<typeof approvalDecisionSchema>;
-
 /** HTTP payload schema for recording approval intent for a task. */
 export const recordTaskApprovalSchema = z.object({
   controlEpoch: controlEpochSchema.optional(),
@@ -244,4 +243,5 @@ export const recordTaskApprovalSchema = z.object({
   instanceId: z.string().min(1).optional(),
   participantId: z.string().min(1),
   reason: z.record(z.string(), z.unknown()).default({}),
+  target: approvalTargetSchema.optional(),
 });

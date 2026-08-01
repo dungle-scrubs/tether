@@ -1,7 +1,7 @@
 import { z } from "zod";
+import { approvalDecisionSchema } from "./approval-targets.js";
 import type { ParticipantRecord, SessionEvent, SessionEventType, TaskRecord } from "./records.js";
 import { sessionEventType, systemProducerId, taskRecordSchema } from "./records.js";
-import { approvalDecisionSchema } from "./rest-schemas.js";
 
 const sessionEventTypeSchema = z
   .string()

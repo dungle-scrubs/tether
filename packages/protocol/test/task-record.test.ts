@@ -5,12 +5,14 @@ import { ZodError } from "zod";
 import type { CandidateScheduleIdentity, TaskRecord } from "../src/index.js";
 import {
   candidateScheduleIdentitySchema,
+  completeTaskSchema,
   formatTaskFailurePayload,
   formatTaskResultPayload,
   scheduledTaskIdentitySchema,
   taskContractAdvertisementSchema,
   taskContractSummarySchema,
   taskRecordSchema,
+  targetManifestSchema,
 } from "../src/index.js";
 
 type IsExact<TLeft, TRight> = [TLeft] extends [TRight]
@@ -212,6 +214,34 @@ describe("taskRecordSchema", () => {
         scopeKey: "scope_01JEMAIL",
       }).success,
     ).toBe(false);
+  });
+});
+
+describe("target manifests", () => {
+  it("persists bounded opaque target entries in completed task results", () => {
+    const targetManifest = [
+      {
+        action: "action_opaque_1",
+        digest: "digest_opaque_1",
+        scopeKey: "scope_opaque_1",
+        targetId: "target_opaque_1",
+        targetKind: "kind_opaque_1",
+        targetRevision: "revision_opaque_1",
+      },
+    ];
+    const completion = completeTaskSchema.parse({
+      claimId: "claim_1",
+      participantId: "part_1",
+      result: { targetManifest },
+    });
+    const task = taskRecordSchema.parse({
+      ...createTaskFixture(),
+      completedAt: "2026-01-01T00:01:00.000Z",
+      result: completion.result,
+    });
+
+    expect(targetManifestSchema.parse(targetManifest)).toEqual(targetManifest);
+    expect(task.result).toEqual({ targetManifest });
   });
 });
 

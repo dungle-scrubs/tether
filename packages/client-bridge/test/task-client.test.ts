@@ -346,6 +346,14 @@ describe("ClientBridgeTaskClient", () => {
 
   it("records task approval intent without mutating the task", async () => {
     const requests: CapturedRequest[] = [];
+    const target = {
+      action: "action_opaque_1",
+      digest: "digest_opaque_1",
+      scopeKey: "scope_opaque_1",
+      targetId: "target_opaque_1",
+      targetKind: "kind_opaque_1",
+      targetRevision: "revision_opaque_1",
+    };
     const task = createTaskFixture({
       objective: "handle request",
       sessionId: "sess_1",
@@ -358,6 +366,7 @@ describe("ClientBridgeTaskClient", () => {
       },
       {
         body: {
+          approval: createTaskApprovalFixture(task, "evt_approval"),
           decision: "approved",
           event: createSessionEventFixture({
             eventId: "evt_approval",
@@ -376,9 +385,11 @@ describe("ClientBridgeTaskClient", () => {
       client.recordTaskApproval("sess_1", {
         decision: "approved",
         reason: { chatId: "123", source: "external-chat" },
+        target,
         taskId: "task_1",
       }),
     ).resolves.toEqual({
+      approval: createTaskApprovalFixture(task, "evt_approval"),
       decision: "approved",
       event: createSessionEventFixture({
         eventId: "evt_approval",
@@ -411,6 +422,7 @@ describe("ClientBridgeTaskClient", () => {
           instanceId: "inst_bridge",
           participantId: "part_bridge",
           reason: { chatId: "123", source: "external-chat" },
+          target,
         },
         method: "POST",
         path: "/sessions/sess_1/tasks/task_1/approval",
@@ -432,6 +444,7 @@ describe("ClientBridgeTaskClient", () => {
       },
       {
         body: {
+          approval: createTaskApprovalFixture(task, "evt_existing_approval"),
           decision: "rejected",
           existingDecision: "approved",
           ignoredReason: "already_approved",
@@ -449,6 +462,7 @@ describe("ClientBridgeTaskClient", () => {
         taskId: "task_1",
       }),
     ).resolves.toEqual({
+      approval: createTaskApprovalFixture(task, "evt_existing_approval"),
       decision: "rejected",
       existingDecision: "approved",
       ignoredReason: "already_approved",
@@ -469,6 +483,7 @@ describe("ClientBridgeTaskClient", () => {
       { body: { task }, status: 200 },
       {
         body: {
+          approval: createTaskApprovalFixture(task, "evt_approval_reuse"),
           decision: "approved",
           event: createSessionEventFixture({
             eventId: "evt_approval_reuse",
@@ -538,6 +553,7 @@ describe("ClientBridgeTaskClient", () => {
         }
         return new Response(
           JSON.stringify({
+            approval: createTaskApprovalFixture(task, "evt_after_uncertain"),
             decision: "approved",
             event: createSessionEventFixture({
               eventId: "evt_after_uncertain",
@@ -613,6 +629,7 @@ describe("ClientBridgeTaskClient", () => {
         }
         return new Response(
           JSON.stringify({
+            approval: createTaskApprovalFixture(task, "evt_after_body_loss"),
             decision: "approved",
             event: createSessionEventFixture({
               eventId: "evt_after_body_loss",
@@ -656,6 +673,7 @@ describe("ClientBridgeTaskClient", () => {
       { body: createControlAcquisitionFixture(), status: 201 },
       {
         body: {
+          approval: createTaskApprovalFixture(task, "evt_after_conflict"),
           decision: "approved",
           event: createSessionEventFixture({
             eventId: "evt_after_conflict",
@@ -874,6 +892,20 @@ function createTaskFixture(input: {
     ...(input.schedule !== undefined ? { schedule: input.schedule } : {}),
     sessionId: input.sessionId,
     taskId: input.taskId,
+  };
+}
+
+/** Builds the canonical approval row returned with an approval decision. */
+function createTaskApprovalFixture(task: ClientBridgeTaskRecord, eventId: string) {
+  return {
+    approvalEventId: eventId,
+    decidedAt: "2026-01-01T00:00:00.000Z",
+    decidedByParticipantId: "part_bridge",
+    decision: "approved" as const,
+    reason: {},
+    sessionId: task.sessionId,
+    targetKey: "task",
+    taskId: task.taskId,
   };
 }
 

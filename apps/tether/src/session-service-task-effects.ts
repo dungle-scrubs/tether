@@ -6,6 +6,7 @@ import type {
   SessionPersistenceStores,
 } from "./db-store-contracts.js";
 import {
+  ApprovalTargetManifestError,
   type EnsureScheduledRunResult,
   ScheduledRunIdentityConflictError,
   ScheduledTaskIdentityMismatchError,
@@ -303,8 +304,8 @@ export function createSessionTaskEffects(input: SessionTaskEffectsInput): Sessio
             new TaskApprovalRejectedError(taskInput.decision, rejectionReason, task),
           );
         }
-        const targetKey = approvalTargetKey(taskInput.reason);
-        const persisted = yield* trySessionPromise(() =>
+        const targetKey = approvalTargetKey(taskInput.reason, taskInput.target);
+        const persisted: PersistedTaskApprovalResult | null = yield* trySessionPromise(() =>
           input.stores.tasks.recordApproval({
             controlGuard: taskInput.controlGuard,
             decision: taskInput.decision,
@@ -312,7 +313,22 @@ export function createSessionTaskEffects(input: SessionTaskEffectsInput): Sessio
             participantId: taskInput.participantId,
             reason: taskInput.reason,
             sessionId: taskInput.sessionId,
+            ...(taskInput.target === undefined ? {} : { target: taskInput.target }),
             taskId: taskInput.taskId,
+          }),
+        ).pipe(
+          Effect.catchAll((error): Effect.Effect<never, SessionServiceFailure> => {
+            if (error.cause instanceof ApprovalTargetManifestError) {
+              input.observability.debug(operation, "approval.target_manifest.rejected", {
+                reason: error.cause.reason,
+                sessionId: taskInput.sessionId,
+                taskId: taskInput.taskId,
+              });
+              return Effect.fail(
+                new TaskApprovalRejectedError(taskInput.decision, error.cause.reason, task),
+              );
+            }
+            return Effect.fail(error);
           }),
         );
         if (!persisted) {
@@ -333,6 +349,7 @@ export function createSessionTaskEffects(input: SessionTaskEffectsInput): Sessio
         if (persisted.status === "ignored") {
           return yield* Effect.fail(
             new TaskApprovalIgnoredError(
+              persisted.approval,
               taskInput.decision,
               persisted.existingDecision,
               persisted.existingDecision === "approved" ? "already_approved" : "already_rejected",
@@ -341,6 +358,7 @@ export function createSessionTaskEffects(input: SessionTaskEffectsInput): Sessio
           );
         }
         const result = {
+          approval: persisted.approval,
           decision: taskInput.decision,
           event: persisted.event,
           events: persisted.events,
@@ -650,6 +668,7 @@ export function mapTaskApprovalRejection(
     }
     if (error instanceof TaskApprovalIgnoredError) {
       const result: TaskApprovalResult = {
+        approval: error.approval,
         decision: error.decision,
         events: [],
         existingDecision: error.existingDecision,

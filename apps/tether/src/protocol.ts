@@ -1,5 +1,6 @@
 export type {
   AppendSessionEventInput,
+  ApprovalTarget,
   ApprovalDecision,
   CommandResultEnvelope,
   EventListPagination,
@@ -95,6 +96,7 @@ export {
   taskFromCreatedEvent,
   taskIdFromCancelledEvent,
   taskRecordSchema,
+  targetManifestSchema,
   webSocketCommandResultEnvelopeSchema,
   webSocketErrorEnvelopeSchema,
   webSocketEventEnvelopeSchema,

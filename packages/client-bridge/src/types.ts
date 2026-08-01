@@ -1,7 +1,9 @@
 import type {
+  ApprovalTarget,
   ScheduleWindow,
   SessionEvent as ProtocolSessionEvent,
   TaskListStatus as ProtocolTaskListStatus,
+  TaskApprovalRecord,
   TaskRecord as ProtocolTaskRecord,
 } from "@dungle-scrubs/tether-protocol";
 import type {
@@ -172,12 +174,16 @@ export interface ClientBridgeRecordTaskApprovalInput {
   readonly decision: "approved" | "rejected";
   /** Optional bridge-specific approval context. */
   readonly reason?: Record<string, unknown>;
+  /** Opaque target that must exactly match the completed task manifest. */
+  readonly target?: ApprovalTarget;
   /** Durable task id to approve or reject. */
   readonly taskId: string;
 }
 
 /** Result returned after recording new approval intent. */
 export interface ClientBridgeTaskApprovalRecorded {
+  /** Canonical first-committer-wins approval row. */
+  readonly approval: TaskApprovalRecord;
   /** Approval decision recorded by Tether. */
   readonly decision: "approved" | "rejected";
   /** Durable approval event returned by Tether. */
@@ -192,6 +198,8 @@ export interface ClientBridgeTaskApprovalRecorded {
 
 /** Result returned when approval intent already exists. */
 export interface ClientBridgeTaskApprovalIgnored {
+  /** Canonical first-committer-wins approval row. */
+  readonly approval: TaskApprovalRecord;
   /** Approval decision requested by the bridge. */
   readonly decision: "approved" | "rejected";
   /** Existing durable decision for this task. */

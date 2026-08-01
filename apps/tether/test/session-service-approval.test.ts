@@ -5,12 +5,13 @@ import type {
   PersistedTaskApprovalResult,
   SessionPersistenceStores,
 } from "../src/db-store-contracts.js";
+import { ApprovalTargetManifestError } from "../src/db.js";
 import { ModuleObservability, type StructuredLogEntry } from "../src/observability.js";
 import {
   createSessionTaskEffects,
   mapTaskApprovalRejection,
 } from "../src/session-service-task-effects.js";
-import type { SessionEvent, TaskRecord } from "../src/types.js";
+import type { ApprovalTarget, SessionEvent, TaskRecord } from "../src/types.js";
 
 describe("session service approval recording", () => {
   it("delegates duplicate detection to TaskStore.recordApproval without listing events", async () => {
@@ -18,6 +19,7 @@ describe("session service approval recording", () => {
     const event = createApprovalEvent(task);
     const logs: StructuredLogEntry[] = [];
     const stores = createApprovalStores(task, {
+      approval: createApprovalRecord(task),
       decision: "approved",
       event,
       events: [event],
@@ -111,6 +113,10 @@ describe("session service approval recording", () => {
     );
 
     expect(result).toMatchObject({
+      approval: {
+        decidedByParticipantId: "part_first_service_approval_test",
+        decision: "approved",
+      },
       existingDecision: "approved",
       ignoredReason: "already_approved",
       status: "ignored",
@@ -126,11 +132,103 @@ describe("session service approval recording", () => {
       }),
     );
   });
+
+  it("passes the submitted opaque target into the atomic approval store operation", async () => {
+    const task = createCompletedApprovalTask();
+    const event = createApprovalEvent(task);
+    const target: ApprovalTarget = {
+      action: "action_opaque_1",
+      digest: "digest_opaque_1",
+      scopeKey: "scope_opaque_1",
+      targetId: "target_opaque_1",
+      targetKind: "kind_opaque_1",
+      targetRevision: "revision_opaque_1",
+    };
+    let persistedTarget: ApprovalTarget | undefined;
+    const stores = createApprovalStores(
+      task,
+      {
+        approval: createApprovalRecord(task),
+        decision: "approved",
+        event,
+        events: [event],
+        status: "recorded",
+        targetKey: "target_key",
+        task,
+      },
+      (recordedTarget) => {
+        persistedTarget = recordedTarget;
+      },
+    );
+    const effects = createSessionTaskEffects({
+      approvalValidators: new Map(),
+      assertBroadcastEvents: () => undefined,
+      eventSourceId: "src_service_approval_test",
+      observability: new ModuleObservability({ moduleName: "SessionServiceApprovalTest" }),
+      stores,
+      taskClaimLeaseTtlMs: 1_000,
+    });
+
+    await Effect.runPromise(
+      effects.recordTaskApprovalEffect({
+        decision: "approved",
+        participantId: "part_service_approval_test",
+        reason: {},
+        sessionId: task.sessionId,
+        target,
+        taskId: task.taskId,
+      }),
+    );
+
+    expect(persistedTarget).toEqual(target);
+  });
+
+  it("maps atomic target-manifest refusal to a typed approval rejection", async () => {
+    const task = createCompletedApprovalTask();
+    const stores = createApprovalStores(
+      task,
+      null as never,
+      () => undefined,
+      new ApprovalTargetManifestError("digest_mismatch"),
+    );
+    const effects = createSessionTaskEffects({
+      approvalValidators: new Map(),
+      assertBroadcastEvents: () => undefined,
+      eventSourceId: "src_service_approval_test",
+      observability: new ModuleObservability({ moduleName: "SessionServiceApprovalTest" }),
+      stores,
+      taskClaimLeaseTtlMs: 1_000,
+    });
+
+    const result = await Effect.runPromise(
+      mapTaskApprovalRejection(
+        effects.recordTaskApprovalEffect({
+          decision: "approved",
+          participantId: "part_service_approval_test",
+          reason: {},
+          sessionId: task.sessionId,
+          target: {
+            action: "action_opaque_1",
+            digest: "digest_wrong",
+            scopeKey: "scope_opaque_1",
+            targetId: "target_opaque_1",
+            targetKind: "kind_opaque_1",
+            targetRevision: "revision_opaque_1",
+          },
+          taskId: task.taskId,
+        }),
+      ),
+    );
+
+    expect(result).toMatchObject({ rejectionReason: "digest_mismatch", status: "rejected" });
+  });
 });
 
 function createApprovalStores(
   task: TaskRecord,
   approvalResult: PersistedTaskApprovalResult,
+  onRecordApproval: (target: ApprovalTarget | undefined) => void = () => undefined,
+  recordApprovalError?: Error | undefined,
 ): SessionPersistenceStores {
   return {
     clientBindings: {
@@ -213,7 +311,13 @@ function createApprovalStores(
       get: async () => task,
       list: async () => [],
       listSnapshots: async () => [],
-      recordApproval: async () => approvalResult,
+      recordApproval: async (input) => {
+        onRecordApproval(input.target);
+        if (recordApprovalError !== undefined) {
+          throw recordApprovalError;
+        }
+        return approvalResult;
+      },
       refreshClaim: async () => task,
       releaseWithEvent: async () => null,
       supersedeScheduled: async () => ({ events: [], tasks: [] }),
@@ -267,5 +371,18 @@ function createApprovalEvent(task: TaskRecord): SessionEvent {
     seq: 1,
     sessionId: task.sessionId,
     type: "approval.recorded",
+  };
+}
+
+function createApprovalRecord(task: TaskRecord) {
+  return {
+    approvalEventId: "evt_service_approval_test",
+    decidedAt: "2026-08-01T00:00:00.000Z",
+    decidedByParticipantId: "part_service_approval_test",
+    decision: "approved" as const,
+    reason: {},
+    sessionId: task.sessionId,
+    targetKey: "task",
+    taskId: task.taskId,
   };
 }

@@ -29,6 +29,7 @@ import {
   deriveScheduledTaskId,
   newSessionId,
   parsePositiveSafeInteger,
+  targetManifestSchema,
 } from "./protocol.js";
 import * as schema from "./schema.js";
 import {
@@ -41,6 +42,7 @@ import {
   tasks,
 } from "./schema.js";
 import type {
+  ApprovalTarget,
   CandidateScheduleIdentity,
   ClientSessionBindingRecord,
   ControlChannel,
@@ -671,6 +673,7 @@ export class SessionEventSequenceRangeError extends Error {
 
 export type PersistedTaskApprovalResult =
   | {
+      readonly approval: TaskApprovalRecord;
       readonly decision: ApprovalDecision;
       readonly event: SessionEvent;
       readonly events: readonly [SessionEvent];
@@ -687,6 +690,24 @@ export type PersistedTaskApprovalResult =
       readonly task: TaskRecord;
       readonly targetKey: string;
     };
+
+export type ApprovalTargetManifestErrorReason =
+  | "action_mismatch"
+  | "digest_mismatch"
+  | "scope_mismatch"
+  | "target_absent"
+  | "target_kind_mismatch"
+  | "target_revision_mismatch"
+  | "task_not_completed";
+
+/** Typed refusal raised before an approval target can enter durable history. */
+export class ApprovalTargetManifestError extends Error {
+  readonly name = "ApprovalTargetManifestError";
+
+  constructor(readonly reason: ApprovalTargetManifestErrorReason) {
+    super(`Approval target manifest validation failed: ${reason}`);
+  }
+}
 
 const controlLeaseReturningColumns = `
   acquisition_id AS "acquisitionId",
@@ -2722,10 +2743,11 @@ export async function recordTaskApproval(
     readonly participantId: string;
     readonly reason: Record<string, unknown>;
     readonly sessionId: string;
+    readonly target?: ApprovalTarget | undefined;
     readonly taskId: string;
   },
 ): Promise<PersistedTaskApprovalResult | null> {
-  const targetKey = approvalTargetKey(input.reason);
+  const targetKey = approvalTargetKey(input.reason, input.target);
   const client = await database.pool.connect();
   try {
     await client.query("BEGIN");
@@ -2736,6 +2758,9 @@ export async function recordTaskApproval(
     if (!task) {
       await client.query("COMMIT");
       return null;
+    }
+    if (input.target !== undefined) {
+      assertApprovalTargetManifest(task, input.target);
     }
     const eventInput = buildTaskApprovalRecordedEventInput({
       decision: input.decision,
@@ -2792,6 +2817,7 @@ export async function recordTaskApproval(
     const event = await appendEventWithClient(client, eventInput, input.eventSourceId);
     await client.query("COMMIT");
     return {
+      approval: toTaskApprovalRecord(insertedRows.rows[0]),
       decision: input.decision,
       event,
       events: [event] as const,
@@ -2804,6 +2830,40 @@ export async function recordTaskApproval(
     throw error;
   } finally {
     client.release();
+  }
+}
+
+/** Verifies one submitted target against the completed result inside the commit transaction. */
+function assertApprovalTargetManifest(task: TaskRecord, target: ApprovalTarget): void {
+  if (task.completedAt === null) {
+    throw new ApprovalTargetManifestError("task_not_completed");
+  }
+  const manifest = targetManifestSchema.safeParse(task.result?.targetManifest);
+  if (!manifest.success) {
+    throw new ApprovalTargetManifestError("target_absent");
+  }
+  const sameId = manifest.data.filter((entry) => entry.targetId === target.targetId);
+  if (sameId.length === 0) {
+    throw new ApprovalTargetManifestError("target_absent");
+  }
+  const sameKind = sameId.filter((entry) => entry.targetKind === target.targetKind);
+  if (sameKind.length === 0) {
+    throw new ApprovalTargetManifestError("target_kind_mismatch");
+  }
+  const sameScope = sameKind.filter((entry) => entry.scopeKey === target.scopeKey);
+  if (sameScope.length === 0) {
+    throw new ApprovalTargetManifestError("scope_mismatch");
+  }
+  const sameRevision = sameScope.filter((entry) => entry.targetRevision === target.targetRevision);
+  if (sameRevision.length === 0) {
+    throw new ApprovalTargetManifestError("target_revision_mismatch");
+  }
+  const sameAction = sameRevision.filter((entry) => entry.action === target.action);
+  if (sameAction.length === 0) {
+    throw new ApprovalTargetManifestError("action_mismatch");
+  }
+  if (!sameAction.some((entry) => entry.digest === target.digest)) {
+    throw new ApprovalTargetManifestError("digest_mismatch");
   }
 }
 

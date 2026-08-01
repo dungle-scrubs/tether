@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { approvalDecisionSchema, taskResultSchema } from "./approval-targets.js";
 import type { CandidateScheduleIdentity } from "./task-contracts.js";
 import { candidateScheduleIdentitySchema } from "./task-contracts.js";
 
@@ -239,6 +240,18 @@ export interface TaskApprovalRecord {
   /** Approved task id. */
   readonly taskId: string;
 }
+
+/** Runtime validator for one canonical durable task approval record. */
+export const taskApprovalRecordSchema = z.object({
+  approvalEventId: z.string().min(1),
+  decidedAt: z.string().datetime({ offset: true }),
+  decidedByParticipantId: z.string().min(1),
+  decision: approvalDecisionSchema,
+  reason: z.record(z.string(), z.unknown()),
+  sessionId: z.string().min(1),
+  targetKey: z.string().min(1),
+  taskId: z.string().min(1),
+});
 
 /** Read-only diagnostic view of one task with derived lifecycle state. */
 export interface TaskSnapshot extends TaskRecord {
@@ -497,7 +510,7 @@ export const taskRecordSchema = z.object({
   objective: z.string().min(1),
   releasedAt: z.string().nullable(),
   releasedBy: z.string().nullable(),
-  result: z.record(z.string(), z.unknown()).nullable(),
+  result: taskResultSchema.nullable(),
   schedule: candidateScheduleIdentitySchema.nullable().optional(),
   sessionId: z.string().min(1),
   taskId: z.string().min(1),

@@ -22,6 +22,7 @@ import type {
 } from "./db.js";
 import type { AppendSessionEventInput, ApprovalDecision } from "./protocol.js";
 import type {
+  ApprovalTarget,
   ClientSessionBindingRecord,
   ControlLeaseSnapshot,
   ParticipantRecord,
@@ -245,6 +246,7 @@ export interface TaskStore {
     readonly participantId: string;
     readonly reason: Record<string, unknown>;
     readonly sessionId: string;
+    readonly target?: ApprovalTarget | undefined;
     readonly taskId: string;
   }) => Promise<PersistedTaskApprovalResult | null>;
   readonly claimWithEvent: (input: {

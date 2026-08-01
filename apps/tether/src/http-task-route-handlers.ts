@@ -340,6 +340,7 @@ export function handleTaskHttpRoute(
         participantId,
         reason: body.reason,
         sessionId,
+        ...(body.target === undefined ? {} : { target: body.target }),
         taskId: routeMatchParam(approvalMatch, 2),
       });
       sendRestTaskApprovalResult(response, hub, result);
@@ -786,6 +787,7 @@ function sendRestTaskApprovalResult(
   }
   if (result.status === "ignored") {
     sendJson(response, 200, {
+      approval: result.approval,
       decision: result.decision,
       existingDecision: result.existingDecision,
       ignoredReason: result.ignoredReason,
@@ -796,6 +798,7 @@ function sendRestTaskApprovalResult(
   }
   broadcastEvents(hub, result.events);
   sendJson(response, 200, {
+    approval: result.approval,
     decision: result.decision,
     event: result.event,
     status: result.status,

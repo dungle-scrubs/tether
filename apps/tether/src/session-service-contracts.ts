@@ -5,6 +5,7 @@ import type {
 } from "@dungle-scrubs/tether-protocol";
 
 import type {
+  ApprovalTargetManifestErrorReason,
   ControlEpochGuard,
   ControlLeaseClaim,
   ParticipantRegistration,
@@ -25,6 +26,7 @@ import type {
 import type { ApprovalDecision } from "./protocol.js";
 import type { RestControlPolicyDebugInfo } from "./rest-control-policy.js";
 import type {
+  ApprovalTarget,
   ClientSessionBindingRecord,
   ControlChannel,
   ControlLeaseSnapshot,
@@ -43,6 +45,7 @@ import type {
   SessionListItem,
   SessionRecord,
   TaskListStatus,
+  TaskApprovalRecord,
   TaskRecord,
   TaskSnapshot,
 } from "./types.js";
@@ -69,6 +72,7 @@ export class SessionServicePersistenceError extends Error {
 
 /** Reason an approval decision was not recorded. */
 export type TaskApprovalRejectionReason =
+  | ApprovalTargetManifestErrorReason
   | "invalid_approval_plan"
   | "task_not_completed"
   | "task_not_found"
@@ -554,6 +558,7 @@ export type RestTaskClaimRefreshResult =
 /** Result for recording approval intent without mutating the task itself. */
 export type TaskApprovalResult =
   | {
+      readonly approval: TaskApprovalRecord;
       readonly decision: ApprovalDecision;
       readonly event: SessionEvent;
       readonly events: readonly [SessionEvent];
@@ -561,6 +566,7 @@ export type TaskApprovalResult =
       readonly task: TaskRecord;
     }
   | {
+      readonly approval: TaskApprovalRecord;
       readonly decision: ApprovalDecision;
       readonly events: readonly [];
       readonly existingDecision: ApprovalDecision;
@@ -622,6 +628,7 @@ export class TaskApprovalIgnoredError extends Error {
   readonly _tag = "TaskApprovalIgnored";
 
   constructor(
+    readonly approval: TaskApprovalRecord,
     readonly decision: ApprovalDecision,
     readonly existingDecision: ApprovalDecision,
     readonly ignoredReason: TaskApprovalIgnoredReason,
@@ -709,6 +716,7 @@ export interface CancelTaskInput extends TaskParticipantInput {
 export interface RecordTaskApprovalInput extends TaskParticipantInput {
   readonly decision: ApprovalDecision;
   readonly reason: Record<string, unknown>;
+  readonly target?: ApprovalTarget | undefined;
 }
 
 export interface CreateTaskInput {
