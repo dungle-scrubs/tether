@@ -1,4 +1,8 @@
-import type { SessionSummaryContent, SessionSummaryFailure } from "@dungle-scrubs/tether-protocol";
+import type {
+  OperatorGrantScope,
+  SessionSummaryContent,
+  SessionSummaryFailure,
+} from "@dungle-scrubs/tether-protocol";
 import { sql } from "drizzle-orm";
 import {
   bigint,
@@ -25,6 +29,9 @@ import type {
   SessionProjectionForkLineage,
   SessionProjectionTangentLineage,
 } from "./session-projection.js";
+import { snapshotRecordMaxBytes } from "./snapshot-limits.js";
+
+const snapshotRecordMaxBytesSql = sql.raw(String(snapshotRecordMaxBytes));
 
 /** Durable authorization grants. Bearer values are intentionally absent. */
 export const authGrants = pgTable(
@@ -60,7 +67,7 @@ export const authGrants = pgTable(
         AND ${table.metadata} ? 'source'
         AND ${table.metadata} - ARRAY['requestId', 'source'] = '{}'::jsonb
         AND jsonb_typeof(${table.metadata}->'source') = 'string'
-        AND ${table.metadata}->>'source' IN ('admin', 'bootstrap', 'migration')
+        AND ${table.metadata}->>'source' IN ('admin', 'bootstrap', 'browser', 'migration')
         AND (
           jsonb_typeof(${table.metadata}->'requestId') = 'null'
           OR (
@@ -197,6 +204,159 @@ export const authTickets = pgTable(
   ],
 );
 
+/** Durable provider-neutral authority attached only to browser operator grants. */
+export const operatorGrantScopes = pgTable(
+  "operator_grant_scopes",
+  {
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    grantJti: text("grant_jti")
+      .primaryKey()
+      .references(() => authGrants.jti, { onDelete: "cascade" }),
+    scope: jsonb("scope").$type<OperatorGrantScope>().notNull(),
+  },
+  (table) => [
+    check(
+      "operator_grant_scopes_size_check",
+      sql`octet_length(${table.scope}::text) BETWEEN 2 AND 8192`,
+    ),
+    check(
+      "operator_grant_scopes_shape_check",
+      sql`jsonb_typeof(${table.scope}) = 'object'
+        AND ${table.scope} ?& ARRAY['actions', 'commands', 'permissions', 'scopeKeys', 'sessionIds', 'targetKinds']
+        AND ${table.scope} - ARRAY['actions', 'commands', 'permissions', 'scopeKeys', 'sessionIds', 'targetKinds'] = '{}'::jsonb
+        AND jsonb_typeof(${table.scope}->'actions') = 'array'
+        AND jsonb_typeof(${table.scope}->'commands') = 'array'
+        AND jsonb_typeof(${table.scope}->'permissions') = 'array'
+        AND jsonb_typeof(${table.scope}->'scopeKeys') = 'array'
+        AND jsonb_typeof(${table.scope}->'sessionIds') = 'array'
+        AND jsonb_typeof(${table.scope}->'targetKinds') = 'array'`,
+    ),
+  ],
+);
+
+/** Short-lived pairing requests containing hashes only for browser credentials. */
+export const browserPairingRequests = pgTable(
+  "browser_pairing_requests",
+  {
+    confirmedAt: timestamp("confirmed_at", { withTimezone: true }),
+    confirmedBySubject: text("confirmed_by_subject"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    exchangeSecretHash: text("exchange_secret_hash").notNull(),
+    exchangedAt: timestamp("exchanged_at", { withTimezone: true }),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    failedAttempts: integer("failed_attempts").notNull().default(0),
+    invalidatedAt: timestamp("invalidated_at", { withTimezone: true }),
+    operatorSubject: text("operator_subject").notNull(),
+    origin: text("origin").notNull(),
+    publicNonce: text("public_nonce").notNull(),
+    requestId: text("request_id").primaryKey(),
+    requestedScope: jsonb("requested_scope").$type<OperatorGrantScope>().notNull(),
+    sourceAddressHash: text("source_address_hash"),
+    verificationPhrase: text("verification_phrase").notNull(),
+  },
+  (table) => [
+    index("browser_pairing_requests_source_created_idx").on(
+      table.sourceAddressHash,
+      table.createdAt,
+    ),
+    check(
+      "browser_pairing_requests_secret_hash_check",
+      sql`${table.exchangeSecretHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
+      "browser_pairing_requests_source_hash_check",
+      sql`${table.sourceAddressHash} IS NULL OR ${table.sourceAddressHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check("browser_pairing_requests_attempts_check", sql`${table.failedAttempts} BETWEEN 0 AND 5`),
+    check(
+      "browser_pairing_requests_confirmation_check",
+      sql`(${table.confirmedAt} IS NULL) = (${table.confirmedBySubject} IS NULL)
+        AND (${table.confirmedAt} IS NULL OR ${table.confirmedAt} >= ${table.createdAt})
+        AND (${table.confirmedBySubject} IS NULL OR char_length(${table.confirmedBySubject}) BETWEEN 1 AND 255)`,
+    ),
+    check(
+      "browser_pairing_requests_exchange_check",
+      sql`${table.exchangedAt} IS NULL OR (
+        ${table.confirmedAt} IS NOT NULL
+        AND ${table.exchangedAt} >= ${table.confirmedAt}
+        AND ${table.exchangedAt} < ${table.expiresAt}
+      )`,
+    ),
+    check(
+      "browser_pairing_requests_identity_check",
+      sql`char_length(${table.operatorSubject}) BETWEEN 1 AND 255
+        AND char_length(${table.origin}) BETWEEN 1 AND 512
+        AND char_length(${table.requestId}) BETWEEN 1 AND 128
+        AND char_length(${table.verificationPhrase}) BETWEEN 1 AND 128`,
+    ),
+    check(
+      "browser_pairing_requests_invalidation_check",
+      sql`${table.invalidatedAt} IS NULL OR (
+        ${table.failedAttempts} = 5
+        AND ${table.invalidatedAt} >= ${table.createdAt}
+        AND ${table.invalidatedAt} < ${table.expiresAt}
+      )`,
+    ),
+    check(
+      "browser_pairing_requests_lifetime_check",
+      sql`${table.expiresAt} > ${table.createdAt} AND ${table.expiresAt} <= ${table.createdAt} + interval '15 minutes'`,
+    ),
+    check(
+      "browser_pairing_requests_scope_check",
+      sql`jsonb_typeof(${table.requestedScope}) = 'object' AND octet_length(${table.requestedScope}::text) BETWEEN 2 AND 8192`,
+    ),
+    check(
+      "browser_pairing_requests_nonce_check",
+      sql`char_length(${table.publicNonce}) BETWEEN 22 AND 86 AND ${table.publicNonce} ~ '^[A-Za-z0-9_-]+$'`,
+    ),
+  ],
+);
+
+/** Redacted exchange-failure counters used for source-scoped abuse limits. */
+export const browserPairingExchangeFailures = pgTable(
+  "browser_pairing_exchange_failures",
+  {
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    failureId: text("failure_id").primaryKey(),
+    sourceAddressHash: text("source_address_hash").notNull(),
+  },
+  (table) => [
+    check(
+      "browser_pairing_exchange_failures_id_check",
+      sql`${table.failureId} ~ '^pairfail_[A-Za-z0-9_-]{1,120}$'`,
+    ),
+    check(
+      "browser_pairing_exchange_failures_source_hash_check",
+      sql`${table.sourceAddressHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    index("browser_pairing_exchange_failures_source_created_idx").on(
+      table.sourceAddressHash,
+      table.createdAt,
+    ),
+    index("browser_pairing_exchange_failures_created_idx").on(table.createdAt),
+  ],
+);
+
+/** Grant-bound browser session state without a persisted cookie or CSRF credential. */
+export const browserSessions = pgTable(
+  "browser_sessions",
+  {
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    csrfTokenHash: text("csrf_token_hash").notNull(),
+    grantJti: text("grant_jti")
+      .primaryKey()
+      .references(() => authGrants.jti, { onDelete: "cascade" }),
+    origin: text("origin").notNull(),
+  },
+  (table) => [
+    check("browser_sessions_csrf_hash_check", sql`${table.csrfTokenHash} ~ '^[0-9a-f]{64}$'`),
+    check(
+      "browser_sessions_origin_length_check",
+      sql`char_length(${table.origin}) BETWEEN 1 AND 512`,
+    ),
+  ],
+);
+
 /**
  * Durable session records. A session is the shared coordination object that
  * participants subscribe to; it is not an agent runtime by itself.
@@ -328,7 +488,15 @@ export const participants = pgTable(
   },
   (table) => [
     primaryKey({ columns: [table.sessionId, table.participantId] }),
-    index("participants_session_last_seen_idx").on(table.sessionId, table.lastSeenAt.desc()),
+    check(
+      "participants_snapshot_size_check",
+      sql`octet_length(${table.capabilities}::text) + octet_length(${table.displayName}) <= ${snapshotRecordMaxBytesSql}`,
+    ),
+    index("participants_session_last_seen_idx").on(
+      table.sessionId,
+      table.lastSeenAt.desc(),
+      table.participantId,
+    ),
   ],
 );
 
@@ -400,6 +568,8 @@ export const tasks = pgTable(
     mailboxAccountId: text("mailbox_account_id"),
     mailboxProvider: text("mailbox_provider"),
     objective: text("objective").notNull(),
+    operatorCommandKey: text("operator_command_key"),
+    operatorGrantJti: text("operator_grant_jti"),
     releasedAt: timestamp("released_at", { withTimezone: true }),
     releasedBy: text("released_by"),
     result: jsonb("result").$type<Record<string, unknown>>(),
@@ -418,6 +588,20 @@ export const tasks = pgTable(
   (table) => [
     primaryKey({ columns: [table.sessionId, table.taskId] }),
     index("tasks_claim_expiry_idx").on(table.claimExpiresAt),
+    index("tasks_session_created_idx").on(table.sessionId, table.createdAt.desc(), table.taskId),
+    index("tasks_operator_grant_created_idx")
+      .on(table.operatorGrantJti, table.createdAt)
+      .where(sql`${table.operatorGrantJti} IS NOT NULL`),
+    index("tasks_operator_pending_idx")
+      .on(table.createdAt)
+      .where(
+        sql`${table.operatorCommandKey} IS NOT NULL AND ${table.cancelledAt} IS NULL AND ${table.completedAt} IS NULL AND ${table.failedAt} IS NULL`,
+      ),
+    uniqueIndex("tasks_operator_command_active_unique")
+      .on(table.sessionId, table.operatorCommandKey)
+      .where(
+        sql`${table.operatorCommandKey} IS NOT NULL AND ${table.cancelledAt} IS NULL AND ${table.completedAt} IS NULL AND ${table.failedAt} IS NULL`,
+      ),
     // Unique so duplicate deterministic scheduled runs are impossible at the
     // database level: one row per (session, kind, identity version, scope key, algorithm
     // version, interval, window start). Manual tasks leave the schedule columns
@@ -436,6 +620,14 @@ export const tasks = pgTable(
     check(
       "tasks_schedule_scope_key_size_check",
       sql`${table.scheduleScopeKey} IS NULL OR octet_length(${table.scheduleScopeKey}) BETWEEN 1 AND 512`,
+    ),
+    check(
+      "tasks_operator_command_shape_check",
+      sql`(${table.operatorCommandKey} IS NULL AND ${table.operatorGrantJti} IS NULL AND ${table.kind} NOT LIKE 'operator.%') OR (${table.operatorCommandKey} ~ '^[0-9a-f]{64}$' AND char_length(${table.operatorGrantJti}) BETWEEN 1 AND 128 AND ${table.kind} LIKE 'operator.%')`,
+    ),
+    check(
+      "tasks_snapshot_size_check",
+      sql`octet_length(coalesce(${table.input}::text, '')) + octet_length(coalesce(${table.failure}::text, '')) + octet_length(coalesce(${table.result}::text, '')) + octet_length(${table.kind}) + octet_length(${table.objective}) <= ${snapshotRecordMaxBytesSql}`,
     ),
   ],
 );

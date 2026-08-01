@@ -90,6 +90,10 @@ export interface SessionReadEffects {
   ) => Effect.Effect<ParticipantRuntimeSnapshot[], SessionServiceFailure>;
   readonly listParticipantsEffect: (
     sessionId: string,
+    options?: {
+      readonly before?: Pick<ParticipantRecord, "lastSeenAt" | "participantId"> | undefined;
+      readonly limit?: number | undefined;
+    },
   ) => Effect.Effect<ParticipantRecord[], SessionServiceFailure>;
   readonly listSessionsEffect: () => Effect.Effect<SessionListItem[], SessionServiceFailure>;
   readonly listParticipantTaskContractsByKindEffect: (input: {
@@ -102,6 +106,10 @@ export interface SessionReadEffects {
   readonly listTasksEffect: (
     sessionId: string,
     status?: TaskListStatus,
+    options?: {
+      readonly before?: Pick<TaskRecord, "createdAt" | "taskId"> | undefined;
+      readonly limit?: number | undefined;
+    },
   ) => Effect.Effect<TaskRecord[], SessionServiceFailure>;
   readonly listTaskSnapshotsEffect: (
     sessionId: string,
@@ -122,8 +130,12 @@ export interface SessionReadEffects {
 export function createSessionReadEffects(input: SessionReadEffectsInput): SessionReadEffects {
   const listParticipantsEffect = (
     sessionId: string,
+    options?: {
+      readonly before?: Pick<ParticipantRecord, "lastSeenAt" | "participantId"> | undefined;
+      readonly limit?: number | undefined;
+    },
   ): Effect.Effect<ParticipantRecord[], SessionServiceFailure> =>
-    trySessionPromise(() => input.stores.participants.list(sessionId));
+    trySessionPromise(() => input.stores.participants.list(sessionId, options));
   const listParticipantTaskContractsEffect = (
     sessionId: string,
   ): Effect.Effect<ParticipantTaskContractRecord[], SessionServiceFailure> =>
@@ -131,8 +143,12 @@ export function createSessionReadEffects(input: SessionReadEffectsInput): Sessio
   const listTasksEffect = (
     sessionId: string,
     status: TaskListStatus = "active",
+    options?: {
+      readonly before?: Pick<TaskRecord, "createdAt" | "taskId"> | undefined;
+      readonly limit?: number | undefined;
+    },
   ): Effect.Effect<TaskRecord[], SessionServiceFailure> =>
-    trySessionPromise(() => input.stores.tasks.list(sessionId, status));
+    trySessionPromise(() => input.stores.tasks.list(sessionId, status, options));
 
   return {
     buildSessionContextViewEffect: (contextInput) =>

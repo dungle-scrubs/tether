@@ -19,7 +19,11 @@ const tetherTableNames = [
   "auth_grant_audit_events",
   "auth_grants",
   "auth_tickets",
+  "browser_pairing_exchange_failures",
+  "browser_pairing_requests",
+  "browser_sessions",
   "client_session_bindings",
+  "operator_grant_scopes",
   "participant_control_leases",
   "participants",
   "session_event_sequences",
@@ -416,6 +420,182 @@ async function inspectMigrationJournal(
   return { appliedCount: matchingRows, status: "valid" };
 }
 
+/** Detects any partial browser-operator foundation artifact. */
+async function hasAnyBrowserOperatorAuthorityArtifact(client: pg.PoolClient): Promise<boolean> {
+  return (
+    (await hasTable(client, "browser_pairing_requests")) ||
+    (await hasTable(client, "browser_sessions")) ||
+    (await hasTable(client, "operator_grant_scopes"))
+  );
+}
+
+/** Recognizes the complete initial browser-operator schema migration. */
+async function hasBrowserOperatorAuthorityFoundation(client: pg.PoolClient): Promise<boolean> {
+  return (
+    (await hasColumns(client, "browser_pairing_requests", [
+      "confirmed_at",
+      "created_at",
+      "exchange_secret_hash",
+      "exchanged_at",
+      "expires_at",
+      "failed_attempts",
+      "invalidated_at",
+      "operator_subject",
+      "origin",
+      "public_nonce",
+      "request_id",
+      "requested_scope",
+      "source_address_hash",
+      "verification_phrase",
+    ])) &&
+    (await hasColumns(client, "browser_sessions", [
+      "created_at",
+      "csrf_token_hash",
+      "grant_jti",
+      "origin",
+    ])) &&
+    (await hasColumns(client, "operator_grant_scopes", ["created_at", "grant_jti", "scope"])) &&
+    (await hasIndexSignature(client, "browser_pairing_requests_source_created_idx", {
+      columnNames: ["source_address_hash", "created_at"],
+      predicate: null,
+      tableName: "browser_pairing_requests",
+      unique: false,
+    })) &&
+    (await hasConstraintSignature(client, {
+      columnNames: ["grant_jti"],
+      constraintType: "f",
+      tableName: "browser_sessions",
+    })) &&
+    (await hasConstraintSignature(client, {
+      columnNames: ["grant_jti"],
+      constraintType: "f",
+      tableName: "operator_grant_scopes",
+    }))
+  );
+}
+
+/** Recognizes the complete confirmation and integrity hardening migration. */
+async function hasConfirmedBrowserPairingAuthority(client: pg.PoolClient): Promise<boolean> {
+  const checks = [
+    "browser_pairing_requests_confirmation_check",
+    "browser_pairing_requests_exchange_check",
+    "browser_pairing_requests_identity_check",
+    "browser_pairing_requests_invalidation_check",
+    "operator_grant_scopes_shape_check",
+  ] as const;
+  if (!(await hasColumn(client, "browser_pairing_requests", "confirmed_by_subject"))) {
+    return false;
+  }
+  for (const constraintName of checks) {
+    const tableName = constraintName.startsWith("operator_")
+      ? "operator_grant_scopes"
+      : "browser_pairing_requests";
+    if (!(await hasNamedConstraint(client, tableName, constraintName))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Recognizes durable browser classification in the grant metadata contract. */
+async function hasBrowserGrantClassification(client: pg.PoolClient): Promise<boolean> {
+  return hasNamedCheckConstraint(client, {
+    constraintName: "auth_grants_metadata_shape_check",
+    requiredDefinitionFragments: ["'admin'", "'bootstrap'", "'browser'", "'migration'"],
+    tableName: "auth_grants",
+  });
+}
+
+/** Recognizes durable redacted counters for source-scoped exchange limits. */
+async function hasBrowserPairingExchangeFailureCounters(client: pg.PoolClient): Promise<boolean> {
+  return (
+    (await hasColumns(client, "browser_pairing_exchange_failures", [
+      "created_at",
+      "failure_id",
+      "source_address_hash",
+    ])) &&
+    (await hasIndexSignature(client, "browser_pairing_exchange_failures_source_created_idx", {
+      columnNames: ["source_address_hash", "created_at"],
+      predicate: null,
+      tableName: "browser_pairing_exchange_failures",
+      unique: false,
+    }))
+  );
+}
+
+/** Recognizes indexed server-owned operator admission and bounded snapshot rows. */
+async function hasOperatorCommandAdmissionHardening(client: pg.PoolClient): Promise<boolean> {
+  return (
+    (await hasColumns(client, "tasks", ["operator_command_key", "operator_grant_jti"])) &&
+    (await hasIndexSignature(client, "tasks_session_created_idx", {
+      columnNames: ["session_id", "created_at", "task_id"],
+      predicate: null,
+      tableName: "tasks",
+      unique: false,
+    })) &&
+    (await hasIndexSignature(client, "participants_session_last_seen_idx", {
+      columnNames: ["session_id", "last_seen_at", "participant_id"],
+      predicate: null,
+      tableName: "participants",
+      unique: false,
+    })) &&
+    (await hasIndexSignature(client, "tasks_operator_grant_created_idx", {
+      columnNames: ["operator_grant_jti", "created_at"],
+      predicate: "operator_grant_jti IS NOT NULL",
+      tableName: "tasks",
+      unique: false,
+    })) &&
+    (await hasIndexSignature(client, "tasks_operator_pending_idx", {
+      columnNames: ["created_at"],
+      predicate:
+        "operator_command_key IS NOT NULL AND cancelled_at IS NULL AND completed_at IS NULL AND failed_at IS NULL",
+      tableName: "tasks",
+      unique: false,
+    })) &&
+    (await hasIndexSignature(client, "tasks_operator_command_active_unique", {
+      columnNames: ["session_id", "operator_command_key"],
+      predicate:
+        "operator_command_key IS NOT NULL AND cancelled_at IS NULL AND completed_at IS NULL AND failed_at IS NULL",
+      tableName: "tasks",
+      unique: true,
+    })) &&
+    (await hasNamedCheckConstraint(client, {
+      constraintName: "tasks_operator_command_shape_check",
+      requiredDefinitionFragments: ["operator_command_key", "operator_grant_jti", "operator.%"],
+      tableName: "tasks",
+    })) &&
+    (await hasNamedCheckConstraint(client, {
+      constraintName: "tasks_snapshot_size_check",
+      requiredDefinitionFragments: ["octet_length", "2097152"],
+      tableName: "tasks",
+    })) &&
+    (await hasNamedCheckConstraint(client, {
+      constraintName: "participants_snapshot_size_check",
+      requiredDefinitionFragments: ["octet_length", "2097152"],
+      tableName: "participants",
+    })) &&
+    (await hasIndexSignature(client, "browser_pairing_exchange_failures_created_idx", {
+      columnNames: ["created_at"],
+      predicate: null,
+      tableName: "browser_pairing_exchange_failures",
+      unique: false,
+    }))
+  );
+}
+
+/** Detects any partially applied indexed operator-admission hardening artifact. */
+async function hasAnyOperatorCommandAdmissionHardeningArtifact(
+  client: pg.PoolClient,
+): Promise<boolean> {
+  return (
+    (await hasColumn(client, "tasks", "operator_command_key")) ||
+    (await hasColumn(client, "tasks", "operator_grant_jti")) ||
+    (await hasIndex(client, "tasks_operator_command_active_unique")) ||
+    (await hasNamedConstraint(client, "tasks", "tasks_operator_command_shape_check")) ||
+    (await hasNamedConstraint(client, "participants", "participants_snapshot_size_check"))
+  );
+}
+
 /** Ordered probes for generated migrations that can be represented by schema shape alone. */
 function legacyMigrationProbes(): readonly LegacyMigrationProbe[] {
   return [
@@ -721,6 +901,38 @@ function legacyMigrationProbes(): readonly LegacyMigrationProbe[] {
           tableName: "tasks",
         }),
     },
+    {
+      label: "0021 browser operator authority foundation",
+      contradictionObserved: async (client) =>
+        (await hasAnyBrowserOperatorAuthorityArtifact(client)) &&
+        !(await hasBrowserOperatorAuthorityFoundation(client)),
+      represented: hasBrowserOperatorAuthorityFoundation,
+    },
+    {
+      label: "0022 confirmed browser pairing authority",
+      contradictionObserved: async (client) =>
+        (await hasColumn(client, "browser_pairing_requests", "confirmed_by_subject")) &&
+        !(await hasConfirmedBrowserPairingAuthority(client)),
+      represented: hasConfirmedBrowserPairingAuthority,
+    },
+    {
+      label: "0023 browser grant classification",
+      represented: hasBrowserGrantClassification,
+    },
+    {
+      label: "0024 browser pairing exchange source counters",
+      contradictionObserved: async (client) =>
+        (await hasTable(client, "browser_pairing_exchange_failures")) &&
+        !(await hasBrowserPairingExchangeFailureCounters(client)),
+      represented: hasBrowserPairingExchangeFailureCounters,
+    },
+    {
+      label: "0025 indexed operator admission and bounded snapshot rows",
+      contradictionObserved: async (client) =>
+        (await hasAnyOperatorCommandAdmissionHardeningArtifact(client)) &&
+        !(await hasOperatorCommandAdmissionHardening(client)),
+      represented: hasOperatorCommandAdmissionHardening,
+    },
   ];
 }
 
@@ -852,9 +1064,6 @@ const authFoundationConstraints: readonly NamedConstraintExpectation[] = [
   ]),
   constraint("auth_grants_metadata_shape_check", "c", "auth_grants", [
     "jsonb_typeof(metadata) = 'object'",
-    "jsonb_typeof(metadata->'source') = 'string'",
-    "metadata->>'source' = ANY (ARRAY['admin', 'bootstrap', 'migration'])",
-    "metadata->>'requestId' ~ '^req_[A-Za-z0-9_-]{1,120}$'",
   ]),
   constraint("auth_grants_revoked_check", "c", "auth_grants", [
     "revoked_at IS NULL OR revoked_at >= issued_at",
@@ -919,9 +1128,10 @@ const authFoundationConstraints: readonly NamedConstraintExpectation[] = [
   constraint("auth_tickets_hash_check", "c", "auth_tickets", ["ticket_hash ~ '^[0-9a-f]{64}$'"]),
 ];
 
-/** Exact normalized 0014 constraints; regenerate only with its schema and migration. */
-const authFoundationConstraintFingerprint =
-  "c5a21e2a79a5e62a2025c70eb95f998d9e3480afffcf4341545655898455f31b";
+const authFoundationConstraintFingerprints = new Set([
+  "c5a21e2a79a5e62a2025c70eb95f998d9e3480afffcf4341545655898455f31b",
+  "4915df2b217194414393739addbeab2126bd6c09a1e5b5444b5db9f3def257d9",
+]);
 
 /** Creates one named constraint expectation without exposing mutable arrays. */
 function constraint(
@@ -1270,7 +1480,13 @@ async function hasNamedConstraintExpectations(
         candidate.constraintType === expectation.constraintType &&
         candidate.tableName === expectation.tableName,
     );
-    if (row === undefined) {
+    if (
+      row === undefined ||
+      row.validated !== true ||
+      (expectation.constraintType === "f"
+        ? row.deleteAction !== "a" || row.updateAction !== "a"
+        : row.deleteAction !== null || row.updateAction !== null)
+    ) {
       return false;
     }
     const normalizedDefinition = normalizeConstraintDefinition(row.definition);
@@ -1278,10 +1494,11 @@ async function hasNamedConstraintExpectations(
       normalizedDefinition.includes(normalizeConstraintDefinition(fragment)),
     );
   });
+  const fingerprint = fingerprintAuthConstraints(result.rows);
   return (
     expectedConstraintsPresent &&
     result.rows.length === expectations.length &&
-    fingerprintAuthConstraints(result.rows) === authFoundationConstraintFingerprint
+    authFoundationConstraintFingerprints.has(fingerprint)
   );
 }
 

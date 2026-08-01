@@ -6,6 +6,7 @@ import {
   mintAuthGrantToken,
   verifyAuthGrantToken,
 } from "./grant-token.js";
+import { wholeAuthSecond } from "./opaque-credential.js";
 import type { AuthRole, AuthSigningSecrets } from "./token.js";
 
 /** Secret-free durable grant representation exposed by lifecycle boundaries. */
@@ -89,7 +90,7 @@ export function createAuthGrantLifecycle(options: AuthGrantLifecycleOptions): Au
       if (!options.issuanceEnabled || !options.issuer || !options.secrets[options.activeKid]) {
         throw new Error("auth_grant_issuance_unavailable");
       }
-      const occurredAt = wholeSecond(now());
+      const occurredAt = wholeAuthSecond(now());
       const jti = `grant_${randomUUID()}`;
       const bearer = mintAuthGrantToken(
         {
@@ -144,7 +145,7 @@ export function createAuthGrantLifecycle(options: AuthGrantLifecycleOptions): Au
     issuanceEnabled: options.issuanceEnabled ?? false,
     list: async (limit) => (await options.stores.grants.list(limit)).map(toPublicAuthGrant),
     revoke: async (jti, actorSubject, reasonCode) => {
-      const occurredAt = wholeSecond(now());
+      const occurredAt = wholeAuthSecond(now());
       const result = await options.stores.revokeGrantWithAudit({
         audit: {
           action: "grant.revoked",
@@ -174,10 +175,6 @@ export function toPublicAuthGrant(record: AuthGrantRecord): PublicAuthGrant {
     issuedAt: record.issuedAt.toISOString(),
     revokedAt: record.revokedAt?.toISOString() ?? null,
   };
-}
-
-function wholeSecond(value: Date): Date {
-  return new Date(Math.floor(value.getTime() / 1_000) * 1_000);
 }
 
 export { maximumAuthGrantLifetimeSeconds };

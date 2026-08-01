@@ -9,7 +9,7 @@ export const authGrantAuditReasonCodes = [
   "operator-request",
   "security-response",
 ] as const;
-export const authGrantSources = ["admin", "bootstrap", "migration"] as const;
+export const authGrantSources = ["admin", "bootstrap", "browser", "migration"] as const;
 
 /** Maximum single-use WebSocket admission window required by the protocol. */
 export const maximumAuthTicketAdmissionLifetimeMilliseconds = 30_000;

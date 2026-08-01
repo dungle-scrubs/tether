@@ -1,4 +1,7 @@
 export * from "./approval-targets.js";
+export * from "./browser-pairing.js";
+export * from "./browser-operator.js";
+export * from "./operator-authority.js";
 export * from "./event-builders.js";
 export * from "./records.js";
 export * from "./rest-schemas.js";

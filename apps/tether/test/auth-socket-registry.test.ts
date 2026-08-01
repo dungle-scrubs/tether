@@ -160,6 +160,7 @@ function createContext(grantJti: string, expiresAt = "2026-07-18T01:00:00.000Z")
   return {
     expiresAt,
     grantJti,
+    grantSource: "admin",
     issuer: "https://auth.socket.test",
     kid: "current",
     participantId: "part_socket",

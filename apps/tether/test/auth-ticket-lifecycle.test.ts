@@ -66,6 +66,7 @@ function createContext(): AuthContext {
   return {
     expiresAt: "2026-07-18T00:00:00.000Z",
     grantJti: "grant_ticket_parent",
+    grantSource: "admin",
     issuer: "https://auth.ticket.test",
     kid: "current",
     participantId: "part_ticket",

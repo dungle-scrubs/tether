@@ -14,6 +14,7 @@ import type {
   PersistedTaskClaimResult,
   PersistedTaskCreateResult,
   PersistedTaskEventResult,
+  OperatorCommandTaskAuthority,
   RestControlAcquisition,
   RestControlLeaseRelease,
   ScheduledTaskIdentityInput,
@@ -199,7 +200,13 @@ export interface ParticipantStore {
     readonly participantId: string;
     readonly sessionId: string;
   }) => Promise<HeartbeatParticipantWithEventResult>;
-  readonly list: (sessionId: string) => Promise<ParticipantRecord[]>;
+  readonly list: (
+    sessionId: string,
+    options?: {
+      readonly before?: Pick<ParticipantRecord, "lastSeenAt" | "participantId"> | undefined;
+      readonly limit?: number | undefined;
+    },
+  ) => Promise<ParticipantRecord[]>;
   readonly listRuntimeSnapshots: (sessionId: string) => Promise<ParticipantRuntimeSnapshot[]>;
   readonly upsert: (input: {
     readonly capabilities: Record<string, unknown>;
@@ -243,6 +250,7 @@ export interface TaskStore {
     readonly controlGuard?: ControlEpochGuard | undefined;
     readonly decision: ApprovalDecision;
     readonly eventSourceId: string;
+    readonly operatorGrantJti?: string | undefined;
     readonly participantId: string;
     readonly reason: Record<string, unknown>;
     readonly sessionId: string;
@@ -276,6 +284,11 @@ export interface TaskStore {
     readonly taskId: string;
     readonly taskIdSource: "caller" | "generated";
   }) => Promise<PersistedTaskCreateResult>;
+  readonly createOperatorWithEvent: (input: {
+    readonly authority: OperatorCommandTaskAuthority;
+    readonly eventSourceId: string;
+    readonly taskId: string;
+  }) => Promise<PersistedTaskCreateResult>;
   readonly expireClaims: (input: {
     readonly batchSize: number;
     readonly sourceId: string;
@@ -293,7 +306,14 @@ export interface TaskStore {
     readonly sessionId: string;
     readonly taskId: string;
   }) => Promise<TaskRecord | null>;
-  readonly list: (sessionId: string, status?: TaskListStatus) => Promise<TaskRecord[]>;
+  readonly list: (
+    sessionId: string,
+    status?: TaskListStatus,
+    options?: {
+      readonly before?: Pick<TaskRecord, "createdAt" | "taskId"> | undefined;
+      readonly limit?: number | undefined;
+    },
+  ) => Promise<TaskRecord[]>;
   readonly listSnapshots: (sessionId: string) => Promise<TaskSnapshot[]>;
   readonly refreshClaim: (input: {
     readonly claimId: string;

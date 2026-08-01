@@ -1,11 +1,34 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
-import { and, desc, eq, isNotNull, isNull, notInArray, or, type SQL, sql } from "drizzle-orm";
+import {
+  type OperatorCommandRequest,
+  operatorCommandPermission,
+  type OperatorGrantScope,
+  operatorGrantScopeSchema,
+} from "@dungle-scrubs/tether-protocol";
+import {
+  and,
+  desc,
+  eq,
+  gt,
+  isNotNull,
+  isNull,
+  lt,
+  notInArray,
+  or,
+  type SQL,
+  sql,
+} from "drizzle-orm";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { Context, Effect, Layer } from "effect";
 import pg from "pg";
 
 import { approvalTargetKey } from "./approval-target-key.js";
+import {
+  authorizeOperator,
+  type OperatorAuthorityDenialReason,
+  type OperatorAuthorityRequest,
+} from "./auth/operator-authority.js";
 import { ServerConfigService } from "./config.js";
 import { ControlEpochStaleError, nextControlEpoch, parseControlEpoch } from "./control-epoch.js";
 import { migrateDatabase } from "./database-migration.js";
@@ -708,6 +731,22 @@ export class ApprovalTargetManifestError extends Error {
 
   constructor(readonly reason: ApprovalTargetManifestErrorReason) {
     super(`Approval target manifest validation failed: ${reason}`);
+  }
+}
+
+export type OperatorGrantAuthorityErrorReason =
+  | OperatorAuthorityDenialReason
+  | "operator_grant_denied"
+  | "operator_grant_expired"
+  | "operator_grant_revoked"
+  | "operator_target_required";
+
+/** Typed atomic refusal when browser authority no longer covers an approval target. */
+export class OperatorGrantAuthorityError extends Error {
+  readonly name = "OperatorGrantAuthorityError";
+
+  constructor(readonly reason: OperatorGrantAuthorityErrorReason) {
+    super(`Operator grant authority validation failed: ${reason}`);
   }
 }
 
@@ -2365,12 +2404,34 @@ export async function heartbeatParticipantWithEvent(
 export async function listParticipants(
   database: DatabasePool,
   sessionId: string,
+  options: {
+    readonly before?: Pick<ParticipantRecord, "lastSeenAt" | "participantId"> | undefined;
+    readonly limit?: number | undefined;
+  } = {},
 ): Promise<ParticipantRecord[]> {
-  const rows = await database.db
+  const beforeDate = options.before === undefined ? null : new Date(options.before.lastSeenAt);
+  const query = database.db
     .select()
     .from(participants)
-    .where(eq(participants.sessionId, sessionId))
+    .where(
+      and(
+        eq(participants.sessionId, sessionId),
+        beforeDate === null
+          ? undefined
+          : or(
+              lt(participants.lastSeenAt, beforeDate),
+              and(
+                eq(participants.lastSeenAt, beforeDate),
+                gt(participants.participantId, options.before?.participantId ?? ""),
+              ),
+            ),
+      ),
+    )
     .orderBy(desc(participants.lastSeenAt), participants.participantId);
+  const rows =
+    options.limit === undefined || options.limit <= 0
+      ? await query
+      : await query.limit(options.limit);
   return rows.map(toParticipantRecord);
 }
 
@@ -2520,6 +2581,141 @@ export async function createTaskWithEvent(
   });
 }
 
+/** Browser operator authority carried into one transaction-owning command admission. */
+export interface OperatorCommandTaskAuthority {
+  readonly grantJti: string;
+  readonly request: OperatorCommandRequest & {
+    readonly sessionId: string;
+  };
+}
+
+/** Stable operator command admission failures rendered by the dedicated browser route. */
+export class OperatorCommandAdmissionError extends Error {
+  readonly name = "OperatorCommandAdmissionError";
+
+  constructor(
+    readonly reason:
+      | OperatorGrantAuthorityErrorReason
+      | "operator_command_queue_full"
+      | "operator_command_rate_limited",
+  ) {
+    super(reason);
+  }
+}
+
+const maximumPendingOperatorCommands = 100;
+const maximumOperatorCommandsPerGrantPerMinute = 20;
+
+/** Atomically revalidates browser authority, coalesces duplicates, and creates one command task. */
+export async function createOperatorCommandTaskWithEvent(
+  database: DatabasePool,
+  input: {
+    readonly authority: OperatorCommandTaskAuthority;
+    readonly eventSourceId: string;
+    readonly taskId: string;
+  },
+): Promise<PersistedTaskCreateResult> {
+  const client = await database.pool.connect();
+  try {
+    await client.query("BEGIN");
+    let operatorSubject: string;
+    try {
+      operatorSubject = await assertOperatorGrantAuthorityWithClient(client, {
+        grantJti: input.authority.grantJti,
+        request: {
+          command: input.authority.request.command,
+          permission: operatorCommandPermission(input.authority.request.command),
+          scopeKey: input.authority.request.scopeKey,
+          sessionId: input.authority.request.sessionId,
+        },
+        sessionId: input.authority.request.sessionId,
+      });
+    } catch (error) {
+      if (error instanceof OperatorGrantAuthorityError) {
+        throw new OperatorCommandAdmissionError(error.reason);
+      }
+      throw error;
+    }
+    await acquireTransactionAdvisoryLock(client, "operator-command-admission", "global");
+    const commandKey = createHash("sha256")
+      .update(
+        JSON.stringify({
+          command: input.authority.request.command,
+          grantJti: input.authority.grantJti,
+          scopeKey: input.authority.request.scopeKey,
+          targetId: input.authority.request.targetId ?? null,
+        }),
+      )
+      .digest("hex");
+    const existing = await client.query<PgTaskRow>(
+      `SELECT ${taskReturningColumns}
+       FROM tasks
+       WHERE session_id = $1
+         AND operator_command_key = $2
+         AND cancelled_at IS NULL
+         AND completed_at IS NULL
+         AND failed_at IS NULL
+       ORDER BY created_at, task_id
+       LIMIT 1
+       FOR UPDATE`,
+      [input.authority.request.sessionId, commandKey],
+    );
+    if (existing.rows[0] !== undefined) {
+      await client.query("COMMIT");
+      return { events: [], status: "replayed", task: toTaskRecord(existing.rows[0]) };
+    }
+    const grantRate = await client.query<{ readonly count: number }>(
+      `SELECT count(*)::int AS count
+       FROM tasks
+       WHERE operator_grant_jti = $1
+         AND created_at >= transaction_timestamp() - interval '1 minute'`,
+      [input.authority.grantJti],
+    );
+    if ((grantRate.rows[0]?.count ?? 0) >= maximumOperatorCommandsPerGrantPerMinute) {
+      throw new OperatorCommandAdmissionError("operator_command_rate_limited");
+    }
+    const pending = await client.query<{ readonly count: number }>(
+      `SELECT count(*)::int AS count
+       FROM tasks
+       WHERE operator_command_key IS NOT NULL
+         AND cancelled_at IS NULL
+         AND completed_at IS NULL
+         AND failed_at IS NULL`,
+    );
+    if ((pending.rows[0]?.count ?? 0) >= maximumPendingOperatorCommands) {
+      throw new OperatorCommandAdmissionError("operator_command_queue_full");
+    }
+    const task = await insertTaskWithClient(client, {
+      input: {
+        command: input.authority.request.command,
+        operatorGrantJti: input.authority.grantJti,
+        requestedBy: operatorSubject,
+        scopeKey: input.authority.request.scopeKey,
+        ...(input.authority.request.targetId === undefined
+          ? {}
+          : { targetId: input.authority.request.targetId }),
+      },
+      kind: `operator.${input.authority.request.command}`,
+      objective: `Process operator command ${input.authority.request.command}`,
+      operatorCommand: { commandKey, grantJti: input.authority.grantJti },
+      sessionId: input.authority.request.sessionId,
+      taskId: input.taskId,
+    });
+    const event = await appendEventWithClient(
+      client,
+      buildTaskCreatedEventInput({ sessionId: input.authority.request.sessionId, task }),
+      input.eventSourceId,
+    );
+    await client.query("COMMIT");
+    return { event, events: [event], status: "created", task };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 /**
  * Creates a task and its canonical event on an existing transaction client.
  * The caller owns commit and rollback so adjacent durable state can be atomic.
@@ -2638,12 +2834,32 @@ export async function listTasks(
   database: DatabasePool,
   sessionId: string,
   status: TaskListStatus = "active",
+  options: {
+    readonly before?: Pick<TaskRecord, "createdAt" | "taskId"> | undefined;
+    readonly limit?: number | undefined;
+  } = {},
 ): Promise<TaskRecord[]> {
-  const rows = await database.db
+  const beforeDate = options.before === undefined ? null : new Date(options.before.createdAt);
+  const query = database.db
     .select()
     .from(tasks)
-    .where(and(eq(tasks.sessionId, sessionId), taskListStatusWhere(status)))
+    .where(
+      and(
+        eq(tasks.sessionId, sessionId),
+        taskListStatusWhere(status),
+        beforeDate === null
+          ? undefined
+          : or(
+              lt(tasks.createdAt, beforeDate),
+              and(eq(tasks.createdAt, beforeDate), gt(tasks.taskId, options.before?.taskId ?? "")),
+            ),
+      ),
+    )
     .orderBy(desc(tasks.createdAt), tasks.taskId);
+  const rows =
+    options.limit === undefined || options.limit <= 0
+      ? await query
+      : await query.limit(options.limit);
   return rows.map(toTaskRecord);
 }
 
@@ -2742,6 +2958,7 @@ export async function recordTaskApproval(
     readonly controlGuard?: ControlEpochGuard | undefined;
     readonly decision: ApprovalDecision;
     readonly eventSourceId: string;
+    readonly operatorGrantJti?: string | undefined;
     readonly participantId: string;
     readonly reason: Record<string, unknown>;
     readonly sessionId: string;
@@ -2760,6 +2977,22 @@ export async function recordTaskApproval(
     if (!task) {
       await client.query("COMMIT");
       return null;
+    }
+    if (input.operatorGrantJti !== undefined) {
+      if (input.target === undefined) {
+        throw new OperatorGrantAuthorityError("operator_target_required");
+      }
+      await assertOperatorGrantAuthorityWithClient(client, {
+        grantJti: input.operatorGrantJti,
+        request: {
+          action: input.target.action,
+          permission: "approval.submit",
+          scopeKey: input.target.scopeKey,
+          sessionId: input.sessionId,
+          targetKind: input.target.targetKind,
+        },
+        sessionId: input.sessionId,
+      });
     }
     assertApprovalTargetManifest(task, input.target);
     const approvalEventId = newEventId();
@@ -2838,6 +3071,53 @@ export async function recordTaskApproval(
   } finally {
     client.release();
   }
+}
+
+interface OperatorGrantAuthorityRow {
+  readonly expired: boolean;
+  readonly revoked: boolean;
+  readonly role: string;
+  readonly scope: OperatorGrantScope;
+  readonly sessionScope: string;
+  readonly subject: string;
+}
+
+/** Revalidates the browser grant under the same transaction lock as approval commit. */
+async function assertOperatorGrantAuthorityWithClient(
+  client: pg.PoolClient,
+  input: {
+    readonly grantJti: string;
+    readonly request: OperatorAuthorityRequest;
+    readonly sessionId: string;
+  },
+): Promise<string> {
+  const result = await client.query<OperatorGrantAuthorityRow>(
+    `SELECT
+      auth_grants.expires_at <= transaction_timestamp() AS expired,
+      auth_grants.revoked_at IS NOT NULL AS revoked,
+      auth_grants.role,
+      operator_grant_scopes.scope,
+      auth_grants.session_scope AS "sessionScope",
+      auth_grants.subject
+    FROM auth_grants
+    JOIN operator_grant_scopes ON operator_grant_scopes.grant_jti = auth_grants.jti
+    WHERE auth_grants.jti = $1
+    FOR SHARE OF auth_grants`,
+    [input.grantJti],
+  );
+  const row = result.rows[0];
+  if (row === undefined || row.role !== "observer") {
+    throw new OperatorGrantAuthorityError("operator_grant_denied");
+  }
+  if (row.revoked) throw new OperatorGrantAuthorityError("operator_grant_revoked");
+  if (row.expired) throw new OperatorGrantAuthorityError("operator_grant_expired");
+  const scope = operatorGrantScopeSchema.safeParse(row.scope);
+  if (!scope.success || row.sessionScope !== input.sessionId) {
+    throw new OperatorGrantAuthorityError("operator_session_denied");
+  }
+  const denial = authorizeOperator(scope.data, input.request);
+  if (denial !== null) throw new OperatorGrantAuthorityError(denial);
+  return row.subject;
 }
 
 /** Verifies one submitted target against the completed result inside the commit transaction. */
@@ -3918,6 +4198,9 @@ async function insertTaskWithClient(
     readonly input?: Record<string, unknown> | null;
     readonly kind: string;
     readonly objective: string;
+    readonly operatorCommand?:
+      | { readonly commandKey: string; readonly grantJti: string }
+      | undefined;
     readonly schedule?: ScheduledTaskIdentityInput | undefined;
     readonly sessionId: string;
     readonly taskId: string;
@@ -3930,6 +4213,8 @@ async function insertTaskWithClient(
         input,
         kind,
         objective,
+        operator_command_key,
+        operator_grant_jti,
         schedule_algorithm_version,
         schedule_identity_version,
         schedule_interval_ms,
@@ -3938,13 +4223,15 @@ async function insertTaskWithClient(
         session_id,
         task_id
       )
-      VALUES ($1::jsonb, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      VALUES ($1::jsonb, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
       RETURNING ${taskReturningColumns}
     `,
     [
       input.input === undefined || input.input === null ? null : JSON.stringify(input.input),
       input.kind,
       input.objective,
+      input.operatorCommand?.commandKey ?? null,
+      input.operatorCommand?.grantJti ?? null,
       schedule?.scheduleAlgorithmVersion ?? null,
       schedule?.scheduleIdentityVersion ?? null,
       schedule?.scheduleIntervalMs ?? null,

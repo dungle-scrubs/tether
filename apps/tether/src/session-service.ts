@@ -396,22 +396,22 @@ function makeSessionServiceEffect(
         listEventsEffect(sessionId, afterSeq, options),
         (events) => ({ eventCount: events.length }),
       ),
-    listParticipants: (sessionId) =>
+    listParticipants: (sessionId, options) =>
       traceEffect(
         "listParticipants",
-        { sessionId },
-        listParticipantsEffect(sessionId),
+        { limit: options?.limit ?? null, sessionId },
+        listParticipantsEffect(sessionId, options),
         (participants) => ({ participantCount: participants.length }),
       ),
     listSessions: () =>
       traceEffect("listSessions", {}, listSessionsEffect(), (sessions) => ({
         sessionCount: sessions.length,
       })),
-    listTasks: (sessionId, status = "active") =>
+    listTasks: (sessionId, status = "active", options) =>
       traceEffect(
         "listTasks",
-        { sessionId, status },
-        listTasksEffect(sessionId, status),
+        { limit: options?.limit ?? null, sessionId, status },
+        listTasksEffect(sessionId, status, options),
         (tasks) => ({ status, taskCount: tasks.length }),
       ),
     listParticipantTaskContracts: (sessionId) =>
@@ -510,8 +510,14 @@ function makeSessionServiceEffect(
         "createTask",
         {
           hasTaskId: input.taskId !== undefined,
-          kind: input.kind,
-          sessionId: input.sessionId,
+          kind:
+            input.operatorAuthority === undefined
+              ? input.kind
+              : `operator.${input.operatorAuthority.request.command}`,
+          sessionId:
+            input.operatorAuthority === undefined
+              ? input.sessionId
+              : input.operatorAuthority.request.sessionId,
         },
         createTaskEffect(input),
         (result) => ({

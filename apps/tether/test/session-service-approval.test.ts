@@ -382,6 +382,9 @@ function createApprovalStores(
       createWithEvent: async () => {
         throw new Error("unexpected task create with event");
       },
+      createOperatorWithEvent: async () => {
+        throw new Error("unexpected operator task create with event");
+      },
       ensureScheduledRun: async () => {
         throw new Error("unexpected ensure scheduled run");
       },

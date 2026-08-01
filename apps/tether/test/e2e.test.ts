@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { createConnection, createServer } from "node:net";
+import { createConnection } from "node:net";
 import { fileURLToPath } from "node:url";
 
 import { readMigrationFiles } from "drizzle-orm/migrator";
@@ -20,6 +20,8 @@ import type {
   SessionSummaryContent,
   SessionSummaryGenerationJob,
   SessionSummaryOllamaIdentity,
+  OperatorGrantScope,
+  BrowserOperatorCommandResponse,
   TaskRecord,
 } from "@dungle-scrubs/tether-protocol";
 import {
@@ -30,6 +32,9 @@ import {
 import type { AuthRole } from "../src/auth/token.js";
 import { createAuthPersistenceStores } from "../src/auth/db-grant-stores.js";
 import { runBootstrapAdminCli } from "../src/auth/bootstrap-cli.js";
+import { executeBrowserPairingCli } from "../src/auth/browser-pairing-cli.js";
+import { createBrowserPairingLifecycle } from "../src/auth/browser-pairing.js";
+import { createBrowserPairingStore } from "../src/auth/browser-pairing-stores.js";
 import { hashAuthTicket } from "../src/auth/ticket-lifecycle.js";
 import type {
   AuthGrantAuditMetadata,
@@ -48,6 +53,7 @@ import {
   archiveClientSessionBinding,
   claimTaskWithEvent,
   completeTaskWithEvent,
+  createOperatorCommandTaskWithEvent,
   createSession as createDbSession,
   createPool,
   createTaskWithEvent,
@@ -162,6 +168,11 @@ const generatedMigrationNames = [
   "0018_complex_elektra.sql",
   "0019_hesitant_jazinda.sql",
   "0020_busy_maria_hill.sql",
+  "0021_warm_doctor_octopus.sql",
+  "0022_lonely_infant_terrible.sql",
+  "0023_nosy_robbie_robertson.sql",
+  "0024_eminent_lizard.sql",
+  "0025_strange_dakota_north.sql",
 ] as const;
 const authFoundationMigrationIndex = 16;
 const preAuthFoundationMigrationIndex = authFoundationMigrationIndex - 1;
@@ -201,6 +212,18 @@ interface AuthTicketCreateResponse extends JsonResponse {
   readonly ticket: string;
 }
 
+interface BrowserPairingCreateResponse extends JsonResponse {
+  readonly exchangeSecret: string;
+  readonly request: {
+    readonly requestId: string;
+  };
+}
+
+interface BrowserPairingExchangeResponse extends JsonResponse {
+  readonly csrfToken: string;
+  readonly grantJti: string;
+}
+
 interface ServerProcessResult {
   readonly exitCode: number | null;
   readonly signal: NodeJS.Signals | null;
@@ -228,6 +251,7 @@ function readRequiredE2eAdminDatabaseUrl(): string {
 
 interface RawJsonResponse<TResponse extends JsonResponse> {
   readonly body: TResponse;
+  readonly headers: Headers;
   readonly status: number;
   readonly text: string;
 }
@@ -624,8 +648,7 @@ e2e("tether e2e", () => {
       },
       taskClaimSweeper: { intervalMs: 50 },
     });
-    const port = await findOpenPort();
-    await app.listen(port);
+    const port = await app.listen(0);
     baseUrl = `http://127.0.0.1:${port}`;
   }, 30_000);
 
@@ -736,6 +759,628 @@ e2e("tether e2e", () => {
     expect(publications.filter((result) => result.status === "rejected")).toHaveLength(1);
     expect(active.rows[0]?.count).toBe(1);
     expect(summaryIds).toContain(active.rows[0]?.summaryId);
+  });
+
+  it("atomically invalidates failed browser pairings and admits only one stolen-code racer", async () => {
+    const store = createBrowserPairingStore(currentPool());
+    const currentTime = { value: new Date("2026-08-01T02:00:00.000Z") };
+    const createLifecycle = (exchangeSecret: string, csrfToken: string) =>
+      createBrowserPairingLifecycle({
+        activeKid: testAuthSigningKid,
+        issuer: e2eAuthOptions.issuer,
+        now: () => currentTime.value,
+        randomCsrfToken: () => csrfToken,
+        randomExchangeSecret: () => exchangeSecret,
+        randomPhrase: () => "amber cedar orbit",
+        secrets: e2eAuthOptions.secrets,
+        store,
+      });
+    const scope: OperatorGrantScope = {
+      actions: ["archive"],
+      commands: ["scan"],
+      permissions: ["approval.submit", "session.read"],
+      scopeKeys: ["account-primary:inbox"],
+      sessionIds: [`sess_browser_pairing_${randomUUID()}`],
+      targetKinds: ["message"],
+    };
+    const nonce = "N".repeat(22);
+    const failedSecret = "F".repeat(43);
+    const failedLifecycle = createLifecycle(failedSecret, "C".repeat(43));
+    const failedRequest = await failedLifecycle.create({
+      operatorSubject: "operator@example.test",
+      origin: "https://hub.example.test",
+      publicNonce: nonce,
+      requestedScope: scope,
+      sourceAddress: "source-a",
+    });
+    await failedLifecycle.confirm(failedRequest.request.requestId, "admin@example.test");
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const input = {
+        exchangeSecret: "X".repeat(43),
+        publicNonce: attempt === 0 ? "Q".repeat(22) : nonce,
+      };
+      await expect(
+        failedLifecycle.exchange(failedRequest.request.requestId, input, {
+          origin: "https://hub.example.test",
+          sourceAddress: "source-a",
+        }),
+      ).rejects.toEqual(
+        expect.objectContaining({
+          code: attempt === 0 ? "pairing_nonce_mismatch" : "pairing_secret_invalid",
+        }),
+      );
+    }
+    await expect(
+      failedLifecycle.exchange(
+        failedRequest.request.requestId,
+        {
+          exchangeSecret: failedSecret,
+          publicNonce: nonce,
+        },
+        { origin: "https://hub.example.test", sourceAddress: "source-a" },
+      ),
+    ).rejects.toEqual(expect.objectContaining({ code: "pairing_invalidated" }));
+    const failedStored = await store.inspect(failedRequest.request.requestId);
+    expect(failedStored).toMatchObject({ failedAttempts: 5 });
+    expect(failedStored?.invalidatedAt).not.toBeNull();
+    expect(JSON.stringify(failedStored)).not.toContain(failedSecret);
+
+    const raceSecret = "R".repeat(43);
+    const raceLifecycle = createLifecycle(raceSecret, "S".repeat(43));
+    const raceRequest = await raceLifecycle.create({
+      operatorSubject: "operator@example.test",
+      origin: "https://hub.example.test",
+      publicNonce: nonce,
+      requestedScope: scope,
+      sourceAddress: "source-b",
+    });
+    await raceLifecycle.confirm(raceRequest.request.requestId, "admin@example.test");
+    const races = await Promise.allSettled([
+      raceLifecycle.exchange(
+        raceRequest.request.requestId,
+        { exchangeSecret: raceSecret, publicNonce: nonce },
+        { origin: "https://hub.example.test", sourceAddress: "source-b" },
+      ),
+      raceLifecycle.exchange(
+        raceRequest.request.requestId,
+        { exchangeSecret: raceSecret, publicNonce: nonce },
+        { origin: "https://hub.example.test", sourceAddress: "source-b" },
+      ),
+    ]);
+    expect(races.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    const rejected = races.find((result) => result.status === "rejected");
+    expect(rejected).toMatchObject({
+      reason: expect.objectContaining({ code: "pairing_already_exchanged" }),
+      status: "rejected",
+    });
+    const grants = await currentPool().pool.query<{ readonly count: number }>(
+      `SELECT count(*)::int AS count FROM auth_grants WHERE subject = $1`,
+      ["operator@example.test"],
+    );
+    expect(grants.rows[0]?.count).toBe(1);
+
+    const expirySecret = "Y".repeat(43);
+    const expiryLifecycle = createLifecycle(expirySecret, "D".repeat(43));
+    const expiryRequest = await expiryLifecycle.create({
+      operatorSubject: "expired-operator@example.test",
+      origin: "https://hub.example.test",
+      publicNonce: nonce,
+      requestedScope: scope,
+      sourceAddress: "source-c",
+    });
+    await expiryLifecycle.confirm(expiryRequest.request.requestId, "admin@example.test");
+    currentTime.value = new Date("2026-08-01T02:11:00.000Z");
+    await expect(
+      expiryLifecycle.exchange(
+        expiryRequest.request.requestId,
+        { exchangeSecret: expirySecret, publicNonce: nonce },
+        { origin: "https://hub.example.test", sourceAddress: "source-c" },
+      ),
+    ).rejects.toEqual(expect.objectContaining({ code: "pairing_expired" }));
+
+    const rateLifecycle = createLifecycle("L".repeat(43), "K".repeat(43));
+    const creations = await Promise.allSettled(
+      Array.from({ length: 6 }, () =>
+        rateLifecycle.create({
+          operatorSubject: "rate-limited-operator@example.test",
+          origin: "https://hub.example.test",
+          publicNonce: nonce,
+          requestedScope: scope,
+          sourceAddress: "source-d",
+        }),
+      ),
+    );
+    expect(creations.filter((result) => result.status === "fulfilled")).toHaveLength(5);
+    expect(creations.filter((result) => result.status === "rejected")).toEqual([
+      expect.objectContaining({
+        reason: expect.objectContaining({ code: "pairing_rate_limited" }),
+        status: "rejected",
+      }),
+    ]);
+
+    const exchangeSource = "shared-exchange-source";
+    const expiredFailureId = `pairfail_${randomUUID()}`;
+    await currentPool().pool.query(
+      `INSERT INTO browser_pairing_exchange_failures (created_at, failure_id, source_address_hash)
+       VALUES ($1, $2, $3)`,
+      [new Date(currentTime.value.getTime() - 11 * 60 * 1_000), expiredFailureId, "a".repeat(64)],
+    );
+    const aggregateRequests = await Promise.all(
+      Array.from({ length: 6 }, async (_, requestIndex) => {
+        const lifecycle = createLifecycle(
+          String(requestIndex).padStart(1, "0").repeat(43),
+          String(requestIndex + 1).repeat(43),
+        );
+        const created = await lifecycle.create({
+          operatorSubject: `aggregate-${requestIndex}@example.test`,
+          origin: "https://hub.example.test",
+          publicNonce: nonce,
+          requestedScope: scope,
+          sourceAddress: `creation-source-${requestIndex}`,
+        });
+        await lifecycle.confirm(created.request.requestId, "admin@example.test");
+        return { created, lifecycle };
+      }),
+    );
+    for (const { created, lifecycle } of aggregateRequests.slice(0, 5)) {
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        await expect(
+          lifecycle.exchange(
+            created.request.requestId,
+            { exchangeSecret: "Z".repeat(43), publicNonce: nonce },
+            { origin: "https://hub.example.test", sourceAddress: exchangeSource },
+          ),
+        ).rejects.toEqual(expect.objectContaining({ code: "pairing_secret_invalid" }));
+      }
+    }
+    const rateLimitedExchange = aggregateRequests[5];
+    if (rateLimitedExchange === undefined) throw new Error("aggregate pairing fixture missing");
+    await expect(
+      rateLimitedExchange.lifecycle.exchange(
+        rateLimitedExchange.created.request.requestId,
+        { exchangeSecret: "Z".repeat(43), publicNonce: nonce },
+        { origin: "https://hub.example.test", sourceAddress: exchangeSource },
+      ),
+    ).rejects.toEqual(expect.objectContaining({ code: "pairing_rate_limited" }));
+    const retainedExpiredFailure = await currentPool().pool.query(
+      `SELECT failure_id FROM browser_pairing_exchange_failures WHERE failure_id = $1`,
+      [expiredFailureId],
+    );
+    expect(retainedExpiredFailure.rowCount).toBe(0);
+
+    const unknownRequestSource = "unknown-request-source";
+    const unknownRequestLifecycle = aggregateRequests[0]?.lifecycle;
+    if (unknownRequestLifecycle === undefined) throw new Error("unknown request fixture missing");
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await expect(
+        unknownRequestLifecycle.exchange(
+          `pair_missing_${attempt}`,
+          { exchangeSecret: "Z".repeat(43), publicNonce: nonce },
+          { origin: "https://hub.example.test", sourceAddress: unknownRequestSource },
+        ),
+      ).rejects.toEqual(expect.objectContaining({ code: "pairing_not_found" }));
+    }
+    await expect(
+      unknownRequestLifecycle.exchange(
+        "pair_missing_rate_limited",
+        { exchangeSecret: "Z".repeat(43), publicNonce: nonce },
+        { origin: "https://hub.example.test", sourceAddress: unknownRequestSource },
+      ),
+    ).rejects.toEqual(expect.objectContaining({ code: "pairing_rate_limited" }));
+  });
+
+  it("creates and confirms a browser pairing through the loopback admin CLI", async () => {
+    const scope: OperatorGrantScope = {
+      actions: ["archive"],
+      commands: ["scan"],
+      permissions: ["session.read"],
+      scopeKeys: ["account-primary:inbox"],
+      sessionIds: [`sess_cli_pairing_${randomUUID()}`],
+      targetKinds: ["message"],
+    };
+    const created = JSON.parse(
+      await executeBrowserPairingCli({
+        command: "create",
+        databaseUrl,
+        operatorSubject: "cli-operator@example.test",
+        origin: "https://hub.example.test",
+        publicNonce: "N".repeat(22),
+        requestedScope: scope,
+      }),
+    ) as {
+      readonly request: {
+        readonly requestId: string;
+        readonly verificationPhrase: string;
+      };
+      readonly status: "created";
+    };
+    expect(created.status).toBe("created");
+
+    const confirmed = JSON.parse(
+      await executeBrowserPairingCli({
+        actorSubject: "cli-admin@example.test",
+        command: "confirm",
+        databaseUrl,
+        requestId: created.request.requestId,
+        verificationPhrase: created.request.verificationPhrase,
+      }),
+    ) as { readonly status: string };
+
+    expect(confirmed.status).toBe("confirmed");
+    await expect(
+      createBrowserPairingStore(currentPool()).inspect(created.request.requestId),
+    ).resolves.toMatchObject({
+      confirmedBySubject: "cli-admin@example.test",
+    });
+  });
+
+  it("pairs a browser into dedicated operator routes and revokes it independently", async () => {
+    const sessionId = `sess_browser_operator_${randomUUID()}`;
+    await createDbSession(currentPool(), sessionId);
+    const origin = "https://hub.example.test";
+    const operatorApp = createAppServer(currentPool(), {
+      auth: e2eAuthOptions,
+      cors: { allowedOrigins: [origin] },
+      eventFanout: { catchUpPollIntervalMs: 0 },
+      resourceLimits: { ...defaultResourceLimits, restEventListMaxBytes: 4_096 },
+      sessionService: { controlEpochEnforcement: false },
+      taskClaimSweeper: { intervalMs: 0 },
+    });
+    const port = await operatorApp.listen(0);
+    const operatorUrl = `http://127.0.0.1:${port}`;
+    let operatorSocket: WebSocket | null = null;
+    try {
+      const nonce = "B".repeat(22);
+      const scope: OperatorGrantScope = {
+        actions: ["archive"],
+        commands: ["authority-revoke", "backlog-preview", "scan"],
+        permissions: [
+          "approval.submit",
+          "authority.revoke",
+          "backlog-preview.request",
+          "browser-session.read",
+          "browser-session.revoke",
+          "scan.request",
+          "session.read",
+          "websocket.connect",
+        ],
+        scopeKeys: ["account-primary:inbox"],
+        sessionIds: [sessionId],
+        targetKinds: ["message"],
+      };
+      const created = await requestStatusFrom<BrowserPairingCreateResponse>(
+        operatorUrl,
+        "/browser/pairing-requests",
+        {
+          authToken: null,
+          body: {
+            operatorSubject: "operator@example.test",
+            publicNonce: nonce,
+            requestedScope: scope,
+          },
+          headers: { origin },
+          method: "POST",
+        },
+      );
+      expect(created.status).toBe(201);
+      expect(created.headers.get("cache-control")).toBe("no-store");
+      await createBrowserPairingStore(currentPool()).confirm({
+        actorSubject: "admin@example.test",
+        confirmedAt: new Date(),
+        requestId: created.body.request.requestId,
+      });
+      const exchanged = await requestStatusFrom<BrowserPairingExchangeResponse>(
+        operatorUrl,
+        `/browser/pairing-requests/${created.body.request.requestId}/exchange`,
+        {
+          authToken: null,
+          body: { exchangeSecret: created.body.exchangeSecret, publicNonce: nonce },
+          headers: { origin },
+          method: "POST",
+        },
+      );
+      const setCookie = exchanged.headers.get("set-cookie");
+      expect(exchanged.status).toBe(200);
+      expect(setCookie).toContain("__Host-Http-tether-operator=");
+      expect(setCookie).toContain("Path=/");
+      expect(setCookie).toContain("Secure");
+      expect(setCookie).toContain("HttpOnly");
+      expect(setCookie).toContain("SameSite=Strict");
+      const cookie = setCookie?.split(";", 1)[0];
+      expect(cookie).toBeTruthy();
+      if (!cookie) throw new Error("browser operator cookie missing");
+      const headers = { cookie, origin };
+      const self = await requestStatusFrom(operatorUrl, "/operator/browser-session", {
+        authToken: null,
+        headers,
+      });
+      expect(self).toMatchObject({
+        body: { grantJti: exchanged.body.grantJti, status: "active" },
+        status: 200,
+      });
+      expect(self.headers.get("cache-control")).toBe("no-store");
+      const sameOriginSelf = await requestStatusFrom(operatorUrl, "/operator/browser-session", {
+        authToken: null,
+        headers: { cookie },
+      });
+      expect(sameOriginSelf.status).toBe(200);
+      const generic = await requestStatusFrom(operatorUrl, "/sessions", {
+        authToken: null,
+        headers,
+      });
+      expect(generic).toMatchObject({ status: 401 });
+      const wrongSession = await requestStatusFrom(
+        operatorUrl,
+        "/operator/sessions/sess_other/snapshot",
+        { authToken: null, headers },
+      );
+      expect(wrongSession).toMatchObject({
+        body: { reason: "operator_session_denied" },
+        status: 403,
+      });
+      const command = await requestStatusFrom<BrowserOperatorCommandResponse>(
+        operatorUrl,
+        `/operator/sessions/${sessionId}/commands`,
+        {
+          authToken: null,
+          body: { command: "scan", scopeKey: "account-primary:inbox" },
+          headers: { ...headers, "x-tether-csrf": exchanged.body.csrfToken },
+          method: "POST",
+        },
+      );
+      expect(command.status).toBe(201);
+      const persistedCommand = await currentPool().pool.query<{
+        readonly operatorCommandKey: string | null;
+        readonly operatorGrantJti: string | null;
+      }>(
+        `SELECT operator_command_key AS "operatorCommandKey", operator_grant_jti AS "operatorGrantJti"
+         FROM tasks WHERE session_id = $1 AND task_id = $2`,
+        [sessionId, command.body.task.taskId],
+      );
+      expect(persistedCommand.rows[0]).toEqual({
+        operatorCommandKey: expect.stringMatching(/^[0-9a-f]{64}$/u),
+        operatorGrantJti: exchanged.body.grantJti,
+      });
+      const forgedOperatorTask = await requestStatusFrom(
+        operatorUrl,
+        `/sessions/${sessionId}/tasks`,
+        {
+          body: { kind: "operator.scan", objective: "forged operator command" },
+          method: "POST",
+        },
+      );
+      expect(forgedOperatorTask.status).toBe(400);
+      const duplicateCommand = await requestStatusFrom<BrowserOperatorCommandResponse>(
+        operatorUrl,
+        `/operator/sessions/${sessionId}/commands`,
+        {
+          authToken: null,
+          body: { command: "scan", scopeKey: "account-primary:inbox" },
+          headers: { ...headers, "x-tether-csrf": exchanged.body.csrfToken },
+          method: "POST",
+        },
+      );
+      expect(duplicateCommand).toMatchObject({
+        body: { status: "replayed", task: { taskId: command.body.task.taskId } },
+        status: 200,
+      });
+      const snapshot = await requestStatusFrom(
+        operatorUrl,
+        `/operator/sessions/${sessionId}/snapshot`,
+        { authToken: null, headers },
+      );
+      expect(snapshot).toMatchObject({
+        body: {
+          sessionId,
+          truncated: { events: false, participants: false, tasks: false },
+        },
+        status: 200,
+      });
+      expect(Buffer.byteLength(snapshot.text)).toBeLessThanOrEqual(4_096);
+      const csrfDenied = await requestStatusFrom(
+        operatorUrl,
+        `/operator/sessions/${sessionId}/commands`,
+        {
+          authToken: null,
+          body: { command: "scan", scopeKey: "account-primary:inbox" },
+          headers: { ...headers, "x-tether-csrf": "Z".repeat(43) },
+          method: "POST",
+        },
+      );
+      expect(csrfDenied).toMatchObject({
+        body: { reason: "operator_csrf_denied" },
+        status: 403,
+      });
+      const target = {
+        action: "archive",
+        digest: "digest_browser_operator",
+        scopeKey: "account-primary:inbox",
+        targetId: "message_browser_operator",
+        targetKind: "message",
+        targetRevision: "revision_browser_operator",
+      };
+      const task = await request<TaskResponse>(`/sessions/${sessionId}/tasks`, {
+        body: { kind: "opaque_manifest_review", objective: "review browser target" },
+        method: "POST",
+      });
+      const controller = {
+        instanceId: `inst_browser_operator_${randomUUID()}`,
+        participantId: `part_browser_operator_${randomUUID()}`,
+      };
+      const claimed = await request<TaskResponse>(
+        `/sessions/${sessionId}/tasks/${task.task.taskId}/claim`,
+        { body: controller, method: "POST" },
+      );
+      await request<TaskResponse>(`/sessions/${sessionId}/tasks/${task.task.taskId}/complete`, {
+        body: {
+          ...controller,
+          claimId: requireClaimId(claimed.task),
+          result: { targetManifest: [target] },
+        },
+        method: "POST",
+      });
+      const approvalPath = `/operator/sessions/${sessionId}/tasks/${task.task.taskId}/approval`;
+      const operatorMutationHeaders = {
+        ...headers,
+        "x-tether-csrf": exchanged.body.csrfToken,
+      };
+      const scopeDenied = await requestStatusFrom(operatorUrl, approvalPath, {
+        authToken: null,
+        body: { decision: "approved", reason: {}, target: { ...target, scopeKey: "other" } },
+        headers: operatorMutationHeaders,
+        method: "POST",
+      });
+      expect(scopeDenied).toMatchObject({
+        body: { reason: "operator_scope_key_denied" },
+        status: 403,
+      });
+      const actionDenied = await requestStatusFrom(operatorUrl, approvalPath, {
+        authToken: null,
+        body: { decision: "approved", reason: {}, target: { ...target, action: "trash" } },
+        headers: operatorMutationHeaders,
+        method: "POST",
+      });
+      expect(actionDenied).toMatchObject({
+        body: { reason: "operator_action_denied" },
+        status: 403,
+      });
+      const manifestDenied = await requestStatusFrom(operatorUrl, approvalPath, {
+        authToken: null,
+        body: {
+          decision: "approved",
+          reason: {},
+          target: { ...target, targetId: "message_guessed" },
+        },
+        headers: operatorMutationHeaders,
+        method: "POST",
+      });
+      expect(manifestDenied).toMatchObject({
+        body: { rejectionReason: "target_absent" },
+        status: 409,
+      });
+      const approval = await requestStatusFrom(operatorUrl, approvalPath, {
+        authToken: null,
+        body: { decision: "approved", reason: {}, target },
+        headers: operatorMutationHeaders,
+        method: "POST",
+      });
+      const duplicate = await requestStatusFrom(operatorUrl, approvalPath, {
+        authToken: null,
+        body: { decision: "rejected", reason: {}, target },
+        headers: operatorMutationHeaders,
+        method: "POST",
+      });
+      expect(approval).toMatchObject({
+        body: {
+          approval: { decidedByParticipantId: "operator@example.test", decision: "approved" },
+          status: "recorded",
+        },
+        status: 200,
+      });
+      expect(duplicate).toMatchObject({
+        body: {
+          approval: { decidedByParticipantId: "operator@example.test", decision: "approved" },
+          existingDecision: "approved",
+          status: "ignored",
+        },
+        status: 200,
+      });
+      const deniedOrigin = await requestStatusFrom(operatorUrl, "/operator/browser-session", {
+        authToken: null,
+        headers: { cookie, origin: "https://evil.example.test" },
+      });
+      expect(deniedOrigin).toMatchObject({
+        body: { reason: "operator_origin_denied" },
+        status: 403,
+      });
+      const websocketTicket = await requestStatusFrom<AuthTicketCreateResponse>(
+        operatorUrl,
+        "/operator/websocket-ticket",
+        {
+          authToken: null,
+          headers: { ...headers, "x-tether-csrf": exchanged.body.csrfToken },
+          method: "POST",
+        },
+      );
+      expect(websocketTicket.status).toBe(201);
+      expect(websocketTicket.headers.get("cache-control")).toBe("no-store");
+      const operatorStreamUrl = new URL(
+        `${operatorUrl.replace("http:", "ws:")}/sessions/${sessionId}/stream`,
+      );
+      operatorStreamUrl.searchParams.set("after", "0");
+      operatorStreamUrl.searchParams.set("runtimeKind", "observer");
+      operatorStreamUrl.searchParams.set("ticket", websocketTicket.body.ticket);
+      operatorSocket = new WebSocket(operatorStreamUrl, { origin });
+      const operatorMessages: unknown[] = [];
+      operatorSocket.on("message", (data) => {
+        operatorMessages.push(JSON.parse(String(data)) as unknown);
+      });
+      await waitForSocketOpen(operatorSocket);
+      await waitFor(() => operatorMessages.some(isReplayCompleteEnvelope));
+      const operatorSocketClose = waitForSocketCloseDetails(operatorSocket);
+      const revoked = await requestStatusFrom(operatorUrl, "/operator/browser-session/revoke", {
+        authToken: null,
+        headers: { ...headers, "x-tether-csrf": exchanged.body.csrfToken },
+        method: "POST",
+      });
+      expect(revoked).toMatchObject({ body: { status: "revoked" }, status: 200 });
+      const revokedCommandTaskId = `task_revoked_operator_${randomUUID()}`;
+      await expect(
+        createOperatorCommandTaskWithEvent(currentPool(), {
+          authority: {
+            grantJti: exchanged.body.grantJti,
+            request: {
+              command: "scan",
+              scopeKey: "account-primary:inbox",
+              sessionId,
+            },
+          },
+          eventSourceId: `evt_revoked_operator_${randomUUID()}`,
+          taskId: revokedCommandTaskId,
+        }),
+      ).rejects.toMatchObject({
+        name: "OperatorCommandAdmissionError",
+        reason: "operator_grant_revoked",
+      });
+      await expect(
+        getTask(currentPool(), { sessionId, taskId: revokedCommandTaskId }),
+      ).resolves.toBeNull();
+      await expect(operatorSocketClose).resolves.toEqual({
+        code: 1008,
+        reason: "auth_grant_revoked",
+      });
+      const afterRevocation = await requestStatusFrom(operatorUrl, "/operator/browser-session", {
+        authToken: null,
+        headers,
+      });
+      expect(afterRevocation).toMatchObject({
+        body: { reason: "operator_auth_denied" },
+        status: 401,
+      });
+      const rePair = await requestStatusFrom<BrowserPairingCreateResponse>(
+        operatorUrl,
+        "/browser/pairing-requests",
+        {
+          authToken: null,
+          body: {
+            operatorSubject: "operator@example.test",
+            publicNonce: "P".repeat(22),
+            requestedScope: scope,
+          },
+          headers: { origin },
+          method: "POST",
+        },
+      );
+      expect(rePair).toMatchObject({ body: { status: "created" }, status: 201 });
+      expect(rePair.body.request.requestId).not.toBe(created.body.request.requestId);
+    } finally {
+      if (operatorSocket && operatorSocket.readyState !== WebSocket.CLOSED) {
+        operatorSocket.close();
+        await waitForSocketClose(operatorSocket);
+      }
+      await operatorApp.close();
+    }
   });
 
   it("persists grant authority, bounded audit state, and hashed tickets through narrow stores", async () => {
@@ -2377,8 +3022,7 @@ e2e("tether e2e", () => {
         taskClaimSweeper: { intervalMs: 0 },
       }),
     ] as const;
-    const ports = await Promise.all([findOpenPort(), findOpenPort()]);
-    await Promise.all(replicas.map((replica, index) => replica.listen(ports[index] ?? 0)));
+    const ports = await Promise.all(replicas.map((replica) => replica.listen(0)));
     const sockets = ports.map((port, index) => {
       const url = new URL(`ws://127.0.0.1:${port}/sessions/${session.sessionId}/stream`);
       url.searchParams.set("after", "0");
@@ -2553,8 +3197,7 @@ e2e("tether e2e", () => {
       sessionService: { controlEpochEnforcement: false },
       taskClaimSweeper: { intervalMs: 0 },
     });
-    const port = await findOpenPort();
-    await registryApp.listen(port);
+    const port = await registryApp.listen(0);
     const streamKinds = ["codex", "observer", "host", "viewer"] as const;
     const sockets = streamKinds.map((runtimeKind) => {
       const url = new URL(`ws://127.0.0.1:${port}/sessions/${session.sessionId}/stream`);
@@ -2626,10 +3269,8 @@ e2e("tether e2e", () => {
         taskClaimSweeper: { intervalMs: 0 },
       }),
     ] as const;
-    const firstPort = await findOpenPort();
-    await replicas[0].listen(firstPort);
-    const secondPort = await findOpenPort();
-    await replicas[1].listen(secondPort);
+    const firstPort = await replicas[0].listen(0);
+    const secondPort = await replicas[1].listen(0);
     const sockets = [firstPort, secondPort].map((port, index) => {
       const url = new URL(`ws://127.0.0.1:${port}/sessions/${session.sessionId}/stream`);
       url.searchParams.set("after", "0");
@@ -2690,8 +3331,7 @@ e2e("tether e2e", () => {
       eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
       taskClaimSweeper: { intervalMs: 0 },
     });
-    const port = await findOpenPort();
-    await pollingApp.listen(port);
+    const port = await pollingApp.listen(0);
     const url = new URL(`ws://127.0.0.1:${port}/sessions/${session.sessionId}/stream`);
     url.searchParams.set("after", "0");
     url.searchParams.set("runtimeKind", "observer");
@@ -2744,8 +3384,7 @@ e2e("tether e2e", () => {
       eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
       taskClaimSweeper: { intervalMs: 0 },
     });
-    const port = await findOpenPort();
-    await expiryApp.listen(port);
+    const port = await expiryApp.listen(0);
     const url = new URL(`ws://127.0.0.1:${port}/sessions/${session.sessionId}/stream`);
     url.searchParams.set("after", "0");
     url.searchParams.set("runtimeKind", "observer");
@@ -2800,8 +3439,7 @@ e2e("tether e2e", () => {
       },
       taskClaimSweeper: { intervalMs: 0 },
     });
-    const delayedClosurePort = await findOpenPort();
-    await delayedClosureApp.listen(delayedClosurePort);
+    const delayedClosurePort = await delayedClosureApp.listen(0);
     const url = new URL(
       `ws://127.0.0.1:${delayedClosurePort}/sessions/${session.sessionId}/stream`,
     );
@@ -2935,8 +3573,7 @@ e2e("tether e2e", () => {
       },
       taskClaimSweeper: { intervalMs: 0 },
     });
-    const port = await findOpenPort();
-    await authorityApp.listen(port);
+    const port = await authorityApp.listen(0);
     const url = new URL(`ws://127.0.0.1:${port}/sessions/${session.sessionId}/stream`);
     url.searchParams.set("access_token", created.bearer);
     url.searchParams.set("after", "0");
@@ -3037,8 +3674,7 @@ e2e("tether e2e", () => {
       eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
       taskClaimSweeper: { intervalMs: 0 },
     });
-    const port = await findOpenPort();
-    await delayedFailureApp.listen(port);
+    const port = await delayedFailureApp.listen(0);
     const url = new URL(`ws://127.0.0.1:${port}/sessions/${session.sessionId}/stream`);
     url.searchParams.set("access_token", created.bearer);
     url.searchParams.set("participantId", participantId);
@@ -3104,8 +3740,7 @@ e2e("tether e2e", () => {
         secrets: { [testAuthSigningKid]: testAuthSigningSecret },
       },
     });
-    const port = await findOpenPort();
-    await gatedApp.listen(port);
+    const port = await gatedApp.listen(0);
     onTestFinished(() => gatedApp.close());
 
     expect(gatedApp.debugInfo().auth.grantIssuanceEnabled).toBe(false);
@@ -3140,8 +3775,7 @@ e2e("tether e2e", () => {
         secrets: { [testAuthSigningKid]: testAuthSigningSecret },
       },
     });
-    const port = await findOpenPort();
-    await disabledApp.listen(port);
+    const port = await disabledApp.listen(0);
     onTestFinished(() => disabledApp.close());
 
     const response = await requestStatusFrom<AuthGrantCreateResponse>(
@@ -3233,8 +3867,7 @@ e2e("tether e2e", () => {
       resourceLimits: { ...defaultResourceLimits, httpMaxBodyBytes: 32 },
       taskClaimSweeper: { intervalMs: 0 },
     });
-    const port = await findOpenPort();
-    await limitedApp.listen(port);
+    const port = await limitedApp.listen(0);
     const limitedUrl = `http://127.0.0.1:${port}`;
     try {
       const response = await requestStatusFrom(limitedUrl, "/sessions", {
@@ -3264,8 +3897,7 @@ e2e("tether e2e", () => {
       resourceLimits: { ...defaultResourceLimits, httpMaxBodyBytes: 32 },
       taskClaimSweeper: { intervalMs: 0 },
     });
-    const port = await findOpenPort();
-    await disabledApp.listen(port);
+    const port = await disabledApp.listen(0);
     const disabledUrl = `http://127.0.0.1:${port}`;
     try {
       const response = await requestStatusFrom(disabledUrl, "/sessions", {
@@ -3297,8 +3929,7 @@ e2e("tether e2e", () => {
       sessionService: { controlEpochEnforcement: false },
       taskClaimSweeper: { intervalMs: 0 },
     });
-    const port = await findOpenPort();
-    await limitedApp.listen(port);
+    const port = await limitedApp.listen(0);
     const limitedUrl = `http://127.0.0.1:${port}`;
     try {
       const session = (
@@ -3663,8 +4294,7 @@ e2e("tether e2e", () => {
       eventFanout: { catchUpPollIntervalMs: 0 },
       taskClaimSweeper: { intervalMs: 0 },
     });
-    const port = await findOpenPort();
-    await corsApp.listen(port);
+    const port = await corsApp.listen(0);
     const corsUrl = `http://127.0.0.1:${port}`;
     try {
       const allowed = await fetch(`${corsUrl}/sessions`, {
@@ -3943,8 +4573,7 @@ e2e("tether e2e", () => {
       resourceLimits: { ...defaultResourceLimits, wsMaxPayloadBytes: 64 },
       taskClaimSweeper: { intervalMs: 0 },
     });
-    const port = await findOpenPort();
-    await limitedApp.listen(port);
+    const port = await limitedApp.listen(0);
     const limitedUrl = `http://127.0.0.1:${port}`;
     let socket: WebSocket | null = null;
     try {
@@ -4002,8 +4631,7 @@ e2e("tether e2e", () => {
       },
       taskClaimSweeper: { intervalMs: 0 },
     });
-    const port = await findOpenPort();
-    await limitedApp.listen(port);
+    const port = await limitedApp.listen(0);
     const limitedUrl = `http://127.0.0.1:${port}`;
     let socket: WebSocket | null = null;
     try {
@@ -4056,8 +4684,7 @@ e2e("tether e2e", () => {
       sessionService: { controlEpochEnforcement: false },
       taskClaimSweeper: { intervalMs: 0 },
     });
-    const port = await findOpenPort();
-    await limitedApp.listen(port);
+    const port = await limitedApp.listen(0);
     const limitedUrl = `http://127.0.0.1:${port}`;
     let socket: WebSocket | null = null;
     try {
@@ -4412,8 +5039,7 @@ e2e("tether e2e", () => {
       },
       taskClaimSweeper: { intervalMs: 0 },
     });
-    const port = await findOpenPort();
-    await observedApp.listen(port);
+    const port = await observedApp.listen(0);
     const observedUrl = `http://127.0.0.1:${port}`;
     try {
       const session = (
@@ -4854,8 +5480,7 @@ e2e("tether e2e", () => {
         secrets: { [testAuthSigningKid]: testAuthSigningSecret },
       },
     });
-    const port = await findOpenPort();
-    await disabledApp.listen(port);
+    const port = await disabledApp.listen(0);
     const disabledUrl = `http://127.0.0.1:${port}`;
     try {
       const sessionResponse = await requestStatusFrom<SessionResponse>(disabledUrl, "/sessions", {
@@ -5678,12 +6303,8 @@ e2e("tether e2e", () => {
           taskClaimSweeper: { intervalMs: 0 },
         });
         const [mutationPort, supersessionPort] = await Promise.all([
-          findOpenPort(),
-          findOpenPort(),
-        ]);
-        await Promise.all([
-          mutationApp.listen(mutationPort),
-          supersessionApp.listen(supersessionPort),
+          mutationApp.listen(0),
+          supersessionApp.listen(0),
         ]);
         const mutationBaseUrl = `http://127.0.0.1:${mutationPort}`;
         const supersessionBaseUrl = `http://127.0.0.1:${supersessionPort}`;
@@ -5783,10 +6404,9 @@ e2e("tether e2e", () => {
     const result = await coordinator.run(async ({ databaseFor, releasePhase, waitForPhase }) => {
       const mutationApp = createControlEpochRaceApp(databaseFor("mutation"), 120_000);
       const supersessionApp = createControlEpochRaceApp(databaseFor("supersession"), 60_000);
-      const [mutationPort, supersessionPort] = await Promise.all([findOpenPort(), findOpenPort()]);
-      await Promise.all([
-        mutationApp.listen(mutationPort),
-        supersessionApp.listen(supersessionPort),
+      const [mutationPort, supersessionPort] = await Promise.all([
+        mutationApp.listen(0),
+        supersessionApp.listen(0),
       ]);
       const mutationBaseUrl = `http://127.0.0.1:${mutationPort}`;
       const supersessionBaseUrl = `http://127.0.0.1:${supersessionPort}`;
@@ -5944,13 +6564,12 @@ e2e("tether e2e", () => {
     const responses = await coordinator.run(async ({ databaseFor, releasePhase, waitForPhase }) => {
       const claimantAApp = createTaskClaimRaceApp(databaseFor("claimant-a"));
       const claimantBApp = createTaskClaimRaceApp(databaseFor("claimant-b"));
-      const [claimantAPort, claimantBPort] = await Promise.all([findOpenPort(), findOpenPort()]);
       let claimantAStarted = false;
       let claimantBStarted = false;
       try {
-        await claimantAApp.listen(claimantAPort);
+        const claimantAPort = await claimantAApp.listen(0);
         claimantAStarted = true;
-        await claimantBApp.listen(claimantBPort);
+        const claimantBPort = await claimantBApp.listen(0);
         claimantBStarted = true;
         const requests = [
           requestStatusFrom(
@@ -7319,8 +7938,7 @@ e2e("tether e2e", () => {
         wsControlLeaseTtlMs: 1_000,
       },
     });
-    const port = await findOpenPort();
-    await unvalidatedApp.listen(port);
+    const port = await unvalidatedApp.listen(0);
     const unvalidatedOrigin = `http://127.0.0.1:${port}`;
     try {
       const session = await requestFrom<SessionResponse>(unvalidatedOrigin, "/sessions", {
@@ -9959,11 +10577,9 @@ e2e("tether e2e", () => {
     let replicaBStarted = false;
     let host: WebSocket | null = null;
     try {
-      const portA = await findOpenPort();
-      const portB = await findOpenPort();
-      await replicaA.listen(portA);
+      const portA = await replicaA.listen(0);
+      const portB = await replicaB.listen(0);
       replicaAStarted = true;
-      await replicaB.listen(portB);
       replicaBStarted = true;
       const replicaAUrl = `http://127.0.0.1:${portA}`;
       const replicaBUrl = `http://127.0.0.1:${portB}`;
@@ -10046,11 +10662,9 @@ e2e("tether e2e", () => {
     let socketA: WebSocket | null = null;
     let socketB: WebSocket | null = null;
     try {
-      const portA = await findOpenPort();
-      const portB = await findOpenPort();
-      await replicaA.listen(portA);
+      const portA = await replicaA.listen(0);
+      const portB = await replicaB.listen(0);
       replicaAStarted = true;
-      await replicaB.listen(portB);
       replicaBStarted = true;
       const replicaAUrl = `http://127.0.0.1:${portA}`;
       const replicaBUrl = `http://127.0.0.1:${portB}`;
@@ -10152,11 +10766,9 @@ e2e("tether e2e", () => {
     let replicaBStarted = false;
     let socket: WebSocket | null = null;
     try {
-      const portA = await findOpenPort();
-      const portB = await findOpenPort();
-      await replicaA.listen(portA);
+      const portA = await replicaA.listen(0);
+      const portB = await replicaB.listen(0);
       replicaAStarted = true;
-      await replicaB.listen(portB);
       replicaBStarted = true;
       const replicaAUrl = `http://127.0.0.1:${portA}`;
       const replicaBUrl = `http://127.0.0.1:${portB}`;
@@ -10245,11 +10857,9 @@ e2e("tether e2e", () => {
     let replicaBStarted = false;
     let socket: WebSocket | null = null;
     try {
-      const portA = await findOpenPort();
-      const portB = await findOpenPort();
-      await replicaA.listen(portA);
+      const portA = await replicaA.listen(0);
+      const portB = await replicaB.listen(0);
       replicaAStarted = true;
-      await replicaB.listen(portB);
       replicaBStarted = true;
       const replicaAUrl = `http://127.0.0.1:${portA}`;
       const replicaBUrl = `http://127.0.0.1:${portB}`;
@@ -10502,8 +11112,7 @@ e2e("tether e2e", () => {
     const participantId = `part_epoch_${label}_${randomUUID()}`;
     const instanceId = `inst_epoch_${label}_${randomUUID()}`;
     const setupApp = createControlEpochRaceApp(currentPool(), 60_000);
-    const setupPort = await findOpenPort();
-    await setupApp.listen(setupPort);
+    const setupPort = await setupApp.listen(0);
     const setupBaseUrl = `http://127.0.0.1:${setupPort}`;
     try {
       const acquisition = await requestFrom<ParticipantRegistrationResponse>(
@@ -10703,8 +11312,7 @@ e2e("tether e2e", () => {
         taskClaimSweeper: { intervalMs: 0 },
       },
     );
-    const port = await findOpenPort();
-    await app.listen(port);
+    const port = await app.listen(0);
     return { app, baseUrl: `http://127.0.0.1:${port}` };
   }
 
@@ -11213,12 +11821,14 @@ e2e("tether e2e", () => {
       headers: {
         "content-type": "application/json",
         ...(authToken ? { authorization: `Bearer ${authToken}` } : {}),
+        ...init.headers,
       },
       method: init.method ?? "GET",
     });
     const text = await response.text();
     return {
       body: parseJsonResponseBody<TResponse>(text),
+      headers: response.headers,
       status: response.status,
       text,
     };
@@ -11274,6 +11884,7 @@ e2e("tether e2e", () => {
 interface E2eRequestInit {
   readonly authToken?: string | null;
   readonly body?: unknown;
+  readonly headers?: Readonly<Record<string, string>>;
   readonly method?: string;
 }
 
@@ -11603,31 +12214,6 @@ async function dropDatabase(databaseName: string): Promise<void> {
   } finally {
     await adminPool.end();
   }
-}
-
-/**
- * Reserves and releases a port using the same wildcard bind as the e2e app server.
- */
-async function findOpenPort(): Promise<number> {
-  const server = createServer();
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, resolve);
-  });
-  const address = server.address();
-  await new Promise<void>((resolve, reject) => {
-    server.close((error) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve();
-    });
-  });
-  if (typeof address !== "object" || address === null) {
-    throw new Error("Failed to allocate e2e port");
-  }
-  return address.port;
 }
 
 /**

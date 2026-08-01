@@ -24,7 +24,7 @@ import type { ControlChannel, SessionEvent } from "./types.js";
 
 /** Stable public message for unexpected HTTP route failures. */
 const internalServerErrorMessage = "Internal server error";
-const defaultAllowedCorsHeaders = "authorization, content-type";
+const defaultAllowedCorsHeaders = "authorization, content-type, x-tether-csrf";
 const defaultAllowedCorsMethods = "GET, POST, OPTIONS";
 
 /** CORS allowlist configuration for browser-based non-repo clients. */
@@ -395,10 +395,32 @@ function parseAllowedOrigins(value: string | undefined): readonly string[] {
   if (!value) {
     return [];
   }
-  return value
+  const configured = value
     .split(",")
     .map((origin) => origin.trim())
-    .filter((origin) => origin.length > 0 && origin !== "*");
+    .filter((origin) => origin.length > 0);
+  const origins = new Set<string>();
+  for (const rawOrigin of configured) {
+    let parsed: URL;
+    try {
+      parsed = new URL(rawOrigin);
+    } catch {
+      throw new Error("browser_allowed_origin_invalid");
+    }
+    if (
+      (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+      parsed.origin === "null" ||
+      parsed.username !== "" ||
+      parsed.password !== "" ||
+      parsed.pathname !== "/" ||
+      parsed.search !== "" ||
+      parsed.hash !== ""
+    ) {
+      throw new Error("browser_allowed_origin_invalid");
+    }
+    origins.add(parsed.origin);
+  }
+  return [...origins];
 }
 
 /** Writes stable CORS headers for an already allowlisted origin. */

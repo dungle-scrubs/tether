@@ -14,6 +14,7 @@ import {
   claimTaskWithEvent,
   completeTaskWithEvent,
   createSession,
+  createOperatorCommandTaskWithEvent,
   createTaskWithEventIdempotent,
   type DatabasePool,
   deleteSession,
@@ -55,7 +56,7 @@ import type {
   SessionStore,
   TaskStore,
 } from "./db-store-contracts.js";
-import type { AppendSessionEventInput } from "./protocol.js";
+import type { AppendSessionEventInput, ApprovalTarget } from "./protocol.js";
 import type { ParticipantRuntimeKind, TaskListStatus } from "./types.js";
 
 /** Builds focused persistence stores over the current database function implementations. */
@@ -209,8 +210,8 @@ class DbParticipantStore implements ParticipantStore {
     return heartbeatParticipantWithEvent(this.database, input);
   }
 
-  list(sessionId: string) {
-    return listParticipants(this.database, sessionId);
+  list(sessionId: string, options?: { readonly limit?: number | undefined }) {
+    return listParticipants(this.database, sessionId, options);
   }
 
   listRuntimeSnapshots(sessionId: string) {
@@ -286,9 +287,11 @@ class DbTaskStore implements TaskStore {
     readonly controlGuard?: ControlEpochGuard | undefined;
     readonly decision: "approved" | "rejected";
     readonly eventSourceId: string;
+    readonly operatorGrantJti?: string | undefined;
     readonly participantId: string;
     readonly reason: Record<string, unknown>;
     readonly sessionId: string;
+    readonly target?: ApprovalTarget | undefined;
     readonly taskId: string;
   }) {
     return recordTaskApproval(this.database, input);
@@ -330,6 +333,10 @@ class DbTaskStore implements TaskStore {
     return createTaskWithEventIdempotent(this.database, input);
   }
 
+  createOperatorWithEvent(input: Parameters<TaskStore["createOperatorWithEvent"]>[0]) {
+    return createOperatorCommandTaskWithEvent(this.database, input);
+  }
+
   supersedeScheduled(input: SupersedeScheduledRunsInput) {
     return supersedeScheduledRunsWithEvent(this.database, input);
   }
@@ -358,8 +365,12 @@ class DbTaskStore implements TaskStore {
     return getTask(this.database, input);
   }
 
-  list(sessionId: string, status: TaskListStatus = "active") {
-    return listTasks(this.database, sessionId, status);
+  list(
+    sessionId: string,
+    status: TaskListStatus = "active",
+    options?: { readonly limit?: number | undefined },
+  ) {
+    return listTasks(this.database, sessionId, status, options);
   }
 
   listSnapshots(sessionId: string) {

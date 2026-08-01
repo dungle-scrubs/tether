@@ -7,6 +7,7 @@ import type {
 } from "./db-store-contracts.js";
 import {
   ApprovalTargetManifestError,
+  OperatorGrantAuthorityError,
   type EnsureScheduledRunResult,
   ScheduledRunIdentityConflictError,
   ScheduledTaskIdentityMismatchError,
@@ -21,6 +22,7 @@ import {
   type ClaimOwnedTaskInput,
   type CompleteTaskInput,
   type CreateTaskInput,
+  type StandardCreateTaskInput,
   type EnsureScheduledRunRequest,
   type FailTaskInput,
   type RecordedTaskApprovalResult,
@@ -230,9 +232,30 @@ export function createSessionTaskEffects(input: SessionTaskEffectsInput): Sessio
         // id that would evade schedule-identity uniqueness and atomic supersession
         // of older windows. A supplied id must equal the derived identity or the
         // create is rejected.
+        if (taskInput.operatorAuthority !== undefined) {
+          const taskId = taskInput.taskId ?? newTaskId();
+          const operatorSessionId = taskInput.operatorAuthority.request.sessionId;
+          const persisted = yield* trySessionPromise(() =>
+            input.stores.tasks.createOperatorWithEvent({
+              authority: taskInput.operatorAuthority,
+              eventSourceId: input.eventSourceId,
+              taskId,
+            }),
+          );
+          yield* Effect.sync(() =>
+            input.assertBroadcastEvents(
+              input.observability,
+              "createTask",
+              operatorSessionId,
+              persisted.events,
+            ),
+          );
+          return persisted;
+        }
         if (taskInput.schedule !== undefined) {
           return yield* createScheduledTaskEffect(input, taskInput, taskInput.schedule);
         }
+        const taskId = taskInput.taskId ?? newTaskId();
         const persisted = yield* trySessionPromise(() =>
           input.stores.tasks.createWithEvent({
             eventSourceId: input.eventSourceId,
@@ -240,7 +263,7 @@ export function createSessionTaskEffects(input: SessionTaskEffectsInput): Sessio
             kind: taskInput.kind,
             objective: taskInput.objective,
             sessionId: taskInput.sessionId,
-            taskId: taskInput.taskId ?? newTaskId(),
+            taskId,
             taskIdSource: taskInput.taskId === undefined ? "generated" : "caller",
           }),
         );
@@ -312,6 +335,7 @@ export function createSessionTaskEffects(input: SessionTaskEffectsInput): Sessio
             controlGuard: taskInput.controlGuard,
             decision: taskInput.decision,
             eventSourceId: input.eventSourceId,
+            operatorGrantJti: taskInput.operatorGrantJti,
             participantId: taskInput.participantId,
             reason: taskInput.reason,
             sessionId: taskInput.sessionId,
@@ -322,6 +346,16 @@ export function createSessionTaskEffects(input: SessionTaskEffectsInput): Sessio
           Effect.catchAll((error): Effect.Effect<never, SessionServiceFailure> => {
             if (error.cause instanceof ApprovalTargetManifestError) {
               input.observability.debug(operation, "approval.target_manifest.rejected", {
+                reason: error.cause.reason,
+                sessionId: taskInput.sessionId,
+                taskId: taskInput.taskId,
+              });
+              return Effect.fail(
+                new TaskApprovalRejectedError(taskInput.decision, error.cause.reason, task),
+              );
+            }
+            if (error.cause instanceof OperatorGrantAuthorityError) {
+              input.observability.debug(operation, "approval.operator_authority.rejected", {
                 reason: error.cause.reason,
                 sessionId: taskInput.sessionId,
                 taskId: taskInput.taskId,
@@ -478,7 +512,7 @@ function ensureScheduledRunStoreEffect(
  */
 function createScheduledTaskEffect(
   input: SessionTaskEffectsInput,
-  taskInput: CreateTaskInput,
+  taskInput: StandardCreateTaskInput,
   schedule: NonNullable<CreateTaskInput["schedule"]>,
 ): Effect.Effect<TaskCreatedResult, SessionServiceFailure> {
   return Effect.gen(function* () {

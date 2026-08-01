@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  createTaskSchema,
   registerParticipantSchema,
   releaseParticipantControlSchema,
   restControlAcquisitionResponseSchema,
@@ -56,5 +57,14 @@ describe("REST participant control contracts", () => {
       }).success,
     ).toBe(true);
     expect(releaseParticipantControlSchema.safeParse({ instanceId: "inst_1" }).success).toBe(false);
+  });
+
+  it("reserves operator task kinds for the dedicated server-owned boundary", () => {
+    expect(
+      createTaskSchema.safeParse({ kind: "operator.scan", objective: "forged command" }).success,
+    ).toBe(false);
+    expect(createTaskSchema.safeParse({ kind: "email.scan", objective: "scan mail" }).success).toBe(
+      true,
+    );
   });
 });

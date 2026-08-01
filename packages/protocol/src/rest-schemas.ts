@@ -181,7 +181,12 @@ export const scheduledTaskIdentitySchema = z
 /** HTTP body schema for task creation. */
 export const createTaskSchema = z.object({
   input: z.record(z.string(), z.unknown()).nullable().optional(),
-  kind: z.string().min(1),
+  kind: z
+    .string()
+    .min(1)
+    .refine((kind) => !kind.startsWith("operator."), {
+      message: "The operator task namespace is reserved",
+    }),
   objective: z.string().min(1),
   requireContract: z.boolean().optional(),
   schedule: scheduledTaskIdentitySchema.optional(),

@@ -12,6 +12,8 @@ import type {
   PermanentSessionDeleteResult,
   PersistedEventAppendResult,
   PersistedTaskCreateResult,
+  OperatorGrantAuthorityErrorReason,
+  OperatorCommandTaskAuthority,
   ScheduledTaskIdentityInput,
 } from "./db.js";
 
@@ -73,6 +75,7 @@ export class SessionServicePersistenceError extends Error {
 /** Reason an approval decision was not recorded. */
 export type TaskApprovalRejectionReason =
   | ApprovalTargetManifestErrorReason
+  | OperatorGrantAuthorityErrorReason
   | "invalid_approval_plan"
   | "task_not_completed"
   | "task_not_found"
@@ -223,11 +226,19 @@ export interface SessionServiceEffect {
   /** Lists visible participants for a session. */
   readonly listParticipants: (
     sessionId: string,
+    options?: {
+      readonly before?: Pick<ParticipantRecord, "lastSeenAt" | "participantId"> | undefined;
+      readonly limit?: number | undefined;
+    },
   ) => Effect.Effect<ParticipantRecord[], SessionServiceFailure>;
   /** Lists durable tasks for a session and lifecycle filter. */
   readonly listTasks: (
     sessionId: string,
     status?: TaskListStatus,
+    options?: {
+      readonly before?: Pick<TaskRecord, "createdAt" | "taskId"> | undefined;
+      readonly limit?: number | undefined;
+    },
   ) => Effect.Effect<TaskRecord[], SessionServiceFailure>;
   /** Lists normalized participant task contracts advertised in one session. */
   readonly listParticipantTaskContracts: (
@@ -715,19 +726,33 @@ export interface CancelTaskInput extends TaskParticipantInput {
 
 export interface RecordTaskApprovalInput extends TaskParticipantInput {
   readonly decision: ApprovalDecision;
+  readonly operatorGrantJti?: string | undefined;
   readonly reason: Record<string, unknown>;
   readonly target?: ApprovalTarget | undefined;
 }
 
-export interface CreateTaskInput {
+export interface StandardCreateTaskInput {
   readonly input: Record<string, unknown> | null;
   readonly kind: string;
   readonly objective: string;
+  readonly operatorAuthority?: undefined;
   /** Deterministic provider-neutral identity for scheduled runs. */
   readonly schedule?: ScheduledTaskIdentityInput | undefined;
   readonly sessionId: string;
   readonly taskId: string | undefined;
 }
+
+export type CreateTaskInput =
+  | StandardCreateTaskInput
+  | {
+      readonly input?: never;
+      readonly kind?: never;
+      readonly objective?: never;
+      /** Transaction-owned browser command authority with server-derived durable task fields. */
+      readonly operatorAuthority: OperatorCommandTaskAuthority;
+      readonly schedule?: never;
+      readonly taskId: string | undefined;
+    };
 
 /**
  * Request for one atomic scheduled-run supersession. The identity fixes the
