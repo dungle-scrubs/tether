@@ -1,6 +1,6 @@
 {
   "name": "@dungle-scrubs/tether-client",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Participant runtime client for Tether REST and WebSocket integration.",
   "license": "MIT",
   "author": "Kevin Frilot",

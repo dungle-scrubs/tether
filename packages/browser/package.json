@@ -1,6 +1,6 @@
 {
   "name": "@dungle-scrubs/tether-browser",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Browser-only operator client for Tether snapshots, replay, commands, and approvals.",
   "license": "MIT",
   "author": "Kevin Frilot",

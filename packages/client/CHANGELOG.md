@@ -1,5 +1,12 @@
 # @dungle-scrubs/tether-client
 
+## 1.0.1
+
+### Patch Changes
+
+- Updated dependencies [0c6025d]
+  - @dungle-scrubs/tether-protocol@0.3.0
+
 ## 1.0.0
 
 ### Major Changes
