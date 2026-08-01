@@ -153,17 +153,17 @@ export const releaseParticipantControlResponseSchema = z.object({
 });
 
 /**
- * Deterministic schedule and Mailbox Scope identity a scheduled maintenance run
+ * Deterministic schedule and opaque scope identity a recurring-work run
  * carries at creation. Interval and algorithm version are part of task identity.
  */
 export const scheduledTaskIdentitySchema = z
   .object({
-    mailboxAccountId: z.string().min(1),
-    mailboxProvider: z.string().min(1),
     scheduleAlgorithmVersion: z.number().int().positive(),
     scheduleIntervalMs: z.number().int().positive(),
     scheduleWindowStart: z.number().int().nonnegative(),
+    scopeKey: z.string().min(1),
   })
+  .strict()
   .refine(
     (identity) => Number.isSafeInteger(identity.scheduleWindowStart + identity.scheduleIntervalMs),
     {

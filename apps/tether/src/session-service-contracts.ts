@@ -28,7 +28,6 @@ import type {
   ClientSessionBindingRecord,
   ControlChannel,
   ControlLeaseSnapshot,
-  MailboxScope,
   ParticipantRecord,
   ParticipantRuntimeKind,
   ParticipantRuntimeSnapshot,
@@ -48,7 +47,7 @@ import type {
   TaskSnapshot,
 } from "./types.js";
 
-export type { MailboxScope, ScheduledMaintenanceIdentity, ScheduleWindow };
+export type { ScheduledMaintenanceIdentity, ScheduleWindow };
 
 export const restControlLeaseTtlMs = 60_000;
 export const taskClaimLeaseTtlMs = 30_000;
@@ -716,7 +715,7 @@ export interface CreateTaskInput {
   readonly input: Record<string, unknown> | null;
   readonly kind: string;
   readonly objective: string;
-  /** Deterministic schedule and Mailbox Scope identity for scheduled runs. */
+  /** Deterministic provider-neutral identity for scheduled runs. */
   readonly schedule?: ScheduledTaskIdentityInput | undefined;
   readonly sessionId: string;
   readonly taskId: string | undefined;

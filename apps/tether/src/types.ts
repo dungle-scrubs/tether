@@ -17,7 +17,6 @@ export type {
   ControlChannel,
   ControlLeaseSnapshot,
   ControlLeaseStatus,
-  MailboxScope,
   ParticipantRecord,
   ParticipantRuntimeKind,
   ParticipantRuntimeSnapshot,

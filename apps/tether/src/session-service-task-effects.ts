@@ -377,12 +377,12 @@ export function createSessionTaskEffects(input: SessionTaskEffectsInput): Sessio
                 : {}),
               eventSourceId: input.eventSourceId,
               kind: identity.kind,
-              mailboxAccountId: identity.mailboxScope.accountId,
-              mailboxProvider: identity.mailboxScope.provider,
               participantId: request.participantId ?? scheduledSupersessionActorId,
               ...(request.reason === undefined ? {} : { reason: request.reason }),
               scheduleAlgorithmVersion: identity.scheduleWindow.algorithmVersion,
+              scheduleIdentityVersion: identity.identityVersion,
               scheduleIntervalMs: identity.scheduleWindow.intervalMs,
+              scheduleScopeKey: identity.scopeKey,
               scheduleWindowStart: identity.scheduleWindow.startMs,
               sessionId: identity.sessionId,
             }),
@@ -433,13 +433,13 @@ function ensureScheduledRunStoreEffect(
         ...(request.expectedTaskId !== undefined ? { expectedTaskId: request.expectedTaskId } : {}),
         input: request.input ?? null,
         kind: identity.kind,
-        mailboxAccountId: identity.mailboxScope.accountId,
-        mailboxProvider: identity.mailboxScope.provider,
         objective: request.objective,
         participantId: request.participantId ?? scheduledSupersessionActorId,
         ...(request.reason === undefined ? {} : { reason: request.reason }),
         scheduleAlgorithmVersion: identity.scheduleWindow.algorithmVersion,
+        scheduleIdentityVersion: identity.identityVersion,
         scheduleIntervalMs: identity.scheduleWindow.intervalMs,
+        scheduleScopeKey: identity.scopeKey,
         scheduleWindowStart: identity.scheduleWindow.startMs,
         sessionId: identity.sessionId,
       }),
@@ -463,17 +463,15 @@ function createScheduledTaskEffect(
 ): Effect.Effect<TaskCreatedResult, SessionServiceFailure> {
   return Effect.gen(function* () {
     const identity: ScheduledMaintenanceIdentity = {
+      identityVersion: schedule.scheduleIdentityVersion,
       kind: taskInput.kind,
-      mailboxScope: {
-        accountId: schedule.mailboxAccountId,
-        provider: schedule.mailboxProvider,
-      },
       scheduleWindow: {
         algorithmVersion: schedule.scheduleAlgorithmVersion,
         endMs: schedule.scheduleWindowStart + schedule.scheduleIntervalMs,
         intervalMs: schedule.scheduleIntervalMs,
         startMs: schedule.scheduleWindowStart,
       },
+      scopeKey: schedule.scheduleScopeKey,
       sessionId: taskInput.sessionId,
     };
     const derivedTaskId = deriveScheduledTaskId(identity);

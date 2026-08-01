@@ -48,9 +48,9 @@ export interface TaskRecord {
   /** Structured result payload, when the task completed with details. */
   readonly result: Record<string, unknown> | null;
   /**
-   * Deterministic schedule and Mailbox Scope identity for scheduled maintenance
+   * Deterministic schedule and opaque scope identity for recurring work
    * runs; null for manual tasks. Present only when the durable row carries a
-   * complete Schedule Window and Mailbox Scope.
+   * complete Schedule Window and scope key.
    */
   readonly schedule?: CandidateScheduleIdentity | null | undefined;
   /** Durable Tether session that owns the task. */

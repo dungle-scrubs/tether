@@ -396,18 +396,19 @@ export const tasks = pgTable(
     failure: jsonb("failure").$type<Record<string, unknown>>(),
     input: jsonb("input").$type<Record<string, unknown>>(),
     kind: text("kind").notNull(),
-    // Immutable opaque configured-account identity for scheduled tasks; null for
-    // manual tasks. Paired with mailboxProvider to form the Mailbox Scope.
+    // Legacy scheduled-work identity retained only for migration and rollback.
     mailboxAccountId: text("mailbox_account_id"),
     mailboxProvider: text("mailbox_provider"),
     objective: text("objective").notNull(),
     releasedAt: timestamp("released_at", { withTimezone: true }),
     releasedBy: text("released_by"),
     result: jsonb("result").$type<Record<string, unknown>>(),
-    // Schedule Window identity for scheduled maintenance runs; null for manual
-    // tasks. Interval and algorithm version are part of the schedule identity.
+    // Versioned provider-neutral recurring-work identity. Version 1 denotes a
+    // row backfilled from legacy columns; version 2 is the opaque-scope contract.
+    scheduleIdentityVersion: integer("schedule_identity_version"),
     scheduleAlgorithmVersion: integer("schedule_algorithm_version"),
     scheduleIntervalMs: bigint("schedule_interval_ms", { mode: "number" }),
+    scheduleScopeKey: text("schedule_scope_key"),
     scheduleWindowStart: bigint("schedule_window_start", { mode: "number" }),
     sessionId: text("session_id")
       .notNull()
@@ -418,7 +419,7 @@ export const tasks = pgTable(
     primaryKey({ columns: [table.sessionId, table.taskId] }),
     index("tasks_claim_expiry_idx").on(table.claimExpiresAt),
     // Unique so duplicate deterministic scheduled runs are impossible at the
-    // database level: one row per (session, kind, Mailbox Scope, algorithm
+    // database level: one row per (session, kind, identity version, scope key, algorithm
     // version, interval, window start). Manual tasks leave the schedule columns
     // null and never collide because NULLs are distinct in a Postgres unique
     // index. The deterministic scheduled task id derives from exactly these
@@ -426,8 +427,8 @@ export const tasks = pgTable(
     uniqueIndex("tasks_schedule_identity_idx").on(
       table.sessionId,
       table.kind,
-      table.mailboxProvider,
-      table.mailboxAccountId,
+      table.scheduleIdentityVersion,
+      table.scheduleScopeKey,
       table.scheduleAlgorithmVersion,
       table.scheduleIntervalMs,
       table.scheduleWindowStart,

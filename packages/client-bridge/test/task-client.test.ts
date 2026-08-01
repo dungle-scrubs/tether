@@ -5,6 +5,7 @@ import {
   ClientBridgeRequestError,
   ClientBridgeTaskClient,
   computeScheduleWindow,
+  currentScheduledTaskIdentityVersion,
   deriveScheduledTaskId,
 } from "../src/index.js";
 
@@ -56,11 +57,12 @@ describe("ClientBridgeTaskClient", () => {
   it("ensures a deterministic scheduled run through the create idempotency seam", async () => {
     const requests: CapturedRequest[] = [];
     const scheduleWindow = computeScheduleWindow(1_700_000_123_456, 3_600_000);
-    const mailboxScope = { accountId: "acct_opaque_1", provider: "fastmail" };
+    const scopeKey = "scope_01JEMAIL";
     const expectedTaskId = deriveScheduledTaskId({
+      identityVersion: currentScheduledTaskIdentityVersion,
       kind: "email_organization",
-      mailboxScope,
       scheduleWindow,
+      scopeKey,
       sessionId: "sess_1",
     });
     const fetch = createJsonFetch(requests, [
@@ -68,7 +70,11 @@ describe("ClientBridgeTaskClient", () => {
         body: {
           task: createTaskFixture({
             objective: "organize mailbox",
-            schedule: { mailboxScope, scheduleWindow },
+            schedule: {
+              identityVersion: currentScheduledTaskIdentityVersion,
+              scheduleWindow,
+              scopeKey,
+            },
             sessionId: "sess_1",
             taskId: expectedTaskId,
           }),
@@ -81,12 +87,16 @@ describe("ClientBridgeTaskClient", () => {
     await expect(
       client.createScheduledTask("sess_1", {
         kind: "email_organization",
-        mailboxScope,
         objective: "organize mailbox",
         scheduleWindow,
+        scopeKey,
       }),
     ).resolves.toMatchObject({
-      schedule: { mailboxScope, scheduleWindow },
+      schedule: {
+        identityVersion: currentScheduledTaskIdentityVersion,
+        scheduleWindow,
+        scopeKey,
+      },
       taskId: expectedTaskId,
     });
 
@@ -96,11 +106,10 @@ describe("ClientBridgeTaskClient", () => {
           kind: "email_organization",
           objective: "organize mailbox",
           schedule: {
-            mailboxAccountId: "acct_opaque_1",
-            mailboxProvider: "fastmail",
             scheduleAlgorithmVersion: scheduleWindow.algorithmVersion,
             scheduleIntervalMs: scheduleWindow.intervalMs,
             scheduleWindowStart: scheduleWindow.startMs,
+            scopeKey,
           },
           taskId: expectedTaskId,
         },
@@ -698,13 +707,14 @@ describe("ClientBridgeTaskClient", () => {
 
   it("maps malformed scheduled responses without exposing the raw payload", async () => {
     const scheduleWindow = computeScheduleWindow(1_700_000_123_456, 3_600_000);
-    const mailboxScope = {
-      accountId: "raw_payload_marker",
-      provider: "fastmail",
-    };
+    const scopeKey = "raw_payload_marker";
     const task = createTaskFixture({
       objective: "organize mailbox",
-      schedule: { mailboxScope, scheduleWindow },
+      schedule: {
+        identityVersion: currentScheduledTaskIdentityVersion,
+        scheduleWindow,
+        scopeKey,
+      },
       sessionId: "sess_1",
       taskId: "task_sched_invalid",
     });
@@ -718,11 +728,11 @@ describe("ClientBridgeTaskClient", () => {
               task: {
                 ...task,
                 schedule: {
-                  mailboxScope,
                   scheduleWindow: {
                     ...scheduleWindow,
                     endMs: scheduleWindow.endMs + 1,
                   },
+                  scopeKey,
                 },
               },
             }),
@@ -735,9 +745,9 @@ describe("ClientBridgeTaskClient", () => {
     try {
       await client.createScheduledTask("sess_1", {
         kind: "email_organization",
-        mailboxScope,
         objective: "organize mailbox",
         scheduleWindow,
+        scopeKey,
       });
     } catch (error) {
       caught = error;

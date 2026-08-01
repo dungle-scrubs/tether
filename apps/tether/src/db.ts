@@ -290,15 +290,15 @@ interface ExpiredTaskClaimRow {
   readonly failure: Record<string, unknown> | null;
   readonly input: Record<string, unknown> | null;
   readonly kind: string;
-  readonly mailboxAccountId: string | null;
-  readonly mailboxProvider: string | null;
   readonly objective: string;
   readonly previousClaimedBy: string;
   readonly releasedAt: Date | null;
   readonly releasedBy: string | null;
   readonly result: Record<string, unknown> | null;
   readonly scheduleAlgorithmVersion: number | string | null;
+  readonly scheduleIdentityVersion: number | string | null;
   readonly scheduleIntervalMs: number | string | null;
+  readonly scheduleScopeKey: string | null;
   readonly scheduleWindowStart: number | string | null;
   readonly sessionId: string;
   readonly taskId: string;
@@ -318,15 +318,15 @@ interface PgTaskRow {
   readonly failure: Record<string, unknown> | null;
   readonly input: Record<string, unknown> | null;
   readonly kind: string;
-  readonly mailboxAccountId: string | null;
-  readonly mailboxProvider: string | null;
   readonly objective: string;
   readonly releasedAt: Date | null;
   readonly releasedBy: string | null;
   readonly result: Record<string, unknown> | null;
   // bigint/integer columns arrive as numeric strings over the raw pg driver.
   readonly scheduleAlgorithmVersion: number | string | null;
+  readonly scheduleIdentityVersion: number | string | null;
   readonly scheduleIntervalMs: number | string | null;
+  readonly scheduleScopeKey: string | null;
   readonly scheduleWindowStart: number | string | null;
   readonly sessionId: string;
   readonly taskId: string;
@@ -334,19 +334,19 @@ interface PgTaskRow {
 
 /** Structural read of the durable schedule-identity task columns. */
 interface ScheduleIdentityColumns {
-  readonly mailboxAccountId?: string | null;
-  readonly mailboxProvider?: string | null;
   readonly scheduleAlgorithmVersion?: number | string | null;
+  readonly scheduleIdentityVersion?: number | string | null;
   readonly scheduleIntervalMs?: number | string | null;
+  readonly scheduleScopeKey?: string | null;
   readonly scheduleWindowStart?: number | string | null;
 }
 
-/** Caller-supplied schedule and Mailbox Scope identity for a scheduled task. */
+/** Caller-supplied provider-neutral identity for a scheduled task. */
 export interface ScheduledTaskIdentityInput {
-  readonly mailboxAccountId: string;
-  readonly mailboxProvider: string;
   readonly scheduleAlgorithmVersion: number;
+  readonly scheduleIdentityVersion: number;
   readonly scheduleIntervalMs: number;
+  readonly scheduleScopeKey: string;
   readonly scheduleWindowStart: number;
 }
 
@@ -716,14 +716,14 @@ const taskReturningColumns = `
   failure,
   input,
   kind,
-  mailbox_account_id AS "mailboxAccountId",
-  mailbox_provider AS "mailboxProvider",
   objective,
   released_at AS "releasedAt",
   released_by AS "releasedBy",
   result,
   schedule_algorithm_version AS "scheduleAlgorithmVersion",
+  schedule_identity_version AS "scheduleIdentityVersion",
   schedule_interval_ms AS "scheduleIntervalMs",
+  schedule_scope_key AS "scheduleScopeKey",
   schedule_window_start AS "scheduleWindowStart",
   session_id AS "sessionId",
   task_id AS "taskId"
@@ -1935,15 +1935,15 @@ export async function expireTaskClaims(
           tasks.failure,
           tasks.input,
           tasks.kind,
-          tasks.mailbox_account_id AS "mailboxAccountId",
-          tasks.mailbox_provider AS "mailboxProvider",
           tasks.objective,
           expired.previous_claimed_by AS "previousClaimedBy",
           tasks.released_at AS "releasedAt",
           tasks.released_by AS "releasedBy",
           tasks.result,
           tasks.schedule_algorithm_version AS "scheduleAlgorithmVersion",
+          tasks.schedule_identity_version AS "scheduleIdentityVersion",
           tasks.schedule_interval_ms AS "scheduleIntervalMs",
+          tasks.schedule_scope_key AS "scheduleScopeKey",
           tasks.schedule_window_start AS "scheduleWindowStart",
           tasks.session_id AS "sessionId",
           tasks.task_id AS "taskId"
@@ -3112,13 +3112,13 @@ export interface SupersedeScheduledRunsInput {
   readonly candidateTaskIds?: readonly string[] | undefined;
   readonly eventSourceId: string;
   readonly kind: string;
-  readonly mailboxAccountId: string;
-  readonly mailboxProvider: string;
   /** Actor recorded on each supersession cancellation event. */
   readonly participantId: string;
   readonly reason?: Record<string, unknown> | undefined;
   readonly scheduleAlgorithmVersion: number;
+  readonly scheduleIdentityVersion: number;
   readonly scheduleIntervalMs: number;
+  readonly scheduleScopeKey: string;
   /** Start of the current window; only strictly older runs are superseded. */
   readonly scheduleWindowStart: number;
   readonly sessionId: string;
@@ -3136,8 +3136,8 @@ export interface SupersededScheduledRunsResult {
  * This is the single service-owned mutation the RFC's `pending(old) -> cancelled`
  * transition requires. A list-then-generic-cancel sequence is forbidden because
  * it races a worker claim: the predicate below is the atomic fence. It cancels
- * only rows that match the exact schedule identity (session, kind, Mailbox
- * Scope, algorithm version, interval), carry a strictly older Schedule Window,
+ * only rows that match the exact schedule identity (session, kind, identity
+ * version, opaque scope key, algorithm version, interval), carry a strictly older Schedule Window,
  * and are still unclaimed and nonterminal. A claim that lands before this
  * transaction sets `claimed_by`, so the row no longer matches and cannot be
  * cancelled; manual tasks (null schedule columns), terminal tasks, and tasks
@@ -3164,8 +3164,8 @@ export async function supersedeScheduledRunsWithEvent(
     const params: unknown[] = [
       input.sessionId,
       input.kind,
-      input.mailboxProvider,
-      input.mailboxAccountId,
+      input.scheduleIdentityVersion,
+      input.scheduleScopeKey,
       input.scheduleAlgorithmVersion,
       input.scheduleIntervalMs,
       input.scheduleWindowStart,
@@ -3181,8 +3181,8 @@ export async function supersedeScheduledRunsWithEvent(
           claim_expires_at = NULL
         WHERE session_id = $1
           AND kind = $2
-          AND mailbox_provider = $3
-          AND mailbox_account_id = $4
+          AND schedule_identity_version = $3
+          AND schedule_scope_key = $4
           AND schedule_algorithm_version = $5
           AND schedule_interval_ms = $6
           AND schedule_window_start IS NOT NULL
@@ -3276,14 +3276,14 @@ export interface EnsureScheduledRunInput {
   readonly expectedTaskId?: string | undefined;
   readonly input?: Record<string, unknown> | null;
   readonly kind: string;
-  readonly mailboxAccountId: string;
-  readonly mailboxProvider: string;
   readonly objective: string;
   /** Actor recorded on each supersession cancellation event. */
   readonly participantId: string;
   readonly reason?: Record<string, unknown> | undefined;
   readonly scheduleAlgorithmVersion: number;
+  readonly scheduleIdentityVersion: number;
   readonly scheduleIntervalMs: number;
+  readonly scheduleScopeKey: string;
   /** Start of the current window; only strictly older runs are superseded. */
   readonly scheduleWindowStart: number;
   readonly sessionId: string;
@@ -3316,19 +3316,19 @@ export interface EnsureScheduledRunResult {
  */
 function scheduleIdentityLockKey(input: {
   readonly kind: string;
-  readonly mailboxAccountId: string;
-  readonly mailboxProvider: string;
   readonly scheduleAlgorithmVersion: number;
+  readonly scheduleIdentityVersion: number;
   readonly scheduleIntervalMs: number;
+  readonly scheduleScopeKey: string;
   readonly sessionId: string;
 }): string {
   return JSON.stringify([
     "scheduled_run",
+    input.scheduleIdentityVersion,
     input.scheduleAlgorithmVersion,
     input.sessionId,
     input.kind,
-    input.mailboxProvider,
-    input.mailboxAccountId,
+    input.scheduleScopeKey,
     input.scheduleIntervalMs,
   ]);
 }
@@ -3343,10 +3343,10 @@ async function readNewerScheduledRunWithClient(
   client: TransactionClient,
   input: {
     readonly kind: string;
-    readonly mailboxAccountId: string;
-    readonly mailboxProvider: string;
     readonly scheduleAlgorithmVersion: number;
+    readonly scheduleIdentityVersion: number;
     readonly scheduleIntervalMs: number;
+    readonly scheduleScopeKey: string;
     readonly scheduleWindowStart: number;
     readonly sessionId: string;
   },
@@ -3357,8 +3357,8 @@ async function readNewerScheduledRunWithClient(
       FROM tasks
       WHERE session_id = $1
         AND kind = $2
-        AND mailbox_provider = $3
-        AND mailbox_account_id = $4
+        AND schedule_identity_version = $3
+        AND schedule_scope_key = $4
         AND schedule_algorithm_version = $5
         AND schedule_interval_ms = $6
         AND schedule_window_start IS NOT NULL
@@ -3370,8 +3370,8 @@ async function readNewerScheduledRunWithClient(
     [
       input.sessionId,
       input.kind,
-      input.mailboxProvider,
-      input.mailboxAccountId,
+      input.scheduleIdentityVersion,
+      input.scheduleScopeKey,
       input.scheduleAlgorithmVersion,
       input.scheduleIntervalMs,
       input.scheduleWindowStart,
@@ -3405,17 +3405,15 @@ export async function ensureScheduledRunWithEvents(
   input: EnsureScheduledRunInput,
 ): Promise<EnsureScheduledRunResult> {
   const identity: ScheduledMaintenanceIdentity = {
+    identityVersion: input.scheduleIdentityVersion,
     kind: input.kind,
-    mailboxScope: {
-      accountId: input.mailboxAccountId,
-      provider: input.mailboxProvider,
-    },
     scheduleWindow: {
       algorithmVersion: input.scheduleAlgorithmVersion,
       endMs: input.scheduleWindowStart + input.scheduleIntervalMs,
       intervalMs: input.scheduleIntervalMs,
       startMs: input.scheduleWindowStart,
     },
+    scopeKey: input.scheduleScopeKey,
     sessionId: input.sessionId,
   };
   const taskId = deriveScheduledTaskId(identity);
@@ -3448,8 +3446,8 @@ export async function ensureScheduledRunWithEvents(
           claim_expires_at = NULL
         WHERE session_id = $1
           AND kind = $2
-          AND mailbox_provider = $3
-          AND mailbox_account_id = $4
+          AND schedule_identity_version = $3
+          AND schedule_scope_key = $4
           AND schedule_algorithm_version = $5
           AND schedule_interval_ms = $6
           AND schedule_window_start IS NOT NULL
@@ -3463,8 +3461,8 @@ export async function ensureScheduledRunWithEvents(
       [
         input.sessionId,
         input.kind,
-        input.mailboxProvider,
-        input.mailboxAccountId,
+        input.scheduleIdentityVersion,
+        input.scheduleScopeKey,
         input.scheduleAlgorithmVersion,
         input.scheduleIntervalMs,
         input.scheduleWindowStart,
@@ -3503,10 +3501,10 @@ export async function ensureScheduledRunWithEvents(
       const conflictingFields = [
         ...(existing.kind === input.kind ? [] : ["kind"]),
         ...compareScheduleIdentity(existing.schedule ?? null, {
-          mailboxAccountId: input.mailboxAccountId,
-          mailboxProvider: input.mailboxProvider,
           scheduleAlgorithmVersion: input.scheduleAlgorithmVersion,
+          scheduleIdentityVersion: input.scheduleIdentityVersion,
           scheduleIntervalMs: input.scheduleIntervalMs,
+          scheduleScopeKey: input.scheduleScopeKey,
           scheduleWindowStart: input.scheduleWindowStart,
         }),
       ];
@@ -3533,10 +3531,10 @@ export async function ensureScheduledRunWithEvents(
           kind: input.kind,
           objective: input.objective,
           schedule: {
-            mailboxAccountId: input.mailboxAccountId,
-            mailboxProvider: input.mailboxProvider,
             scheduleAlgorithmVersion: input.scheduleAlgorithmVersion,
+            scheduleIdentityVersion: input.scheduleIdentityVersion,
             scheduleIntervalMs: input.scheduleIntervalMs,
+            scheduleScopeKey: input.scheduleScopeKey,
             scheduleWindowStart: input.scheduleWindowStart,
           },
           sessionId: input.sessionId,
@@ -3836,11 +3834,11 @@ async function insertTaskWithClient(
       INSERT INTO tasks (
         input,
         kind,
-        mailbox_account_id,
-        mailbox_provider,
         objective,
         schedule_algorithm_version,
+        schedule_identity_version,
         schedule_interval_ms,
+        schedule_scope_key,
         schedule_window_start,
         session_id,
         task_id
@@ -3851,11 +3849,11 @@ async function insertTaskWithClient(
     [
       input.input === undefined || input.input === null ? null : JSON.stringify(input.input),
       input.kind,
-      schedule?.mailboxAccountId ?? null,
-      schedule?.mailboxProvider ?? null,
       input.objective,
       schedule?.scheduleAlgorithmVersion ?? null,
+      schedule?.scheduleIdentityVersion ?? null,
       schedule?.scheduleIntervalMs ?? null,
+      schedule?.scheduleScopeKey ?? null,
       schedule?.scheduleWindowStart ?? null,
       input.sessionId,
       input.taskId,
@@ -3944,7 +3942,7 @@ function compareTaskCreateInput(
   return conflicts;
 }
 
-/** Compares the immutable schedule and Mailbox Scope identity of a replayed create. */
+/** Compares the immutable recurring-work identity of a replayed create. */
 function compareScheduleIdentity(
   existing: CandidateScheduleIdentity | null,
   input: ScheduledTaskIdentityInput | undefined,
@@ -3957,11 +3955,11 @@ function compareScheduleIdentity(
   if (existing === null || input === undefined) {
     return conflicts;
   }
-  if (existing.mailboxScope.provider !== input.mailboxProvider) {
-    conflicts.push("mailboxProvider");
+  if (existing.identityVersion !== input.scheduleIdentityVersion) {
+    conflicts.push("scheduleIdentityVersion");
   }
-  if (existing.mailboxScope.accountId !== input.mailboxAccountId) {
-    conflicts.push("mailboxAccountId");
+  if (existing.scopeKey !== input.scheduleScopeKey) {
+    conflicts.push("scheduleScopeKey");
   }
   if (existing.scheduleWindow.algorithmVersion !== input.scheduleAlgorithmVersion) {
     conflicts.push("scheduleAlgorithmVersion");
@@ -4414,19 +4412,19 @@ function toTaskRecord(row: DbTaskRow | ExpiredTaskClaimRow | PgTaskRow | undefin
 }
 
 /**
- * Builds the schedule and Mailbox Scope identity from durable task columns.
+ * Builds the provider-neutral schedule identity from durable task columns.
  * Returns null unless every schedule-identity column is present, so a manual
  * task or a partially populated legacy row is treated as unscheduled.
  */
 function toTaskScheduleIdentity(row: ScheduleIdentityColumns): CandidateScheduleIdentity | null {
-  const provider = row.mailboxProvider ?? null;
-  const accountId = row.mailboxAccountId ?? null;
+  const identityVersion = coerceNullableInteger(row.scheduleIdentityVersion);
+  const scopeKey = row.scheduleScopeKey ?? null;
   const startMs = coerceNullableInteger(row.scheduleWindowStart);
   const intervalMs = coerceNullableInteger(row.scheduleIntervalMs);
   const algorithmVersion = coerceNullableInteger(row.scheduleAlgorithmVersion);
   if (
-    provider === null ||
-    accountId === null ||
+    identityVersion === null ||
+    scopeKey === null ||
     startMs === null ||
     intervalMs === null ||
     algorithmVersion === null
@@ -4434,13 +4432,14 @@ function toTaskScheduleIdentity(row: ScheduleIdentityColumns): CandidateSchedule
     return null;
   }
   return {
-    mailboxScope: { accountId, provider },
+    identityVersion,
     scheduleWindow: {
       algorithmVersion,
       endMs: startMs + intervalMs,
       intervalMs,
       startMs,
     },
+    scopeKey,
   };
 }
 

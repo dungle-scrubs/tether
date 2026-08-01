@@ -47,6 +47,7 @@ export {
   controlAcquisitionIdSchema,
   createSessionSchema,
   createTaskSchema,
+  currentScheduledTaskIdentityVersion,
   deriveScheduledTaskId,
   eventListPaginationSchema,
   eventListResponseSchema,

@@ -46,9 +46,10 @@ const mailboxScope = { accountId: "acct_opaque_1", provider: "fastmail" };
 const currentWindow = computeScheduleWindow(1_700_003_600_000, 3_600_000);
 const olderWindow = computeScheduleWindow(1_700_000_000_000, 3_600_000);
 const identity: ScheduledMaintenanceIdentity = {
+  identityVersion: 2,
   kind: "email_organization",
-  mailboxScope,
   scheduleWindow: currentWindow,
+  scopeKey: mailboxScope.accountId,
   sessionId: "sess_mailbox_1",
 };
 
@@ -58,11 +59,11 @@ describe("supersedeScheduledRunsWithEvent atomic predicate", () => {
     const result = await supersedeScheduledRunsWithEvent(recordingDatabase(client), {
       eventSourceId: "src_supersede_test",
       kind: identity.kind,
-      mailboxAccountId: mailboxScope.accountId,
-      mailboxProvider: mailboxScope.provider,
       participantId: "operator_1",
       scheduleAlgorithmVersion: currentWindow.algorithmVersion,
+      scheduleIdentityVersion: identity.identityVersion,
       scheduleIntervalMs: currentWindow.intervalMs,
+      scheduleScopeKey: identity.scopeKey,
       scheduleWindowStart: currentWindow.startMs,
       sessionId: identity.sessionId,
     });
@@ -82,15 +83,15 @@ describe("supersedeScheduledRunsWithEvent atomic predicate", () => {
     expect(sql).toContain("failed_at IS NULL");
     expect(sql).toContain("cancelled_at IS NULL");
     expect(sql).toContain("schedule_window_start < $7");
-    expect(sql).toContain("mailbox_provider = $3");
-    expect(sql).toContain("mailbox_account_id = $4");
+    expect(sql).toContain("schedule_identity_version = $3");
+    expect(sql).toContain("schedule_scope_key = $4");
     expect(sql).toContain("schedule_algorithm_version = $5");
     expect(sql).toContain("schedule_interval_ms = $6");
     expect(update?.params).toEqual([
       identity.sessionId,
       identity.kind,
-      mailboxScope.provider,
-      mailboxScope.accountId,
+      identity.identityVersion,
+      identity.scopeKey,
       currentWindow.algorithmVersion,
       currentWindow.intervalMs,
       currentWindow.startMs,
@@ -111,11 +112,11 @@ describe("supersedeScheduledRunsWithEvent atomic predicate", () => {
       candidateTaskIds: reviewedIds,
       eventSourceId: "src_supersede_test",
       kind: identity.kind,
-      mailboxAccountId: mailboxScope.accountId,
-      mailboxProvider: mailboxScope.provider,
       participantId: "operator_1",
       scheduleAlgorithmVersion: currentWindow.algorithmVersion,
+      scheduleIdentityVersion: identity.identityVersion,
       scheduleIntervalMs: currentWindow.intervalMs,
+      scheduleScopeKey: identity.scopeKey,
       scheduleWindowStart: currentWindow.startMs,
       sessionId: identity.sessionId,
     });
@@ -137,11 +138,11 @@ describe("supersedeScheduledRunsWithEvent atomic predicate", () => {
       candidateTaskIds: [],
       eventSourceId: "src_supersede_test",
       kind: identity.kind,
-      mailboxAccountId: mailboxScope.accountId,
-      mailboxProvider: mailboxScope.provider,
       participantId: "operator_1",
       scheduleAlgorithmVersion: currentWindow.algorithmVersion,
+      scheduleIdentityVersion: identity.identityVersion,
       scheduleIntervalMs: currentWindow.intervalMs,
+      scheduleScopeKey: identity.scopeKey,
       scheduleWindowStart: currentWindow.startMs,
       sessionId: identity.sessionId,
     });
@@ -170,7 +171,11 @@ describe("supersedeScheduledRunsWithEvent atomic predicate", () => {
 
 describe("scheduled supersession service effect", () => {
   const olderPendingTask = createScheduledTask({
-    schedule: { mailboxScope, scheduleWindow: olderWindow },
+    schedule: {
+      identityVersion: identity.identityVersion,
+      scheduleWindow: olderWindow,
+      scopeKey: identity.scopeKey,
+    },
     taskId: "task_older_pending",
   });
 
@@ -244,7 +249,11 @@ describe("scheduled supersession service effect", () => {
     // superseded set; classifying it yields a typed `claimed` refusal.
     const claimedTask = createScheduledTask({
       claimedBy: "part_worker",
-      schedule: { mailboxScope, scheduleWindow: olderWindow },
+      schedule: {
+        identityVersion: identity.identityVersion,
+        scheduleWindow: olderWindow,
+        scopeKey: identity.scopeKey,
+      },
       taskId: "task_raced_claim",
     });
     const effects = createEffects({
@@ -271,13 +280,18 @@ describe("scheduled supersession service effect", () => {
     });
     const terminalTask = createScheduledTask({
       completedAt: "2026-07-12T00:00:00.000Z",
-      schedule: { mailboxScope, scheduleWindow: olderWindow },
+      schedule: {
+        identityVersion: identity.identityVersion,
+        scheduleWindow: olderWindow,
+        scopeKey: identity.scopeKey,
+      },
       taskId: "task_terminal",
     });
     const mismatchedTask = createScheduledTask({
       schedule: {
-        mailboxScope: { accountId: "acct_other", provider: "fastmail" },
+        identityVersion: identity.identityVersion,
         scheduleWindow: olderWindow,
+        scopeKey: "acct_other",
       },
       taskId: "task_mismatch",
     });
@@ -312,7 +326,11 @@ describe("scheduled supersession service effect", () => {
     // produces no refusal.
     const expiredThenPending = createScheduledTask({
       claimExpiredBy: "part_worker",
-      schedule: { mailboxScope, scheduleWindow: olderWindow },
+      schedule: {
+        identityVersion: identity.identityVersion,
+        scheduleWindow: olderWindow,
+        scopeKey: identity.scopeKey,
+      },
       taskId: "task_expired_pending",
     });
     const effects = createEffects({
@@ -343,10 +361,10 @@ describe("scheduled supersession service effect", () => {
           kind: identity.kind,
           objective: "Organize the mailbox",
           schedule: {
-            mailboxAccountId: mailboxScope.accountId,
-            mailboxProvider: mailboxScope.provider,
             scheduleAlgorithmVersion: currentWindow.algorithmVersion,
+            scheduleIdentityVersion: identity.identityVersion,
             scheduleIntervalMs: currentWindow.intervalMs,
+            scheduleScopeKey: identity.scopeKey,
             scheduleWindowStart: currentWindow.startMs,
           },
           sessionId: identity.sessionId,
@@ -367,7 +385,11 @@ describe("scheduled supersession service effect", () => {
   it("creates a scheduled task through the deterministic ensure path and replays an existing one", async () => {
     const deterministicTaskId = deriveScheduledTaskId(identity);
     const createdTask = createScheduledTask({
-      schedule: { mailboxScope, scheduleWindow: currentWindow },
+      schedule: {
+        identityVersion: identity.identityVersion,
+        scheduleWindow: currentWindow,
+        scopeKey: identity.scopeKey,
+      },
       taskId: deterministicTaskId,
     });
     const createdEvent = createCancelEvent();
@@ -405,10 +427,10 @@ describe("scheduled supersession service effect", () => {
         kind: identity.kind,
         objective: "Organize the mailbox",
         schedule: {
-          mailboxAccountId: mailboxScope.accountId,
-          mailboxProvider: mailboxScope.provider,
           scheduleAlgorithmVersion: currentWindow.algorithmVersion,
+          scheduleIdentityVersion: identity.identityVersion,
           scheduleIntervalMs: currentWindow.intervalMs,
+          scheduleScopeKey: identity.scopeKey,
           scheduleWindowStart: currentWindow.startMs,
         },
         sessionId: identity.sessionId,
@@ -424,10 +446,10 @@ describe("scheduled supersession service effect", () => {
         kind: identity.kind,
         objective: "Organize the mailbox",
         schedule: {
-          mailboxAccountId: mailboxScope.accountId,
-          mailboxProvider: mailboxScope.provider,
           scheduleAlgorithmVersion: currentWindow.algorithmVersion,
+          scheduleIdentityVersion: identity.identityVersion,
           scheduleIntervalMs: currentWindow.intervalMs,
+          scheduleScopeKey: identity.scopeKey,
           scheduleWindowStart: currentWindow.startMs,
         },
         sessionId: identity.sessionId,
@@ -439,8 +461,8 @@ describe("scheduled supersession service effect", () => {
     expect(captured).toHaveLength(2);
     expect(captured[0]).toMatchObject({
       expectedTaskId: deterministicTaskId,
-      mailboxAccountId: mailboxScope.accountId,
-      mailboxProvider: mailboxScope.provider,
+      scheduleIdentityVersion: identity.identityVersion,
+      scheduleScopeKey: identity.scopeKey,
       scheduleWindowStart: currentWindow.startMs,
     });
   });
@@ -452,7 +474,11 @@ describe("scheduled supersession service effect", () => {
     // unfenced create seam.
     const deterministicTaskId = deriveScheduledTaskId(identity);
     const createdTask = createScheduledTask({
-      schedule: { mailboxScope, scheduleWindow: currentWindow },
+      schedule: {
+        identityVersion: identity.identityVersion,
+        scheduleWindow: currentWindow,
+        scopeKey: identity.scopeKey,
+      },
       taskId: deterministicTaskId,
     });
     const olderCancelEvent = createCancelEvent();
@@ -489,10 +515,10 @@ describe("scheduled supersession service effect", () => {
         kind: identity.kind,
         objective: "Organize the mailbox",
         schedule: {
-          mailboxAccountId: mailboxScope.accountId,
-          mailboxProvider: mailboxScope.provider,
           scheduleAlgorithmVersion: currentWindow.algorithmVersion,
+          scheduleIdentityVersion: identity.identityVersion,
           scheduleIntervalMs: currentWindow.intervalMs,
+          scheduleScopeKey: identity.scopeKey,
           scheduleWindowStart: currentWindow.startMs,
         },
         sessionId: identity.sessionId,
@@ -638,7 +664,11 @@ function createScheduledTask(overrides: Partial<TaskRecord>): TaskRecord {
     releasedAt: null,
     releasedBy: null,
     result: null,
-    schedule: { mailboxScope, scheduleWindow: olderWindow },
+    schedule: {
+      identityVersion: identity.identityVersion,
+      scheduleWindow: olderWindow,
+      scopeKey: identity.scopeKey,
+    },
     sessionId: identity.sessionId,
     taskId: "task_scheduled",
     ...overrides,

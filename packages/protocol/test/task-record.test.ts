@@ -95,17 +95,17 @@ describe("taskRecordSchema", () => {
     expect(taskRecordSchema.parse(task)).toEqual(task);
   });
 
-  it("strips unknown Mailbox Scope properties", () => {
+  it("rejects legacy Mailbox Scope properties", () => {
     const schedule = createScheduleFixture();
-    const parsed = taskRecordSchema.parse({
-      ...createTaskFixture(),
-      schedule: {
-        ...schedule,
-        mailboxScope: { ...schedule.mailboxScope, ignored: true },
-      },
-    });
-
-    expect(parsed.schedule?.mailboxScope).toEqual(schedule.mailboxScope);
+    expect(
+      taskRecordSchema.safeParse({
+        ...createTaskFixture(),
+        schedule: {
+          ...schedule,
+          mailboxScope: { accountId: "acct_private", provider: "fastmail" },
+        },
+      }).success,
+    ).toBe(false);
   });
 
   it("strips unknown Schedule Window properties", () => {
@@ -121,43 +121,38 @@ describe("taskRecordSchema", () => {
     expect(parsed.schedule?.scheduleWindow).toEqual(schedule.scheduleWindow);
   });
 
-  it("rejects an empty Mailbox Scope account identifier", () => {
+  it("rejects an empty recurring-work scope key", () => {
     const schedule = createScheduleFixture();
 
     expect(
       candidateScheduleIdentitySchema.safeParse({
         ...schedule,
-        mailboxScope: { ...schedule.mailboxScope, accountId: "" },
+        scopeKey: "",
       }).success,
     ).toBe(false);
   });
 
-  it("rejects an empty Mailbox Scope provider", () => {
+  it("rejects a provider-specific field in a durable schedule", () => {
     const schedule = createScheduleFixture();
 
     expect(
       candidateScheduleIdentitySchema.safeParse({
         ...schedule,
-        mailboxScope: { ...schedule.mailboxScope, provider: "" },
+        provider: "fastmail",
       }).success,
     ).toBe(false);
   });
 
-  it("rejects a present schedule missing either Mailbox Scope field", () => {
+  it("rejects a present schedule missing its scope key", () => {
     const schedule = createScheduleFixture();
-    const incompleteMailboxScopes = [
-      { accountId: schedule.mailboxScope.accountId },
-      { provider: schedule.mailboxScope.provider },
-    ];
+    const { scopeKey: _scopeKey, ...scheduleWithoutScope } = schedule;
 
-    for (const mailboxScope of incompleteMailboxScopes) {
-      expect(() =>
-        taskRecordSchema.parse({
-          ...createTaskFixture(),
-          schedule: { ...schedule, mailboxScope },
-        }),
-      ).toThrowError(ZodError);
-    }
+    expect(() =>
+      taskRecordSchema.parse({
+        ...createTaskFixture(),
+        schedule: scheduleWithoutScope,
+      }),
+    ).toThrowError(ZodError);
   });
 
   it("rejects a present schedule missing any Schedule Window field", () => {
@@ -182,27 +177,25 @@ describe("taskRecordSchema", () => {
 
   it("keeps scheduled task creation flat and aligned with schedule leaf constraints", () => {
     const identity = {
-      mailboxAccountId: "acct_opaque_1",
-      mailboxProvider: "fastmail",
       scheduleAlgorithmVersion: 1,
       scheduleIntervalMs: 3_600_000,
       scheduleWindowStart: 1_699_999_200_000,
+      scopeKey: "scope_01JEMAIL",
     };
 
     expect(scheduledTaskIdentitySchema.parse(identity)).toEqual(identity);
-    expect(scheduledTaskIdentitySchema.parse({ ...identity, endMs: 1_700_002_800_000 })).toEqual(
-      identity,
-    );
+    expect(
+      scheduledTaskIdentitySchema.safeParse({ ...identity, endMs: 1_700_002_800_000 }).success,
+    ).toBe(false);
 
     const invalidIdentities = [
-      { ...identity, mailboxAccountId: "" },
-      { ...identity, mailboxProvider: "" },
       { ...identity, scheduleAlgorithmVersion: 0 },
       { ...identity, scheduleAlgorithmVersion: Number.MAX_SAFE_INTEGER + 1 },
       { ...identity, scheduleIntervalMs: 0 },
       { ...identity, scheduleIntervalMs: Number.MAX_SAFE_INTEGER + 1 },
       { ...identity, scheduleWindowStart: -1 },
       { ...identity, scheduleWindowStart: Number.MAX_SAFE_INTEGER + 1 },
+      { ...identity, scopeKey: "" },
     ];
 
     for (const invalidIdentity of invalidIdentities) {
@@ -213,11 +206,10 @@ describe("taskRecordSchema", () => {
   it("rejects a scheduled creation window whose start-plus-interval sum is unsafe", () => {
     expect(
       scheduledTaskIdentitySchema.safeParse({
-        mailboxAccountId: "acct_opaque_1",
-        mailboxProvider: "fastmail",
         scheduleAlgorithmVersion: 1,
         scheduleIntervalMs: 2,
         scheduleWindowStart: Number.MAX_SAFE_INTEGER - 1,
+        scopeKey: "scope_01JEMAIL",
       }).success,
     ).toBe(false);
   });
@@ -300,16 +292,14 @@ describe("task contract schemas", () => {
 /** Builds a complete durable schedule identity fixture. */
 function createScheduleFixture(): CandidateScheduleIdentity {
   return {
-    mailboxScope: {
-      accountId: "acct_opaque_1",
-      provider: "fastmail",
-    },
+    identityVersion: 2,
     scheduleWindow: {
       algorithmVersion: 1,
       endMs: 1_700_002_800_000,
       intervalMs: 3_600_000,
       startMs: 1_699_999_200_000,
     },
+    scopeKey: "scope_01JEMAIL",
   };
 }
 

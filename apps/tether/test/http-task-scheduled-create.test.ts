@@ -70,12 +70,13 @@ function jsonRequest(method: string, body: Record<string, unknown>): IncomingMes
   return request;
 }
 
-const mailboxScope = { accountId: "acct_1", provider: "fastmail" };
+const scopeKey = "scope_01JEMAIL";
 const window = computeScheduleWindow(1_700_003_600_000, 3_600_000);
 const derivedTaskId = deriveScheduledTaskId({
+  identityVersion: 2,
   kind: "email_organization",
-  mailboxScope,
   scheduleWindow: window,
+  scopeKey,
   sessionId: "sess_mailbox_1",
 });
 
@@ -135,11 +136,10 @@ describe("scheduled task REST create routing", () => {
         kind: "email_organization",
         objective: "Organize the mailbox",
         schedule: {
-          mailboxAccountId: mailboxScope.accountId,
-          mailboxProvider: mailboxScope.provider,
           scheduleAlgorithmVersion: 1,
           scheduleIntervalMs: 2,
           scheduleWindowStart: Number.MAX_SAFE_INTEGER - 1,
+          scopeKey,
         },
       },
       hub: new RecordingHub() as unknown as SubscriptionHub,
@@ -175,11 +175,10 @@ describe("scheduled task REST create routing", () => {
         kind: "email_organization",
         objective: "Organize the mailbox",
         schedule: {
-          mailboxAccountId: mailboxScope.accountId,
-          mailboxProvider: mailboxScope.provider,
           scheduleAlgorithmVersion: window.algorithmVersion,
           scheduleIntervalMs: window.intervalMs,
           scheduleWindowStart: window.startMs,
+          scopeKey,
         },
         taskId: derivedTaskId,
       },
@@ -196,8 +195,9 @@ describe("scheduled task REST create routing", () => {
       throw new Error("expected an ensureScheduledRun request");
     }
     expect(request.expectedTaskId).toBe(derivedTaskId);
+    expect(request.identity.identityVersion).toBe(2);
     expect(request.identity.scheduleWindow.startMs).toBe(window.startMs);
-    expect(request.identity.mailboxScope).toEqual(mailboxScope);
+    expect(request.identity.scopeKey).toBe(scopeKey);
     expect(response.statusCode).toBe(201);
     expect(response.body).toEqual({ status: "created", task: current });
   });
@@ -227,11 +227,10 @@ describe("scheduled task REST create routing", () => {
         kind: "email_organization",
         objective: "Organize the mailbox",
         schedule: {
-          mailboxAccountId: mailboxScope.accountId,
-          mailboxProvider: mailboxScope.provider,
           scheduleAlgorithmVersion: window.algorithmVersion,
           scheduleIntervalMs: window.intervalMs,
           scheduleWindowStart: window.startMs,
+          scopeKey,
         },
         taskId: "task_client_supplied_wrong",
       },

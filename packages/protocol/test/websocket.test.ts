@@ -46,13 +46,14 @@ describe("WebSocket task command results", () => {
 /** Builds a complete durable schedule identity fixture. */
 function createScheduleFixture(): CandidateScheduleIdentity {
   return {
-    mailboxScope: { accountId: "acct_opaque_1", provider: "fastmail" },
+    identityVersion: 2,
     scheduleWindow: {
       algorithmVersion: 1,
       endMs: 1_700_002_800_000,
       intervalMs: 3_600_000,
       startMs: 1_699_999_200_000,
     },
+    scopeKey: "scope_01JEMAIL",
   };
 }
 

@@ -2,7 +2,10 @@ import {
   RestParticipantControlClient,
   type RestParticipantControlContext,
 } from "@dungle-scrubs/tether-client";
-import { deriveScheduledTaskId } from "@dungle-scrubs/tether-protocol";
+import {
+  currentScheduledTaskIdentityVersion,
+  deriveScheduledTaskId,
+} from "@dungle-scrubs/tether-protocol";
 
 import { clientBridgeRoutes } from "./routes.js";
 import {
@@ -91,7 +94,7 @@ export class ClientBridgeTaskClient {
 
   /**
    * Ensures the one deterministic scheduled maintenance run for the current
-   * Schedule Window. The task id is derived from session, kind, Mailbox Scope,
+   * Schedule Window. The task id is derived from session, kind, scope key,
    * interval, algorithm version, and window start, so a repeated tick reuses the
    * existing task through Tether's create idempotency seam instead of a
    * read-then-create race. Missed windows are not backfilled; only the supplied
@@ -102,9 +105,10 @@ export class ClientBridgeTaskClient {
     input: ClientBridgeCreateScheduledTaskInput,
   ): Promise<ClientBridgeTaskRecord> {
     const taskId = deriveScheduledTaskId({
+      identityVersion: currentScheduledTaskIdentityVersion,
       kind: input.kind,
-      mailboxScope: input.mailboxScope,
       scheduleWindow: input.scheduleWindow,
+      scopeKey: input.scopeKey,
       sessionId,
     });
     const body = await this.requestTaskResponse({
@@ -113,11 +117,10 @@ export class ClientBridgeTaskClient {
         kind: input.kind,
         objective: input.objective,
         schedule: {
-          mailboxAccountId: input.mailboxScope.accountId,
-          mailboxProvider: input.mailboxScope.provider,
           scheduleAlgorithmVersion: input.scheduleWindow.algorithmVersion,
           scheduleIntervalMs: input.scheduleWindow.intervalMs,
           scheduleWindowStart: input.scheduleWindow.startMs,
+          scopeKey: input.scopeKey,
         },
         taskId,
       },
@@ -167,7 +170,7 @@ export class ClientBridgeTaskClient {
     return body.task;
   }
 
-  /** Records approval intent for one task without mutating task or mailbox state. */
+  /** Records approval intent for one task without mutating task-owned state. */
   async recordTaskApproval(
     sessionId: string,
     input: ClientBridgeRecordTaskApprovalInput,

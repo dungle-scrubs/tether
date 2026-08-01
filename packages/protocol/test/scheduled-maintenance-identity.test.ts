@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 
 import type {
-  MailboxScope,
   ScheduledMaintenanceIdentity,
   ScheduledSupersessionCandidate,
   ScheduleWindow,
@@ -9,6 +8,7 @@ import type {
 import {
   classifyScheduledSupersession,
   computeScheduleWindow,
+  currentScheduledTaskIdentityVersion,
   deriveScheduledTaskId,
   scheduledSupersessionResultSchema,
   scheduleWindowAlgorithmVersion,
@@ -16,7 +16,7 @@ import {
   scheduleWindowSchema,
 } from "../src/index.js";
 
-const mailboxScope: MailboxScope = { accountId: "acct_opaque_1", provider: "fastmail" };
+const scopeKey = "scope_01JEMAIL";
 
 describe("computeScheduleWindow", () => {
   it("buckets a timestamp into the half-open UTC interval", () => {
@@ -47,9 +47,10 @@ describe("computeScheduleWindow", () => {
 
 describe("deriveScheduledTaskId", () => {
   const identity: ScheduledMaintenanceIdentity = {
+    identityVersion: currentScheduledTaskIdentityVersion,
     kind: "email_organization",
-    mailboxScope,
     scheduleWindow: computeScheduleWindow(1_700_000_123_456, 3_600_000),
+    scopeKey,
     sessionId: "sess_mailbox_1",
   };
 
@@ -58,18 +59,12 @@ describe("deriveScheduledTaskId", () => {
     expect(deriveScheduledTaskId(identity)).toMatch(/^task_sched_[0-9a-f]+$/u);
   });
 
-  it("changes when the mailbox scope, kind, interval, or window changes", () => {
+  it("changes when the scope key, kind, interval, or window changes", () => {
     const base = deriveScheduledTaskId(identity);
     expect(
       deriveScheduledTaskId({
         ...identity,
-        mailboxScope: { accountId: "acct_opaque_2", provider: "fastmail" },
-      }),
-    ).not.toBe(base);
-    expect(
-      deriveScheduledTaskId({
-        ...identity,
-        mailboxScope: { accountId: "acct_opaque_1", provider: "gmail" },
+        scopeKey: "scope_01JOTHER",
       }),
     ).not.toBe(base);
     expect(deriveScheduledTaskId({ ...identity, kind: "email_triage" })).not.toBe(base);
@@ -94,6 +89,12 @@ describe("deriveScheduledTaskId", () => {
       scheduleWindow: { ...identity.scheduleWindow, algorithmVersion: 2 },
     };
     expect(deriveScheduledTaskId(nextAlgorithm)).not.toBe(base);
+  });
+
+  it("changes when the durable identity version changes", () => {
+    expect(deriveScheduledTaskId({ ...identity, identityVersion: 1 })).not.toBe(
+      deriveScheduledTaskId(identity),
+    );
   });
 });
 
@@ -204,9 +205,10 @@ describe("classifyScheduledSupersession", () => {
   const currentWindow = computeScheduleWindow(1_700_003_600_000, 3_600_000);
   const olderWindow = computeScheduleWindow(1_700_000_000_000, 3_600_000);
   const target: ScheduledMaintenanceIdentity = {
+    identityVersion: currentScheduledTaskIdentityVersion,
     kind: "email_organization",
-    mailboxScope,
     scheduleWindow: currentWindow,
+    scopeKey,
     sessionId: "sess_mailbox_1",
   };
 
@@ -216,7 +218,11 @@ describe("classifyScheduledSupersession", () => {
     completedAt: null,
     failedAt: null,
     kind: "email_organization",
-    schedule: { mailboxScope, scheduleWindow: olderWindow },
+    schedule: {
+      identityVersion: currentScheduledTaskIdentityVersion,
+      scheduleWindow: olderWindow,
+      scopeKey,
+    },
     sessionId: "sess_mailbox_1",
   };
 
@@ -259,8 +265,9 @@ describe("classifyScheduledSupersession", () => {
         {
           ...olderPendingCandidate,
           schedule: {
-            mailboxScope: { accountId: "acct_other", provider: "fastmail" },
+            identityVersion: currentScheduledTaskIdentityVersion,
             scheduleWindow: olderWindow,
+            scopeKey: "acct_other",
           },
         },
         target,
@@ -271,7 +278,14 @@ describe("classifyScheduledSupersession", () => {
   it("refuses the current or newer window run so it is never cancelled", () => {
     expect(
       classifyScheduledSupersession(
-        { ...olderPendingCandidate, schedule: { mailboxScope, scheduleWindow: currentWindow } },
+        {
+          ...olderPendingCandidate,
+          schedule: {
+            identityVersion: currentScheduledTaskIdentityVersion,
+            scheduleWindow: currentWindow,
+            scopeKey,
+          },
+        },
         target,
       ),
     ).toEqual({ decision: "refuse", reason: "current_window" });

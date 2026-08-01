@@ -28,6 +28,7 @@ import {
   claimTaskSchema,
   completeTaskSchema,
   createTaskSchema,
+  currentScheduledTaskIdentityVersion,
   failTaskSchema,
   recordTaskApprovalSchema,
   refreshTaskClaimSchema,
@@ -48,13 +49,12 @@ import {
 } from "./session-service-contracts.js";
 import type { TaskListStatus } from "./types.js";
 
-/** Deterministic schedule and Mailbox Scope identity carried on a scheduled create. */
+/** Deterministic provider-neutral identity carried on a scheduled create. */
 interface ScheduledTaskCreateSchedule {
-  readonly mailboxAccountId: string;
-  readonly mailboxProvider: string;
   readonly scheduleAlgorithmVersion: number;
   readonly scheduleIntervalMs: number;
   readonly scheduleWindowStart: number;
+  readonly scopeKey: string;
 }
 
 interface ScheduledTaskCreateInput {
@@ -299,17 +299,15 @@ export function handleTaskHttpRoute(
       const result = yield* service.supersedeScheduledRuns({
         ...(body.candidateTaskIds !== undefined ? { candidateTaskIds: body.candidateTaskIds } : {}),
         identity: {
+          identityVersion: currentScheduledTaskIdentityVersion,
           kind: body.kind,
-          mailboxScope: {
-            accountId: body.schedule.mailboxAccountId,
-            provider: body.schedule.mailboxProvider,
-          },
           scheduleWindow: {
             algorithmVersion: body.schedule.scheduleAlgorithmVersion,
             endMs: body.schedule.scheduleWindowStart + body.schedule.scheduleIntervalMs,
             intervalMs: body.schedule.scheduleIntervalMs,
             startMs: body.schedule.scheduleWindowStart,
           },
+          scopeKey: body.schedule.scopeKey,
           sessionId,
         },
         // The recorded actor is the authenticated operator identity, never a
@@ -547,17 +545,15 @@ function handleScheduledTaskCreate(
     .ensureScheduledRun({
       ...(body.taskId !== undefined ? { expectedTaskId: body.taskId } : {}),
       identity: {
+        identityVersion: currentScheduledTaskIdentityVersion,
         kind: body.kind,
-        mailboxScope: {
-          accountId: body.schedule.mailboxAccountId,
-          provider: body.schedule.mailboxProvider,
-        },
         scheduleWindow: {
           algorithmVersion: body.schedule.scheduleAlgorithmVersion,
           endMs: body.schedule.scheduleWindowStart + body.schedule.scheduleIntervalMs,
           intervalMs: body.schedule.scheduleIntervalMs,
           startMs: body.schedule.scheduleWindowStart,
         },
+        scopeKey: body.schedule.scopeKey,
         sessionId,
       },
       input: body.input ?? null,

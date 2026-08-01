@@ -26,10 +26,41 @@ const tetherTableNames = [
   "session_events",
   "session_projections",
   "session_summaries",
+  "session_tombstones",
   "sessions",
   "task_approvals",
   "tasks",
 ] as const;
+
+const legacyScheduleIdentityIndex: IndexSignature = {
+  columnNames: [
+    "session_id",
+    "kind",
+    "mailbox_provider",
+    "mailbox_account_id",
+    "schedule_algorithm_version",
+    "schedule_interval_ms",
+    "schedule_window_start",
+  ],
+  predicate: null,
+  tableName: "tasks",
+  unique: true,
+};
+
+const providerNeutralScheduleIdentityIndex: IndexSignature = {
+  columnNames: [
+    "session_id",
+    "kind",
+    "schedule_identity_version",
+    "schedule_scope_key",
+    "schedule_algorithm_version",
+    "schedule_interval_ms",
+    "schedule_window_start",
+  ],
+  predicate: null,
+  tableName: "tasks",
+  unique: true,
+};
 
 /** Minimal database Interface accepted by startup migration orchestration. */
 export interface MigrationDatabase {
@@ -505,21 +536,18 @@ function legacyMigrationProbes(): readonly LegacyMigrationProbe[] {
     },
     {
       label: "0011 task schedule and mailbox scope identity with unique schedule index",
-      contradictionObserved: (client) =>
-        hasNamedIndexContradiction(client, "tasks_schedule_identity_idx", {
-          columnNames: [
-            "session_id",
-            "kind",
-            "mailbox_provider",
-            "mailbox_account_id",
-            "schedule_algorithm_version",
-            "schedule_interval_ms",
-            "schedule_window_start",
-          ],
-          predicate: null,
-          tableName: "tasks",
-          unique: true,
-        }),
+      contradictionObserved: async (client) =>
+        (await hasIndex(client, "tasks_schedule_identity_idx")) &&
+        !(await hasIndexSignature(
+          client,
+          "tasks_schedule_identity_idx",
+          legacyScheduleIdentityIndex,
+        )) &&
+        !(await hasIndexSignature(
+          client,
+          "tasks_schedule_identity_idx",
+          providerNeutralScheduleIdentityIndex,
+        )),
       represented: async (client) =>
         (await hasColumns(client, "tasks", [
           "mailbox_account_id",
@@ -528,20 +556,16 @@ function legacyMigrationProbes(): readonly LegacyMigrationProbe[] {
           "schedule_interval_ms",
           "schedule_window_start",
         ])) &&
-        (await hasIndexSignature(client, "tasks_schedule_identity_idx", {
-          columnNames: [
-            "session_id",
-            "kind",
-            "mailbox_provider",
-            "mailbox_account_id",
-            "schedule_algorithm_version",
-            "schedule_interval_ms",
-            "schedule_window_start",
-          ],
-          predicate: null,
-          tableName: "tasks",
-          unique: true,
-        })),
+        ((await hasIndexSignature(
+          client,
+          "tasks_schedule_identity_idx",
+          legacyScheduleIdentityIndex,
+        )) ||
+          (await hasIndexSignature(
+            client,
+            "tasks_schedule_identity_idx",
+            providerNeutralScheduleIdentityIndex,
+          ))),
     },
     {
       label: "0012 control lease generation history primary key including epoch",
@@ -642,6 +666,27 @@ function legacyMigrationProbes(): readonly LegacyMigrationProbe[] {
     {
       label: "0017 task claim id",
       represented: async (client) => hasColumn(client, "tasks", "claim_id"),
+    },
+    {
+      label: "0018 session tombstones",
+      represented: (client) => hasTable(client, "session_tombstones"),
+    },
+    {
+      label: "0019 provider-neutral recurring-work identity",
+      contradictionObserved: async (client) =>
+        (await hasIndex(client, "tasks_schedule_identity_idx")) &&
+        !(await hasIndexSignature(
+          client,
+          "tasks_schedule_identity_idx",
+          providerNeutralScheduleIdentityIndex,
+        )),
+      represented: async (client) =>
+        (await hasColumns(client, "tasks", ["schedule_identity_version", "schedule_scope_key"])) &&
+        (await hasIndexSignature(
+          client,
+          "tasks_schedule_identity_idx",
+          providerNeutralScheduleIdentityIndex,
+        )),
     },
   ];
 }

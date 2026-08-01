@@ -189,16 +189,15 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
  */
 export const scheduleWindowAlgorithmVersion = 1;
 
-/**
- * Provider plus opaque configured-account identity for one mailbox. A
- * provider-local message id never identifies work outside its Mailbox Scope.
- */
-export interface MailboxScope {
-  /** Immutable opaque configured account identity within one provider. */
-  readonly accountId: string;
-  /** Provider that owns the account, such as `fastmail` or `gmail`. */
-  readonly provider: string;
-}
+/** Current durable scheduled-task identity format written by Tether. */
+export const currentScheduledTaskIdentityVersion = 2;
+
+/** Runtime validator for an opaque recurring-work scope. */
+export const recurringWorkScopeSchema = z
+  .object({
+    scopeKey: z.string().min(1),
+  })
+  .strict();
 
 /**
  * Deterministic half-open UTC time bucket for recurring work identity. Version 1
@@ -217,12 +216,14 @@ export interface ScheduleWindow {
 
 /** Inputs that deterministically identify one Scheduled Maintenance Run. */
 export interface ScheduledMaintenanceIdentity {
-  /** Durable Tether task kind, such as `email_organization`. */
+  /** Durable identity format version, independent of the windowing algorithm. */
+  readonly identityVersion: number;
+  /** Durable Tether task kind. */
   readonly kind: string;
-  /** Mailbox Scope the scheduled run is restricted to. */
-  readonly mailboxScope: MailboxScope;
   /** Deterministic Schedule Window the run belongs to. */
   readonly scheduleWindow: ScheduleWindow;
+  /** Opaque participant-owned recurring-work scope key. */
+  readonly scopeKey: string;
   /** Durable Tether session that owns the scheduled run. */
   readonly sessionId: string;
 }
@@ -259,17 +260,17 @@ export function scheduleWindowKey(window: ScheduleWindow): string {
 /**
  * Derives a stable, opaque scheduled task id from a Scheduled Maintenance
  * Identity. Repeated derivation for one identity is deterministic; any change to
- * session, kind, Mailbox Scope, interval, algorithm version, or window start
+ * session, kind, scope key, interval, algorithm version, or window start
  * yields a different id. Callers pass this into the existing task-creation
  * idempotency seam instead of performing a read-then-create race.
  */
 export function deriveScheduledTaskId(identity: ScheduledMaintenanceIdentity): string {
   const canonical = JSON.stringify([
+    identity.identityVersion,
     identity.scheduleWindow.algorithmVersion,
     identity.sessionId,
     identity.kind,
-    identity.mailboxScope.provider,
-    identity.mailboxScope.accountId,
+    identity.scopeKey,
     identity.scheduleWindow.intervalMs,
     identity.scheduleWindow.startMs,
   ]);
@@ -295,8 +296,9 @@ export const scheduledSupersessionRefusalReasons = [
 
 /** Durable schedule identity attached to a scheduled task candidate. */
 export interface CandidateScheduleIdentity {
-  readonly mailboxScope: MailboxScope;
+  readonly identityVersion: number;
   readonly scheduleWindow: ScheduleWindow;
+  readonly scopeKey: string;
 }
 
 /**
@@ -365,8 +367,8 @@ function scheduleIdentityMatches(
   return (
     candidate.sessionId === target.sessionId &&
     candidate.kind === target.kind &&
-    schedule.mailboxScope.provider === target.mailboxScope.provider &&
-    schedule.mailboxScope.accountId === target.mailboxScope.accountId &&
+    schedule.identityVersion === target.identityVersion &&
+    schedule.scopeKey === target.scopeKey &&
     schedule.scheduleWindow.algorithmVersion === target.scheduleWindow.algorithmVersion &&
     schedule.scheduleWindow.intervalMs === target.scheduleWindow.intervalMs
   );
@@ -383,12 +385,6 @@ export interface ScheduledSupersessionResultRecord {
   readonly refusals: readonly ScheduledSupersessionRefusalRecord[];
   readonly supersededTaskIds: readonly string[];
 }
-
-/** Runtime validator for a mailbox scope. */
-export const mailboxScopeSchema = z.object({
-  accountId: z.string().min(1),
-  provider: z.string().min(1),
-});
 
 /** Runtime validator for a deterministic Schedule Window. */
 export const scheduleWindowSchema = z
@@ -408,10 +404,13 @@ export const scheduleWindowSchema = z
   });
 
 /** Runtime validator for durable schedule identity attached to a task candidate. */
-export const candidateScheduleIdentitySchema = z.object({
-  mailboxScope: mailboxScopeSchema,
-  scheduleWindow: scheduleWindowSchema,
-});
+export const candidateScheduleIdentitySchema = z
+  .object({
+    identityVersion: z.number().int().positive(),
+    scheduleWindow: scheduleWindowSchema,
+    scopeKey: z.string().min(1),
+  })
+  .strict();
 
 /** Runtime validator for a scheduled-supersession refusal reason. */
 export const scheduledSupersessionRefusalReasonSchema = z.enum(scheduledSupersessionRefusalReasons);
