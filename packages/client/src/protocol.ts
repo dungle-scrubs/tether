@@ -1,5 +1,6 @@
 export {
   appendEventSchema,
+  boundedExponentialRetryDelayMs,
   buildPublishedEventInput,
   buildTaskOutputEventInput,
   buildTaskProgressEventInput,

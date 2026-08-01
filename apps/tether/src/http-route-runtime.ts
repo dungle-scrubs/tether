@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 
 import { Effect } from "effect";
 import { ZodError, type z } from "zod";
+import { browserCsrfHeaderName } from "@dungle-scrubs/tether-protocol";
 
 import { authErrorPayload, authErrorStatus } from "./auth/enforcement.js";
 import type { AuthError } from "./auth/token.js";
@@ -24,7 +25,7 @@ import type { ControlChannel, SessionEvent } from "./types.js";
 
 /** Stable public message for unexpected HTTP route failures. */
 const internalServerErrorMessage = "Internal server error";
-const defaultAllowedCorsHeaders = "authorization, content-type, x-tether-csrf";
+const defaultAllowedCorsHeaders = `authorization, content-type, ${browserCsrfHeaderName}`;
 const defaultAllowedCorsMethods = "GET, POST, OPTIONS";
 
 /** CORS allowlist configuration for browser-based non-repo clients. */

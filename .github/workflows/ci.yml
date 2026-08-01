@@ -56,8 +56,14 @@ jobs:
       - name: Typecheck
         run: pnpm run typecheck
 
+      - name: Install browser test runtime
+        run: pnpm --filter @dungle-scrubs/tether-browser exec playwright install --with-deps chromium
+
       - name: Unit tests
         run: pnpm run test
+
+      - name: Verify browser package
+        run: pnpm run verify:package:prepared
 
   e2e:
     name: end-to-end tests

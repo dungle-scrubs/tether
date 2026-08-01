@@ -4,6 +4,8 @@ export * from "./browser-operator.js";
 export * from "./operator-authority.js";
 export * from "./event-builders.js";
 export * from "./records.js";
+export * from "./retry.js";
+export * from "./serial-event-delivery.js";
 export * from "./rest-schemas.js";
 export * from "./session-summary.js";
 export * from "./task-contracts.js";

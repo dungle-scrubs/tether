@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  browserCsrfHeaderName,
   browserPairingCreateResponseSchema,
   browserPairingExchangeResponseSchema,
 } from "../src/browser-pairing.js";
@@ -15,6 +16,10 @@ const scope = {
 };
 
 describe("browser pairing protocol", () => {
+  it("owns the canonical browser mutation CSRF header", () => {
+    expect(browserCsrfHeaderName).toBe("x-tether-csrf");
+  });
+
   it("validates credential-bearing creation and credential-safe exchange responses", () => {
     expect(
       browserPairingCreateResponseSchema.safeParse({

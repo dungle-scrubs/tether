@@ -5,6 +5,7 @@ import { resolveServiceAuthToken } from "./auth-token.js";
 import { sleepUnrefEffect } from "./effect-timing.js";
 import { ModuleObservability, readModuleObservabilityOptions } from "./observability.js";
 import {
+  boundedExponentialRetryDelayMs,
   classifyWebSocketServerEnvelope,
   parseWebSocketRecoveryCondition,
   type WebSocketRecoveryReason,
@@ -612,5 +613,5 @@ export function buildSessionEventStreamUrl(config: SessionEventStreamClientConfi
 function observerReconnectDelayMs(attempt: number, config: SessionEventStreamClientConfig): number {
   const baseDelayMs = config.reconnect?.baseDelayMs ?? defaultReconnectBaseDelayMs;
   const maxDelayMs = config.reconnect?.maxDelayMs ?? defaultReconnectMaxDelayMs;
-  return Math.min(maxDelayMs, baseDelayMs * 2 ** attempt);
+  return boundedExponentialRetryDelayMs(attempt, baseDelayMs, maxDelayMs);
 }

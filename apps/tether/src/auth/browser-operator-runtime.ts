@@ -1,6 +1,10 @@
 import type { IncomingMessage } from "node:http";
 
-import { type OperatorGrantScope, operatorGrantScopeSchema } from "@dungle-scrubs/tether-protocol";
+import {
+  browserCsrfHeaderName,
+  type OperatorGrantScope,
+  operatorGrantScopeSchema,
+} from "@dungle-scrubs/tether-protocol";
 
 import type { AuthRuntime } from "./enforcement.js";
 import {
@@ -101,7 +105,7 @@ export function createBrowserOperatorRuntime(
           if (request.headers.origin !== authority.session.origin) {
             throw new BrowserOperatorAuthorityError("operator_origin_denied");
           }
-          assertCsrfToken(request.headers["x-tether-csrf"], authority.session.csrfTokenHash);
+          assertCsrfToken(request.headers[browserCsrfHeaderName], authority.session.csrfTokenHash);
         }
         const denial = authorizeOperator(scope.data, requirement.resource);
         if (denial !== null) {

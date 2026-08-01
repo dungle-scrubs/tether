@@ -30,6 +30,9 @@ export const exchangeBrowserPairingRequestSchema = z
 /** Grant-bound anti-CSRF token returned outside the HttpOnly session cookie. */
 export const browserCsrfTokenSchema = base64UrlSecretSchema.length(43);
 
+/** Canonical request header carrying the grant-bound browser CSRF token. */
+export const browserCsrfHeaderName = "x-tether-csrf";
+
 /** Secret-free pairing request projection shared by browser and loopback CLI surfaces. */
 export const publicBrowserPairingRequestSchema = z
   .object({

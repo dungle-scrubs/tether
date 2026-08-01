@@ -1,5 +1,3 @@
-import { createServer } from "node:net";
-
 import { Effect } from "effect";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
@@ -63,8 +61,7 @@ describe("HTTP app server error boundary", () => {
       },
     );
     openApps.push(app);
-    const port = await findOpenPort();
-    await app.listen(port);
+    const port = await app.listen(0);
 
     const response = await fetch(`http://127.0.0.1:${port}/sessions/sess_remote_host/delete`, {
       method: "POST",
@@ -94,8 +91,7 @@ describe("HTTP app server error boundary", () => {
       },
     );
     openApps.push(app);
-    const port = await findOpenPort();
-    await app.listen(port);
+    const port = await app.listen(0);
 
     const response = await fetch(`http://127.0.0.1:${port}/sessions`);
 
@@ -121,8 +117,7 @@ describe("HTTP app server error boundary", () => {
       },
     );
     openApps.push(app);
-    const port = await findOpenPort();
-    await app.listen(port);
+    const port = await app.listen(0);
 
     const readiness = await fetch(`http://127.0.0.1:${port}/ready`);
     const health = await fetch(`http://127.0.0.1:${port}/health`);
@@ -159,8 +154,7 @@ describe("HTTP app server error boundary", () => {
       },
     );
     openApps.push(app);
-    const port = await findOpenPort();
-    await app.listen(port);
+    const port = await app.listen(0);
 
     const response = await fetch(`http://127.0.0.1:${port}/sessions`, {
       body: "{}",
@@ -202,8 +196,7 @@ describe("HTTP app server error boundary", () => {
       },
     );
     openApps.push(app);
-    const port = await findOpenPort();
-    await app.listen(port);
+    const port = await app.listen(0);
     const socket = new WebSocket(`ws://127.0.0.1:${port}/sessions/sess_gateway/stream?after=0`);
     const messages: unknown[] = [];
     socket.on("message", (data) => {
@@ -264,8 +257,7 @@ describe("REST events-list byte budget", () => {
       },
     );
     openApps.push(app);
-    const port = await findOpenPort();
-    await app.listen(port);
+    const port = await app.listen(0);
 
     const response = await fetch(`http://127.0.0.1:${port}/sessions/${sessionId}/events`);
     expect(response.status).toBe(200);
@@ -309,8 +301,7 @@ describe("REST events-list byte budget", () => {
       },
     );
     openApps.push(app);
-    const port = await findOpenPort();
-    await app.listen(port);
+    const port = await app.listen(0);
 
     const response = await fetch(`http://127.0.0.1:${port}/sessions/${sessionId}/events`);
     expect(response.status).toBe(200);
@@ -439,29 +430,6 @@ function createSessionServiceDebugInfo(): SessionServiceDebugInfo {
 
 function createUnusedDatabasePool(): DatabasePool {
   return {} as unknown as DatabasePool;
-}
-
-async function findOpenPort(): Promise<number> {
-  const server = createServer();
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, resolve);
-  });
-  const address = server.address();
-  if (typeof address !== "object" || address === null) {
-    throw new Error("Expected TCP server address");
-  }
-  const port = address.port;
-  await new Promise<void>((resolve, reject) => {
-    server.close((error) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve();
-    });
-  });
-  return port;
 }
 
 interface Deferred<TValue> {
