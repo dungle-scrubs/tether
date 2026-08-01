@@ -10,8 +10,8 @@ concurrency:
 
 permissions:
   contents: write
+  packages: write
   pull-requests: write
-  id-token: write
 
 jobs:
   release:
@@ -30,13 +30,11 @@ jobs:
         with:
           node-version: "22"
           cache: pnpm
+          registry-url: https://npm.pkg.github.com
+          scope: "@dungle-scrubs"
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-
-      # npm >= 11.5.1 is required for OIDC trusted publishing and provenance.
-      - name: Update npm for OIDC trusted publishing
-        run: npm install --global npm@latest
 
       - name: Create release pull request or publish
         uses: changesets/action@v1
@@ -47,4 +45,4 @@ jobs:
           title: "chore: version packages"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_CONFIG_PROVENANCE: "true"
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
