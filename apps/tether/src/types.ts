@@ -1,4 +1,5 @@
 import type {
+  ParticipantRecord,
   ParticipantRuntimeKind,
   SessionEvent,
   SessionSummaryContent,
@@ -42,6 +43,22 @@ export type {
 /** Optional bounded read settings for durable session event-list queries. */
 export interface SessionEventListOptions {
   /** Maximum number of events to materialize after the sequence cursor. */
+  readonly limit?: number | undefined;
+}
+
+/** Optional bounded keyset settings for durable participant-list queries. */
+export interface ParticipantListOptions {
+  /** Exclusive keyset cursor; only participants ordered before it are returned. */
+  readonly before?: Pick<ParticipantRecord, "lastSeenAt" | "participantId"> | undefined;
+  /** Maximum number of participants to materialize. */
+  readonly limit?: number | undefined;
+}
+
+/** Optional bounded keyset settings for durable task-list queries. */
+export interface TaskListOptions {
+  /** Exclusive keyset cursor; only tasks ordered before it are returned. */
+  readonly before?: Pick<TaskRecord, "createdAt" | "taskId"> | undefined;
+  /** Maximum number of tasks to materialize. */
   readonly limit?: number | undefined;
 }
 

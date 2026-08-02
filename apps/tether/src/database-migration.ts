@@ -15,7 +15,18 @@ import type pg from "pg";
 
 const MIGRATION_ADVISORY_LOCK_KEY = "8387255305985817959";
 const migrationsFolder = "drizzle";
-const generatedMigrations = readMigrationFiles({ migrationsFolder });
+let cachedGeneratedMigrations: readonly MigrationMeta[] | undefined;
+
+/**
+ * Reads and hashes every generated migration once, on first use. Loading them
+ * at module evaluation would make any process that transitively imports
+ * persistence pay synchronous disk I/O, and would turn a missing `drizzle/`
+ * folder into an import-time crash instead of a handled call-site failure.
+ */
+function generatedMigrations(): readonly MigrationMeta[] {
+  cachedGeneratedMigrations ??= readMigrationFiles({ migrationsFolder });
+  return cachedGeneratedMigrations;
+}
 const tetherTableNames = [
   "auth_grant_audit_events",
   "auth_grants",
@@ -87,8 +98,9 @@ export async function readDatabaseMigrationReadiness(
     return "unavailable";
   }
   try {
-    const inspection = await inspectMigrationJournal(client, generatedMigrations);
-    return inspection.status === "valid" && inspection.appliedCount === generatedMigrations.length
+    const migrations = generatedMigrations();
+    const inspection = await inspectMigrationJournal(client, migrations);
+    return inspection.status === "valid" && inspection.appliedCount === migrations.length
       ? "current"
       : "incomplete";
   } catch (error) {
@@ -188,27 +200,25 @@ interface SchemaObjectExistsRow {
   readonly exists: boolean;
 }
 
-interface AuthColumnExpectation {
-  readonly columnDefault: string | null;
-  readonly columnName: string;
-  readonly dataType: "jsonb" | "text" | "timestamp with time zone";
-  readonly isNullable: "NO" | "YES";
-  readonly tableName: "auth_grant_audit_events" | "auth_grants" | "auth_tickets";
-}
-
-interface AuthColumnRow {
-  readonly columnDefault: string | null;
-  readonly columnName: string;
-  readonly dataType: string;
-  readonly isNullable: string;
-  readonly tableName: string;
-}
-
 interface ColumnDefinitionExpectation {
   readonly columnDefault: string | null;
   readonly columnName: string;
   readonly dataType: string;
   readonly isNullable: "NO" | "YES";
+  readonly tableName: string;
+}
+
+interface AuthColumnExpectation extends ColumnDefinitionExpectation {
+  readonly dataType: "jsonb" | "text" | "timestamp with time zone";
+  readonly tableName: "auth_grant_audit_events" | "auth_grants" | "auth_tickets";
+}
+
+interface ColumnDefinitionRow {
+  readonly columnDefault: string | null;
+  readonly columnName: string;
+  readonly dataType: string;
+  readonly isNullable: string;
+  readonly tableName: string;
 }
 
 interface UnlockRow {
@@ -317,7 +327,7 @@ async function baselineLegacySchema(client: pg.PoolClient): Promise<void> {
       created_at bigint
     );
   `);
-  const migrations = readMigrationFiles({ migrationsFolder });
+  const migrations = generatedMigrations();
   const journal = await inspectMigrationJournal(client, migrations);
   if (journal.status === "invalid") {
     throw new DatabaseMigrationError(journal.context);
@@ -994,24 +1004,27 @@ function legacyMigrationProbes(): readonly LegacyMigrationProbe[] {
 /** Recognizes the one-to-one durable deployment bootstrap identity mapping. */
 async function hasStableSessionBootstrapIdentities(client: pg.PoolClient): Promise<boolean> {
   return (
-    (await hasExactColumnDefinitions(client, "session_bootstrap_identities", [
+    (await hasExactColumnDefinitions(client, [
       {
         columnDefault: "now()",
         columnName: "created_at",
         dataType: "timestamp with time zone",
         isNullable: "NO",
+        tableName: "session_bootstrap_identities",
       },
       {
         columnDefault: null,
         columnName: "identity_key",
         dataType: "text",
         isNullable: "NO",
+        tableName: "session_bootstrap_identities",
       },
       {
         columnDefault: null,
         columnName: "session_id",
         dataType: "text",
         isNullable: "NO",
+        tableName: "session_bootstrap_identities",
       },
     ])) &&
     (await hasNamedCheckConstraint(client, {
@@ -1238,8 +1251,18 @@ const authFoundationConstraints: readonly NamedConstraintExpectation[] = [
   constraint("auth_tickets_hash_check", "c", "auth_tickets", ["ticket_hash ~ '^[0-9a-f]{64}$'"]),
 ];
 
+/**
+ * Every exact normalized auth-foundation constraint shape a live deployment may
+ * legitimately be running, newest last. A shape is added, never replaced, when a
+ * migration changes the constraints `fingerprintAuthConstraints` covers, because
+ * databases still on the older shape must stay recognized. Regenerate an entry
+ * by applying its migration to an empty database and logging the fingerprint
+ * `hasNamedConstraintExpectations` computes.
+ */
 const authFoundationConstraintFingerprints = new Set([
+  // 0014 auth foundation as generated.
   "c5a21e2a79a5e62a2025c70eb95f998d9e3480afffcf4341545655898455f31b",
+  // 0023 auth_grants metadata shape, which admits the 'browser' grant source.
   "4915df2b217194414393739addbeab2126bd6c09a1e5b5444b5db9f3def257d9",
 ]);
 
@@ -1261,7 +1284,7 @@ function constraint(
 /** Recognizes only the complete security-relevant auth foundation migration. */
 async function hasAuthFoundationMigration(client: pg.PoolClient): Promise<boolean> {
   if (
-    !(await hasExactAuthFoundationColumns(client)) ||
+    !(await hasExactColumnDefinitions(client, authFoundationColumns)) ||
     !(await hasNamedConstraintExpectations(client, authFoundationConstraints))
   ) {
     return false;
@@ -1316,43 +1339,17 @@ async function hasColumns(
   return true;
 }
 
-/** Requires one table's exact column set, types, nullability, and defaults. */
+/**
+ * Requires the exact column set, types, nullability, and defaults of every
+ * table the expectations name. Extra columns fail because the observed row
+ * count must equal the expected one.
+ */
 async function hasExactColumnDefinitions(
   client: pg.PoolClient,
-  tableName: string,
   expectations: readonly ColumnDefinitionExpectation[],
 ): Promise<boolean> {
-  const result = await client.query<AuthColumnRow>(
-    `
-      SELECT
-        column_default AS "columnDefault",
-        column_name AS "columnName",
-        data_type AS "dataType",
-        is_nullable AS "isNullable",
-        table_name AS "tableName"
-      FROM information_schema.columns
-      WHERE table_schema = 'public' AND table_name = $1
-    `,
-    [tableName],
-  );
-  return (
-    result.rows.length === expectations.length &&
-    expectations.every((expected) =>
-      result.rows.some(
-        (row) =>
-          row.columnDefault === expected.columnDefault &&
-          row.columnName === expected.columnName &&
-          row.dataType === expected.dataType &&
-          row.isNullable === expected.isNullable &&
-          row.tableName === tableName,
-      ),
-    )
-  );
-}
-
-/** Requires the exact generated auth column set, types, nullability, and defaults. */
-async function hasExactAuthFoundationColumns(client: pg.PoolClient): Promise<boolean> {
-  const result = await client.query<AuthColumnRow>(
+  const tableNames = [...new Set(expectations.map((expected) => expected.tableName))];
+  const result = await client.query<ColumnDefinitionRow>(
     `
       SELECT
         column_default AS "columnDefault",
@@ -1364,11 +1361,11 @@ async function hasExactAuthFoundationColumns(client: pg.PoolClient): Promise<boo
       WHERE table_schema = 'public'
         AND table_name = ANY($1::text[])
     `,
-    [["auth_grant_audit_events", "auth_grants", "auth_tickets"]],
+    [tableNames],
   );
   return (
-    result.rows.length === authFoundationColumns.length &&
-    authFoundationColumns.every((expected) =>
+    result.rows.length === expectations.length &&
+    expectations.every((expected) =>
       result.rows.some(
         (row) =>
           row.columnDefault === expected.columnDefault &&

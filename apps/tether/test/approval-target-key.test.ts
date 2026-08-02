@@ -1,11 +1,15 @@
 import { describe, expect, it } from "vitest";
 
-import { approvalTargetKey, wholeTaskApprovalTargetKey } from "../src/approval-target-key.js";
+import {
+  approvalTargetKeyFromTarget,
+  legacyApprovalTargetKey,
+  wholeTaskApprovalTargetKey,
+} from "../src/approval-target-key.js";
 
-describe("approvalTargetKey", () => {
+describe("legacyApprovalTargetKey", () => {
   it("derives durable approval target keys from recommendation reasons", () => {
     expect(
-      approvalTargetKey({
+      legacyApprovalTargetKey({
         approvalTarget: {
           action: "junk",
           key: "m_external_compact_ref",
@@ -13,29 +17,31 @@ describe("approvalTargetKey", () => {
       }),
     ).toBe("approvalTarget:junk:m_external_compact_ref");
     expect(
-      approvalTargetKey({
+      legacyApprovalTargetKey({
         approvalTarget: {
           key: "<raw-rest-message@example.test>",
         },
       }),
     ).toBe("approvalTarget:<raw-rest-message@example.test>");
     expect(
-      approvalTargetKey({
+      legacyApprovalTargetKey({
         approvalTarget: {
           action: "keep",
           key: "<raw-rest-message@example.test>",
         },
       }),
     ).not.toBe(
-      approvalTargetKey({
+      legacyApprovalTargetKey({
         approvalTarget: {
           key: "<raw-rest-message@example.test>",
         },
       }),
     );
-    expect(approvalTargetKey({ source: "external-chat" })).toBe(wholeTaskApprovalTargetKey);
+    expect(legacyApprovalTargetKey({ source: "external-chat" })).toBe(wholeTaskApprovalTargetKey);
   });
+});
 
+describe("approvalTargetKeyFromTarget", () => {
   it("uses one fixed-size digest for bounded opaque target identities", () => {
     const target = {
       action: "a".repeat(512),
@@ -45,13 +51,13 @@ describe("approvalTargetKey", () => {
       targetKind: "k".repeat(512),
       targetRevision: "r".repeat(512),
     };
-    const key = approvalTargetKey({}, target);
+    const key = approvalTargetKeyFromTarget(target);
 
     expect(key).toMatch(/^approvalTarget:v2:sha256:[0-9a-f]{64}$/);
     expect(key).toHaveLength(89);
-    expect(approvalTargetKey({}, target)).toBe(key);
+    expect(approvalTargetKeyFromTarget(target)).toBe(key);
     expect(
-      approvalTargetKey({}, { ...target, targetRevision: `2${target.targetRevision}` }),
+      approvalTargetKeyFromTarget({ ...target, targetRevision: `2${target.targetRevision}` }),
     ).not.toBe(key);
   });
 });

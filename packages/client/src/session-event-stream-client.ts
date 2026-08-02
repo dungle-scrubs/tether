@@ -5,7 +5,8 @@ import { resolveServiceAuthToken } from "./auth-token.js";
 import { sleepUnrefEffect } from "./effect-timing.js";
 import { ModuleObservability, readModuleObservabilityOptions } from "./observability.js";
 import {
-  boundedExponentialRetryDelayMs,
+  boundedReconnectDelayMs,
+  buildSessionStreamUrl,
   classifyWebSocketServerEnvelope,
   parseWebSocketRecoveryCondition,
   type WebSocketRecoveryReason,
@@ -14,8 +15,6 @@ import {
 import { SerialEventDelivery, type SerialEventDeliveryOutcome } from "./serial-event-delivery.js";
 import type { SessionEvent } from "./types.js";
 
-const defaultReconnectBaseDelayMs = 100;
-const defaultReconnectMaxDelayMs = 2_000;
 const observerHandlerTimeoutMs = 30_000;
 const observerMaxErrorBacklog = 32;
 const observerMaxQueueBytes = 16 * 1024 * 1024;
@@ -581,37 +580,20 @@ export class SessionEventStreamClient {
   }
 }
 
-/**
- * Runtime-kind value that selects the server's passive full-event observer
- * mode: the connection receives the durable event stream (replay + live) but
- * does not register a durable participant or acquire a control lease. Keep this
- * in sync with `classifyHostPresenceStream` in the Tether gateway.
- */
-export const sessionEventObserverRuntimeKind = "observer";
+export { sessionEventObserverRuntimeKind } from "./protocol.js";
 
 /** Builds the observer WebSocket URL without participant or task authority. */
 export function buildSessionEventStreamUrl(config: SessionEventStreamClientConfig): string {
-  const url = new URL(
-    `/sessions/${encodeURIComponent(config.sessionId)}/stream`,
-    config.serviceUrl,
-  );
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  url.searchParams.set("after", String(config.afterSeq));
-  // Opt into the passive full-event observer mode so the server delivers the
-  // durable event stream without treating this connection as a control
-  // participant. A passive reader never acquires a control lease, so its
-  // reconnects cannot collide with the runtime's own control channel.
-  url.searchParams.set("runtimeKind", sessionEventObserverRuntimeKind);
   const authToken = resolveServiceAuthToken(config.authToken);
-  if (authToken) {
-    url.searchParams.set("access_token", authToken);
-  }
-  return url.toString();
+  return buildSessionStreamUrl({
+    ...(authToken ? { accessToken: authToken } : {}),
+    afterSeq: config.afterSeq,
+    serviceUrl: config.serviceUrl,
+    sessionId: config.sessionId,
+  });
 }
 
 /** Computes bounded exponential reconnect backoff from observer configuration. */
 function observerReconnectDelayMs(attempt: number, config: SessionEventStreamClientConfig): number {
-  const baseDelayMs = config.reconnect?.baseDelayMs ?? defaultReconnectBaseDelayMs;
-  const maxDelayMs = config.reconnect?.maxDelayMs ?? defaultReconnectMaxDelayMs;
-  return boundedExponentialRetryDelayMs(attempt, baseDelayMs, maxDelayMs);
+  return boundedReconnectDelayMs(attempt, config.reconnect);
 }

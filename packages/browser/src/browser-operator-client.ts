@@ -24,7 +24,7 @@ import {
   operatorTaskApprovalRequestSchema,
 } from "@dungle-scrubs/tether-protocol";
 
-import { BrowserOperatorHttpError } from "./errors.js";
+import { BrowserOperatorConfigurationError, BrowserOperatorHttpError } from "./errors.js";
 import {
   BrowserSessionStream,
   type BrowserSessionDeliveryPolicy,
@@ -68,12 +68,23 @@ export interface ConnectBrowserSessionInput {
   readonly sessionId: string;
 }
 
+/** Cookie-authenticated operations counted by the browser operator client. */
+export type BrowserOperatorOperation =
+  | "approval"
+  | "bootstrap"
+  | "command"
+  | "pairing_create"
+  | "pairing_exchange"
+  | "snapshot"
+  | "websocket_ticket";
+
 /** Point-in-time HTTP client diagnostics. */
 export interface BrowserOperatorClientDebugInfo {
   readonly approvalCount: number;
   readonly bootstrapCount: number;
   readonly commandCount: number;
   readonly lastErrorReason: string | null;
+  readonly pairingCreateCount: number;
   readonly pairingExchangeCount: number;
   readonly snapshotCount: number;
   readonly ticketCount: number;
@@ -85,18 +96,21 @@ interface RuntimeParser<T> {
 
 /** Browser-only cookie operator client. */
 export class BrowserOperatorClient {
-  private approvalCount = 0;
-  private bootstrapCount = 0;
-  private commandCount = 0;
   private csrfToken: string | null;
   private readonly delivery: BrowserSessionDeliveryPolicy | undefined;
   private readonly fetch: BrowserOperatorFetch;
   private lastErrorReason: string | null = null;
-  private pairingExchangeCount = 0;
+  private readonly operationCounts: Record<BrowserOperatorOperation, number> = {
+    approval: 0,
+    bootstrap: 0,
+    command: 0,
+    pairing_create: 0,
+    pairing_exchange: 0,
+    snapshot: 0,
+    websocket_ticket: 0,
+  };
   private readonly reconnect: BrowserSessionReconnectPolicy | undefined;
   private readonly serviceUrl: string;
-  private snapshotCount = 0;
-  private ticketCount = 0;
   private readonly webSocketConstructor: typeof WebSocket;
 
   constructor(config: BrowserOperatorClientConfig = {}) {
@@ -110,13 +124,7 @@ export class BrowserOperatorClient {
 
   /** Reads the active cookie session and its allowed resources. */
   async bootstrap(): Promise<BrowserOperatorSession> {
-    const result = await this.requestJson(
-      "bootstrap",
-      "/operator/browser-session",
-      browserOperatorSessionSchema,
-    );
-    this.bootstrapCount += 1;
-    return result;
+    return this.requestJson("bootstrap", "/operator/browser-session", browserOperatorSessionSchema);
   }
 
   /** Creates an unconfirmed browser pairing request. */
@@ -151,19 +159,16 @@ export class BrowserOperatorClient {
       },
     );
     this.csrfToken = result.csrfToken;
-    this.pairingExchangeCount += 1;
     return result;
   }
 
   /** Loads one bounded provider-neutral snapshot. */
   async loadSnapshot(sessionId: string): Promise<BrowserSessionSnapshot> {
-    const result = await this.requestJson(
+    return this.requestJson(
       "snapshot",
       `/operator/sessions/${encodeURIComponent(sessionId)}/snapshot`,
       browserSessionSnapshotSchema,
     );
-    this.snapshotCount += 1;
-    return result;
   }
 
   /** Requests one provider-neutral operator command. */
@@ -171,14 +176,12 @@ export class BrowserOperatorClient {
     sessionId: string,
     request: OperatorCommandRequest,
   ): Promise<BrowserOperatorCommandResponse> {
-    const result = await this.requestJson(
+    return this.requestJson(
       "command",
       `/operator/sessions/${encodeURIComponent(sessionId)}/commands`,
       browserOperatorCommandResponseSchema,
       this.mutationRequest(operatorCommandRequestSchema.parse(request)),
     );
-    this.commandCount += 1;
-    return result;
   }
 
   /** Submits one manifest-bound approval and returns the canonical server result. */
@@ -187,26 +190,22 @@ export class BrowserOperatorClient {
     taskId: string,
     request: OperatorTaskApprovalRequest,
   ): Promise<BrowserOperatorApprovalResponse> {
-    const result = await this.requestJson(
+    return this.requestJson(
       "approval",
       `/operator/sessions/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(taskId)}/approval`,
       browserOperatorApprovalResponseSchema,
       this.mutationRequest(operatorTaskApprovalRequestSchema.parse(request)),
     );
-    this.approvalCount += 1;
-    return result;
   }
 
   /** Mints one single-use ticket for a browser WebSocket upgrade. */
   async issueWebSocketTicket(): Promise<BrowserWebSocketTicketResponse> {
-    const result = await this.requestJson(
+    return this.requestJson(
       "websocket_ticket",
       "/operator/websocket-ticket",
       browserWebSocketTicketResponseSchema,
       this.mutationRequest(),
     );
-    this.ticketCount += 1;
-    return result;
   }
 
   /** Opens one awaited browser stream that refreshes its ticket on reconnect. */
@@ -228,24 +227,21 @@ export class BrowserOperatorClient {
   /** Returns safe request counters and the latest stable rejection reason. */
   debugInfo(): BrowserOperatorClientDebugInfo {
     return {
-      approvalCount: this.approvalCount,
-      bootstrapCount: this.bootstrapCount,
-      commandCount: this.commandCount,
+      approvalCount: this.operationCounts.approval,
+      bootstrapCount: this.operationCounts.bootstrap,
+      commandCount: this.operationCounts.command,
       lastErrorReason: this.lastErrorReason,
-      pairingExchangeCount: this.pairingExchangeCount,
-      snapshotCount: this.snapshotCount,
-      ticketCount: this.ticketCount,
+      pairingCreateCount: this.operationCounts.pairing_create,
+      pairingExchangeCount: this.operationCounts.pairing_exchange,
+      snapshotCount: this.operationCounts.snapshot,
+      ticketCount: this.operationCounts.websocket_ticket,
     };
   }
 
   /** Builds a state-changing request using the grant-bound CSRF token. */
   private mutationRequest(body?: unknown): RequestInit {
     if (this.csrfToken === null) {
-      const error = new BrowserOperatorHttpError({
-        operation: "mutation",
-        reason: "csrf_token_missing",
-        status: 0,
-      });
+      const error = new BrowserOperatorConfigurationError({ reason: "csrf_token_missing" });
       this.lastErrorReason = error.reason;
       throw error;
     }
@@ -258,7 +254,7 @@ export class BrowserOperatorClient {
 
   /** Performs one cookie-authenticated request and validates its protocol response. */
   private async requestJson<T>(
-    operation: string,
+    operation: BrowserOperatorOperation,
     path: string,
     parser: RuntimeParser<T>,
     init: RequestInit = {},
@@ -281,8 +277,9 @@ export class BrowserOperatorClient {
         status: response.status,
       });
     }
+    let parsed: T;
     try {
-      return parser.parse(body);
+      parsed = parser.parse(body);
     } catch (cause) {
       throw this.captureHttpError({
         cause,
@@ -291,12 +288,17 @@ export class BrowserOperatorClient {
         status: response.status,
       });
     }
+    this.operationCounts[operation] += 1;
+    return parsed;
   }
 
   /** Stores a safe HTTP error reason for diagnostics. */
-  private captureHttpError(
-    input: ConstructorParameters<typeof BrowserOperatorHttpError>[0],
-  ): BrowserOperatorHttpError {
+  private captureHttpError(input: {
+    readonly cause?: unknown;
+    readonly operation: BrowserOperatorOperation;
+    readonly reason: string;
+    readonly status: number;
+  }): BrowserOperatorHttpError {
     const error = new BrowserOperatorHttpError(input);
     this.lastErrorReason = error.reason;
     return error;
@@ -305,7 +307,12 @@ export class BrowserOperatorClient {
 
 /** Validates and normalizes the configured browser service origin. */
 function normalizeServiceUrl(value: string): string {
-  const url = new URL(value);
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch (cause) {
+    throw new BrowserOperatorConfigurationError({ cause, reason: "service_url_invalid" });
+  }
   if (
     (url.protocol !== "http:" && url.protocol !== "https:") ||
     url.username !== "" ||
@@ -313,13 +320,8 @@ function normalizeServiceUrl(value: string): string {
     url.search !== "" ||
     url.hash !== ""
   ) {
-    throw new BrowserOperatorHttpError({
-      operation: "configure",
-      reason: "service_url_invalid",
-      status: 0,
-    });
+    throw new BrowserOperatorConfigurationError({ reason: "service_url_invalid" });
   }
-  url.pathname = url.pathname.replace(/\/$/u, "");
   return url.toString().replace(/\/$/u, "");
 }
 

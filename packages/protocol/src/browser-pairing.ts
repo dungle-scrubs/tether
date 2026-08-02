@@ -1,8 +1,48 @@
 import { z } from "zod";
 
-import { operatorGrantScopeSchema } from "./operator-authority.js";
+import {
+  operatorGrantJtiSchema,
+  operatorGrantScopeSchema,
+  operatorSubjectSchema,
+} from "./operator-authority.js";
 
 const base64UrlSecretSchema = z.string().regex(/^[A-Za-z0-9_-]+$/u);
+
+/** Maximum accepted length of one exact HTTP origin string. */
+export const exactHttpOriginMaxLength = 512;
+
+/**
+ * Returns whether a value is an exact `http:` or `https:` origin: the complete
+ * string equals the parsed origin, so it carries no credentials, path, query,
+ * or fragment, and opaque origins serialized as `null` are rejected.
+ */
+export function isExactHttpOrigin(value: string): boolean {
+  if (value.length > exactHttpOriginMaxLength) {
+    return false;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return false;
+  }
+  return (
+    (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+    parsed.origin === value &&
+    parsed.origin !== "null" &&
+    parsed.username === "" &&
+    parsed.password === "" &&
+    parsed.pathname === "/" &&
+    parsed.search === "" &&
+    parsed.hash === ""
+  );
+}
+
+/** Runtime validator for one exact browser origin allowed to reach Tether. */
+export const exactHttpOriginSchema = z
+  .string()
+  .max(exactHttpOriginMaxLength)
+  .refine(isExactHttpOrigin, { message: "Expected an exact HTTP origin" });
 
 /** Browser-generated nonce carrying at least 128 bits in canonical base64url form. */
 export const browserPairingNonceSchema = base64UrlSecretSchema.min(22).max(86);
@@ -13,7 +53,7 @@ export const browserPairingExchangeSecretSchema = base64UrlSecretSchema.length(4
 /** Public request for an explicitly confirmed browser operator grant. */
 export const createBrowserPairingRequestSchema = z
   .object({
-    operatorSubject: z.string().min(1).max(255),
+    operatorSubject: operatorSubjectSchema,
     publicNonce: browserPairingNonceSchema,
     requestedScope: operatorGrantScopeSchema,
   })
@@ -30,6 +70,9 @@ export const exchangeBrowserPairingRequestSchema = z
 /** Grant-bound anti-CSRF token returned outside the HttpOnly session cookie. */
 export const browserCsrfTokenSchema = base64UrlSecretSchema.length(43);
 
+/** Single-use credential minted for one browser WebSocket upgrade. */
+export const browserOneTimeTicketSchema = base64UrlSecretSchema.length(43);
+
 /** Canonical request header carrying the grant-bound browser CSRF token. */
 export const browserCsrfHeaderName = "x-tether-csrf";
 
@@ -37,13 +80,13 @@ export const browserCsrfHeaderName = "x-tether-csrf";
 export const publicBrowserPairingRequestSchema = z
   .object({
     confirmedAt: z.string().datetime({ offset: true }).nullable(),
-    confirmedBySubject: z.string().min(1).max(255).nullable(),
+    confirmedBySubject: operatorSubjectSchema.nullable(),
     createdAt: z.string().datetime({ offset: true }),
     exchangedAt: z.string().datetime({ offset: true }).nullable(),
     expiresAt: z.string().datetime({ offset: true }),
     failedAttempts: z.number().int().min(0).max(5),
     invalidatedAt: z.string().datetime({ offset: true }).nullable(),
-    operatorSubject: z.string().min(1).max(255),
+    operatorSubject: operatorSubjectSchema,
     origin: z.string().min(1).max(512),
     publicNonce: browserPairingNonceSchema,
     requestId: z.string().regex(/^pair_[A-Za-z0-9_-]{1,120}$/u),
@@ -66,7 +109,7 @@ export const browserPairingExchangeResponseSchema = z
   .object({
     csrfToken: browserCsrfTokenSchema,
     expiresAt: z.string().datetime({ offset: true }),
-    grantJti: z.string().min(1).max(128),
+    grantJti: operatorGrantJtiSchema,
     scope: operatorGrantScopeSchema,
     status: z.literal("exchanged"),
   })

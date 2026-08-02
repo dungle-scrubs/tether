@@ -4,6 +4,7 @@ import {
   browserCsrfHeaderName,
   browserPairingCreateResponseSchema,
   browserPairingExchangeResponseSchema,
+  exactHttpOriginSchema,
 } from "../src/browser-pairing.js";
 
 const scope = {
@@ -52,5 +53,25 @@ describe("browser pairing protocol", () => {
         status: "exchanged",
       }).success,
     ).toBe(false);
+  });
+
+  it("accepts only exact credential-free HTTP origins", () => {
+    for (const origin of ["http://127.0.0.1:17445", "https://hub.example.test"]) {
+      expect(exactHttpOriginSchema.parse(origin)).toBe(origin);
+    }
+    for (const value of [
+      "",
+      "null",
+      "hub.example.test",
+      "ws://hub.example.test",
+      "https://hub.example.test/",
+      "https://hub.example.test/app",
+      "https://hub.example.test?query=1",
+      "https://hub.example.test#fragment",
+      "https://operator:secret@hub.example.test",
+      `https://${"h".repeat(600)}.example.test`,
+    ]) {
+      expect(exactHttpOriginSchema.safeParse(value).success).toBe(false);
+    }
   });
 });

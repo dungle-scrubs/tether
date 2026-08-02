@@ -12,8 +12,8 @@ import {
   type OperatorAuthorityDenialReason,
   type OperatorAuthorityRequest,
 } from "./operator-authority.js";
-import { browserSessionCookieName, hashBrowserCredential } from "./browser-pairing.js";
-import { opaqueCredentialHashesEqual } from "./opaque-credential.js";
+import { browserSessionCookieName } from "./browser-pairing.js";
+import { hashOpaqueCredential, opaqueCredentialHashesEqual } from "./opaque-credential.js";
 import type { BrowserPairingStore, BrowserSessionRecord } from "./browser-pairing-stores.js";
 import type { AuthContext } from "./token.js";
 
@@ -95,16 +95,13 @@ export function createBrowserOperatorRuntime(
         if (!scope.success) {
           throw new BrowserOperatorAuthorityError("operator_scope_invalid");
         }
-        if (
-          request.headers.origin !== undefined &&
-          request.headers.origin !== authority.session.origin
-        ) {
+        // A present Origin must always match; a CSRF-required route additionally
+        // requires one to be present at all.
+        const originMustMatch = requirement.csrfRequired || request.headers.origin !== undefined;
+        if (originMustMatch && request.headers.origin !== authority.session.origin) {
           throw new BrowserOperatorAuthorityError("operator_origin_denied");
         }
         if (requirement.csrfRequired) {
-          if (request.headers.origin !== authority.session.origin) {
-            throw new BrowserOperatorAuthorityError("operator_origin_denied");
-          }
           assertCsrfToken(request.headers[browserCsrfHeaderName], authority.session.csrfTokenHash);
         }
         const denial = authorizeOperator(scope.data, requirement.resource);
@@ -159,7 +156,7 @@ function assertCsrfToken(value: string | string[] | undefined, expectedHash: str
   if (typeof value !== "string") {
     throw new BrowserOperatorAuthorityError("operator_csrf_denied");
   }
-  if (!opaqueCredentialHashesEqual(hashBrowserCredential(value), expectedHash)) {
+  if (!opaqueCredentialHashesEqual(hashOpaqueCredential(value), expectedHash)) {
     throw new BrowserOperatorAuthorityError("operator_csrf_denied");
   }
 }

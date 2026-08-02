@@ -17,7 +17,7 @@ import { ParticipantCursorWriter } from "./participant-cursor-writer.js";
 import { runParticipantTaskClaimFlow } from "./participant-task-claim-flow.js";
 import {
   type AppendSessionEventInput,
-  boundedExponentialRetryDelayMs,
+  boundedReconnectDelayMs,
   buildWsPublishMessage,
   buildWsTaskClaimMessage,
   buildWsTaskCompleteMessage,
@@ -27,6 +27,7 @@ import {
   type CommandResultEnvelope,
   classifyWebSocketServerEnvelope,
   parseWebSocketRecoveryCondition,
+  serialDeliveryFailureReason,
   type WebSocketCommandMessage,
   webSocketOperation,
 } from "./protocol.js";
@@ -35,8 +36,6 @@ import type { ParticipantRuntimeKind, SessionEvent, TaskRecord } from "./types.j
 
 export { ParticipantRuntimeCursorPersistError } from "./participant-cursor-writer.js";
 
-const defaultReconnectBaseDelayMs = 100;
-const defaultReconnectMaxDelayMs = 2_000;
 const defaultCommandTimeoutMs = 15_000;
 const defaultCursorPersistIntervalMs = 1_000;
 const defaultCursorPersistEventCount = 50;
@@ -1335,7 +1334,7 @@ export class ParticipantRuntimeClient {
     switch (outcome.kind) {
       case "delivery-byte-overflow":
         this.enterPausedState(
-          "delivery_byte_overflow",
+          serialDeliveryFailureReason(outcome.kind),
           undefined,
           {
             maxQueueBytes: outcome.maxQueueBytes,
@@ -1346,7 +1345,7 @@ export class ParticipantRuntimeClient {
         return;
       case "delivery-queue-overflow":
         this.enterPausedState(
-          "delivery_queue_overflow",
+          serialDeliveryFailureReason(outcome.kind),
           undefined,
           {
             maxQueueSize: outcome.maxQueueSize,
@@ -1370,7 +1369,7 @@ export class ParticipantRuntimeClient {
             cause: outcome.cause,
             event: outcome.event,
             handlerIndex: outcome.handlerIndex,
-            reason: "event_handler_failed",
+            reason: serialDeliveryFailureReason(outcome.kind),
             timeoutMs: null,
           },
           generation,
@@ -1381,18 +1380,18 @@ export class ParticipantRuntimeClient {
           {
             event: outcome.event,
             handlerIndex: outcome.handlerIndex,
-            reason: "event_handler_timeout",
+            reason: serialDeliveryFailureReason(outcome.kind),
             timeoutMs: outcome.timeoutMs,
           },
           generation,
         );
         return;
       case "invalid-server-envelope":
-        this.enterPausedState("invalid_server_envelope", undefined, {}, generation);
+        this.enterPausedState(serialDeliveryFailureReason(outcome.kind), undefined, {}, generation);
         return;
       case "non-contiguous-event":
         this.enterPausedState(
-          "non_contiguous_event",
+          serialDeliveryFailureReason(outcome.kind),
           undefined,
           { expectedSeq: outcome.expectedSeq, observedSeq: outcome.observedSeq },
           generation,
@@ -1822,9 +1821,7 @@ export function buildParticipantRuntimeStreamUrl(config: ParticipantRuntimeClien
  * Computes bounded exponential reconnect backoff from client configuration.
  */
 function reconnectDelayMs(attempt: number, config: ParticipantRuntimeClientConfig): number {
-  const baseDelayMs = config.reconnect?.baseDelayMs ?? defaultReconnectBaseDelayMs;
-  const maxDelayMs = config.reconnect?.maxDelayMs ?? defaultReconnectMaxDelayMs;
-  return boundedExponentialRetryDelayMs(attempt, baseDelayMs, maxDelayMs);
+  return boundedReconnectDelayMs(attempt, config.reconnect);
 }
 
 /** Applies one overall deadline to graceful participant shutdown settlement. */

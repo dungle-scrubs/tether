@@ -1,8 +1,10 @@
 import { z } from "zod";
 
+import { rejectDuplicateEntries } from "./schema-refinements.js";
 import { recurringWorkScopeKeySchema } from "./task-contracts.js";
 
-const opaqueTargetValueSchema = z.string().min(1).max(512);
+/** Runtime validator for one bounded opaque approval-target value. */
+export const opaqueTargetValueSchema = z.string().min(1).max(512);
 
 /** Durable approval decision values recorded in task approval history. */
 export const approvalDecisionSchema = z.union([z.literal("approved"), z.literal("rejected")]);
@@ -39,35 +41,17 @@ export function approvalTargetIdentityKey(target: ApprovalTarget): string {
 export const targetManifestSchema = z
   .array(approvalTargetSchema)
   .max(1_000)
-  .superRefine((entries, context) => {
-    const identities = new Set<string>();
-    for (const [index, entry] of entries.entries()) {
-      const identity = approvalTargetIdentityKey(entry);
-      if (identities.has(identity)) {
-        context.addIssue({
-          code: "custom",
-          message: "Target manifest identities must be unique",
-          path: [index],
-        });
-      }
-      identities.add(identity);
-    }
-  });
+  .superRefine(
+    rejectDuplicateEntries({
+      identity: approvalTargetIdentityKey,
+      message: "Target manifest identities must be unique",
+    }),
+  );
 
 /** Target manifest embedded in a generic task result. */
 export type TargetManifest = z.infer<typeof targetManifestSchema>;
 
 /** Generic task result with optional validated target-manifest content. */
-export const taskResultSchema = z.record(z.string(), z.unknown()).superRefine((result, context) => {
-  if (!("targetManifest" in result)) {
-    return;
-  }
-  const parsed = targetManifestSchema.safeParse(result.targetManifest);
-  if (!parsed.success) {
-    context.addIssue({
-      code: "custom",
-      message: "Task result targetManifest is invalid",
-      path: ["targetManifest"],
-    });
-  }
+export const taskResultSchema = z.looseObject({
+  targetManifest: targetManifestSchema.optional(),
 });

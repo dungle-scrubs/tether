@@ -1,18 +1,16 @@
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
 
 import {
+  type BrowserPairingCreateResponse,
+  type BrowserPairingExchangeResponse,
   browserCsrfTokenSchema,
   browserPairingExchangeSecretSchema,
   browserPairingNonceSchema,
-  type BrowserPairingCreateResponse,
-  type BrowserPairingExchangeResponse,
   type CreateBrowserPairingRequest,
   exchangeBrowserPairingRequestSchema,
   operatorGrantScopeSchema,
   type PublicBrowserPairingRequest,
 } from "@dungle-scrubs/tether-protocol";
-
-import type { AuthSigningSecrets } from "./token.js";
 import type {
   BrowserPairingRequestRecord,
   BrowserPairingStore,
@@ -25,6 +23,7 @@ import {
   randomOpaqueCredential,
   wholeAuthSecond,
 } from "./opaque-credential.js";
+import type { AuthSigningSecrets } from "./token.js";
 
 /** Host-only cookie name used for browser operator authority. */
 export const browserSessionCookieName = "__Host-Http-tether-operator";
@@ -139,7 +138,7 @@ export async function createBrowserPairingRequest(
     confirmedAt: null,
     confirmedBySubject: null,
     createdAt,
-    exchangeSecretHash: hashBrowserCredential(exchangeSecret),
+    exchangeSecretHash: hashOpaqueCredential(exchangeSecret),
     exchangedAt: null,
     expiresAt: new Date(createdAt.getTime() + browserPairingLifetimeMs),
     failedAttempts: 0,
@@ -276,13 +275,13 @@ export function createBrowserPairingLifecycle(
             scope,
             session: {
               createdAt: attemptedAt,
-              csrfTokenHash: hashBrowserCredential(csrfToken),
+              csrfTokenHash: hashOpaqueCredential(csrfToken),
               grantJti,
               origin: request.origin,
             },
           };
         },
-        exchangeSecretHash: hashBrowserCredential(input.data.exchangeSecret),
+        exchangeSecretHash: hashOpaqueCredential(input.data.exchangeSecret),
         failureId: `pairfail_${randomUUID()}`,
         publicNonce: input.data.publicNonce,
         requestId,
@@ -298,11 +297,6 @@ export function createBrowserPairingLifecycle(
       return request === null ? null : toPublicPairingRequest(request);
     },
   };
-}
-
-/** Hashes credentials and source addresses before durable persistence. */
-export function hashBrowserCredential(value: string): string {
-  return hashOpaqueCredential(value);
 }
 
 /** Produces a non-enumerable source pseudonym for durable abuse accounting. */

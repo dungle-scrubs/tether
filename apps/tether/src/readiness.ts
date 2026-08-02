@@ -24,7 +24,11 @@ export interface ReadinessInput {
   readonly runtimeTopology: RuntimeTopology;
 }
 
-/** Evaluates database reachability and local subscriber catch-up health. */
+/**
+ * Evaluates, in order, migration-journal completeness, signing-authority
+ * configuration, configuration compatibility, and local subscriber catch-up
+ * health.
+ */
 export async function projectReadiness(input: ReadinessInput): Promise<ReadinessProjection> {
   let databaseMigrationReadiness: DatabaseMigrationReadiness;
   try {

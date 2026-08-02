@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { utf8ByteLength } from "./text.js";
+
 /** Approval behavior advertised for an orchestratable task contract. */
 export type TaskContractApproval = "none" | "optional" | "required_for_mutation";
 
@@ -195,13 +197,11 @@ export const currentScheduledTaskIdentityVersion = 2;
 /** Maximum encoded size of one provider-neutral recurring-work scope key. */
 export const recurringWorkScopeKeyMaxBytes = 512;
 
-const utf8Encoder = new TextEncoder();
-
 /** Runtime validator for one bounded opaque recurring-work scope key. */
 export const recurringWorkScopeKeySchema = z
   .string()
   .min(1)
-  .refine((value) => utf8Encoder.encode(value).byteLength <= recurringWorkScopeKeyMaxBytes, {
+  .refine((value) => utf8ByteLength(value) <= recurringWorkScopeKeyMaxBytes, {
     message: `Scope key must not exceed ${recurringWorkScopeKeyMaxBytes} UTF-8 bytes`,
   });
 

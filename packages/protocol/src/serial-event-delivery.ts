@@ -65,6 +65,35 @@ export type SerialEventDeliveryOutcome<TEvent extends SequencedDeliveryEvent> =
     }
   | { readonly kind: "replay-complete" };
 
+/** Delivery outcome kinds that halt a transport instead of advancing its cursor. */
+export type SerialEventDeliveryFailureKind =
+  | "delivery-byte-overflow"
+  | "delivery-queue-overflow"
+  | "handler-failed"
+  | "handler-timeout"
+  | "invalid-server-envelope"
+  | "non-contiguous-event";
+
+const serialDeliveryFailureReasonByKind = {
+  "delivery-byte-overflow": "delivery_byte_overflow",
+  "delivery-queue-overflow": "delivery_queue_overflow",
+  "handler-failed": "event_handler_failed",
+  "handler-timeout": "event_handler_timeout",
+  "invalid-server-envelope": "invalid_server_envelope",
+  "non-contiguous-event": "non_contiguous_event",
+} as const satisfies Record<SerialEventDeliveryFailureKind, string>;
+
+/** Stable transport-neutral failure reasons owned beside the delivery machine. */
+export type SerialDeliveryFailureReason =
+  (typeof serialDeliveryFailureReasonByKind)[SerialEventDeliveryFailureKind];
+
+/** Returns the one stable reason name for a halting delivery outcome kind. */
+export function serialDeliveryFailureReason<TKind extends SerialEventDeliveryFailureKind>(
+  kind: TKind,
+): (typeof serialDeliveryFailureReasonByKind)[TKind] {
+  return serialDeliveryFailureReasonByKind[kind];
+}
+
 /** Dependencies and limits for one independent serial delivery instance. */
 export interface SerialEventDeliveryOptions<TEvent extends SequencedDeliveryEvent> {
   readonly clock?: SerialEventDeliveryClock;

@@ -95,16 +95,13 @@ import { createParticipantWebSocketGateway } from "./websocket-participant-gatew
 
 /** Allows compact participant contract advertisements to fit in WebSocket URLs. */
 const participantStreamMaxHeaderSizeBytes = 128 * 1024;
-const consoleAuthRuntimeLogger: AuthRuntimeLogger = {
-  warn: (event, details) => {
-    console.warn(event, details);
-  },
-};
-const consoleBrowserSecurityLogger = {
-  info: (event: string, details: Record<string, unknown>) => {
+const consoleSecurityLogger: AuthRuntimeLogger & {
+  readonly info: (event: string, details: Record<string, unknown>) => void;
+} = {
+  info: (event, details) => {
     console.info(event, details);
   },
-  warn: (event: string, details: Record<string, unknown>) => {
+  warn: (event, details) => {
     console.warn(event, details);
   },
 };
@@ -239,7 +236,7 @@ export const AppServerLive = Layer.scoped(
       },
       auth: {
         ...authRuntimeOptionsFromConfig(config),
-        logger: consoleAuthRuntimeLogger,
+        logger: consoleSecurityLogger,
       },
     });
     yield* Effect.acquireRelease(
@@ -269,23 +266,57 @@ export function createAppServer(pool: DatabasePool, options: AppServerOptions = 
   );
 }
 
+/**
+ * Returns whether the deployment can sign browser grants: either authentication
+ * is not required, or a nonempty issuer and the active signing secret are both
+ * configured. Grant issuance and readiness must agree on this, so it has one
+ * definition.
+ */
+function hasGrantSigningAuthority(authOptions: AuthRuntimeOptions): boolean {
+  return authOptions.mode !== "required" || configuredGrantIssuer(authOptions) !== null;
+}
+
+/** Returns the nonempty issuer backed by the active signing secret, when both exist. */
+function configuredGrantIssuer(authOptions: AuthRuntimeOptions): string | null {
+  const issuer = authOptions.issuer;
+  return typeof issuer === "string" &&
+    issuer.length > 0 &&
+    authOptions.secrets[authOptions.activeKid] !== undefined
+    ? issuer
+    : null;
+}
+
+/**
+ * Caches only a `current` journal, which cannot regress while the process runs,
+ * so the unauthenticated readiness probe stops checking out a pool client and
+ * re-reading every generated migration on each poll. Incomplete and unavailable
+ * states stay uncached so a probe can still observe recovery.
+ */
+function memoizeCurrentMigrationReadiness(
+  pool: DatabasePool,
+): () => Promise<DatabaseMigrationReadiness> {
+  let current = false;
+  return async () => {
+    if (current) return "current";
+    const readiness = await readDatabaseMigrationReadiness(pool);
+    current = readiness === "current";
+    return readiness;
+  };
+}
+
 /** Creates browser grant issuance only for a fully configured required-auth deployment. */
 function createConfiguredBrowserPairingLifecycle(
   authOptions: AuthRuntimeOptions,
   store: ReturnType<typeof createBrowserPairingStore>,
   logger: NonNullable<BrowserPairingLifecycleOptions["logger"]>,
 ): BrowserPairingLifecycle | null {
-  if (
-    authOptions.mode !== "required" ||
-    authOptions.issuer === null ||
-    authOptions.issuer === undefined ||
-    authOptions.secrets[authOptions.activeKid] === undefined
-  ) {
+  const issuer = authOptions.mode === "required" ? configuredGrantIssuer(authOptions) : null;
+  if (issuer === null) {
     return null;
   }
   return createBrowserPairingLifecycle({
     activeKid: authOptions.activeKid,
-    issuer: authOptions.issuer,
+    issuer,
     logger,
     secrets: authOptions.secrets,
     store,
@@ -362,7 +393,7 @@ export function createAppServerWithSessionService(
   });
   const browserOperatorRuntime = createBrowserOperatorRuntime({
     auth,
-    logger: consoleBrowserSecurityLogger,
+    logger: consoleSecurityLogger,
     store: browserPairingStore,
   });
   const browserPairingLifecycle =
@@ -370,11 +401,11 @@ export function createAppServerWithSessionService(
       ? createConfiguredBrowserPairingLifecycle(
           authOptions,
           browserPairingStore,
-          consoleBrowserSecurityLogger,
+          consoleSecurityLogger,
         )
       : options.browserPairing.lifecycle;
   const databaseMigrationReadiness =
-    options.readiness?.databaseMigrationReadiness ?? (() => readDatabaseMigrationReadiness(pool));
+    options.readiness?.databaseMigrationReadiness ?? memoizeCurrentMigrationReadiness(pool);
   /**
    * Reads process-local diagnostics for the app server and its child modules.
    */
@@ -399,11 +430,7 @@ export function createAppServerWithSessionService(
           (corsOptions.allowedOrigins.length === 0 || browserPairingLifecycle !== null),
         databaseMigrationReadiness,
         signingAuthorityReady:
-          options.readiness?.signingAuthorityReady ??
-          (authOptions.mode !== "required" ||
-            (typeof authOptions.issuer === "string" &&
-              authOptions.issuer.length > 0 &&
-              authOptions.secrets[authOptions.activeKid] !== undefined)),
+          options.readiness?.signingAuthorityReady ?? hasGrantSigningAuthority(authOptions),
       },
       fanout: eventFanout,
       fanoutStaleAfterMs,

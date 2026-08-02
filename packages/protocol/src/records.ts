@@ -530,3 +530,16 @@ export const participantRuntimeKindSchema = z
     z.string().min(1),
   ])
   .default("generic_agent");
+
+/** Runtime validator for visible participant presence records. */
+export const participantRecordSchema: z.ZodType<ParticipantRecord> = z
+  .object({
+    capabilities: z.record(z.string(), z.unknown()),
+    displayName: z.string(),
+    joinedAt: z.string(),
+    lastSeenAt: z.string(),
+    participantId: z.string().min(1),
+    runtimeKind: participantRuntimeKindSchema,
+    sessionId: z.string().min(1),
+  })
+  .strict();

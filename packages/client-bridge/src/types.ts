@@ -1,4 +1,5 @@
 import type {
+  ApprovalDecision,
   ApprovalTarget,
   ScheduleWindow,
   SessionEvent as ProtocolSessionEvent,
@@ -171,7 +172,7 @@ export interface ClientBridgeCancelTaskInput {
 /** Input for recording approval intent for one durable task. */
 export interface ClientBridgeRecordTaskApprovalInput {
   /** Approval decision to record. */
-  readonly decision: "approved" | "rejected";
+  readonly decision: ApprovalDecision;
   /** Optional bridge-specific approval context. */
   readonly reason?: Record<string, unknown>;
   /** Opaque target that must exactly match the completed task manifest. */
@@ -185,7 +186,7 @@ export interface ClientBridgeTaskApprovalRecorded {
   /** Canonical first-committer-wins approval row. */
   readonly approval: TaskApprovalRecord;
   /** Approval decision recorded by Tether. */
-  readonly decision: "approved" | "rejected";
+  readonly decision: ApprovalDecision;
   /** Durable approval event returned by Tether. */
   readonly event: ClientBridgeSessionEvent;
   /** Durable approval event id. */
@@ -201,9 +202,9 @@ export interface ClientBridgeTaskApprovalIgnored {
   /** Canonical first-committer-wins approval row. */
   readonly approval: TaskApprovalRecord;
   /** Approval decision requested by the bridge. */
-  readonly decision: "approved" | "rejected";
+  readonly decision: ApprovalDecision;
   /** Existing durable decision for this task. */
-  readonly existingDecision: "approved" | "rejected";
+  readonly existingDecision: ApprovalDecision;
   /** Stable reason no new approval event was appended. */
   readonly ignoredReason: "already_approved" | "already_rejected";
   /** Approval result status. */

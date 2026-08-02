@@ -56,14 +56,30 @@ jobs:
       - name: Typecheck
         run: pnpm run typecheck
 
+      - name: Resolve Playwright version
+        id: playwright
+        run: |
+          echo "version=$(node -p "require('./packages/browser/package.json').devDependencies.playwright")" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ steps.playwright.outputs.version }}
+
+      - name: Install browser test runtime dependencies
+        run: pnpm --filter @dungle-scrubs/tether-browser exec playwright install-deps chromium
+
       - name: Install browser test runtime
-        run: pnpm --filter @dungle-scrubs/tether-browser exec playwright install --with-deps chromium
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: pnpm --filter @dungle-scrubs/tether-browser exec playwright install chromium
 
       - name: Unit tests
         run: pnpm run test
 
       - name: Verify browser package
-        run: pnpm run verify:package:prepared
+        run: pnpm run verify:package
 
   e2e:
     name: end-to-end tests

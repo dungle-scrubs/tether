@@ -8,8 +8,8 @@ import {
   browserOperatorSessionSchema,
   browserSessionSnapshotSchema,
   browserWebSocketTicketResponseSchema,
-  operatorCommandRequestSchema,
   operatorCommandPermission,
+  operatorCommandRequestSchema,
   operatorTaskApprovalRequestSchema,
 } from "@dungle-scrubs/tether-protocol";
 import { Effect } from "effect";
@@ -19,15 +19,18 @@ import {
   type BrowserOperatorRuntime,
 } from "./auth/browser-operator-runtime.js";
 import type { AuthGrantLifecycle } from "./auth/grant-lifecycle.js";
-import { browserSessionCookieName } from "./auth/browser-pairing.js";
 import type { AuthTicketLifecycle } from "./auth/ticket-lifecycle.js";
+import {
+  fitBrowserSnapshotWithinByteBudget,
+  listRecordsWithinSnapshotBudget,
+} from "./browser-snapshot-budget.js";
 import { OperatorCommandAdmissionError } from "./db.js";
-import { broadcastEvents, parseJsonBody, sendJson } from "./http-route-runtime.js";
-import { defineHttpRoute, matchHttpRoute } from "./http-route-spec.js";
+import { clearBrowserSessionCookie } from "./http-browser-pairing-route-handlers.js";
 import { listEventPageWithinByteBudget } from "./http-event-pagination.js";
+import { broadcastEvents, parseJsonBody, sendJson } from "./http-route-runtime.js";
+import { defineHttpRoute, matchHttpRoute, routeMatchParam } from "./http-route-spec.js";
 import type { SubscriptionHub } from "./hub.js";
 import type { ResourceLimits } from "./resource-limits.js";
-import { snapshotRecordMaxBytes } from "./snapshot-limits.js";
 import type { SessionServiceEffect, TaskApprovalResult } from "./session-service.js";
 import { SessionServicePersistenceError } from "./session-service-contracts.js";
 
@@ -137,7 +140,6 @@ function handleBrowserOperatorHttpRouteEffect(
           expiresAt: authorized.context.expiresAt,
           grantJti: authorized.context.grantJti,
           scope: authorized.scope,
-          sessionIds: authorized.scope.sessionIds,
           status: "active",
           subject: authorized.context.participantId,
         }),
@@ -168,69 +170,54 @@ function handleBrowserOperatorHttpRouteEffect(
         csrfRequired: false,
         resource: { permission: "session.read", sessionId },
       });
-      const eventLimit = Math.min(input.resourceLimits.eventListMaxLimit, 1_000);
-      const participantLimit = 1_000;
-      const taskLimit = 1_000;
-      const eventPage = yield* listEventPageWithinByteBudget({
-        afterSeq: 0,
-        limit: eventLimit,
-        maxBytes: input.resourceLimits.restEventListMaxBytes,
-        maxEventBytes: input.resourceLimits.httpMaxBodyBytes,
-        service: input.service,
-        sessionId,
-      });
-      const eventSnapshot = fitBrowserSnapshotWithinByteBudget(
+      const maxBytes = input.resourceLimits.restEventListMaxBytes;
+      // The three reads are independent, so they run together and the final fit
+      // below is the one authority on the assembled response size.
+      const [eventPage, participantPage, taskPage] = yield* Effect.all(
+        [
+          listEventPageWithinByteBudget({
+            afterSeq: 0,
+            limit: Math.min(input.resourceLimits.eventListMaxLimit, 1_000),
+            maxBytes,
+            maxEventBytes: input.resourceLimits.httpMaxBodyBytes,
+            service: input.service,
+            sessionId,
+          }),
+          listRecordsWithinSnapshotBudget<BrowserSessionSnapshot["participants"][number]>({
+            fetch: (before, limit) =>
+              input.service.listParticipants(sessionId, {
+                ...(before === undefined ? {} : { before }),
+                limit,
+              }),
+            limit: 1_000,
+            maxBytes,
+          }),
+          listRecordsWithinSnapshotBudget<BrowserSessionSnapshot["tasks"][number]>({
+            fetch: (before, limit) =>
+              input.service.listTasks(sessionId, "all", {
+                ...(before === undefined ? {} : { before }),
+                limit,
+              }),
+            limit: 1_000,
+            maxBytes,
+          }),
+        ],
+        { concurrency: 3 },
+      );
+      const snapshot = fitBrowserSnapshotWithinByteBudget(
         {
           cursor: eventPage.events.at(-1)?.seq ?? 0,
           events: eventPage.events,
-          participants: [],
-          sessionId,
-          tasks: [],
-          truncated: { events: eventPage.hasMore, participants: false, tasks: false },
-        },
-        input.resourceLimits.restEventListMaxBytes,
-      );
-      const participantBudget = remainingSnapshotBytes(
-        eventSnapshot,
-        input.resourceLimits.restEventListMaxBytes,
-      );
-      const participantPage = yield* listParticipantsWithinSnapshotBudget({
-        limit: participantLimit,
-        maxBytes: participantBudget,
-        service: input.service,
-        sessionId,
-      });
-      const participantSnapshot = fitBrowserSnapshotWithinByteBudget(
-        {
-          ...eventSnapshot,
           participants: participantPage.records,
-          truncated: {
-            ...eventSnapshot.truncated,
-            participants: participantPage.hasMore,
-          },
-        },
-        input.resourceLimits.restEventListMaxBytes,
-      );
-      const taskBudget = remainingSnapshotBytes(
-        participantSnapshot,
-        input.resourceLimits.restEventListMaxBytes,
-      );
-      const taskPage = yield* listTasksWithinSnapshotBudget({
-        limit: taskLimit,
-        maxBytes: taskBudget,
-        service: input.service,
-        sessionId,
-      });
-      const snapshot = fitBrowserSnapshotWithinByteBudget(
-        {
-          ...participantSnapshot,
+          sessionId,
           tasks: taskPage.records,
           truncated: {
-            ...participantSnapshot.truncated,
+            events: eventPage.hasMore,
+            participants: participantPage.hasMore,
             tasks: taskPage.hasMore,
           },
         },
-        input.resourceLimits.restEventListMaxBytes,
+        maxBytes,
       );
       sendJson(response, 200, browserSessionSnapshotSchema.parse(snapshot));
       return true;
@@ -335,161 +322,10 @@ function authorizeBrowserOperator(
   });
 }
 
-/** Returns a deletion cookie retaining the production security attributes. */
-function clearBrowserSessionCookie(): string {
-  return `${browserSessionCookieName}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict`;
-}
-
 /** Requires the durable parent id guaranteed by browser operator authentication. */
 function requiredGrantJti(grantJti: string | null): string {
   if (grantJti === null) throw new BrowserOperatorAuthorityError("operator_auth_denied");
   return grantJti;
-}
-
-/** Reads a required regex capture without accepting an empty resource id. */
-function routeMatchParam(match: RegExpMatchArray, index: number): string {
-  const value = match[index];
-  if (!value) throw new Error("operator_route_parameter_missing");
-  return value;
-}
-
-interface BoundedSnapshotPage<TRecord> {
-  readonly hasMore: boolean;
-  readonly records: TRecord[];
-}
-
-/** Reads participants in small indexed keyset pages until the response budget is full. */
-function listParticipantsWithinSnapshotBudget(input: {
-  readonly limit: number;
-  readonly maxBytes: number;
-  readonly service: SessionServiceEffect;
-  readonly sessionId: string;
-}): Effect.Effect<BoundedSnapshotPage<BrowserSessionSnapshot["participants"][number]>, unknown> {
-  return Effect.gen(function* () {
-    const records: BrowserSessionSnapshot["participants"] = [];
-    let before: BrowserSessionSnapshot["participants"][number] | undefined;
-    let byteLength = 0;
-    for (;;) {
-      const pageLimit = Math.min(
-        snapshotReadPageSize(input.maxBytes),
-        input.limit + 1 - records.length,
-      );
-      const page = yield* input.service.listParticipants(input.sessionId, {
-        ...(before === undefined
-          ? {}
-          : {
-              before: { lastSeenAt: before.lastSeenAt, participantId: before.participantId },
-            }),
-        limit: pageLimit,
-      });
-      for (const participant of page) {
-        if (records.length >= input.limit) return { hasMore: true, records };
-        const nextByteLength = byteLength + Buffer.byteLength(JSON.stringify(participant)) + 1;
-        if (nextByteLength > input.maxBytes) return { hasMore: true, records };
-        byteLength = nextByteLength;
-        records.push(participant);
-      }
-      if (page.length < pageLimit) return { hasMore: false, records };
-      before = page.at(-1);
-    }
-  });
-}
-
-/** Reads tasks in small indexed keyset pages until the response budget is full. */
-function listTasksWithinSnapshotBudget(input: {
-  readonly limit: number;
-  readonly maxBytes: number;
-  readonly service: SessionServiceEffect;
-  readonly sessionId: string;
-}): Effect.Effect<BoundedSnapshotPage<BrowserSessionSnapshot["tasks"][number]>, unknown> {
-  return Effect.gen(function* () {
-    const records: BrowserSessionSnapshot["tasks"] = [];
-    let before: BrowserSessionSnapshot["tasks"][number] | undefined;
-    let byteLength = 0;
-    for (;;) {
-      const pageLimit = Math.min(
-        snapshotReadPageSize(input.maxBytes),
-        input.limit + 1 - records.length,
-      );
-      const page = yield* input.service.listTasks(input.sessionId, "all", {
-        ...(before === undefined
-          ? {}
-          : { before: { createdAt: before.createdAt, taskId: before.taskId } }),
-        limit: pageLimit,
-      });
-      for (const task of page) {
-        if (records.length >= input.limit) return { hasMore: true, records };
-        const nextByteLength = byteLength + Buffer.byteLength(JSON.stringify(task)) + 1;
-        if (nextByteLength > input.maxBytes) return { hasMore: true, records };
-        byteLength = nextByteLength;
-        records.push(task);
-      }
-      if (page.length < pageLimit) return { hasMore: false, records };
-      before = page.at(-1);
-    }
-  });
-}
-
-/** Caps one keyset read so a full page cannot exceed the persisted row bound. */
-function snapshotReadPageSize(maxBytes: number): number {
-  return Math.max(1, Math.min(32, Math.floor(maxBytes / snapshotRecordMaxBytes)));
-}
-
-/** Trims a row-bounded snapshot until the complete serialized response meets its byte budget. */
-export function fitBrowserSnapshotWithinByteBudget(
-  input: BrowserSessionSnapshot,
-  maxBytes: number,
-): BrowserSessionSnapshot {
-  const snapshot = {
-    ...input,
-    events: [...input.events],
-    participants: [...input.participants],
-    tasks: [...input.tasks],
-    truncated: { ...input.truncated },
-  };
-  if (Buffer.byteLength(JSON.stringify(snapshot)) <= maxBytes) return snapshot;
-  if (trimSnapshotArray(snapshot, "tasks", maxBytes)) snapshot.truncated.tasks = true;
-  if (Buffer.byteLength(JSON.stringify(snapshot)) <= maxBytes) return snapshot;
-  if (trimSnapshotArray(snapshot, "participants", maxBytes)) snapshot.truncated.participants = true;
-  if (Buffer.byteLength(JSON.stringify(snapshot)) <= maxBytes) return snapshot;
-  if (trimSnapshotArray(snapshot, "events", maxBytes)) {
-    snapshot.cursor = snapshot.events.at(-1)?.seq ?? 0;
-    snapshot.truncated.events = true;
-  }
-  if (Buffer.byteLength(JSON.stringify(snapshot)) > maxBytes) {
-    throw new Error("browser_snapshot_byte_budget_invalid");
-  }
-  return snapshot;
-}
-
-/** Finds the largest prefix of one snapshot collection that fits using logarithmic probes. */
-function trimSnapshotArray(
-  snapshot: BrowserSessionSnapshot,
-  key: "events" | "participants" | "tasks",
-  maxBytes: number,
-): boolean {
-  const values = snapshot[key];
-  if (values.length === 0) return false;
-  let lower = 0;
-  let upper = values.length;
-  while (lower < upper) {
-    const midpoint = Math.ceil((lower + upper) / 2);
-    const candidate = { ...snapshot, [key]: values.slice(0, midpoint) };
-    if (Buffer.byteLength(JSON.stringify(candidate)) <= maxBytes) lower = midpoint;
-    else upper = midpoint - 1;
-  }
-  if (lower === values.length) return false;
-  if (key === "tasks") snapshot.tasks = values.slice(0, lower) as typeof snapshot.tasks;
-  if (key === "participants") {
-    snapshot.participants = values.slice(0, lower) as typeof snapshot.participants;
-  }
-  if (key === "events") snapshot.events = values.slice(0, lower) as typeof snapshot.events;
-  return true;
-}
-
-/** Returns the remaining serialized response budget after one bounded snapshot stage. */
-function remainingSnapshotBytes(snapshot: BrowserSessionSnapshot, maxBytes: number): number {
-  return Math.max(1, maxBytes - Buffer.byteLength(JSON.stringify(snapshot)));
 }
 
 /** Renders canonical first-committer-wins approval results. */

@@ -3,8 +3,10 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   type OperatorCommandRequest,
   type OperatorGrantScope,
+  operatorCommandIdentityKey,
   operatorCommandPermission,
   operatorGrantScopeSchema,
+  operatorTaskKind,
 } from "@dungle-scrubs/tether-protocol";
 import {
   and,
@@ -23,7 +25,7 @@ import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { Context, Effect, Layer } from "effect";
 import pg from "pg";
 
-import { approvalTargetKey } from "./approval-target-key.js";
+import { approvalTargetKeyFromTarget, legacyApprovalTargetKey } from "./approval-target-key.js";
 import {
   authorizeOperator,
   type OperatorAuthorityDenialReason,
@@ -72,6 +74,7 @@ import type {
   ControlChannel,
   ControlLeaseSnapshot,
   ControlLeaseStatus,
+  ParticipantListOptions,
   ParticipantRecord,
   ParticipantRuntimeSnapshot,
   ParticipantRuntimeSnapshotStatus,
@@ -82,6 +85,7 @@ import type {
   SessionListItem,
   SessionRecord,
   TaskApprovalRecord,
+  TaskListOptions,
   TaskListStatus,
   TaskRecord,
   TaskSnapshot,
@@ -604,7 +608,7 @@ export class TaskClaimExpirationDeadlockError extends Error {
 }
 
 /** Acquires a transaction-scoped advisory lock for a two-part identity key. */
-async function acquireTransactionAdvisoryLock(
+export async function acquireTransactionAdvisoryLock(
   client: TransactionClient,
   leftKey: string,
   rightKey: string,
@@ -2508,10 +2512,7 @@ export async function heartbeatParticipantWithEvent(
 export async function listParticipants(
   database: DatabasePool,
   sessionId: string,
-  options: {
-    readonly before?: Pick<ParticipantRecord, "lastSeenAt" | "participantId"> | undefined;
-    readonly limit?: number | undefined;
-  } = {},
+  options: ParticipantListOptions = {},
 ): Promise<ParticipantRecord[]> {
   const beforeDate = options.before === undefined ? null : new Date(options.before.lastSeenAt);
   const query = database.db
@@ -2740,17 +2741,27 @@ export async function createOperatorCommandTaskWithEvent(
       }
       throw error;
     }
-    await acquireTransactionAdvisoryLock(client, "operator-command-admission", "global");
     const commandKey = createHash("sha256")
       .update(
-        JSON.stringify({
+        operatorCommandIdentityKey({
           command: input.authority.request.command,
           grantJti: input.authority.grantJti,
           scopeKey: input.authority.request.scopeKey,
-          targetId: input.authority.request.targetId ?? null,
+          ...(input.authority.request.targetId === undefined
+            ? {}
+            : { targetId: input.authority.request.targetId }),
         }),
       )
       .digest("hex");
+    // Only concurrent admissions of the same command need serializing, and
+    // `tasks_operator_command_active_unique` is the durable fence behind this
+    // lock. Keying it globally would bound the whole operator surface to one
+    // transaction at a time for the sake of an approximate queue-depth cap.
+    await acquireTransactionAdvisoryLock(
+      client,
+      "operator-command-admission",
+      `${input.authority.request.sessionId}:${commandKey}`,
+    );
     const existing = await client.query<PgTaskRow>(
       `SELECT ${taskReturningColumns}
        FROM tasks
@@ -2782,6 +2793,8 @@ export async function createOperatorCommandTaskWithEvent(
     if ((grantRate.rows[0]?.count ?? 0) >= maximumOperatorCommandsPerGrantPerMinute) {
       throw new OperatorCommandAdmissionError("operator_command_rate_limited");
     }
+    // Deployment-wide queue depth, read without a global lock: the cap tolerates
+    // admitting a few commands past it under concurrency.
     const pending = await client.query<{ readonly count: number }>(
       `SELECT count(*)::int AS count
        FROM tasks
@@ -2803,7 +2816,7 @@ export async function createOperatorCommandTaskWithEvent(
           ? {}
           : { targetId: input.authority.request.targetId }),
       },
-      kind: `operator.${input.authority.request.command}`,
+      kind: operatorTaskKind(input.authority.request.command),
       objective: `Process operator command ${input.authority.request.command}`,
       operatorCommand: { commandKey, grantJti: input.authority.grantJti },
       sessionId: input.authority.request.sessionId,
@@ -2945,10 +2958,7 @@ export async function listTasks(
   database: DatabasePool,
   sessionId: string,
   status: TaskListStatus = "active",
-  options: {
-    readonly before?: Pick<TaskRecord, "createdAt" | "taskId"> | undefined;
-    readonly limit?: number | undefined;
-  } = {},
+  options: TaskListOptions = {},
 ): Promise<TaskRecord[]> {
   const beforeDate = options.before === undefined ? null : new Date(options.before.createdAt);
   const query = database.db
@@ -3077,7 +3087,10 @@ export async function recordTaskApproval(
     readonly taskId: string;
   },
 ): Promise<PersistedTaskApprovalResult | null> {
-  const targetKey = approvalTargetKey(input.reason, input.target);
+  const targetKey =
+    input.target === undefined
+      ? legacyApprovalTargetKey(input.reason)
+      : approvalTargetKeyFromTarget(input.target);
   const client = await database.pool.connect();
   try {
     await client.query("BEGIN");
@@ -3231,6 +3244,26 @@ async function assertOperatorGrantAuthorityWithClient(
   return row.subject;
 }
 
+/** One manifest field compared in order, and the refusal its first mismatch raises. */
+interface ApprovalTargetManifestCheck {
+  readonly field: keyof ApprovalTarget;
+  readonly reason: ApprovalTargetManifestErrorReason;
+}
+
+/**
+ * Ordered manifest comparison. A submitted target must match a manifest entry
+ * on every field; the refusal names the first field that did not match on the
+ * entry that matched furthest, so the operator learns what actually diverged.
+ */
+const approvalTargetManifestChecks: readonly ApprovalTargetManifestCheck[] = [
+  { field: "targetId", reason: "target_absent" },
+  { field: "targetKind", reason: "target_kind_mismatch" },
+  { field: "scopeKey", reason: "scope_mismatch" },
+  { field: "targetRevision", reason: "target_revision_mismatch" },
+  { field: "action", reason: "action_mismatch" },
+  { field: "digest", reason: "digest_mismatch" },
+];
+
 /** Verifies one submitted target against the completed result inside the commit transaction. */
 function assertApprovalTargetManifest(task: TaskRecord, target: ApprovalTarget | undefined): void {
   if (target === undefined) {
@@ -3249,48 +3282,21 @@ function assertApprovalTargetManifest(task: TaskRecord, target: ApprovalTarget |
   if (!manifest.success) {
     throw new ApprovalTargetManifestError("target_absent");
   }
-  let deepestMatch = 0;
+  let matchedFields = 0;
   for (const entry of manifest.data) {
-    if (entry.targetId !== target.targetId) {
-      continue;
+    let depth = 0;
+    while (depth < approvalTargetManifestChecks.length) {
+      const check = approvalTargetManifestChecks[depth] as ApprovalTargetManifestCheck;
+      if (entry[check.field] !== target[check.field]) break;
+      depth += 1;
     }
-    deepestMatch = Math.max(deepestMatch, 1);
-    if (entry.targetKind !== target.targetKind) {
-      continue;
-    }
-    deepestMatch = Math.max(deepestMatch, 2);
-    if (entry.scopeKey !== target.scopeKey) {
-      continue;
-    }
-    deepestMatch = Math.max(deepestMatch, 3);
-    if (entry.targetRevision !== target.targetRevision) {
-      continue;
-    }
-    deepestMatch = Math.max(deepestMatch, 4);
-    if (entry.action !== target.action) {
-      continue;
-    }
-    deepestMatch = Math.max(deepestMatch, 5);
-    if (entry.digest === target.digest) {
+    if (depth === approvalTargetManifestChecks.length) {
       return;
     }
+    matchedFields = Math.max(matchedFields, depth);
   }
-  if (deepestMatch === 0) {
-    throw new ApprovalTargetManifestError("target_absent");
-  }
-  if (deepestMatch === 1) {
-    throw new ApprovalTargetManifestError("target_kind_mismatch");
-  }
-  if (deepestMatch === 2) {
-    throw new ApprovalTargetManifestError("scope_mismatch");
-  }
-  if (deepestMatch === 3) {
-    throw new ApprovalTargetManifestError("target_revision_mismatch");
-  }
-  if (deepestMatch === 4) {
-    throw new ApprovalTargetManifestError("action_mismatch");
-  }
-  throw new ApprovalTargetManifestError("digest_mismatch");
+  const failed = approvalTargetManifestChecks[matchedFields] as ApprovalTargetManifestCheck;
+  throw new ApprovalTargetManifestError(failed.reason);
 }
 
 /**

@@ -14,13 +14,20 @@ import type { ApprovalTarget } from "./types.js";
 export const wholeTaskApprovalTargetKey = "task";
 
 /**
- * Builds the stable approval target key stored in `task_approvals`.
+ * Builds the approval target key stored in `task_approvals` for one typed
+ * provider-neutral target.
  */
-export function approvalTargetKey(reason: unknown, target?: ApprovalTarget | undefined): string {
-  if (target !== undefined) {
-    const digest = createHash("sha256").update(approvalTargetIdentityKey(target)).digest("hex");
-    return `approvalTarget:v2:sha256:${digest}`;
-  }
+export function approvalTargetKeyFromTarget(target: ApprovalTarget): string {
+  const digest = createHash("sha256").update(approvalTargetIdentityKey(target)).digest("hex");
+  return `approvalTarget:v2:sha256:${digest}`;
+}
+
+/**
+ * Builds the approval target key for an approval that carries no typed target,
+ * reading the pre-manifest `reason.approvalTarget` shape still present in
+ * durable history. New callers should supply a typed target instead.
+ */
+export function legacyApprovalTargetKey(reason: unknown): string {
   if (typeof reason !== "object" || reason === null) {
     return wholeTaskApprovalTargetKey;
   }

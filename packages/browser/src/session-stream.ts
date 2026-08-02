@@ -1,9 +1,13 @@
 import {
-  boundedExponentialRetryDelayMs,
+  boundedReconnectDelayMs,
+  buildSessionStreamUrl,
   classifyWebSocketServerEnvelope,
+  parseWebSocketRecoveryCondition,
   SerialEventDelivery,
   type SerialEventDeliveryOutcome,
   type SessionEvent,
+  serialDeliveryFailureReason,
+  utf8ByteLength,
   webSocketOperation,
 } from "@dungle-scrubs/tether-protocol";
 
@@ -12,9 +16,8 @@ import { BrowserSessionStreamError } from "./errors.js";
 const defaultHandlerTimeoutMs = 30_000;
 const defaultMaxQueueBytes = 16 * 1024 * 1024;
 const defaultMaxQueueSize = 2_000;
-const defaultReconnectBaseDelayMs = 100;
 const defaultReconnectMaxAttempts = 5;
-const defaultReconnectMaxDelayMs = 2_000;
+const serverStreamErrorReason = "server_stream_error";
 
 /** Browser session stream lifecycle states. */
 export type BrowserSessionStreamState =
@@ -301,7 +304,7 @@ export class BrowserSessionStream {
     }
     const envelope = classified.envelope;
     if (envelope.op === webSocketOperation.event) {
-      this.delivery.enqueueEvent(envelope.event, new TextEncoder().encode(data).byteLength);
+      this.delivery.enqueueEvent(envelope.event, utf8ByteLength(data));
       return;
     }
     if (envelope.op === webSocketOperation.replayComplete) {
@@ -309,7 +312,8 @@ export class BrowserSessionStream {
       return;
     }
     if (envelope.op === webSocketOperation.error) {
-      this.pause(envelope.reason ?? "server_stream_error");
+      const recovery = parseWebSocketRecoveryCondition(envelope);
+      this.pause(recovery?.reason ?? serverStreamErrorReason);
     }
   }
 
@@ -336,9 +340,8 @@ export class BrowserSessionStream {
       this.replay.resolve();
       return;
     }
-    const reason = deliveryFailureReason(outcome);
     const cause = outcome.kind === "handler-failed" ? outcome.cause : undefined;
-    this.pause(reason, cause);
+    this.pause(deliveryFailureReason(outcome), cause);
   }
 
   /** Stops old admission and reconnects only after its active handler settles. */
@@ -442,12 +445,7 @@ export function buildBrowserSessionStreamUrl(input: {
   readonly sessionId: string;
   readonly ticket: string;
 }): string {
-  const url = new URL(`/sessions/${encodeURIComponent(input.sessionId)}/stream`, input.serviceUrl);
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  url.searchParams.set("after", String(input.afterSeq));
-  url.searchParams.set("runtimeKind", "observer");
-  url.searchParams.set("ticket", input.ticket);
-  return url.toString();
+  return buildSessionStreamUrl(input);
 }
 
 /** Computes a validated bounded exponential reconnect delay. */
@@ -455,11 +453,7 @@ function reconnectDelayMs(
   attempt: number,
   policy: BrowserSessionReconnectPolicy | undefined,
 ): number {
-  return boundedExponentialRetryDelayMs(
-    attempt,
-    policy?.baseDelayMs ?? defaultReconnectBaseDelayMs,
-    policy?.maxDelayMs ?? defaultReconnectMaxDelayMs,
-  );
+  return boundedReconnectDelayMs(attempt, policy);
 }
 
 /** Validates all finite reconnect controls at construction time. */
@@ -474,22 +468,12 @@ function validateReconnectPolicy(policy: BrowserSessionReconnectPolicy | undefin
 /** Converts one delivery failure outcome to a stable browser-safe reason. */
 function deliveryFailureReason(outcome: SerialEventDeliveryOutcome<SessionEvent>): string {
   switch (outcome.kind) {
-    case "delivery-byte-overflow":
-      return "delivery_byte_overflow";
-    case "delivery-queue-overflow":
-      return "delivery_queue_overflow";
-    case "handler-failed":
-      return "event_handler_failed";
-    case "handler-timeout":
-      return "event_handler_timeout";
-    case "invalid-server-envelope":
-      return "invalid_server_envelope";
-    case "non-contiguous-event":
-      return "non_contiguous_event";
     case "duplicate-ignored":
     case "event-handled":
     case "replay-complete":
       throw new Error(`Successful delivery outcome cannot be mapped to failure: ${outcome.kind}`);
+    default:
+      return serialDeliveryFailureReason(outcome.kind);
   }
 }
 

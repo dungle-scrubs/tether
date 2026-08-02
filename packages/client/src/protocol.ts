@@ -1,7 +1,9 @@
 export {
   appendEventSchema,
   boundedExponentialRetryDelayMs,
+  boundedReconnectDelayMs,
   buildPublishedEventInput,
+  buildSessionStreamUrl,
   buildTaskOutputEventInput,
   buildTaskProgressEventInput,
   buildWsPublishMessage,
@@ -17,8 +19,10 @@ export {
   parseWebSocketServerEnvelope,
   participantRuntimeKindSchema,
   registerParticipantSchema,
+  serialDeliveryFailureReason,
   serializeCommandResultEnvelope,
   serializeErrorEnvelope,
+  sessionEventObserverRuntimeKind,
   sessionEventSchema,
   sessionEventType,
   systemProducerId,
@@ -43,6 +47,7 @@ export {
 export type {
   AppendSessionEventInput,
   CommandResultEnvelope,
+  ReconnectDelayPolicy,
   WebSocketCommandMessage,
   WebSocketServerEnvelope,
   WebSocketServerEnvelopeClassification,

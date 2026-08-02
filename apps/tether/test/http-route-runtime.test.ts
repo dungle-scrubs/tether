@@ -21,7 +21,7 @@ describe("handleHttpRouteError", () => {
   it("accepts only canonical HTTP origins in browser authority configuration", () => {
     expect(
       readCorsOptionsFromEnv({
-        BROWSER_ALLOWED_ORIGINS: "https://Hub.Example.Test, http://127.0.0.1:17445/",
+        BROWSER_ALLOWED_ORIGINS: "https://hub.example.test, http://127.0.0.1:17445",
       }),
     ).toEqual({
       allowedOrigins: ["https://hub.example.test", "http://127.0.0.1:17445"],
@@ -36,6 +36,8 @@ describe("handleHttpRouteError", () => {
       "https://example.test?query=1",
       "https://example.test#fragment",
       "not-an-origin",
+      "https://Hub.Example.Test",
+      "http://127.0.0.1:17445/",
     ]) {
       expect(() => readCorsOptionsFromEnv({ BROWSER_ALLOWED_ORIGINS: value })).toThrowError(
         "browser_allowed_origin_invalid",

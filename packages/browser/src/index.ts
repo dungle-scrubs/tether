@@ -4,10 +4,15 @@ export type {
   BrowserOperatorClientConfig,
   BrowserOperatorClientDebugInfo,
   BrowserOperatorFetch,
+  BrowserOperatorOperation,
   ConnectBrowserSessionInput,
 } from "./browser-operator-client.js";
 export { BrowserOperatorClient } from "./browser-operator-client.js";
-export { BrowserOperatorHttpError, BrowserSessionStreamError } from "./errors.js";
+export {
+  BrowserOperatorConfigurationError,
+  BrowserOperatorHttpError,
+  BrowserSessionStreamError,
+} from "./errors.js";
 export type {
   BrowserSessionDeliveryPolicy,
   BrowserSessionReconnectPolicy,

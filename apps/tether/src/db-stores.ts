@@ -13,8 +13,8 @@ import {
   claimControlLease,
   claimTaskWithEvent,
   completeTaskWithEvent,
-  createSession,
   createOperatorCommandTaskWithEvent,
+  createSession,
   createTaskWithEventIdempotent,
   type DatabasePool,
   deleteSession,
@@ -26,9 +26,9 @@ import {
   heartbeatParticipant,
   heartbeatParticipantWithEvent,
   listClientSessionBindings,
+  listContextEventSuffix,
   listControlLeaseSnapshots,
   listEvents,
-  listContextEventSuffix,
   listParticipantRuntimeSnapshots,
   listParticipants,
   listSessions,
@@ -57,7 +57,12 @@ import type {
   TaskStore,
 } from "./db-store-contracts.js";
 import type { AppendSessionEventInput, ApprovalTarget } from "./protocol.js";
-import type { ParticipantRuntimeKind, TaskListStatus } from "./types.js";
+import type {
+  ParticipantListOptions,
+  ParticipantRuntimeKind,
+  TaskListOptions,
+  TaskListStatus,
+} from "./types.js";
 
 /** Builds focused persistence stores over the current database function implementations. */
 export function createSessionPersistenceStores(database: DatabasePool): SessionPersistenceStores {
@@ -210,7 +215,7 @@ class DbParticipantStore implements ParticipantStore {
     return heartbeatParticipantWithEvent(this.database, input);
   }
 
-  list(sessionId: string, options?: { readonly limit?: number | undefined }) {
+  list(sessionId: string, options?: ParticipantListOptions) {
     return listParticipants(this.database, sessionId, options);
   }
 
@@ -365,11 +370,7 @@ class DbTaskStore implements TaskStore {
     return getTask(this.database, input);
   }
 
-  list(
-    sessionId: string,
-    status: TaskListStatus = "active",
-    options?: { readonly limit?: number | undefined },
-  ) {
+  list(sessionId: string, status: TaskListStatus = "active", options?: TaskListOptions) {
     return listTasks(this.database, sessionId, status, options);
   }
 

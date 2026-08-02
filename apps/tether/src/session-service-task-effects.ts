@@ -1,18 +1,18 @@
 import { Effect } from "effect";
 
-import { approvalTargetKey } from "./approval-target-key.js";
-import type {
-  PersistedTaskApprovalResult,
-  SessionPersistenceStores,
-} from "./db-store-contracts.js";
+import { approvalTargetKeyFromTarget, legacyApprovalTargetKey } from "./approval-target-key.js";
 import {
   ApprovalTargetManifestError,
-  OperatorGrantAuthorityError,
   type EnsureScheduledRunResult,
+  OperatorGrantAuthorityError,
   ScheduledRunIdentityConflictError,
   ScheduledTaskIdentityMismatchError,
   TaskClaimExpirationDeadlockError,
 } from "./db.js";
+import type {
+  PersistedTaskApprovalResult,
+  SessionPersistenceStores,
+} from "./db-store-contracts.js";
 import type { ModuleObservability } from "./observability.js";
 import { classifyScheduledSupersession, deriveScheduledTaskId, newTaskId } from "./protocol.js";
 import {
@@ -22,7 +22,6 @@ import {
   type ClaimOwnedTaskInput,
   type CompleteTaskInput,
   type CreateTaskInput,
-  type StandardCreateTaskInput,
   type EnsureScheduledRunRequest,
   type FailTaskInput,
   type RecordedTaskApprovalResult,
@@ -33,6 +32,8 @@ import {
   type ScheduledSupersessionRefusal,
   type ScheduledSupersessionResult,
   type SessionServiceFailure,
+  SessionServicePersistenceError,
+  type StandardCreateTaskInput,
   type SupersedeScheduledRunsRequest,
   TaskApprovalIgnoredError,
   TaskApprovalRejectedError,
@@ -46,7 +47,6 @@ import {
   TaskMutationRejectedError,
   type TaskMutationResult,
   type TaskParticipantInput,
-  SessionServicePersistenceError,
 } from "./session-service-contracts.js";
 import { trySessionPromise } from "./session-service-runtime.js";
 import type {
@@ -329,7 +329,10 @@ export function createSessionTaskEffects(input: SessionTaskEffectsInput): Sessio
             new TaskApprovalRejectedError(taskInput.decision, rejectionReason, task),
           );
         }
-        const targetKey = approvalTargetKey(taskInput.reason, taskInput.target);
+        const targetKey =
+          taskInput.target === undefined
+            ? legacyApprovalTargetKey(taskInput.reason)
+            : approvalTargetKeyFromTarget(taskInput.target);
         const persisted: PersistedTaskApprovalResult | null = yield* trySessionPromise(() =>
           input.stores.tasks.recordApproval({
             controlGuard: taskInput.controlGuard,
@@ -738,7 +741,10 @@ export function taskApprovalTraceInput(input: RecordTaskApprovalInput): Record<s
   return {
     ...taskParticipantTraceInput(input),
     decision: input.decision,
-    targetKey: approvalTargetKey(input.reason, input.target),
+    targetKey:
+      input.target === undefined
+        ? legacyApprovalTargetKey(input.reason)
+        : approvalTargetKeyFromTarget(input.target),
   };
 }
 

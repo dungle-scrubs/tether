@@ -44,6 +44,19 @@ export interface BrowserPairingHttpRouteInput {
   readonly url: URL;
 }
 
+/** Security attributes every browser session cookie carries, set and cleared alike. */
+const browserSessionCookieSecurityAttributes = ["Secure", "HttpOnly", "SameSite=Strict"] as const;
+
+/** Builds one browser session cookie under the single shared attribute policy. */
+function browserSessionCookie(value: string, lifetime: string): string {
+  return [
+    `${browserSessionCookieName}=${value}`,
+    "Path=/",
+    lifetime,
+    ...browserSessionCookieSecurityAttributes,
+  ].join("; ");
+}
+
 /** Serializes a browser bearer into the only cookie form accepted by the operator boundary. */
 export function serializeBrowserSessionCookie(input: {
   readonly bearer: string;
@@ -53,14 +66,12 @@ export function serializeBrowserSessionCookie(input: {
   if (Number.isNaN(expiresAt.getTime())) {
     throw new Error("browser_session_expiry_invalid");
   }
-  return [
-    `${browserSessionCookieName}=${input.bearer}`,
-    "Path=/",
-    `Expires=${expiresAt.toUTCString()}`,
-    "Secure",
-    "HttpOnly",
-    "SameSite=Strict",
-  ].join("; ");
+  return browserSessionCookie(input.bearer, `Expires=${expiresAt.toUTCString()}`);
+}
+
+/** Returns a deletion cookie retaining the same security attributes it was set with. */
+export function clearBrowserSessionCookie(): string {
+  return browserSessionCookie("", "Max-Age=0");
 }
 
 /** Handles creation and one-time exchange without admitting cookie credentials to generic REST. */

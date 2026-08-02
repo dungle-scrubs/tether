@@ -1,13 +1,19 @@
 import { z } from "zod";
 
-import { approvalDecisionSchema, approvalTargetSchema } from "./approval-targets.js";
-import { sessionEventSchema } from "./event-builders.js";
-import { operatorGrantScopeSchema, type OperatorPermission } from "./operator-authority.js";
 import {
-  participantRuntimeKindSchema,
-  taskApprovalRecordSchema,
-  taskRecordSchema,
-} from "./records.js";
+  approvalDecisionSchema,
+  approvalTargetSchema,
+  opaqueTargetValueSchema,
+} from "./approval-targets.js";
+import { browserOneTimeTicketSchema } from "./browser-pairing.js";
+import { sessionEventSchema } from "./event-builders.js";
+import {
+  type OperatorPermission,
+  operatorGrantJtiSchema,
+  operatorGrantScopeSchema,
+  operatorSubjectSchema,
+} from "./operator-authority.js";
+import { participantRecordSchema, taskApprovalRecordSchema, taskRecordSchema } from "./records.js";
 import { recurringWorkScopeKeySchema } from "./task-contracts.js";
 
 /** Fixed provider-neutral commands exposed by the non-participant browser boundary. */
@@ -26,10 +32,33 @@ const operatorCommandPermissionByCommand = {
 } as const satisfies Record<OperatorCommand, OperatorPermission>;
 
 /** Returns the single permission that authorizes one fixed operator command. */
-export function operatorCommandPermission(
-  command: OperatorCommand,
-): (typeof operatorCommandPermissionByCommand)[OperatorCommand] {
+export function operatorCommandPermission<TCommand extends OperatorCommand>(
+  command: TCommand,
+): (typeof operatorCommandPermissionByCommand)[TCommand] {
   return operatorCommandPermissionByCommand[command];
+}
+
+/** Durable task-kind namespace reserved for browser operator commands. */
+export const operatorTaskKindPrefix = "operator.";
+
+/** Returns the durable task kind recorded for one operator command. */
+export function operatorTaskKind(command: OperatorCommand): string {
+  return `${operatorTaskKindPrefix}${command}`;
+}
+
+/**
+ * Collision-free canonical encoding of the tuple that makes one operator
+ * command a duplicate of another. This is hashed into the durable
+ * `operator_command_key`, so its shape is versioned with the protocol rather
+ * than restated at the persistence boundary.
+ */
+export function operatorCommandIdentityKey(input: {
+  readonly command: OperatorCommand;
+  readonly grantJti: string;
+  readonly scopeKey: string;
+  readonly targetId?: string | undefined;
+}): string {
+  return JSON.stringify([input.command, input.grantJti, input.scopeKey, input.targetId ?? null]);
 }
 
 /** Bounded request that can create only a server-selected operator command task. */
@@ -37,7 +66,7 @@ export const operatorCommandRequestSchema = z
   .object({
     command: operatorCommandSchema,
     scopeKey: recurringWorkScopeKeySchema,
-    targetId: z.string().min(1).max(512).optional(),
+    targetId: opaqueTargetValueSchema.optional(),
   })
   .strict()
   .superRefine((request, context) => {
@@ -70,48 +99,20 @@ export const operatorTaskApprovalRequestSchema = z
 export const browserOperatorSessionSchema = z
   .object({
     expiresAt: z.string().datetime({ offset: true }),
-    grantJti: z.string().min(1).max(128),
+    grantJti: operatorGrantJtiSchema,
     scope: operatorGrantScopeSchema,
-    sessionIds: operatorGrantScopeSchema.shape.sessionIds,
     status: z.literal("active"),
-    subject: z.string().min(1).max(255),
+    subject: operatorSubjectSchema,
   })
-  .strict()
-  .superRefine((session, context) => {
-    const allowed = new Set(session.scope.sessionIds);
-    if (
-      session.sessionIds.length !== allowed.size ||
-      session.sessionIds.some((sessionId) => !allowed.has(sessionId))
-    ) {
-      context.addIssue({
-        code: "custom",
-        message: "Session discovery must exactly match grant scope",
-        path: ["sessionIds"],
-      });
-    }
-  });
+  .strict();
 
 /** Provider-neutral non-participant snapshot used before WebSocket replay begins. */
 export const browserSessionSnapshotSchema = z
   .object({
     cursor: z.number().int().nonnegative().safe(),
     events: z.array(sessionEventSchema).max(1_000),
-    participants: z
-      .array(
-        z
-          .object({
-            capabilities: z.record(z.string(), z.unknown()),
-            displayName: z.string(),
-            joinedAt: z.string(),
-            lastSeenAt: z.string(),
-            participantId: z.string().min(1),
-            runtimeKind: participantRuntimeKindSchema,
-            sessionId: z.string().min(1),
-          })
-          .strict(),
-      )
-      .max(1_000),
-    sessionId: z.string().min(1).max(512),
+    participants: z.array(participantRecordSchema).max(1_000),
+    sessionId: opaqueTargetValueSchema,
     tasks: z.array(taskRecordSchema).max(10_000),
     truncated: z
       .object({
@@ -165,7 +166,7 @@ export const browserOperatorApprovalResponseSchema = z.discriminatedUnion("statu
 export const browserWebSocketTicketResponseSchema = z
   .object({
     expiresAt: z.string().datetime({ offset: true }),
-    ticket: z.string().regex(/^[A-Za-z0-9_-]{43}$/u),
+    ticket: browserOneTimeTicketSchema,
   })
   .strict();
 
