@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { Cause, Effect, Option, Runtime } from "effect";
 
 import { type ControlEpochStaleError, isControlEpochStaleError } from "./control-epoch.js";
+import { TaskGrantDeniedError } from "./auth/task-grants-policy.js";
 import type { ModuleObservability } from "./observability.js";
 import {
   type ControlEpochStaleResult,
@@ -22,6 +23,25 @@ export function extractControlEpochStale(error: unknown): ControlEpochStaleError
     return error;
   }
   if (error instanceof SessionServicePersistenceError && isControlEpochStaleError(error.cause)) {
+    return error.cause;
+  }
+  return null;
+}
+
+/**
+ * Returns the task-grant denial carried by an effect error, whether it was
+ * raised directly or wrapped as a persistence failure cause. Grant enforcement
+ * runs inside the task write transaction, so a denial surfaces here as a
+ * rolled-back persistence error rather than a clean authorization outcome.
+ */
+export function extractTaskGrantDenied(error: unknown): TaskGrantDeniedError | null {
+  if (error instanceof TaskGrantDeniedError) {
+    return error;
+  }
+  if (
+    error instanceof SessionServicePersistenceError &&
+    error.cause instanceof TaskGrantDeniedError
+  ) {
     return error.cause;
   }
   return null;

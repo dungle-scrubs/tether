@@ -126,6 +126,7 @@ export const SessionServiceEffectLive = Layer.effect(
     const config = yield* ServerConfigService;
     return createSessionServiceEffect(database, {
       controlEpochEnforcement: config.controlEpochEnforcement,
+      taskGrantAuthMode: config.authMode,
     });
   }),
 );
@@ -171,6 +172,9 @@ export function createSessionServiceEffect(
     eventSourceId,
     observability,
     taskClaimLeaseTtlMs: options.taskClaimLeaseTtlMs ?? taskClaimLeaseTtlMs,
+    ...(options.taskGrantAuthMode === undefined
+      ? {}
+      : { taskGrantAuthMode: options.taskGrantAuthMode }),
     wsControlLeaseTtlMs: options.wsControlLeaseTtlMs ?? wsControlLeaseTtlMs,
   });
 }
@@ -235,6 +239,9 @@ function makeSessionServiceEffect(
     observability,
     stores,
     taskClaimLeaseTtlMs: claimLeaseTtlMs,
+    ...(options.taskGrantAuthMode === undefined
+      ? {}
+      : { taskGrantAuthMode: options.taskGrantAuthMode }),
   });
   const traceEffect = createSessionTraceEffect(observability);
   const withRestControlOutcome = <TValue, TError>(
@@ -522,10 +529,12 @@ function makeSessionServiceEffect(
         createTaskEffect(input),
         (result) => ({
           conflictReason: result.status === "conflict" ? "task_id_conflict" : null,
+          ...(result.status === "denied" ? { denialReason: result.reason } : {}),
           eventCount: result.events.length,
           replayReason: result.status === "replayed" ? "task_id_replay" : null,
           status: result.status,
-          taskId: result.status === "conflict" ? result.taskId : result.task.taskId,
+          taskId:
+            result.status === "conflict" || result.status === "denied" ? null : result.task.taskId,
         }),
       ),
     expireTaskClaims: (input) =>
