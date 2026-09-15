@@ -1,5 +1,13 @@
 # @dungle-scrubs/tether-client-bridge
 
+## 2.0.1
+
+### Patch Changes
+
+- Updated dependencies [ff9906f]
+  - @dungle-scrubs/tether-protocol@0.4.0
+  - @dungle-scrubs/tether-client@1.1.0
+
 ## 2.0.0
 
 ### Major Changes

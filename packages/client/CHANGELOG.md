@@ -1,5 +1,16 @@
 # @dungle-scrubs/tether-client
 
+## 1.1.0
+
+### Minor Changes
+
+- ff9906f: Add fine-grained task authorization: separate task.create and task.claim actions with kind allowlists and optional explicit assignee, parent linkage as lineage only, typed claim denials distinct from race rejection. Default off with no policy rows; strict when rows exist.
+
+### Patch Changes
+
+- Updated dependencies [ff9906f]
+  - @dungle-scrubs/tether-protocol@0.4.0
+
 ## 1.0.1
 
 ### Patch Changes
