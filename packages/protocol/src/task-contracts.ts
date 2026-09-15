@@ -212,6 +212,18 @@ export const recurringWorkScopeSchema = z
   })
   .strict();
 
+/** Maximum encoded size of one task delegation scope label. */
+export const taskScopeLabelMaxLength = 128;
+
+/** Runtime validator for an optional task delegation scope label. */
+export const taskScopeLabelSchema = z.string().min(1).max(taskScopeLabelMaxLength);
+
+/** Runtime validator for an optional task assignee participant id. */
+export const taskAssigneeParticipantIdSchema = z.string().min(1).max(255);
+
+/** Runtime validator for an optional same-session parent task id. */
+export const taskParentTaskIdSchema = z.string().min(1);
+
 /**
  * Deterministic half-open UTC time bucket for recurring work identity. Version 1
  * is `[floor(unix_ms / interval_ms) * interval_ms, start + interval_ms)`.

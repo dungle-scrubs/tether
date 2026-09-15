@@ -15,11 +15,14 @@ import type {
   OperatorGrantAuthorityErrorReason,
   OperatorCommandTaskAuthority,
   ScheduledTaskIdentityInput,
+  TaskDelegationInput,
 } from "./db.js";
 
 export type { ControlEpochGuard };
 
 import type { ClientBindingLifecycleStatus } from "./db-store-contracts.js";
+import type { TaskGrantEnforcementDenial } from "./auth/task-grants-policy.js";
+import type { AuthMode } from "./config.js";
 import type {
   BoundaryDebugInfo,
   ModuleObservability,
@@ -172,6 +175,8 @@ export interface SessionServiceOptions {
   /** Optional source id override for deterministic fanout tests. */
   readonly eventSourceId?: string;
   readonly observability?: ModuleObservabilityOptions;
+  /** Auth mode gating task-grant enforcement; `disabled` never enforces. */
+  readonly taskGrantAuthMode?: AuthMode | undefined;
   readonly taskClaimLeaseTtlMs?: number;
   readonly wsControlLeaseTtlMs?: number;
 }
@@ -472,7 +477,18 @@ export interface ClientSessionBindingResult {
 /**
  * Task creation result including the canonical task-created event.
  */
-export type TaskCreatedResult = PersistedTaskCreateResult;
+export type TaskCreatedResult =
+  | PersistedTaskCreateResult
+  | {
+      // Grant-policy denial: the creating actor holds no live `task.create`
+      // grant covering the session, kind, and scope label while enforcement is
+      // active. Zero events, distinct from the idempotent replay outcome, which
+      // never consults grants.
+      readonly events: readonly [];
+      readonly reason: TaskGrantEnforcementDenial;
+      readonly status: "denied";
+      readonly task: null;
+    };
 
 /**
  * Result for expiring elapsed task claim leases.
@@ -525,6 +541,16 @@ export type TaskMutationResult =
       readonly events: readonly [];
       readonly status: "rejected";
       readonly task: null;
+    }
+  | {
+      // Grant-policy denial: zero events like a race rejection, but typed with
+      // the enforcement reason so callers can distinguish authorization failure
+      // from losing a claim race. Only claim (and create, via TaskCreatedResult)
+      // can deny; complete/fail/release/cancel stay on the claim-ownership fence.
+      readonly events: readonly [];
+      readonly reason: TaskGrantEnforcementDenial;
+      readonly status: "denied";
+      readonly task: null;
     };
 
 /**
@@ -539,6 +565,15 @@ export type TaskClaimRefreshResult =
   | {
       readonly events: readonly [];
       readonly status: "rejected";
+      readonly task: null;
+    }
+  | {
+      // Grant-policy denial: the holder's task.claim grant is revoked, expired,
+      // or missing while enforcement is active. Zero events, like a lost lease,
+      // but typed so revocation is distinguishable from lease expiry.
+      readonly events: readonly [];
+      readonly reason: TaskGrantEnforcementDenial;
+      readonly status: "denied";
       readonly task: null;
     };
 
@@ -731,7 +766,13 @@ export interface RecordTaskApprovalInput extends TaskParticipantInput {
   readonly target?: ApprovalTarget | undefined;
 }
 
-export interface StandardCreateTaskInput {
+export interface StandardCreateTaskInput extends TaskDelegationInput {
+  /**
+   * Authenticated participant performing the create; owns the task when no
+   * assignee is set. Supplied by the route layer from the auth context and
+   * evaluated against `task.create` grants when enforcement is active.
+   */
+  readonly actorParticipantId?: string | undefined;
   readonly input: Record<string, unknown> | null;
   readonly kind: string;
   readonly objective: string;
@@ -868,5 +909,7 @@ export interface SessionServiceEffectRuntimeOptions {
   readonly eventSourceId?: string;
   readonly observability?: ModuleObservability;
   readonly taskClaimLeaseTtlMs?: number;
+  /** Auth mode gating task-grant enforcement; `disabled` never enforces. */
+  readonly taskGrantAuthMode?: AuthMode | undefined;
   readonly wsControlLeaseTtlMs?: number;
 }

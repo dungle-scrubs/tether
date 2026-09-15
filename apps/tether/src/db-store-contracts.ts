@@ -20,6 +20,8 @@ import type {
   ScheduledTaskIdentityInput,
   SupersededScheduledRunsResult,
   SupersedeScheduledRunsInput,
+  TaskDelegationInput,
+  TaskGrantEnforcementInput,
 } from "./db.js";
 import type { AppendSessionEventInput, ApprovalDecision } from "./protocol.js";
 import type {
@@ -257,14 +259,16 @@ export interface TaskStore {
     readonly target?: ApprovalTarget | undefined;
     readonly taskId: string;
   }) => Promise<PersistedTaskApprovalResult | null>;
-  readonly claimWithEvent: (input: {
-    readonly claimLeaseTtlMs: number;
-    readonly controlGuard?: ControlEpochGuard | undefined;
-    readonly eventSourceId: string;
-    readonly participantId: string;
-    readonly sessionId: string;
-    readonly taskId: string;
-  }) => Promise<PersistedTaskClaimResult>;
+  readonly claimWithEvent: (
+    input: {
+      readonly claimLeaseTtlMs: number;
+      readonly controlGuard?: ControlEpochGuard | undefined;
+      readonly eventSourceId: string;
+      readonly participantId: string;
+      readonly sessionId: string;
+      readonly taskId: string;
+    } & TaskGrantEnforcementInput,
+  ) => Promise<PersistedTaskClaimResult>;
   readonly completeWithEvent: (input: {
     readonly claimId: string;
     readonly controlGuard?: ControlEpochGuard | undefined;
@@ -274,16 +278,20 @@ export interface TaskStore {
     readonly sessionId: string;
     readonly taskId: string;
   }) => Promise<PersistedTaskEventResult>;
-  readonly createWithEvent: (input: {
-    readonly eventSourceId: string;
-    readonly input?: Record<string, unknown> | null;
-    readonly kind: string;
-    readonly objective: string;
-    readonly schedule?: ScheduledTaskIdentityInput | undefined;
-    readonly sessionId: string;
-    readonly taskId: string;
-    readonly taskIdSource: "caller" | "generated";
-  }) => Promise<PersistedTaskCreateResult>;
+  readonly createWithEvent: (
+    input: {
+      readonly actorParticipantId?: string | undefined;
+      readonly eventSourceId: string;
+      readonly input?: Record<string, unknown> | null;
+      readonly kind: string;
+      readonly objective: string;
+      readonly schedule?: ScheduledTaskIdentityInput | undefined;
+      readonly sessionId: string;
+      readonly taskId: string;
+      readonly taskIdSource: "caller" | "generated";
+    } & TaskDelegationInput &
+      TaskGrantEnforcementInput,
+  ) => Promise<PersistedTaskCreateResult>;
   readonly createOperatorWithEvent: (input: {
     readonly authority: OperatorCommandTaskAuthority;
     readonly eventSourceId: string;
@@ -315,14 +323,16 @@ export interface TaskStore {
     },
   ) => Promise<TaskRecord[]>;
   readonly listSnapshots: (sessionId: string) => Promise<TaskSnapshot[]>;
-  readonly refreshClaim: (input: {
-    readonly claimId: string;
-    readonly claimLeaseTtlMs: number;
-    readonly controlGuard?: ControlEpochGuard | undefined;
-    readonly participantId: string;
-    readonly sessionId: string;
-    readonly taskId: string;
-  }) => Promise<TaskRecord | null>;
+  readonly refreshClaim: (
+    input: {
+      readonly claimId: string;
+      readonly claimLeaseTtlMs: number;
+      readonly controlGuard?: ControlEpochGuard | undefined;
+      readonly participantId: string;
+      readonly sessionId: string;
+      readonly taskId: string;
+    } & TaskGrantEnforcementInput,
+  ) => Promise<TaskRecord | null>;
   readonly releaseWithEvent: (input: {
     readonly claimId: string;
     readonly controlGuard?: ControlEpochGuard | undefined;

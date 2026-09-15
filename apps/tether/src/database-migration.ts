@@ -35,6 +35,7 @@ const tetherTableNames = [
   "session_tombstones",
   "sessions",
   "task_approvals",
+  "task_grants",
   "tasks",
 ] as const;
 

@@ -7,7 +7,12 @@ import {
 } from "./approval-targets.js";
 import { sessionEventSchema } from "./event-builders.js";
 import { controlChannelSchema, participantRuntimeKindSchema } from "./records.js";
-import { recurringWorkScopeKeySchema } from "./task-contracts.js";
+import {
+  recurringWorkScopeKeySchema,
+  taskAssigneeParticipantIdSchema,
+  taskParentTaskIdSchema,
+  taskScopeLabelSchema,
+} from "./task-contracts.js";
 
 /** Bounded readiness failure reasons safe for unauthenticated responses. */
 export const readinessFailureReason = {
@@ -186,6 +191,7 @@ export const scheduledTaskIdentitySchema = z
 
 /** HTTP body schema for task creation. */
 export const createTaskSchema = z.object({
+  assigneeParticipantId: taskAssigneeParticipantIdSchema.optional(),
   input: z.record(z.string(), z.unknown()).nullable().optional(),
   kind: z
     .string()
@@ -194,8 +200,10 @@ export const createTaskSchema = z.object({
       message: "The operator task namespace is reserved",
     }),
   objective: z.string().min(1),
+  parentTaskId: taskParentTaskIdSchema.optional(),
   requireContract: z.boolean().optional(),
   schedule: scheduledTaskIdentitySchema.optional(),
+  scopeLabel: taskScopeLabelSchema.optional(),
   taskId: z.string().min(1).optional(),
 });
 

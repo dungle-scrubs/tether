@@ -1,6 +1,7 @@
 import { Effect } from "effect";
 
 import { approvalTargetKey } from "./approval-target-key.js";
+import type { AuthMode } from "./config.js";
 import type {
   PersistedTaskApprovalResult,
   SessionPersistenceStores,
@@ -48,7 +49,7 @@ import {
   type TaskParticipantInput,
   SessionServicePersistenceError,
 } from "./session-service-contracts.js";
-import { trySessionPromise } from "./session-service-runtime.js";
+import { extractTaskGrantDenied, trySessionPromise } from "./session-service-runtime.js";
 import type {
   ApprovalTarget,
   CandidateScheduleIdentity,
@@ -87,6 +88,8 @@ export interface SessionTaskEffectsInput {
   readonly observability: ModuleObservability;
   readonly stores: SessionPersistenceStores;
   readonly taskClaimLeaseTtlMs: number;
+  /** Auth mode gating task-grant enforcement; `disabled` never enforces. */
+  readonly taskGrantAuthMode?: AuthMode | undefined;
 }
 
 /** Task-specific Effect programs used by the durable session service. */
@@ -183,6 +186,9 @@ export function createSessionTaskEffects(input: SessionTaskEffectsInput): Sessio
             ...taskInput,
             claimLeaseTtlMs: input.taskClaimLeaseTtlMs,
             eventSourceId: input.eventSourceId,
+            ...(input.taskGrantAuthMode === undefined
+              ? {}
+              : { taskGrantAuthMode: input.taskGrantAuthMode }),
           }),
         );
         if (!persisted) {
@@ -256,15 +262,44 @@ export function createSessionTaskEffects(input: SessionTaskEffectsInput): Sessio
           return yield* createScheduledTaskEffect(input, taskInput, taskInput.schedule);
         }
         const taskId = taskInput.taskId ?? newTaskId();
+        // A grant denial surfaces here wrapped as a persistence failure; map it
+        // to the typed denial result (zero events) so it stays distinct from
+        // the idempotent replay outcome, which never consults grants.
         const persisted = yield* trySessionPromise(() =>
           input.stores.tasks.createWithEvent({
+            ...(taskInput.actorParticipantId === undefined
+              ? {}
+              : { actorParticipantId: taskInput.actorParticipantId }),
+            ...(taskInput.assigneeParticipantId === undefined
+              ? {}
+              : { assigneeParticipantId: taskInput.assigneeParticipantId }),
             eventSourceId: input.eventSourceId,
             input: taskInput.input ?? null,
             kind: taskInput.kind,
             objective: taskInput.objective,
+            ...(taskInput.parentTaskId === undefined
+              ? {}
+              : { parentTaskId: taskInput.parentTaskId }),
+            ...(taskInput.scopeLabel === undefined ? {} : { scopeLabel: taskInput.scopeLabel }),
             sessionId: taskInput.sessionId,
             taskId,
             taskIdSource: taskInput.taskId === undefined ? "generated" : "caller",
+            ...(input.taskGrantAuthMode === undefined
+              ? {}
+              : { taskGrantAuthMode: input.taskGrantAuthMode }),
+          }),
+        ).pipe(
+          Effect.catchAll((error) => {
+            const denied = extractTaskGrantDenied(error);
+            if (denied) {
+              return Effect.succeed({
+                events: [],
+                reason: denied.reason,
+                status: "denied",
+                task: null,
+              } as const);
+            }
+            return Effect.fail(error);
           }),
         );
         yield* Effect.sync(() =>
@@ -409,6 +444,9 @@ export function createSessionTaskEffects(input: SessionTaskEffectsInput): Sessio
           input.stores.tasks.refreshClaim({
             ...taskInput,
             claimLeaseTtlMs: input.taskClaimLeaseTtlMs,
+            ...(input.taskGrantAuthMode === undefined
+              ? {}
+              : { taskGrantAuthMode: input.taskGrantAuthMode }),
           }),
         );
         if (!task) {
@@ -654,9 +692,21 @@ export function mapTaskMutationRejection(
   effect: Effect.Effect<AppliedTaskMutationResult, SessionServiceFailure>,
 ): Effect.Effect<TaskMutationResult, SessionServiceFailure> {
   return effect.pipe(
-    Effect.catchAll((error) => {
+    Effect.catchAll((error): Effect.Effect<TaskMutationResult, SessionServiceFailure> => {
       if (error instanceof TaskMutationRejectedError) {
         const result: TaskMutationResult = { events: [], status: "rejected", task: null };
+        return Effect.succeed(result);
+      }
+      // A grant denial commits zero events like a race rejection but stays
+      // typed, so HTTP, WebSocket, and REST claim paths report the same reason.
+      const denied = extractTaskGrantDenied(error);
+      if (denied) {
+        const result: TaskMutationResult = {
+          events: [],
+          reason: denied.reason,
+          status: "denied",
+          task: null,
+        };
         return Effect.succeed(result);
       }
       return Effect.fail(error);
@@ -672,9 +722,19 @@ export function mapTaskClaimRefreshRejection(
   effect: Effect.Effect<AppliedTaskClaimRefreshResult, SessionServiceFailure>,
 ): Effect.Effect<TaskClaimRefreshResult, SessionServiceFailure> {
   return effect.pipe(
-    Effect.catchAll((error) => {
+    Effect.catchAll((error): Effect.Effect<TaskClaimRefreshResult, SessionServiceFailure> => {
       if (error instanceof TaskClaimRefreshRejectedError) {
         const result: TaskClaimRefreshResult = { events: [], status: "rejected", task: null };
+        return Effect.succeed(result);
+      }
+      const denied = extractTaskGrantDenied(error);
+      if (denied) {
+        const result: TaskClaimRefreshResult = {
+          events: [],
+          reason: denied.reason,
+          status: "denied",
+          task: null,
+        };
         return Effect.succeed(result);
       }
       return Effect.fail(error);
@@ -748,6 +808,7 @@ export function taskApprovalTraceInput(input: RecordTaskApprovalInput): Record<s
 export function summarizeTaskMutationResult(result: TaskMutationResult): Record<string, unknown> {
   return {
     eventCount: result.events.length,
+    ...(result.status === "denied" ? { reason: result.reason } : {}),
     status: result.status,
     taskId: result.task?.taskId ?? null,
   };
@@ -760,6 +821,7 @@ export function summarizeTaskClaimRefreshResult(
   result: TaskClaimRefreshResult,
 ): Record<string, unknown> {
   return {
+    ...(result.status === "denied" ? { reason: result.reason } : {}),
     status: result.status,
     taskId: result.task?.taskId ?? null,
   };
@@ -802,11 +864,13 @@ function assertTaskMutationResultWithObservability(
   result: TaskMutationResult,
   expectedEventCount = 1,
 ): void {
-  if (result.status === "rejected") {
+  if (result.status === "rejected" || result.status === "denied") {
     observability.assertInvariant(
       result.events.length === 0 && result.task === null,
       operation,
-      "Rejected task mutation must not produce task or events",
+      result.status === "denied"
+        ? "Denied task mutation must not produce task or events"
+        : "Rejected task mutation must not produce task or events",
       taskParticipantTraceInput(input),
     );
     return;

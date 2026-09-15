@@ -1,7 +1,6 @@
 import type {
   ControlEpochGuard,
   EnsureScheduledRunInput,
-  ScheduledTaskIdentityInput,
   SupersedeScheduledRunsInput,
 } from "./db.js";
 import {
@@ -297,14 +296,7 @@ class DbTaskStore implements TaskStore {
     return recordTaskApproval(this.database, input);
   }
 
-  claimWithEvent(input: {
-    readonly claimLeaseTtlMs: number;
-    readonly controlGuard?: ControlEpochGuard | undefined;
-    readonly eventSourceId: string;
-    readonly participantId: string;
-    readonly sessionId: string;
-    readonly taskId: string;
-  }) {
+  claimWithEvent(input: Parameters<TaskStore["claimWithEvent"]>[0]) {
     return claimTaskWithEvent(this.database, input);
   }
 
@@ -320,16 +312,7 @@ class DbTaskStore implements TaskStore {
     return completeTaskWithEvent(this.database, input);
   }
 
-  createWithEvent(input: {
-    readonly eventSourceId: string;
-    readonly input?: Record<string, unknown> | null;
-    readonly kind: string;
-    readonly objective: string;
-    readonly schedule?: ScheduledTaskIdentityInput | undefined;
-    readonly sessionId: string;
-    readonly taskId: string;
-    readonly taskIdSource: "caller" | "generated";
-  }) {
+  createWithEvent(input: Parameters<TaskStore["createWithEvent"]>[0]) {
     return createTaskWithEventIdempotent(this.database, input);
   }
 
@@ -377,14 +360,7 @@ class DbTaskStore implements TaskStore {
     return listTaskSnapshots(this.database, sessionId);
   }
 
-  refreshClaim(input: {
-    readonly claimId: string;
-    readonly claimLeaseTtlMs: number;
-    readonly controlGuard?: ControlEpochGuard | undefined;
-    readonly participantId: string;
-    readonly sessionId: string;
-    readonly taskId: string;
-  }) {
+  refreshClaim(input: Parameters<TaskStore["refreshClaim"]>[0]) {
     return refreshTaskClaim(this.database, input);
   }
 
