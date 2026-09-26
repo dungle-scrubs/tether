@@ -167,7 +167,11 @@ function createGrantAuthority(
 }
 
 function createGrantStore(record: AuthGrantRecord): AuthGrantStore {
-  return { findByJti: vi.fn(async () => record), list: vi.fn(async () => []) };
+  return {
+    findByJti: vi.fn(async () => record),
+    list: vi.fn(async () => []),
+    listForSessionInventory: vi.fn(async () => []),
+  };
 }
 
 function createTicketStore(

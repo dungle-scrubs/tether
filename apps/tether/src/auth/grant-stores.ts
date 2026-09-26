@@ -11,6 +11,9 @@ export const authGrantAuditReasonCodes = [
 ] as const;
 export const authGrantSources = ["admin", "bootstrap", "browser", "migration"] as const;
 
+/** Service-wide durable grant scope admitted by authorization. */
+export const serviceWideAuthGrantScope = "*";
+
 /** Maximum single-use WebSocket admission window required by the protocol. */
 export const maximumAuthTicketAdmissionLifetimeMilliseconds = 30_000;
 
@@ -32,6 +35,7 @@ export type AuthPersistenceErrorCode =
   | "auth_grant_limit_invalid"
   | "auth_grant_read_failed"
   | "auth_grant_revoke_failed"
+  | "auth_grant_scope_invalid"
   | "auth_metadata_invalid"
   | "auth_ticket_create_failed"
   | "auth_ticket_consume_failed"
@@ -226,12 +230,29 @@ export type RevokeAuthGrantResult =
     }
   | { readonly grant: null; readonly status: "not_found" };
 
+/** Input for one uncapped session-scoped grant inventory read. */
+export interface AuthGrantSessionInventoryInput {
+  /** Exact durable session scope whose grants, plus `*`, are relevant. */
+  readonly sessionScope: string;
+  /** Exact subject filter, or null to list every subject. */
+  readonly subject: string | null;
+}
+
 /** Narrow grant reads required by later authorization layers. */
 export interface AuthGrantStore {
   /** Reads one durable grant by its public token id. */
   readonly findByJti: (jti: string) => Promise<AuthGrantRecord | null>;
   /** Lists a bounded newest-first page of durable grants. */
   readonly list: (limit: number) => Promise<readonly AuthGrantRecord[]>;
+  /**
+   * Lists every durable grant relevant to one session scope, including
+   * service-wide `*` rows and revoked or expired grants, in deterministic
+   * newest-first order without the bounded-list row cap. Never returns a
+   * bearer; grant rows deliberately do not store one.
+   */
+  readonly listForSessionInventory: (
+    input: AuthGrantSessionInventoryInput,
+  ) => Promise<readonly AuthGrantRecord[]>;
 }
 
 /** Cancellation-aware batch reads used only by proactive socket revocation repair. */
