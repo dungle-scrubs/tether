@@ -113,6 +113,7 @@ describe("durable grant authority", () => {
     const store: AuthGrantStore = {
       findByJti: vi.fn(async (jti) => grants.get(jti) ?? null),
       list: async () => [],
+      listForSessionInventory: async () => [],
     };
     const authority = createAuthGrantAuthority({
       issuer,
@@ -173,6 +174,7 @@ function createStore(record: AuthGrantRecord | null): AuthGrantStore {
   return {
     findByJti: vi.fn(async () => record),
     list: async () => [],
+    listForSessionInventory: async () => [],
   };
 }
 

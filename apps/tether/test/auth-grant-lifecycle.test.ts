@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { createAuthGrantLifecycle } from "../src/auth/grant-lifecycle.js";
 import type { AuthGrantRecord, AuthPersistenceStores } from "../src/auth/grant-stores.js";
+import { serviceWideAuthGrantScope } from "../src/auth/grant-stores.js";
 import { verifyAuthGrantToken } from "../src/auth/grant-token.js";
 import {
   completeBootstrapOneTimeSecret,
@@ -29,6 +30,13 @@ function fakeStores(): AuthPersistenceStores & {
         }),
       findByJti: async (jti) => records.get(jti) ?? null,
       list: async (limit) => [...records.values()].slice(0, limit),
+      listForSessionInventory: async (input) =>
+        [...records.values()].filter(
+          (record) =>
+            (record.sessionScope === input.sessionScope ||
+              record.sessionScope === serviceWideAuthGrantScope) &&
+            (input.subject === null || record.subject === input.subject),
+        ),
     },
     records,
     revokeGrantWithAudit: vi.fn(async ({ jti, revokedAt }) => {

@@ -3749,6 +3749,7 @@ e2e("tether e2e", () => {
         return durableGrantStore.findByJti(jti);
       },
       list: durableGrantStore.list,
+      listForSessionInventory: durableGrantStore.listForSessionInventory,
     };
     const authorityApp = createAppServer(currentPool(), {
       auth: { ...e2eAuthOptions, grantStore: observedGrantStore },
@@ -3855,6 +3856,7 @@ e2e("tether e2e", () => {
         throw new Error("injected delayed auth read failure");
       },
       list: durableGrantStore.list,
+      listForSessionInventory: durableGrantStore.listForSessionInventory,
     };
     const delayedFailureApp = createAppServer(currentPool(), {
       auth: { ...e2eAuthOptions, grantStore: delayedFailureGrantStore },
