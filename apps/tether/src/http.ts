@@ -117,8 +117,13 @@ export interface AppServer {
   readonly close: () => Promise<void>;
   /** Returns process-local diagnostics without mutating durable session state. */
   readonly debugInfo: () => AppServerDebugInfo;
-  /** Starts Postgres fanout, HTTP/WebSocket serving, and task claim sweeping. */
-  readonly listen: (port: number) => Promise<number>;
+  /**
+   * Starts Postgres fanout, HTTP/WebSocket serving, and task claim sweeping.
+   * An explicit host pins the listener to that address (tests bind loopback so
+   * an ephemeral port can never bind a non-loopback interface); omitting it
+   * preserves the production behavior of letting Node pick the bind address.
+   */
+  readonly listen: (port: number, host?: string) => Promise<number>;
 }
 
 /**
@@ -468,7 +473,7 @@ export function createAppServerWithSessionService(
         wsServer,
       }),
     debugInfo: readDebugInfo,
-    listen: async (port) => {
+    listen: async (port, host) => {
       const startupReadiness = await readReadiness();
       if (!startupReadiness.body.ready) {
         throw new AppServerStartupReadinessError(startupReadiness.body.reason);
@@ -481,10 +486,20 @@ export function createAppServerWithSessionService(
           reject(error);
         };
         server.once("error", handleError);
-        server.listen(port, () => {
-          server.off("error", handleError);
-          resolve();
-        });
+        // Omitting the host keeps the prior production bind behavior: Node
+        // chooses the address. An explicit host (tests: "127.0.0.1") is passed
+        // straight through to the underlying listener.
+        if (host === undefined) {
+          server.listen(port, () => {
+            server.off("error", handleError);
+            resolve();
+          });
+        } else {
+          server.listen(port, host, () => {
+            server.off("error", handleError);
+            resolve();
+          });
+        }
       });
       taskClaimSweeper.start();
       const address = server.address();
