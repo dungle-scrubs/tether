@@ -61,6 +61,22 @@ export interface RestParticipantControlClientOptions {
   readonly acquisitionTransportRetries?: number;
   readonly fetch?: RestParticipantControlFetch;
   readonly now?: () => number;
+  /**
+   * Synchronously reports the first renewal error or lease expiry per
+   * acquisition/epoch, before retry or invalidation. Successful renewal does
+   * not reset delivery. An independent timer checks expiry even if renewal
+   * hangs. The fixed payload contains no response or error data.
+   * The callback may invalidate the matching generation to suppress retry.
+   * A thrown callback invalidates only its exact installed context and also
+   * suppresses retry. This notification never grants or restores authority.
+   */
+  readonly onContextUncertain?: (payload: {
+    readonly acquisitionId: string;
+    readonly controlEpoch: number;
+    readonly instanceId: string;
+    readonly reason: RestParticipantControlErrorCode | "LEASE_EXPIRED";
+    readonly sessionId: string;
+  }) => void;
   readonly observability?: ModuleObservabilityOptions;
   readonly shutdownPendingWaitMs?: number;
   readonly timers?: RestParticipantControlTimerScheduler;
@@ -78,6 +94,9 @@ export type RestParticipantControlErrorCode =
   | "PERSISTENCE"
   | "STOPPED"
   | "TRANSPORT";
+
+/** Bounded renewal-or-expiry reason delivered to `onContextUncertain`. */
+type RestParticipantControlUncertaintyReason = RestParticipantControlErrorCode | "LEASE_EXPIRED";
 
 /** Typed, payload-free REST participant-control failure. */
 export class RestParticipantControlError extends Error {
@@ -116,12 +135,16 @@ export interface RestParticipantControlClientDebugInfo {
 type SessionState = {
   acquisitionId: string | null;
   context: RestParticipantControlContext | null;
+  /** Renewal timer driving the next heartbeat at `min(renewAfterMs, expiresIn/2)`. */
+  timer: RestParticipantControlTimerHandle | null;
+  /** Separate expiry timer that notifies `LEASE_EXPIRED` at `leaseExpiresAt`. */
+  expiryTimer: RestParticipantControlTimerHandle | null;
   pending: {
     readonly acquisitionId: string;
     readonly controller: AbortController;
     readonly promise: Promise<RestParticipantControlContext>;
   } | null;
-  timer: RestParticipantControlTimerHandle | null;
+  uncertainty: { readonly acquisitionId: string; readonly controlEpoch: number } | null;
 };
 
 const defaultTimers: RestParticipantControlTimerScheduler = {
@@ -143,6 +166,7 @@ export class RestParticipantControlClient {
   #lastFailureCode: RestParticipantControlErrorCode | null = null;
   readonly #now: () => number;
   readonly #observability: ModuleObservability;
+  readonly #onContextUncertain: RestParticipantControlClientOptions["onContextUncertain"];
   readonly #participantId: string;
   readonly #runtimeKind: string;
   readonly #serviceUrl: string;
@@ -171,6 +195,7 @@ export class RestParticipantControlClient {
     this.#observability = new ModuleObservability(
       options.observability ?? readModuleObservabilityOptions("RestParticipantControlClient"),
     );
+    this.#onContextUncertain = options.onContextUncertain;
     this.#participantId = config.participantId;
     this.#runtimeKind = config.runtimeKind;
     this.#serviceUrl = config.serviceUrl.replace(/\/$/u, "");
@@ -192,7 +217,11 @@ export class RestParticipantControlClient {
         }
         const state = this.#state(sessionId);
         if (state.context && Date.parse(state.context.leaseExpiresAt) <= this.#now()) {
-          this.#invalidateStateContext(state, state.context);
+          const expired = state.context;
+          this.#notifyUncertainty(expired, "LEASE_EXPIRED");
+          if (state.context === expired) {
+            this.#invalidateStateContext(state, expired);
+          }
         }
         if (state.context) {
           return state.context;
@@ -225,7 +254,7 @@ export class RestParticipantControlClient {
     );
   }
 
-  /** Invalidates only the exact matching installed context. */
+  /** Invalidates the installed generation matching the supplied context snapshot. */
   invalidate(context: RestParticipantControlContext): boolean {
     return this.#observability.traceBoundarySync(
       "invalidate",
@@ -239,7 +268,7 @@ export class RestParticipantControlClient {
         ) {
           return false;
         }
-        this.#invalidateStateContext(state, context);
+        this.#invalidateStateContext(state, state.context);
         return true;
       },
       (invalidated) => ({ outcome: invalidated ? "invalidated" : "unchanged" }),
@@ -258,6 +287,7 @@ export class RestParticipantControlClient {
           return false;
         }
         this.#clearTimer(state);
+        this.#clearExpiryTimer(state);
         state.context = null;
         try {
           const response = await this.#request(
@@ -293,6 +323,11 @@ export class RestParticipantControlClient {
       return this.#stopPromise;
     }
     this.#stopped = true;
+    // Clear expiry timers synchronously so a hung release or pending
+    // acquisition cannot keep them active past stop.
+    for (const state of this.#states.values()) {
+      this.#clearExpiryTimer(state);
+    }
     this.#stopPromise = (async () => {
       const pending = [...this.#states.values()].flatMap((state) =>
         state.pending ? [{ pending: state.pending, state }] : [],
@@ -390,6 +425,7 @@ export class RestParticipantControlClient {
         };
         state.context = context;
         this.#scheduleRenewal(state, context);
+        this.#scheduleExpiryTimer(state, context);
         return context;
       } catch (error) {
         if (
@@ -440,15 +476,25 @@ export class RestParticipantControlClient {
         };
         state.context = renewed;
         this.#scheduleRenewal(state, renewed);
+        this.#scheduleExpiryTimer(state, renewed);
       } catch (error) {
-        if (
+        if (state.context !== context) {
+          throw error;
+        }
+        const reason: RestParticipantControlUncertaintyReason =
+          error instanceof RestParticipantControlError ? error.code : "INVALID_RESPONSE";
+        const isStaleClass =
           error instanceof RestParticipantControlError &&
           (error.code === "CONTROL_EPOCH_STALE" ||
             error.code === "CONTROL_CONFLICT" ||
-            error.code === "CONTROL_EPOCH_REQUIRED")
-        ) {
-          this.invalidate(context);
-        } else if (state.context === context) {
+            error.code === "CONTROL_EPOCH_REQUIRED");
+        this.#notifyUncertainty(context, reason);
+        if (state.context !== context) {
+          throw error;
+        }
+        if (isStaleClass) {
+          this.#invalidateStateContext(state, context);
+        } else {
           this.#scheduleRenewalRecovery(state, context);
         }
         throw error;
@@ -510,11 +556,58 @@ export class RestParticipantControlClient {
     state.timer = null;
   }
 
+  /**
+   * Schedules a one-shot expiry timer at `leaseExpiresAt`. Opt-in: only
+   * installed when an uncertainty callback is configured. The callback
+   * checks timer and context identity so a late firing after renewal,
+   * replacement, invalidate, release, or stop cannot notify or invalidate
+   * any other generation.
+   */
+  #scheduleExpiryTimer(state: SessionState, context: RestParticipantControlContext): void {
+    this.#clearExpiryTimer(state);
+    if (!this.#onContextUncertain || this.#stopped || state.context !== context) {
+      return;
+    }
+    const expiresInMs = Date.parse(context.leaseExpiresAt) - this.#now();
+    // Platform timeout maximum: Node's `setTimeout` accepts at most a
+    // signed 32-bit millisecond value. Cap so the timer cannot overflow.
+    const platformMaxMs = 2_147_483_647;
+    const delayMs = Math.min(platformMaxMs, Math.max(1, expiresInMs));
+    const timer = this.#timers.setTimeout(() => {
+      if (state.expiryTimer !== timer) {
+        return;
+      }
+      state.expiryTimer = null;
+      if (this.#stopped || state.context !== context) {
+        return;
+      }
+      if (Date.parse(context.leaseExpiresAt) > this.#now()) {
+        this.#scheduleExpiryTimer(state, context);
+        return;
+      }
+      this.#notifyUncertainty(context, "LEASE_EXPIRED");
+      if (state.context === context) {
+        this.#invalidateStateContext(state, context);
+      }
+    }, delayMs);
+    timer.unref?.();
+    state.expiryTimer = timer;
+  }
+
+  #clearExpiryTimer(state: SessionState): void {
+    if (!state.expiryTimer) {
+      return;
+    }
+    this.#timers.clearTimeout(state.expiryTimer);
+    state.expiryTimer = null;
+  }
+
   #invalidateStateContext(state: SessionState, context: RestParticipantControlContext): void {
     if (state.context !== context) {
       return;
     }
     this.#clearTimer(state);
+    this.#clearExpiryTimer(state);
     state.acquisitionId = null;
     state.context = null;
   }
@@ -547,6 +640,8 @@ export class RestParticipantControlClient {
       context: null,
       pending: null,
       timer: null,
+      expiryTimer: null,
+      uncertainty: null,
     };
     this.#states.set(sessionId, created);
     return created;
@@ -563,6 +658,41 @@ export class RestParticipantControlClient {
       operation,
       status,
     });
+  }
+
+  /** Reports uncertainty only for the installed context, once per acquisition/epoch. */
+  #notifyUncertainty(
+    context: RestParticipantControlContext,
+    reason: RestParticipantControlUncertaintyReason,
+  ): void {
+    const state = this.#states.get(context.sessionId);
+    if (!this.#onContextUncertain || state?.context !== context) {
+      return;
+    }
+    if (
+      state.uncertainty?.acquisitionId === context.acquisitionId &&
+      state.uncertainty.controlEpoch === context.controlEpoch
+    ) {
+      return;
+    }
+    state.uncertainty = {
+      acquisitionId: context.acquisitionId,
+      controlEpoch: context.controlEpoch,
+    };
+    try {
+      this.#onContextUncertain(
+        Object.freeze({
+          acquisitionId: context.acquisitionId,
+          controlEpoch: context.controlEpoch,
+          instanceId: context.instanceId,
+          reason,
+          sessionId: context.sessionId,
+        }),
+      );
+    } catch {
+      // A failed consumer gate must not leave this context installed or retry it.
+      this.#invalidateStateContext(state, context);
+    }
   }
 }
 
