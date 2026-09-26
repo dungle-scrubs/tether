@@ -36,10 +36,11 @@ import type { AuthSigningSecrets } from "./token.js";
  *   metadata only.
  * - The schema must already be migrated (start the service or run
  *   `db:push`); this CLI never runs migrations itself.
- * - Crash gap: the audited durable grant commits before the bearer file is
- *   complete. If the process dies in between, the grant exists but its bearer
- *   is unrecoverable; run `inventory` to find the orphaned jti and `revoke` it.
- *   The bounded TTL limits how long any undelivered grant can stay valid.
+ * - Before persistence, a separate exclusive 0600 `.pending` sidecar stores
+ *   only the public JTI and is fsynced with its parent directory. It remains
+ *   through any partial bearer write. A crash or unknown commit leaves this
+ *   identity for `inventory` and `revoke`; the bearer is unrecoverable until
+ *   delivery completes. The bounded TTL limits an undelivered grant.
  * - `completeBootstrapOneTimeSecret` from bootstrap-cli is deliberately not
  *   reused here: it does not revoke the committed grant when the one-time
  *   output write fails, which this CLI must do.
@@ -242,6 +243,8 @@ export interface GrantOpsIssueResult {
   readonly command: "issue";
   readonly grant: PublicAuthGrant;
   readonly outputPath: string;
+  /** Present only when the public-JTI recovery marker could not be cleared. */
+  readonly recoveryMarkerPath: string | null;
 }
 
 /**
@@ -275,7 +278,9 @@ export async function issueGrantOpsGrant(input: GrantOpsIssueInput): Promise<Gra
     // The exclusive create already restricted the file to the owner; a umask
     // fight here must not block issuance.
   }
-  let lifecycle: ReturnType<typeof createAuthGrantLifecycle>;
+  const recoveryMarkerPath = `${input.outputPath}.pending`;
+  let preparedJti: string | null = null;
+  let lifecycle: ReturnType<typeof createAuthGrantLifecycle> | null = null;
   let created: CreatedAuthGrant;
   try {
     lifecycle = createAuthGrantLifecycle({
@@ -292,15 +297,30 @@ export async function issueGrantOpsGrant(input: GrantOpsIssueInput): Promise<Gra
       role: input.role,
       sessionScope: input.sessionScope,
       source: "admin",
+      onPrepared: async (grant) => {
+        await writeRecoveryMarker(recoveryMarkerPath, grant.jti);
+        preparedJti = grant.jti;
+      },
       subject: input.subject,
       ttlSeconds: input.ttlSeconds,
     });
   } catch (error) {
-    // Nothing committed: remove this run's empty reserved file and surface
-    // the bounded persistence or token error unchanged.
     await closeQuietly(handle);
-    await removeReservedOutput(input.outputPath);
-    throw error;
+    if (preparedJti === null) {
+      // Preparation failed before persistence was permitted to start.
+      await removeReservedOutput(input.outputPath);
+      throw error;
+    }
+    // A rejected create may have committed. The durable marker keeps the
+    // exact public identity even if this process exits before reconciliation.
+    const revoked =
+      lifecycle === null ? false : await tryRevokePreparedGrant(lifecycle, preparedJti);
+    if (revoked) {
+      await removeReservedOutput(input.outputPath);
+      await removeRecoveryMarker(recoveryMarkerPath);
+      throw new Error(`grant_ops_create_failed_revoked ${preparedJti}`);
+    }
+    throw new Error(`grant_ops_create_ambiguous ${preparedJti}`);
   }
   const deliver =
     input.deliver ??
@@ -317,25 +337,67 @@ export async function issueGrantOpsGrant(input: GrantOpsIssueInput): Promise<Gra
     // outlives an undelivered bearer. Crash gap: if this process dies before
     // either the delivery or the revocation lands, the grant stays durable
     // and `inventory` plus `revoke --jti` is the documented recovery.
-    let revoked = false;
-    try {
-      const result = await lifecycle.revoke(
-        created.grant.jti,
-        grantOpsActorSubject,
-        "security-response",
-      );
-      revoked = result.status === "revoked" || result.status === "already_revoked";
-    } catch {
-      revoked = false;
-    }
+    const revoked =
+      lifecycle === null ? false : await tryRevokePreparedGrant(lifecycle, created.grant.jti);
     await removeReservedOutput(input.outputPath);
+    if (revoked) await removeRecoveryMarker(recoveryMarkerPath);
     throw new Error(
       revoked
         ? `grant_ops_output_failed_revoked ${created.grant.jti}`
         : `grant_ops_output_rollback_failed ${created.grant.jti}`,
     );
   }
-  return { command: "issue", grant: created.grant, outputPath: input.outputPath };
+  const markerCleared = await removeRecoveryMarker(recoveryMarkerPath);
+  return {
+    command: "issue",
+    grant: created.grant,
+    outputPath: input.outputPath,
+    recoveryMarkerPath: markerCleared ? null : recoveryMarkerPath,
+  };
+}
+
+/** Persists only the public JTI before the database create may begin. */
+async function writeRecoveryMarker(path: string, jti: string): Promise<void> {
+  let marker: FileHandle;
+  try {
+    marker = await open(path, "wx", 0o600);
+  } catch {
+    throw new Error("grant_ops_recovery_unavailable");
+  }
+  try {
+    await marker.writeFile(`${jti}\n`, "utf8");
+    await marker.sync();
+    await marker.close();
+    await syncParentDirectory(path);
+  } catch {
+    await closeQuietly(marker);
+    await removeReservedOutput(path);
+    throw new Error("grant_ops_recovery_unavailable");
+  }
+}
+
+/** Confirms audited revocation; an absent row remains ambiguous. */
+async function tryRevokePreparedGrant(
+  lifecycle: ReturnType<typeof createAuthGrantLifecycle>,
+  jti: string,
+): Promise<boolean> {
+  try {
+    const result = await lifecycle.revoke(jti, grantOpsActorSubject, "security-response");
+    return result.status === "revoked" || result.status === "already_revoked";
+  } catch {
+    return false;
+  }
+}
+
+/** Clears a public recovery marker only after a confirmed disposition. */
+async function removeRecoveryMarker(path: string): Promise<boolean> {
+  try {
+    await unlink(path);
+    await syncParentDirectory(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Flushes the parent directory entry after the file contents are durable. */
@@ -719,10 +781,13 @@ issue
   optional, default "default"). The database schema must already be migrated;
   this CLI never runs migrations itself.
 
-  Crash gap: the audited durable grant commits before the bearer file is
-  complete. If the process dies in between, the grant exists but its bearer
-  is unrecoverable. Run "inventory" to find the jti and "revoke" it; the
-  bounded TTL limits exposure. If the output write fails after the commit,
+  Before persistence, <out>.pending stores only the public jti in a separate
+  exclusive 0600 file. The marker and parent directory are fsynced before
+  the DB write starts. It stays through any partial bearer write. If the
+  process dies or the create result is unknown, use that jti with "inventory"
+  and "revoke" before retrying. A single absent read does not settle a
+  possibly late commit. The bounded TTL limits exposure.
+  If the output write fails after the commit,
   the CLI immediately revokes the grant by jti and reports
   grant_ops_output_failed_revoked (or grant_ops_output_rollback_failed when
   the revocation itself fails) with the jti.

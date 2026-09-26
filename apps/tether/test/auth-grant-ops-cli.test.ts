@@ -433,7 +433,7 @@ describe("grant-ops CLI parsing", () => {
     const output: string[] = [];
     await runGrantOpsCli([], issueEnvironment, (value) => output.push(value));
     const text = output.join("");
-    expect(text).toContain("Crash gap");
+    expect(text).toContain("<out>.pending");
     expect(text).toContain("grant_ops_output_failed_revoked");
     expect(text).not.toContain("tgr2.");
   });
@@ -462,6 +462,7 @@ describe("grant-ops issue", () => {
     });
 
     const fileContent = await readFile(outputPath, "utf8");
+    await expectMissing(`${outputPath}.pending`);
     expect(fileContent).toMatch(/^tgr2\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\n$/u);
     const bearer = fileContent.trim();
     expect(
@@ -475,6 +476,7 @@ describe("grant-ops issue", () => {
       command: "issue",
       grant: { role: "observer", sessionScope: "sess_ops", subject: "part_ops" },
       outputPath,
+      recoveryMarkerPath: null,
     });
   });
 
@@ -503,6 +505,30 @@ describe("grant-ops issue", () => {
     expect(createGrantWithAudit).not.toHaveBeenCalled();
   });
 
+  it("does not start persistence when a recovery marker path already exists", async () => {
+    const directory = await temporaryDirectory();
+    const outputPath = join(directory, "grant.txt");
+    await writeFile(`${outputPath}.pending`, "operator-content", { mode: 0o600 });
+    const stores = fakeStores();
+    await expect(
+      issueGrantOpsGrant({
+        activeKid: kid,
+        issuer,
+        outputPath,
+        role: "observer",
+        secrets: { [kid]: secret },
+        sessionExists: async () => true,
+        sessionScope: "sess_ops",
+        stores,
+        subject: "part_ops",
+        ttlSeconds: 3_600,
+      }),
+    ).rejects.toThrow("grant_ops_recovery_unavailable");
+    expect(stores.createGrantWithAudit).not.toHaveBeenCalled();
+    expect(await readFile(`${outputPath}.pending`, "utf8")).toBe("operator-content");
+    await expectMissing(outputPath);
+  });
+
   it("requires the session to already exist before reserving any output", async () => {
     const directory = await temporaryDirectory();
     const outputPath = join(directory, "grant.txt");
@@ -527,7 +553,7 @@ describe("grant-ops issue", () => {
     expect(createGrantWithAudit).not.toHaveBeenCalled();
   });
 
-  it("removes the empty reserved file when the durable create fails", async () => {
+  it("retains a public recovery marker when create rejects without a confirmed commit outcome", async () => {
     const directory = await temporaryDirectory();
     const outputPath = join(directory, "grant.txt");
     const stores = fakeStores({
@@ -536,8 +562,9 @@ describe("grant-ops issue", () => {
       }),
     });
 
-    await expect(
-      issueGrantOpsGrant({
+    let failure = "";
+    try {
+      await issueGrantOpsGrant({
         activeKid: kid,
         issuer,
         outputPath,
@@ -548,9 +575,95 @@ describe("grant-ops issue", () => {
         stores,
         subject: "part_ops",
         ttlSeconds: 3_600,
+      });
+    } catch (error) {
+      failure = projectGrantOpsCliError(error);
+    }
+    expect(failure).toMatch(/^grant_ops_create_ambiguous grant_[A-Za-z0-9_-]+$/u);
+    const jti = failure.split(" ")[1];
+    expect(await readFile(`${outputPath}.pending`, "utf8")).toBe(`${jti}\n`);
+    expect(await readFile(outputPath, "utf8")).toBe("");
+  });
+
+  it("revokes the exact persisted grant when its commit acknowledgement is lost", async () => {
+    const directory = await temporaryDirectory();
+    const outputPath = join(directory, "grant.txt");
+    let stores: ReturnType<typeof fakeStores>;
+    stores = fakeStores({
+      createGrantWithAudit: vi.fn(async ({ grant }: { readonly grant: AuthGrantRecord }) => {
+        expect(await readFile(`${outputPath}.pending`, "utf8")).toBe(`${grant.jti}\n`);
+        stores.records.set(grant.jti, grant);
+        throw new Error("commit acknowledgement lost");
       }),
-    ).rejects.toThrow("auth_grant_create_failed");
+    });
+    let failure = "";
+    try {
+      await issueGrantOpsGrant({
+        activeKid: kid,
+        issuer,
+        outputPath,
+        role: "observer",
+        secrets: { [kid]: secret },
+        sessionExists: async () => true,
+        sessionScope: "sess_ops",
+        stores,
+        subject: "part_ops",
+        ttlSeconds: 3_600,
+      });
+    } catch (error) {
+      failure = projectGrantOpsCliError(error);
+    }
+    expect(failure).toMatch(/^grant_ops_create_failed_revoked grant_[A-Za-z0-9_-]+$/u);
+    const jti = failure.split(" ")[1];
+    expect(stores.records.get(jti ?? "")?.revokedAt).toBeInstanceOf(Date);
+    expect(stores.revokeGrantWithAudit).toHaveBeenCalledTimes(1);
     await expectMissing(outputPath);
+    await expectMissing(`${outputPath}.pending`);
+  });
+
+  it("keeps the JTI marker if a commit lands after an absent revoke read", async () => {
+    const directory = await temporaryDirectory();
+    const outputPath = join(directory, "grant.txt");
+    const delayedGrants: AuthGrantRecord[] = [];
+    const stores = fakeStores({
+      createGrantWithAudit: vi.fn(async ({ grant }: { readonly grant: AuthGrantRecord }) => {
+        delayedGrants.push(grant);
+        throw new Error("connection lost before commit settled");
+      }),
+    });
+    let failure = "";
+    try {
+      await issueGrantOpsGrant({
+        activeKid: kid,
+        issuer,
+        outputPath,
+        role: "observer",
+        secrets: { [kid]: secret },
+        sessionExists: async () => true,
+        sessionScope: "sess_ops",
+        stores,
+        subject: "part_ops",
+        ttlSeconds: 3_600,
+      });
+    } catch (error) {
+      failure = projectGrantOpsCliError(error);
+    }
+    expect(failure).toMatch(/^grant_ops_create_ambiguous grant_[A-Za-z0-9_-]+$/u);
+    const jti = failure.split(" ")[1];
+    expect(stores.revokeGrantWithAudit).toHaveBeenCalledTimes(1);
+    expect(await readFile(`${outputPath}.pending`, "utf8")).toBe(`${jti}\n`);
+    const delayedGrant = delayedGrants[0];
+    expect(delayedGrant?.jti).toBe(jti);
+    if (delayedGrant !== undefined) stores.records.set(delayedGrant.jti, delayedGrant);
+    const inventory = await inventorySessionGrants({
+      acceptedKids: [kid],
+      issuer,
+      sessionScope: "sess_ops",
+      stores,
+      subject: null,
+    });
+    expect(inventory.grants).toContainEqual(expect.objectContaining({ jti, state: "active" }));
+    expect(await readFile(`${outputPath}.pending`, "utf8")).toBe(`${jti}\n`);
   });
 
   it("closes and removes the reservation when lifecycle setup throws", async () => {
@@ -734,7 +847,8 @@ describe("grant-ops issue", () => {
     try {
       await issueGrantOpsGrant({
         activeKid: kid,
-        deliver: async () => {
+        deliver: async (handle) => {
+          await handle.writeFile("partial-token", "utf8");
           throw new Error(`private delivery detail ${secret}`);
         },
         issuer,
@@ -767,6 +881,7 @@ describe("grant-ops issue", () => {
     );
     expect(JSON.stringify(inventory)).not.toContain(secret);
     await expectMissing(outputPath);
+    expect(await readFile(`${outputPath}.pending`, "utf8")).toBe(`${jti}\n`);
   });
 });
 
@@ -1045,6 +1160,9 @@ describe("grant-ops bounded error projection", () => {
     );
     expect(projectGrantOpsCliError(new Error("grant_ops_output_rollback_failed grant_abcd"))).toBe(
       "grant_ops_output_rollback_failed grant_abcd",
+    );
+    expect(projectGrantOpsCliError(new Error("grant_ops_create_ambiguous grant_abcd"))).toBe(
+      "grant_ops_create_ambiguous grant_abcd",
     );
     expect(projectGrantOpsCliError(new Error("auth_grant_revoke_failed"))).toBe(
       "auth_grant_revoke_failed",
