@@ -20,10 +20,14 @@ import {
 } from "@dungle-scrubs/tether-protocol";
 import { z } from "zod";
 
-/** Claim and create responses wrap the record: { status: "...", task: {...} }. */
-const wrappedTaskResponseSchema = z.object({
-  status: z.string(),
+/** Read responses wrap the record: { task: {...} }, optionally beside a contract. */
+const readTaskResponseSchema = z.object({
   task: taskRecordSchema.nullable(),
+});
+
+/** Claim and create responses are the read envelope plus a status string. */
+const wrappedTaskResponseSchema = readTaskResponseSchema.extend({
+  status: z.string(),
 });
 
 import { resolveServiceAuthToken } from "./auth-token.js";
@@ -214,7 +218,11 @@ export class RestParticipantTaskClient {
     return parsed;
   }
 
-  /** Reads one task; null when the server reports it absent. */
+  /**
+   * Reads one task; null when the server reports it absent. The live
+   * server wraps the record ({ task }, optionally beside a contract):
+   * the envelope parses first and a bare record remains the fallback.
+   */
   async readTask(sessionId: string, taskId: string): Promise<TaskRecord | null> {
     try {
       const { body } = await this.#request(
@@ -222,6 +230,10 @@ export class RestParticipantTaskClient {
         "GET",
         `/sessions/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(taskId)}`,
       );
+      const wrapped = readTaskResponseSchema.safeParse(body);
+      if (wrapped.success && wrapped.data.task !== null) {
+        return wrapped.data.task;
+      }
       return parseTask(body, this.#error.bind(this), "read");
     } catch (error) {
       if (error instanceof RestParticipantTaskError && error.code === "NOT_FOUND") {

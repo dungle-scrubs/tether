@@ -229,6 +229,20 @@ describe("RestParticipantTaskClient", () => {
     await expect(missing.client.readTask("sess_1", "task_x")).resolves.toBe(null);
   });
 
+  it("reads a task wrapped in the server's {task} envelope", async () => {
+    const wrapped = fetchJson(200, { task: taskRecord });
+    await expect(wrapped.client.readTask("sess_1", "task_1")).resolves.toMatchObject({
+      taskId: "task_1",
+      kind: "media_status",
+      sessionId: "sess_1",
+    });
+
+    const nullTask = fetchJson(200, { task: null });
+    await expect(nullTask.client.readTask("sess_1", "task_null")).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+    });
+  });
+
   it("lists active tasks as records", async () => {
     const { client } = fetchJson(200, { tasks: [taskRecord] });
 
