@@ -381,13 +381,11 @@ export class RestParticipantTaskClient {
         let response: Response;
         try {
           response = await this.#fetch(new URL(path, `${this.#serviceUrl}/`), {
-            ...(body === undefined
-              ? {}
-              : {
-                  body: JSON.stringify(body),
-                  headers: { "content-type": "application/json" },
-                }),
-            headers: this.#authToken ? { authorization: `Bearer ${this.#authToken}` } : {},
+            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+            headers: {
+              ...(body === undefined ? {} : { "content-type": "application/json" }),
+              ...(this.#authToken ? { authorization: `Bearer ${this.#authToken}` } : {}),
+            },
             method,
           });
         } catch {
