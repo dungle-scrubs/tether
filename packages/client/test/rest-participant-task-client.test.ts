@@ -70,8 +70,8 @@ function fetchJson(
 }
 
 describe("RestParticipantTaskClient", () => {
-  it("claims a task with the fenced identity and parses the record", async () => {
-    const { client, requests } = fetchJson(200, taskRecord);
+  it("claims a task with the fenced identity and parses the wrapped record", async () => {
+    const { client, requests } = fetchJson(200, { status: "claimed", task: taskRecord });
 
     const claimed = await client.claimTask("sess_1", "task_1", { controlEpoch: 3 });
 

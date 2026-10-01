@@ -20,6 +20,9 @@ import {
 } from "@dungle-scrubs/tether-protocol";
 import { z } from "zod";
 
+/** Claim responses wrap the record: { status: "claimed", task: {...} } or null. */
+const claimResponseSchema = z.object({ status: z.string(), task: taskRecordSchema.nullable() });
+
 import { resolveServiceAuthToken } from "./auth-token.js";
 import {
   ModuleObservability,
@@ -185,6 +188,10 @@ export class RestParticipantTaskClient {
       `/sessions/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(taskId)}/claim`,
       this.#fencedBody(call),
     );
+    const wrapped = claimResponseSchema.safeParse(body);
+    if (wrapped.success) {
+      return wrapped.data.task;
+    }
     return parseTask(body, this.#error.bind(this), "claim");
   }
 
