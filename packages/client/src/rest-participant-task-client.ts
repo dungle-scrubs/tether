@@ -20,8 +20,8 @@ import {
 } from "@dungle-scrubs/tether-protocol";
 import { z } from "zod";
 
-/** Claim responses wrap the record: { status: "claimed", task: {...} } or null. */
-const claimResponseSchema = z.object({
+/** Claim and create responses wrap the record: { status: "...", task: {...} }. */
+const wrappedTaskResponseSchema = z.object({
   status: z.string(),
   task: taskRecordSchema.nullable(),
 });
@@ -116,6 +116,7 @@ type TaskOperation =
   | "append-event"
   | "claim"
   | "complete"
+  | "create"
   | "fail"
   | "list-active"
   | "list-events"
@@ -179,6 +180,40 @@ export class RestParticipantTaskClient {
     return { invalidRowCount, tasks };
   }
 
+  /**
+   * Creates one task in a session. The create response wraps the record
+   * ({ status, task }), but older servers may return the bare record:
+   * both shapes parse, and anything else is INVALID_RESPONSE.
+   */
+  async createTask(
+    sessionId: string,
+    request: {
+      readonly kind: string;
+      readonly objective: string;
+      readonly input?: Record<string, unknown>;
+    },
+  ): Promise<TaskRecord> {
+    const { body } = await this.#request(
+      "create",
+      "POST",
+      `/sessions/${encodeURIComponent(sessionId)}/tasks`,
+      {
+        kind: request.kind,
+        objective: request.objective,
+        ...(request.input === undefined ? {} : { input: request.input }),
+      },
+    );
+    const wrapped = wrappedTaskResponseSchema.safeParse(body);
+    if (wrapped.success && wrapped.data.task !== null) {
+      return wrapped.data.task;
+    }
+    const parsed = parseTask(body, this.#error.bind(this), "create");
+    if (parsed === null) {
+      throw this.#error("INVALID_RESPONSE", "create");
+    }
+    return parsed;
+  }
+
   /** Reads one task; null when the server reports it absent. */
   async readTask(sessionId: string, taskId: string): Promise<TaskRecord | null> {
     try {
@@ -211,7 +246,7 @@ export class RestParticipantTaskClient {
       `/sessions/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(taskId)}/claim`,
       this.#fencedBody(call),
     );
-    const wrapped = claimResponseSchema.safeParse(body);
+    const wrapped = wrappedTaskResponseSchema.safeParse(body);
     if (wrapped.success) {
       return wrapped.data.task;
     }

@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 
 import {
   RestParticipantTaskClient,
-  RestParticipantTaskError,
   type RestParticipantTaskFetch,
 } from "../src/rest-participant-task-client.js";
 
@@ -111,6 +110,64 @@ describe("RestParticipantTaskClient", () => {
 
     await expect(client.claimTask("sess_1", "task_1")).rejects.toMatchObject({
       code: "CLAIM_CONFLICT",
+    });
+  });
+
+  it("creates a task and parses the wrapped record, sending input only when defined", async () => {
+    const withInput = fetchJson(201, { status: "created", task: taskRecord });
+
+    const created = await withInput.client.createTask("sess_1", {
+      input: { identifier: "kevin@fastmail.com" },
+      kind: "rolodex.who_is",
+      objective: "resolve sender kevin@fastmail.com",
+    });
+
+    expect(created.taskId).toBe("task_1");
+    expect(withInput.requests[0]).toMatchObject({
+      body: {
+        input: { identifier: "kevin@fastmail.com" },
+        kind: "rolodex.who_is",
+        objective: "resolve sender kevin@fastmail.com",
+      },
+      headers: { authorization: "Bearer tok" },
+      method: "POST",
+      path: "/sessions/sess_1/tasks",
+    });
+
+    const withoutInput = fetchJson(201, { status: "created", task: taskRecord });
+    await withoutInput.client.createTask("sess_1", {
+      kind: "media_status",
+      objective: "Report status",
+    });
+    expect(withoutInput.requests[0]?.body).toEqual({
+      kind: "media_status",
+      objective: "Report status",
+    });
+  });
+
+  it("creates a task from a bare record when the response is not wrapped", async () => {
+    const { client, requests } = fetchJson(200, taskRecord);
+
+    const created = await client.createTask("sess_1", {
+      kind: "rolodex.who_is",
+      objective: "resolve sender kevin@fastmail.com",
+    });
+
+    expect(created.taskId).toBe("task_1");
+    expect(requests[0]).toMatchObject({
+      method: "POST",
+      path: "/sessions/sess_1/tasks",
+    });
+  });
+
+  it("maps a malformed create response to INVALID_RESPONSE", async () => {
+    const { client } = fetchJson(201, { status: "created", task: { kind: "media_status" } });
+
+    await expect(
+      client.createTask("sess_1", { kind: "media_status", objective: "Report status" }),
+    ).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+      details: { operation: "create" },
     });
   });
 
