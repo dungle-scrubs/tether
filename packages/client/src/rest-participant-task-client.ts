@@ -21,7 +21,10 @@ import {
 import { z } from "zod";
 
 /** Claim responses wrap the record: { status: "claimed", task: {...} } or null. */
-const claimResponseSchema = z.object({ status: z.string(), task: taskRecordSchema.nullable() });
+const claimResponseSchema = z.object({
+  status: z.string(),
+  task: taskRecordSchema.nullable(),
+});
 
 import { resolveServiceAuthToken } from "./auth-token.js";
 import {
@@ -95,7 +98,9 @@ export interface RecordTaskApprovalCall {
 
 /** Options for one participant-originated session event. */
 export interface AppendTaskEventCall {
+  readonly controlEpoch?: number;
   readonly eventId?: string;
+  readonly instanceId?: string;
   readonly payload: Record<string, unknown>;
   readonly producerId: string;
   readonly type: string;
@@ -142,18 +147,36 @@ export class RestParticipantTaskClient {
     this.#serviceUrl = config.serviceUrl.replace(/\/$/u, "");
   }
 
-  /** Lists active (claimable) tasks for a session. */
-  async listActiveTasks(sessionId: string): Promise<readonly TaskRecord[]> {
+  /**
+   * Lists active (claimable) tasks for a session. Rows that fail the
+   * protocol schema are dropped, not fatal: one malformed row must not
+   * starve the healthy rows behind it (harnesses#32). The caller sees
+   * how many rows were dropped.
+   */
+  async listActiveTasks(sessionId: string): Promise<{
+    readonly invalidRowCount: number;
+    readonly tasks: readonly TaskRecord[];
+  }> {
     const { body } = await this.#request(
       "list-active",
       "GET",
       `/sessions/${encodeURIComponent(sessionId)}/tasks?status=active`,
     );
-    const parsed = z.object({ tasks: taskRecordSchema.array() }).safeParse(body);
-    if (!parsed.success) {
+    const rows = z.object({ tasks: z.array(z.unknown()) }).safeParse(body);
+    if (!rows.success) {
       throw this.#error("INVALID_RESPONSE", "list-active");
     }
-    return parsed.data.tasks;
+    const tasks: TaskRecord[] = [];
+    let invalidRowCount = 0;
+    for (const row of rows.data.tasks) {
+      const parsed = taskRecordSchema.safeParse(row);
+      if (parsed.success) {
+        tasks.push(parsed.data);
+      } else {
+        invalidRowCount += 1;
+      }
+    }
+    return { invalidRowCount, tasks };
   }
 
   /** Reads one task; null when the server reports it absent. */
@@ -276,20 +299,23 @@ export class RestParticipantTaskClient {
   }
 
   /** Appends one participant-originated session event. */
-  async appendEvent(
-    sessionId: string,
-    event: AppendTaskEventCall & { readonly controlEpoch?: number },
-  ): Promise<void> {
+  /**
+   * Appends one participant-originated session event. The wire body is
+   * exactly the caller's fields: events are not fenced, so no identity
+   * is injected beyond what the caller passes.
+   */
+  async appendEvent(sessionId: string, event: AppendTaskEventCall): Promise<void> {
     await this.#request(
       "append-event",
       "POST",
       `/sessions/${encodeURIComponent(sessionId)}/events`,
       {
         ...(event.eventId === undefined ? {} : { eventId: event.eventId }),
+        ...(event.instanceId === undefined ? {} : { instanceId: event.instanceId }),
         payload: event.payload,
         producerId: event.producerId,
         type: event.type,
-        ...this.#identity(event),
+        ...(event.controlEpoch === undefined ? {} : { controlEpoch: event.controlEpoch }),
       },
     );
   }
@@ -317,7 +343,11 @@ export class RestParticipantTaskClient {
   }
 
   #error(code: RestParticipantTaskErrorCode, operation: TaskOperation, status?: number | null) {
-    return new RestParticipantTaskError({ code, operation, status: status ?? null });
+    return new RestParticipantTaskError({
+      code,
+      operation,
+      status: status ?? null,
+    });
   }
 
   #fencedBody(call: {

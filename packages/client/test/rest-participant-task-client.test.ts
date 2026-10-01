@@ -55,7 +55,9 @@ function fetchJson(
   const requests: CapturedRequest[] = [];
   const fetch: RestParticipantTaskFetch = async (url, init) => {
     requests.push(capture(url, init));
-    return new Response(status === 204 ? null : JSON.stringify(body), { status });
+    return new Response(status === 204 ? null : JSON.stringify(body), {
+      status,
+    });
   };
   const client = new RestParticipantTaskClient(
     {
@@ -69,11 +71,24 @@ function fetchJson(
   return { client, requests };
 }
 
+function posted(requests: CapturedRequest[], path: string): Record<string, unknown> {
+  const hit = requests.find((r) => r.path === path);
+  if (hit === undefined || hit.body === null) {
+    throw new Error(`no body captured for ${path}`);
+  }
+  return hit.body as Record<string, unknown>;
+}
+
 describe("RestParticipantTaskClient", () => {
   it("claims a task with the fenced identity and parses the wrapped record", async () => {
-    const { client, requests } = fetchJson(200, { status: "claimed", task: taskRecord });
+    const { client, requests } = fetchJson(200, {
+      status: "claimed",
+      task: taskRecord,
+    });
 
-    const claimed = await client.claimTask("sess_1", "task_1", { controlEpoch: 3 });
+    const claimed = await client.claimTask("sess_1", "task_1", {
+      controlEpoch: 3,
+    });
 
     expect(claimed?.taskId).toBe("task_1");
     expect(claimed?.kind).toBe("media_status");
@@ -107,7 +122,9 @@ describe("RestParticipantTaskClient", () => {
       if (path.endsWith("/complete")) {
         return new Response(null, { status: 204 });
       }
-      return new Response(JSON.stringify({ tasks: [taskRecord] }), { status: 200 });
+      return new Response(JSON.stringify({ tasks: [taskRecord] }), {
+        status: 200,
+      });
     };
     const client = new RestParticipantTaskClient(
       {
@@ -158,7 +175,23 @@ describe("RestParticipantTaskClient", () => {
   it("lists active tasks as records", async () => {
     const { client } = fetchJson(200, { tasks: [taskRecord] });
 
-    await expect(client.listActiveTasks("sess_1")).resolves.toHaveLength(1);
+    const page = await client.listActiveTasks("sess_1");
+    expect(page.tasks).toHaveLength(1);
+    expect(page.invalidRowCount).toBe(0);
+  });
+
+  it("drops malformed rows and reports the count instead of failing the page (#32)", async () => {
+    const badRow = {
+      claimId: null,
+      input: {},
+      kind: "media_status",
+      status: "active",
+    };
+    const { client } = fetchJson(200, { tasks: [badRow, taskRecord] });
+
+    const page = await client.listActiveTasks("sess_1");
+    expect(page.tasks).toHaveLength(1);
+    expect(page.invalidRowCount).toBe(1);
   });
 
   it("lists events with pagination and parses the protocol response", async () => {
@@ -174,7 +207,13 @@ describe("RestParticipantTaskClient", () => {
           type: "agent.output",
         },
       ],
-      pagination: { afterSeq: 0, hasMore: false, limit: 50, nextAfterSeq: 7, returned: 1 },
+      pagination: {
+        afterSeq: 0,
+        hasMore: false,
+        limit: 50,
+        nextAfterSeq: 7,
+        returned: 1,
+      },
     });
 
     const page = await client.listEvents("sess_1", { after: 0, limit: 50 });
@@ -213,15 +252,11 @@ describe("RestParticipantTaskClient", () => {
       type: "agent.output",
     });
 
-    expect(requests[0]).toMatchObject({
-      body: {
-        eventId: "evt_2",
-        payload: { text: "done", v: "proof-shell/chat-v1" },
-        producerId: "media",
-        type: "agent.output",
-      },
-      method: "POST",
-      path: "/sessions/sess_1/events",
+    expect(posted(requests, "/sessions/sess_1/events")).toEqual({
+      eventId: "evt_2",
+      payload: { text: "done", v: "proof-shell/chat-v1" },
+      producerId: "media",
+      type: "agent.output",
     });
   });
 
