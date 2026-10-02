@@ -171,6 +171,18 @@ describe("RestParticipantTaskClient", () => {
     });
   });
 
+  it("maps an envelope with a null task, and a null body, to INVALID_RESPONSE", async () => {
+    const wrapped = fetchJson(201, { status: "created", task: null });
+    await expect(
+      wrapped.client.createTask("sess_1", { kind: "media_status", objective: "Report status" }),
+    ).rejects.toMatchObject({ code: "INVALID_RESPONSE", details: { operation: "create" } });
+
+    const nullBody = fetchJson(201, null);
+    await expect(
+      nullBody.client.createTask("sess_1", { kind: "media_status", objective: "Report status" }),
+    ).rejects.toMatchObject({ code: "INVALID_RESPONSE", details: { operation: "create" } });
+  });
+
   it("completes with the claim id and result, and sends no body on GET", async () => {
     const requests: CapturedRequest[] = [];
     const fetch: RestParticipantTaskFetch = async (url, init) => {
@@ -223,6 +235,10 @@ describe("RestParticipantTaskClient", () => {
     const found = fetchJson(200, taskRecord);
     await expect(found.client.readTask("sess_1", "task_1")).resolves.toMatchObject({
       taskId: "task_1",
+    });
+    expect(found.requests[0]).toMatchObject({
+      method: "GET",
+      path: "/sessions/sess_1/tasks/task_1",
     });
 
     const missing = fetchJson(404, { code: "TASK_NOT_FOUND" });
