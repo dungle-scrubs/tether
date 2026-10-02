@@ -10,6 +10,10 @@ import {
   authorizeParticipantIdentity,
   effectiveParticipantId,
 } from "./auth/authorize.js";
+import {
+  describeTaskGrantEnforcementDenial,
+  type TaskGrantEnforcementDenial,
+} from "./auth/task-grants-policy.js";
 import type { AuthContext } from "./auth/token.js";
 import { ScheduledRunIdentityConflictError, ScheduledTaskIdentityMismatchError } from "./db.js";
 import {
@@ -261,9 +265,15 @@ export function handleTaskHttpRoute(
         });
       }
       const result = yield* service.createTask({
+        ...(input.authContext ? { actorParticipantId: input.authContext.participantId } : {}),
+        ...(body.assigneeParticipantId === undefined
+          ? {}
+          : { assigneeParticipantId: body.assigneeParticipantId }),
         input: body.input ?? null,
         kind: body.kind,
         objective: body.objective,
+        ...(body.parentTaskId === undefined ? {} : { parentTaskId: body.parentTaskId }),
+        ...(body.scopeLabel === undefined ? {} : { scopeLabel: body.scopeLabel }),
         sessionId,
         taskId: body.taskId,
       });
@@ -273,6 +283,13 @@ export function handleTaskHttpRoute(
           error: "Task id conflict",
           reason: "task_id_conflict",
           taskId: result.taskId,
+        });
+        return true;
+      }
+      if (result.status === "denied") {
+        sendJson(response, 403, {
+          error: renderTaskGrantDenial(result.reason),
+          reason: result.reason,
         });
         return true;
       }
@@ -748,8 +765,20 @@ function sendRestTaskMutationResult(
     sendJson(response, 409, { error: rejectedMessage });
     return;
   }
+  if (result.status === "denied") {
+    sendJson(response, 403, {
+      error: renderTaskGrantDenial(result.reason),
+      reason: result.reason,
+    });
+    return;
+  }
   broadcastEvents(hub, result.events);
   sendJson(response, 200, { task: result.task });
+}
+
+/** Renders a task-grant enforcement denial reason into a stable error message. */
+function renderTaskGrantDenial(reason: TaskGrantEnforcementDenial): string {
+  return describeTaskGrantEnforcementDenial(reason);
 }
 
 function sendScheduledSupersessionResult(
@@ -830,6 +859,13 @@ function sendRestTaskClaimRefreshResult(
   if (result.status === "rejected") {
     sendJson(response, 409, {
       error: "Task claim is missing, expired, or terminal",
+    });
+    return;
+  }
+  if (result.status === "denied") {
+    sendJson(response, 403, {
+      error: renderTaskGrantDenial(result.reason),
+      reason: result.reason,
     });
     return;
   }

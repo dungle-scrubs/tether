@@ -20,6 +20,7 @@ function fakeStores(): AuthPersistenceStores & {
     createGrantWithAudit: vi.fn(async ({ grant }) => {
       records.set(grant.jti, grant);
     }),
+    createTaskGrantWithAudit: vi.fn(async () => undefined),
     grants: {
       findManyByJti: async (grantJtis) =>
         grantJtis.flatMap((jti) => {
@@ -38,6 +39,19 @@ function fakeStores(): AuthPersistenceStores & {
       records.set(jti, revoked);
       return { grant: revoked, status: "revoked" } as const;
     }),
+    revokeTaskGrantWithAudit: vi.fn(
+      async () =>
+        ({
+          grant: null,
+          status: "not_found",
+        }) as const,
+    ),
+    taskGrantAudits: { listForTaskGrant: async () => [] },
+    taskGrants: {
+      findByJti: async () => null,
+      list: async () => [],
+      listLiveForSubject: async () => [],
+    },
     tickets: {
       consume: async () => null,
       create: async () => undefined,

@@ -1,5 +1,6 @@
 services:
   postgres:
+    restart: unless-stopped
     image: postgres:17-alpine
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-tether}
@@ -16,6 +17,7 @@ services:
       - tether-postgres:/var/lib/postgresql/data
 
   app:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: apps/tether/Dockerfile

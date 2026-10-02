@@ -98,10 +98,9 @@ export const authGrantAuditEvents = pgTable(
     action: text("action").notNull(),
     actorSubject: text("actor_subject").notNull(),
     auditId: text("audit_id").primaryKey(),
-    grantJti: text("grant_jti")
-      .notNull()
-      .references(() => authGrants.jti),
+    grantJti: text("grant_jti").references(() => authGrants.jti),
     metadata: jsonb("metadata").$type<AuthGrantAuditMetadata>().notNull(),
+    taskGrantJti: text("task_grant_jti").references(() => taskGrants.jti),
     occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull().defaultNow(),
     reasonCode: text("reason_code").notNull(),
   },
@@ -134,7 +133,19 @@ export const authGrantAuditEvents = pgTable(
     ),
     check(
       "auth_grant_audit_action_check",
-      sql`${table.action} IN ('grant.created', 'grant.revoked')`,
+      sql`${table.action} IN ('grant.created', 'grant.revoked', 'task_grant.created', 'task_grant.revoked')`,
+    ),
+    check(
+      "auth_grant_audit_subject_check",
+      sql`(${table.grantJti} IS NULL) <> (${table.taskGrantJti} IS NULL)`,
+    ),
+    check(
+      "auth_grant_audit_task_grant_action_check",
+      sql`(${table.taskGrantJti} IS NULL) = (${table.action} IN ('grant.created', 'grant.revoked'))`,
+    ),
+    check(
+      "auth_grant_audit_task_grant_jti_length_check",
+      sql`${table.taskGrantJti} IS NULL OR char_length(${table.taskGrantJti}) BETWEEN 1 AND 128`,
     ),
     check(
       "auth_grant_audit_reason_length_check",
@@ -146,6 +157,68 @@ export const authGrantAuditEvents = pgTable(
     ),
     index("auth_grant_audit_grant_occurred_idx").on(table.grantJti, table.occurredAt),
     index("auth_grant_audit_occurred_idx").on(table.occurredAt),
+    index("auth_grant_audit_task_grant_occurred_idx").on(table.taskGrantJti, table.occurredAt),
+  ],
+);
+
+/**
+ * Durable task delegation grants. No credential is persisted here: a task
+ * grant is pure authority metadata minted by a service-scoped admin and
+ * evaluated by the task-grants policy at create/claim time.
+ */
+export const taskGrants = pgTable(
+  "task_grants",
+  {
+    /** Bounded task operation this grant authorizes: create or claim. */
+    action: text("action").notNull(),
+    /** Audit id of the creation event; the lifecycle join pointer into the grant audit. */
+    createdAuditId: text("created_audit_id").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    issuedAt: timestamp("issued_at", { withTimezone: true }).notNull(),
+    issuer: text("issuer").notNull(),
+    jti: text("jti").primaryKey(),
+    /** Allowed task kinds; empty matches any non-operator kind. */
+    kindAllowlist: jsonb("kind_allowlist").$type<string[]>().notNull(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    /** Allowed delegation scope labels; empty matches any label (P2 deferred). */
+    scopeLabelAllowlist: jsonb("scope_label_allowlist").$type<string[]>().notNull(),
+    sessionScope: text("session_scope").notNull(),
+    subject: text("subject").notNull(),
+  },
+  (table) => [
+    check("task_grants_action_check", sql`${table.action} IN ('task.create', 'task.claim')`),
+    check("task_grants_expiry_check", sql`${table.expiresAt} > ${table.issuedAt}`),
+    check(
+      "task_grants_lifetime_check",
+      sql`${table.expiresAt} <= ${table.issuedAt} + interval '7 days'`,
+    ),
+    check("task_grants_issuer_length_check", sql`char_length(${table.issuer}) BETWEEN 1 AND 512`),
+    check("task_grants_jti_length_check", sql`char_length(${table.jti}) BETWEEN 1 AND 128`),
+    check("task_grants_jti_shape_check", sql`${table.jti} ~ '^tgrant_[A-Za-z0-9_-]{1,120}$'`),
+    check(
+      "task_grants_created_audit_id_length_check",
+      sql`char_length(${table.createdAuditId}) BETWEEN 1 AND 128`,
+    ),
+    check(
+      "task_grants_allowlist_shape_check",
+      sql`jsonb_typeof(${table.kindAllowlist}) = 'array' AND jsonb_typeof(${table.scopeLabelAllowlist}) = 'array'`,
+    ),
+    check(
+      "task_grants_allowlist_size_check",
+      sql`octet_length(${table.kindAllowlist}::text) + octet_length(${table.scopeLabelAllowlist}::text) <= 8192`,
+    ),
+    check(
+      "task_grants_revoked_check",
+      sql`${table.revokedAt} IS NULL OR ${table.revokedAt} >= ${table.issuedAt}`,
+    ),
+    check(
+      "task_grants_session_scope_length_check",
+      sql`char_length(${table.sessionScope}) BETWEEN 1 AND 255`,
+    ),
+    check("task_grants_subject_length_check", sql`char_length(${table.subject}) BETWEEN 1 AND 255`),
+    index("task_grants_expiry_idx").on(table.expiresAt),
+    index("task_grants_revoked_expiry_idx").on(table.revokedAt, table.expiresAt),
+    index("task_grants_subject_session_idx").on(table.subject, table.sessionScope),
   ],
 );
 
@@ -571,6 +644,8 @@ export const participantControlLeases = pgTable(
 export const tasks = pgTable(
   "tasks",
   {
+    /** Participant id assigned to own this task; null when unassigned. */
+    assigneeParticipantId: text("assignee_participant_id"),
     cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
     claimExpiredAt: timestamp("claim_expired_at", { withTimezone: true }),
     claimExpiredBy: text("claim_expired_by"),
@@ -591,9 +666,13 @@ export const tasks = pgTable(
     objective: text("objective").notNull(),
     operatorCommandKey: text("operator_command_key"),
     operatorGrantJti: text("operator_grant_jti"),
+    /** Same-session parent task id this task was delegated from; null for root tasks. */
+    parentTaskId: text("parent_task_id"),
     releasedAt: timestamp("released_at", { withTimezone: true }),
     releasedBy: text("released_by"),
     result: jsonb("result").$type<Record<string, unknown>>(),
+    /** Optional delegation scope label; null when the task carries no delegation scope. */
+    scopeLabel: text("scope_label"),
     // Versioned provider-neutral recurring-work identity. Version 1 denotes a
     // row backfilled from legacy columns; version 2 is the opaque-scope contract.
     scheduleIdentityVersion: integer("schedule_identity_version"),
@@ -608,7 +687,23 @@ export const tasks = pgTable(
   },
   (table) => [
     primaryKey({ columns: [table.sessionId, table.taskId] }),
+    // Same-session delegation parent: a child task always names a task id in
+    // its own session. The reference is fail-closed: deleting a parent that
+    // still has children is refused instead of cascading the subtree. (SET
+    // NULL is unusable here because it would also null the non-nullable
+    // session column of the composite key.)
+    foreignKey({
+      columns: [table.sessionId, table.parentTaskId],
+      foreignColumns: [table.sessionId, table.taskId],
+      name: "tasks_session_parent_fk",
+    }).onDelete("no action"),
+    index("tasks_assignee_idx")
+      .on(table.sessionId, table.assigneeParticipantId)
+      .where(sql`${table.assigneeParticipantId} IS NOT NULL`),
     index("tasks_claim_expiry_idx").on(table.claimExpiresAt),
+    index("tasks_parent_idx")
+      .on(table.sessionId, table.parentTaskId)
+      .where(sql`${table.parentTaskId} IS NOT NULL`),
     index("tasks_session_created_idx").on(table.sessionId, table.createdAt.desc(), table.taskId),
     index("tasks_operator_grant_created_idx")
       .on(table.operatorGrantJti, table.createdAt)
@@ -637,6 +732,18 @@ export const tasks = pgTable(
       table.scheduleAlgorithmVersion,
       table.scheduleIntervalMs,
       table.scheduleWindowStart,
+    ),
+    check(
+      "tasks_assignee_length_check",
+      sql`${table.assigneeParticipantId} IS NULL OR char_length(${table.assigneeParticipantId}) BETWEEN 1 AND 255`,
+    ),
+    check(
+      "tasks_parent_length_check",
+      sql`${table.parentTaskId} IS NULL OR char_length(${table.parentTaskId}) BETWEEN 1 AND 255`,
+    ),
+    check(
+      "tasks_scope_label_length_check",
+      sql`${table.scopeLabel} IS NULL OR char_length(${table.scopeLabel}) BETWEEN 1 AND 128`,
     ),
     check(
       "tasks_schedule_scope_key_size_check",

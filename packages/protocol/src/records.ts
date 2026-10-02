@@ -2,13 +2,23 @@ import { z } from "zod";
 
 import { approvalDecisionSchema, taskResultSchema } from "./approval-targets.js";
 import type { CandidateScheduleIdentity } from "./task-contracts.js";
-import { candidateScheduleIdentitySchema } from "./task-contracts.js";
+import {
+  candidateScheduleIdentitySchema,
+  taskAssigneeParticipantIdSchema,
+  taskParentTaskIdSchema,
+  taskScopeLabelSchema,
+} from "./task-contracts.js";
 
 /**
  * Durable task record returned by Tether task APIs and embedded in task
  * lifecycle events.
  */
 export interface TaskRecord {
+  /**
+   * Participant id assigned to own this task. Optional so payloads written
+   * before assignees existed still parse; absent means unassigned.
+   */
+  readonly assigneeParticipantId?: string | null | undefined;
   /** Cancellation timestamp, when the task has been cancelled. */
   readonly cancelledAt: string | null;
   /** Claim-expiration timestamp persisted after the scheduler clears an elapsed claim. */
@@ -42,6 +52,11 @@ export interface TaskRecord {
   readonly kind: string;
   /** User-visible task objective. */
   readonly objective: string;
+  /**
+   * Same-session parent task id this task was delegated from. Optional so
+   * payloads written before delegation existed still parse; absent is a root task.
+   */
+  readonly parentTaskId?: string | null | undefined;
   /** Last claim release timestamp, when a participant explicitly released the task. */
   readonly releasedAt: string | null;
   /** Participant id that explicitly released the task claim. */
@@ -54,6 +69,11 @@ export interface TaskRecord {
    * complete Schedule Window and scope key.
    */
   readonly schedule?: CandidateScheduleIdentity | null | undefined;
+  /**
+   * Optional delegation scope label; absent for tasks created before scope
+   * labels existed or for tasks that carry no delegation scope.
+   */
+  readonly scopeLabel?: string | null | undefined;
   /** Durable Tether session that owns the task. */
   readonly sessionId: string;
   /** Durable task id. */
@@ -494,6 +514,7 @@ export const webSocketOperation = {
  * protocol boundaries.
  */
 export const taskRecordSchema = z.object({
+  assigneeParticipantId: taskAssigneeParticipantIdSchema.nullable().optional(),
   cancelledAt: z.string().nullable(),
   claimExpiredAt: z.string().nullable(),
   claimExpiredBy: z.string().nullable(),
@@ -508,10 +529,12 @@ export const taskRecordSchema = z.object({
   input: z.record(z.string(), z.unknown()).nullable(),
   kind: z.string().min(1),
   objective: z.string().min(1),
+  parentTaskId: taskParentTaskIdSchema.nullable().optional(),
   releasedAt: z.string().nullable(),
   releasedBy: z.string().nullable(),
   result: taskResultSchema.nullable(),
   schedule: candidateScheduleIdentitySchema.nullable().optional(),
+  scopeLabel: taskScopeLabelSchema.nullable().optional(),
   sessionId: z.string().min(1),
   taskId: z.string().min(1),
 });

@@ -3,10 +3,8 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   type OperatorCommandRequest,
   type OperatorGrantScope,
-  operatorCommandIdentityKey,
   operatorCommandPermission,
   operatorGrantScopeSchema,
-  operatorTaskKind,
 } from "@dungle-scrubs/tether-protocol";
 import {
   and,
@@ -25,13 +23,17 @@ import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { Context, Effect, Layer } from "effect";
 import pg from "pg";
 
-import { approvalTargetKeyFromTarget, legacyApprovalTargetKey } from "./approval-target-key.js";
+import { approvalTargetKey } from "./approval-target-key.js";
+import {
+  enforceTaskGrantPolicyWithClient,
+  TaskGrantDeniedError,
+} from "./auth/task-grants-policy.js";
 import {
   authorizeOperator,
   type OperatorAuthorityDenialReason,
   type OperatorAuthorityRequest,
 } from "./auth/operator-authority.js";
-import { ServerConfigService } from "./config.js";
+import { type AuthMode, ServerConfigService } from "./config.js";
 import { ControlEpochStaleError, nextControlEpoch, parseControlEpoch } from "./control-epoch.js";
 import { migrateDatabase } from "./database-migration.js";
 import {
@@ -74,7 +76,6 @@ import type {
   ControlChannel,
   ControlLeaseSnapshot,
   ControlLeaseStatus,
-  ParticipantListOptions,
   ParticipantRecord,
   ParticipantRuntimeSnapshot,
   ParticipantRuntimeSnapshotStatus,
@@ -85,7 +86,6 @@ import type {
   SessionListItem,
   SessionRecord,
   TaskApprovalRecord,
-  TaskListOptions,
   TaskListStatus,
   TaskRecord,
   TaskSnapshot,
@@ -307,6 +307,7 @@ interface SequenceRow {
 }
 
 interface ExpiredTaskClaimRow {
+  readonly assigneeParticipantId: string | null;
   readonly cancelledAt: Date | null;
   readonly claimExpiredAt: Date | null;
   readonly claimExpiredBy: string | null;
@@ -321,10 +322,12 @@ interface ExpiredTaskClaimRow {
   readonly input: Record<string, unknown> | null;
   readonly kind: string;
   readonly objective: string;
+  readonly parentTaskId: string | null;
   readonly previousClaimedBy: string;
   readonly releasedAt: Date | null;
   readonly releasedBy: string | null;
   readonly result: Record<string, unknown> | null;
+  readonly scopeLabel: string | null;
   readonly scheduleAlgorithmVersion: number | string | null;
   readonly scheduleIdentityVersion: number | string | null;
   readonly scheduleIntervalMs: number | string | null;
@@ -335,6 +338,7 @@ interface ExpiredTaskClaimRow {
 }
 
 interface PgTaskRow {
+  readonly assigneeParticipantId: string | null;
   readonly cancelledAt: Date | null;
   readonly claimExpiredAt: Date | null;
   readonly claimExpiredBy: string | null;
@@ -349,9 +353,11 @@ interface PgTaskRow {
   readonly input: Record<string, unknown> | null;
   readonly kind: string;
   readonly objective: string;
+  readonly parentTaskId: string | null;
   readonly releasedAt: Date | null;
   readonly releasedBy: string | null;
   readonly result: Record<string, unknown> | null;
+  readonly scopeLabel: string | null;
   // bigint/integer columns arrive as numeric strings over the raw pg driver.
   readonly scheduleAlgorithmVersion: number | string | null;
   readonly scheduleIdentityVersion: number | string | null;
@@ -786,6 +792,7 @@ const controlLeaseReturningColumns = `
 `;
 
 const taskReturningColumns = `
+  assignee_participant_id AS "assigneeParticipantId",
   cancelled_at AS "cancelledAt",
   claim_expired_at AS "claimExpiredAt",
   claim_expired_by AS "claimExpiredBy",
@@ -800,9 +807,11 @@ const taskReturningColumns = `
   input,
   kind,
   objective,
+  parent_task_id AS "parentTaskId",
   released_at AS "releasedAt",
   released_by AS "releasedBy",
   result,
+  scope_label AS "scopeLabel",
   schedule_algorithm_version AS "scheduleAlgorithmVersion",
   schedule_identity_version AS "scheduleIdentityVersion",
   schedule_interval_ms AS "scheduleIntervalMs",
@@ -2092,6 +2101,7 @@ export async function expireTaskClaims(
         WHERE tasks.session_id = expired.session_id
           AND tasks.task_id = expired.task_id
         RETURNING
+          tasks.assignee_participant_id AS "assigneeParticipantId",
           tasks.cancelled_at AS "cancelledAt",
           tasks.claim_expired_at AS "claimExpiredAt",
           tasks.claim_expired_by AS "claimExpiredBy",
@@ -2106,10 +2116,12 @@ export async function expireTaskClaims(
           tasks.input,
           tasks.kind,
           tasks.objective,
+          tasks.parent_task_id AS "parentTaskId",
           expired.previous_claimed_by AS "previousClaimedBy",
           tasks.released_at AS "releasedAt",
           tasks.released_by AS "releasedBy",
           tasks.result,
+          tasks.scope_label AS "scopeLabel",
           tasks.schedule_algorithm_version AS "scheduleAlgorithmVersion",
           tasks.schedule_identity_version AS "scheduleIdentityVersion",
           tasks.schedule_interval_ms AS "scheduleIntervalMs",
@@ -2512,7 +2524,10 @@ export async function heartbeatParticipantWithEvent(
 export async function listParticipants(
   database: DatabasePool,
   sessionId: string,
-  options: ParticipantListOptions = {},
+  options: {
+    readonly before?: Pick<ParticipantRecord, "lastSeenAt" | "participantId"> | undefined;
+    readonly limit?: number | undefined;
+  } = {},
 ): Promise<ParticipantRecord[]> {
   const beforeDate = options.before === undefined ? null : new Date(options.before.lastSeenAt);
   const query = database.db
@@ -2669,6 +2684,7 @@ export async function listContextEventSuffix(
 export async function createTaskWithEvent(
   database: DatabasePool,
   input: {
+    readonly actorParticipantId?: string | undefined;
     readonly eventSourceId: string;
     readonly input?: Record<string, unknown> | null;
     readonly kind: string;
@@ -2676,14 +2692,55 @@ export async function createTaskWithEvent(
     readonly schedule?: ScheduledTaskIdentityInput | undefined;
     readonly sessionId: string;
     readonly taskId: string;
-  },
+  } & TaskDelegationInput &
+    TaskGrantEnforcementInput,
 ): Promise<PersistedTaskEventResult> {
   return runTaskEventTransaction(database, {
     operation: "createTask",
     sourceId: input.eventSourceId,
-    mutate: (client) => insertTaskWithClient(client, input),
+    mutate: async (client) => {
+      await assertTaskCreateGrantedWithClient(client, input, new Date());
+      return insertTaskWithClient(client, input);
+    },
     buildEvent: (task) => buildTaskCreatedEventInput({ sessionId: input.sessionId, task }),
   });
+}
+
+/**
+ * Enforces the task.create grant policy on one generic create. Auth-disabled
+ * callers and databases without policy rows pass through with current
+ * behavior; otherwise the creating actor (the assignee when one is set, else
+ * the authenticated actor) must hold a live `task.create` grant covering the
+ * session, kind, and scope label. Parent linkage is lineage only and confers
+ * nothing. Denial throws TaskGrantDeniedError with zero events committed.
+ */
+async function assertTaskCreateGrantedWithClient(
+  client: TransactionClient,
+  input: {
+    readonly actorParticipantId?: string | undefined;
+    readonly assigneeParticipantId?: string | null | undefined;
+    readonly kind: string;
+    readonly scopeLabel?: string | null | undefined;
+    readonly sessionId: string;
+  } & TaskGrantEnforcementInput,
+  now: Date,
+): Promise<void> {
+  const enforcement = await enforceTaskGrantPolicyWithClient(
+    client,
+    {
+      action: "task.create",
+      actorParticipantId: input.actorParticipantId ?? "",
+      assigneeParticipantId: input.assigneeParticipantId ?? null,
+      kind: input.kind,
+      scopeLabel: input.scopeLabel ?? null,
+      sessionId: input.sessionId,
+    },
+    now,
+    { ...(input.taskGrantAuthMode === undefined ? {} : { authMode: input.taskGrantAuthMode }) },
+  );
+  if (enforcement.status === "denied") {
+    throw new TaskGrantDeniedError(enforcement.reason);
+  }
 }
 
 /** Browser operator authority carried into one transaction-owning command admission. */
@@ -2741,27 +2798,17 @@ export async function createOperatorCommandTaskWithEvent(
       }
       throw error;
     }
+    await acquireTransactionAdvisoryLock(client, "operator-command-admission", "global");
     const commandKey = createHash("sha256")
       .update(
-        operatorCommandIdentityKey({
+        JSON.stringify({
           command: input.authority.request.command,
           grantJti: input.authority.grantJti,
           scopeKey: input.authority.request.scopeKey,
-          ...(input.authority.request.targetId === undefined
-            ? {}
-            : { targetId: input.authority.request.targetId }),
+          targetId: input.authority.request.targetId ?? null,
         }),
       )
       .digest("hex");
-    // Only concurrent admissions of the same command need serializing, and
-    // `tasks_operator_command_active_unique` is the durable fence behind this
-    // lock. Keying it globally would bound the whole operator surface to one
-    // transaction at a time for the sake of an approximate queue-depth cap.
-    await acquireTransactionAdvisoryLock(
-      client,
-      "operator-command-admission",
-      `${input.authority.request.sessionId}:${commandKey}`,
-    );
     const existing = await client.query<PgTaskRow>(
       `SELECT ${taskReturningColumns}
        FROM tasks
@@ -2793,8 +2840,6 @@ export async function createOperatorCommandTaskWithEvent(
     if ((grantRate.rows[0]?.count ?? 0) >= maximumOperatorCommandsPerGrantPerMinute) {
       throw new OperatorCommandAdmissionError("operator_command_rate_limited");
     }
-    // Deployment-wide queue depth, read without a global lock: the cap tolerates
-    // admitting a few commands past it under concurrency.
     const pending = await client.query<{ readonly count: number }>(
       `SELECT count(*)::int AS count
        FROM tasks
@@ -2816,7 +2861,7 @@ export async function createOperatorCommandTaskWithEvent(
           ? {}
           : { targetId: input.authority.request.targetId }),
       },
-      kind: operatorTaskKind(input.authority.request.command),
+      kind: `operator.${input.authority.request.command}`,
       objective: `Process operator command ${input.authority.request.command}`,
       operatorCommand: { commandKey, grantJti: input.authority.grantJti },
       sessionId: input.authority.request.sessionId,
@@ -2853,7 +2898,7 @@ export async function createTaskWithEventOnClient(
     readonly objective: string;
     readonly sessionId: string;
     readonly taskId: string;
-  },
+  } & TaskDelegationInput,
 ): Promise<PersistedTaskEventResult> {
   const task = await insertTaskWithClient(client, input);
   const event = await appendEventWithClient(
@@ -2871,6 +2916,7 @@ export async function createTaskWithEventOnClient(
 export async function createTaskWithEventIdempotent(
   database: DatabasePool,
   input: {
+    readonly actorParticipantId?: string | undefined;
     readonly eventSourceId: string;
     readonly input?: Record<string, unknown> | null;
     readonly kind: string;
@@ -2879,7 +2925,8 @@ export async function createTaskWithEventIdempotent(
     readonly sessionId: string;
     readonly taskId: string;
     readonly taskIdSource: "caller" | "generated";
-  },
+  } & TaskDelegationInput &
+    TaskGrantEnforcementInput,
 ): Promise<PersistedTaskCreateResult> {
   if (input.taskIdSource === "generated") {
     const persisted = await createTaskWithEvent(database, input);
@@ -2909,6 +2956,9 @@ export async function createTaskWithEventIdempotent(
       };
     }
 
+    // Idempotent replay and conflict outcomes above never consult grants, so a
+    // replayed create keeps current behavior. Only the actual insert is gated.
+    await assertTaskCreateGrantedWithClient(client, input, new Date());
     const task = await insertTaskWithClient(client, input);
     const event = await appendEventWithClient(
       client,
@@ -2919,6 +2969,12 @@ export async function createTaskWithEventIdempotent(
     return { event, events: [event], status: "created", task };
   } catch (error) {
     await client.query("ROLLBACK");
+    // A grant denial is a caller-facing authorization outcome, not a
+    // transaction failure; surface it untouched so callers map it to the typed
+    // denial result instead of an opaque rollback error.
+    if (error instanceof TaskGrantDeniedError) {
+      throw error;
+    }
     // A residual duplicate-id race that slipped past the advisory lock (for
     // example a concurrent generated-id insert choosing the same id) surfaces
     // as the task primary-key unique violation. Map it to the same idempotent
@@ -2958,7 +3014,10 @@ export async function listTasks(
   database: DatabasePool,
   sessionId: string,
   status: TaskListStatus = "active",
-  options: TaskListOptions = {},
+  options: {
+    readonly before?: Pick<TaskRecord, "createdAt" | "taskId"> | undefined;
+    readonly limit?: number | undefined;
+  } = {},
 ): Promise<TaskRecord[]> {
   const beforeDate = options.before === undefined ? null : new Date(options.before.createdAt);
   const query = database.db
@@ -3087,10 +3146,7 @@ export async function recordTaskApproval(
     readonly taskId: string;
   },
 ): Promise<PersistedTaskApprovalResult | null> {
-  const targetKey =
-    input.target === undefined
-      ? legacyApprovalTargetKey(input.reason)
-      : approvalTargetKeyFromTarget(input.target);
+  const targetKey = approvalTargetKey(input.reason, input.target);
   const client = await database.pool.connect();
   try {
     await client.query("BEGIN");
@@ -3244,26 +3300,6 @@ async function assertOperatorGrantAuthorityWithClient(
   return row.subject;
 }
 
-/** One manifest field compared in order, and the refusal its first mismatch raises. */
-interface ApprovalTargetManifestCheck {
-  readonly field: keyof ApprovalTarget;
-  readonly reason: ApprovalTargetManifestErrorReason;
-}
-
-/**
- * Ordered manifest comparison. A submitted target must match a manifest entry
- * on every field; the refusal names the first field that did not match on the
- * entry that matched furthest, so the operator learns what actually diverged.
- */
-const approvalTargetManifestChecks: readonly ApprovalTargetManifestCheck[] = [
-  { field: "targetId", reason: "target_absent" },
-  { field: "targetKind", reason: "target_kind_mismatch" },
-  { field: "scopeKey", reason: "scope_mismatch" },
-  { field: "targetRevision", reason: "target_revision_mismatch" },
-  { field: "action", reason: "action_mismatch" },
-  { field: "digest", reason: "digest_mismatch" },
-];
-
 /** Verifies one submitted target against the completed result inside the commit transaction. */
 function assertApprovalTargetManifest(task: TaskRecord, target: ApprovalTarget | undefined): void {
   if (target === undefined) {
@@ -3282,21 +3318,48 @@ function assertApprovalTargetManifest(task: TaskRecord, target: ApprovalTarget |
   if (!manifest.success) {
     throw new ApprovalTargetManifestError("target_absent");
   }
-  let matchedFields = 0;
+  let deepestMatch = 0;
   for (const entry of manifest.data) {
-    let depth = 0;
-    while (depth < approvalTargetManifestChecks.length) {
-      const check = approvalTargetManifestChecks[depth] as ApprovalTargetManifestCheck;
-      if (entry[check.field] !== target[check.field]) break;
-      depth += 1;
+    if (entry.targetId !== target.targetId) {
+      continue;
     }
-    if (depth === approvalTargetManifestChecks.length) {
+    deepestMatch = Math.max(deepestMatch, 1);
+    if (entry.targetKind !== target.targetKind) {
+      continue;
+    }
+    deepestMatch = Math.max(deepestMatch, 2);
+    if (entry.scopeKey !== target.scopeKey) {
+      continue;
+    }
+    deepestMatch = Math.max(deepestMatch, 3);
+    if (entry.targetRevision !== target.targetRevision) {
+      continue;
+    }
+    deepestMatch = Math.max(deepestMatch, 4);
+    if (entry.action !== target.action) {
+      continue;
+    }
+    deepestMatch = Math.max(deepestMatch, 5);
+    if (entry.digest === target.digest) {
       return;
     }
-    matchedFields = Math.max(matchedFields, depth);
   }
-  const failed = approvalTargetManifestChecks[matchedFields] as ApprovalTargetManifestCheck;
-  throw new ApprovalTargetManifestError(failed.reason);
+  if (deepestMatch === 0) {
+    throw new ApprovalTargetManifestError("target_absent");
+  }
+  if (deepestMatch === 1) {
+    throw new ApprovalTargetManifestError("target_kind_mismatch");
+  }
+  if (deepestMatch === 2) {
+    throw new ApprovalTargetManifestError("scope_mismatch");
+  }
+  if (deepestMatch === 3) {
+    throw new ApprovalTargetManifestError("target_revision_mismatch");
+  }
+  if (deepestMatch === 4) {
+    throw new ApprovalTargetManifestError("action_mismatch");
+  }
+  throw new ApprovalTargetManifestError("digest_mismatch");
 }
 
 /**
@@ -3320,7 +3383,7 @@ export async function claimTaskWithEvent(
     readonly participantId: string;
     readonly sessionId: string;
     readonly taskId: string;
-  },
+  } & TaskGrantEnforcementInput,
 ): Promise<PersistedTaskClaimResult> {
   assertPositiveFiniteTtlMs(input.claimLeaseTtlMs, "task claim TTL");
   const newClaimId = generateClaimId();
@@ -3368,6 +3431,27 @@ export async function claimTaskWithEvent(
       // this claim attempt does not win it.
       await client.query("COMMIT");
       return null;
+    }
+    // Grant enforcement runs on the row-locked task before any update or event,
+    // so a denial commits zero events. Race losses above stay typeless
+    // rejections (null); only policy failures throw the typed denial. The
+    // task's assignee binding, kind, and scope label are evaluated; parent
+    // linkage is lineage only and confers nothing.
+    const claimEnforcement = await enforceTaskGrantPolicyWithClient(
+      client,
+      {
+        action: "task.claim",
+        kind: lockedTask.kind,
+        participantId: input.participantId,
+        scopeLabel: lockedTask.scopeLabel ?? null,
+        sessionId: input.sessionId,
+        taskAssigneeParticipantId: lockedTask.assigneeParticipantId ?? null,
+      },
+      lockedRow.databaseNow,
+      { ...(input.taskGrantAuthMode === undefined ? {} : { authMode: input.taskGrantAuthMode }) },
+    );
+    if (claimEnforcement.status === "denied") {
+      throw new TaskGrantDeniedError(claimEnforcement.reason);
     }
     const events: SessionEvent[] = [];
     if (lockedTask.claimedAt !== null) {
@@ -3453,6 +3537,11 @@ export async function claimTaskWithEvent(
     if (error instanceof ControlEpochStaleError) {
       throw error;
     }
+    // A grant denial is likewise caller-facing and commits zero events; surface
+    // it untouched so it stays distinct from the typeless race rejection.
+    if (error instanceof TaskGrantDeniedError) {
+      throw error;
+    }
     throw new TaskEventTransactionRollbackError("claimTask", error);
   } finally {
     client.release();
@@ -3471,9 +3560,19 @@ export async function refreshTaskClaim(
     readonly participantId: string;
     readonly sessionId: string;
     readonly taskId: string;
-  },
+  } & TaskGrantEnforcementInput,
 ): Promise<TaskRecord | null> {
   assertPositiveFiniteTtlMs(input.claimLeaseTtlMs, "task claim TTL");
+  // When grant enforcement can apply (auth required), refresh always runs
+  // as a row-locked transaction: the inner enforcement probe preserves
+  // no-rows behavior on the txn client, so selecting the path on auth mode
+  // alone closes the race where a policy row committed between an outer
+  // probe and the transaction would let one refresh extend a lease
+  // grant-free. Otherwise the legacy lease-only paths below preserve
+  // current behavior exactly.
+  if (input.taskGrantAuthMode !== "disabled") {
+    return refreshTaskClaimEnforced(database, input);
+  }
   if (input.controlGuard) {
     return refreshTaskClaimGuarded(database, {
       ...input,
@@ -3520,6 +3619,100 @@ async function refreshTaskClaimGuarded(
   try {
     await client.query("BEGIN");
     await assertControlEpochCurrentWithClient(client, input.controlGuard);
+    const rows = await client.query<PgTaskRow>(
+      `
+        UPDATE tasks
+        SET claim_expires_at = now() + ($1::text || ' milliseconds')::interval
+        WHERE session_id = $2
+          AND task_id = $3
+          AND claimed_by = $4
+          AND claim_id = $5
+          AND claim_expires_at > now()
+          AND completed_at IS NULL
+          AND failed_at IS NULL
+          AND cancelled_at IS NULL
+        RETURNING ${taskReturningColumns}
+      `,
+      [input.claimLeaseTtlMs, input.sessionId, input.taskId, input.participantId, input.claimId],
+    );
+    await client.query("COMMIT");
+    return rows.rows[0] ? toTaskRecord(rows.rows[0]) : null;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Refreshes an active task claim while grant enforcement is active. The task
+ * row is locked first; the legacy lease predicates (owner, claim id, live
+ * lease, nonterminal) are rechecked on the locked row so this path accepts
+ * exactly the leases the lease-only path accepts. The holder must additionally
+ * hold a live `task.create`-independent `task.claim` grant: a revoked, expired,
+ * or missing grant denies the refresh with a typed reason, while the still-
+ * live lease keeps permitting one terminal write with the current claim id
+ * through complete/fail (which never consult grants). Denial throws
+ * TaskGrantDeniedError with zero events; a lost lease stays a typeless null.
+ */
+async function refreshTaskClaimEnforced(
+  database: DatabasePool,
+  input: {
+    readonly claimId: string;
+    readonly claimLeaseTtlMs: number;
+    readonly controlGuard?: ControlEpochGuard | undefined;
+    readonly participantId: string;
+    readonly sessionId: string;
+    readonly taskId: string;
+  } & TaskGrantEnforcementInput,
+): Promise<TaskRecord | null> {
+  const client = await database.pool.connect();
+  try {
+    await client.query("BEGIN");
+    if (input.controlGuard) {
+      await assertControlEpochCurrentWithClient(client, input.controlGuard);
+    }
+    const lockedRows = await client.query<PgTaskRow & { readonly databaseNow: Date }>(
+      `SELECT ${taskReturningColumns}, now() AS "databaseNow"
+       FROM tasks
+       WHERE session_id = $1 AND task_id = $2
+       FOR UPDATE`,
+      [input.sessionId, input.taskId],
+    );
+    const lockedRow = lockedRows.rows[0];
+    if (!lockedRow) {
+      await client.query("COMMIT");
+      return null;
+    }
+    if (
+      lockedRow.completedAt !== null ||
+      lockedRow.failedAt !== null ||
+      lockedRow.cancelledAt !== null ||
+      lockedRow.claimedBy !== input.participantId ||
+      lockedRow.claimId !== input.claimId ||
+      lockedRow.claimExpiresAt === null ||
+      !(lockedRow.claimExpiresAt.getTime() > lockedRow.databaseNow.getTime())
+    ) {
+      await client.query("COMMIT");
+      return null;
+    }
+    const lockedTask = toTaskRecord(lockedRow);
+    const enforcement = await enforceTaskGrantPolicyWithClient(
+      client,
+      {
+        action: "task.claim",
+        kind: lockedTask.kind,
+        participantId: input.participantId,
+        scopeLabel: lockedTask.scopeLabel ?? null,
+        sessionId: input.sessionId,
+        taskAssigneeParticipantId: lockedTask.assigneeParticipantId ?? null,
+      },
+      lockedRow.databaseNow,
+    );
+    if (enforcement.status === "denied") {
+      throw new TaskGrantDeniedError(enforcement.reason);
+    }
     const rows = await client.query<PgTaskRow>(
       `
         UPDATE tasks
@@ -4284,6 +4477,11 @@ async function runTaskEventTransaction(
     if (error instanceof ControlEpochStaleError) {
       throw error;
     }
+    // A grant denial is likewise caller-facing; surface it untouched so the
+    // service maps it to the typed denial result with zero events committed.
+    if (error instanceof TaskGrantDeniedError) {
+      throw error;
+    }
     throw new TaskEventTransactionRollbackError(input.operation, error);
   } finally {
     client.release();
@@ -4308,6 +4506,29 @@ async function readTaskWithClient(
   return rows.rows[0] ? toTaskRecord(rows.rows[0]) : null;
 }
 
+/**
+ * Shared task-grant enforcement input accepted by the generic task
+ * create/claim/refresh paths. Absent means required-mode enforcement gated
+ * only on policy-row presence; `disabled` never enforces. System-owned paths
+ * (operator commands, scheduled runs, summary tasks) do not take this input
+ * and never consult grants. Complete/fail/release/cancel likewise stay on the
+ * claim-ownership and lease fence and never consult grants.
+ */
+export interface TaskGrantEnforcementInput {
+  /** Auth mode of the calling service; `disabled` skips grant enforcement. */
+  readonly taskGrantAuthMode?: AuthMode | undefined;
+}
+
+/** Shared delegation columns accepted by every task insert path. */
+export interface TaskDelegationInput {
+  /** Participant id assigned to own the task, or null when unassigned. */
+  readonly assigneeParticipantId?: string | null | undefined;
+  /** Same-session parent task id this task was delegated from, or null. */
+  readonly parentTaskId?: string | null | undefined;
+  /** Delegation scope label, or null when the task carries no scope. */
+  readonly scopeLabel?: string | null | undefined;
+}
+
 /** Inserts one task row on the current transaction client. */
 async function insertTaskWithClient(
   client: TransactionClient,
@@ -4321,39 +4542,45 @@ async function insertTaskWithClient(
     readonly schedule?: ScheduledTaskIdentityInput | undefined;
     readonly sessionId: string;
     readonly taskId: string;
-  },
+  } & TaskDelegationInput,
 ): Promise<TaskRecord> {
   const schedule = input.schedule;
   const rows = await client.query<PgTaskRow>(
     `
       INSERT INTO tasks (
+        assignee_participant_id,
         input,
         kind,
         objective,
         operator_command_key,
         operator_grant_jti,
+        parent_task_id,
         schedule_algorithm_version,
         schedule_identity_version,
         schedule_interval_ms,
         schedule_scope_key,
         schedule_window_start,
+        scope_label,
         session_id,
         task_id
       )
-      VALUES ($1::jsonb, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      VALUES ($1, $2::jsonb, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
       RETURNING ${taskReturningColumns}
     `,
     [
+      input.assigneeParticipantId ?? null,
       input.input === undefined || input.input === null ? null : JSON.stringify(input.input),
       input.kind,
       input.objective,
       input.operatorCommand?.commandKey ?? null,
       input.operatorCommand?.grantJti ?? null,
+      input.parentTaskId ?? null,
       schedule?.scheduleAlgorithmVersion ?? null,
       schedule?.scheduleIdentityVersion ?? null,
       schedule?.scheduleIntervalMs ?? null,
       schedule?.scheduleScopeKey ?? null,
       schedule?.scheduleWindowStart ?? null,
+      input.scopeLabel ?? null,
       input.sessionId,
       input.taskId,
     ],
@@ -4419,7 +4646,7 @@ function compareTaskCreateInput(
     readonly schedule?: ScheduledTaskIdentityInput | undefined;
     readonly sessionId: string;
     readonly taskId: string;
-  },
+  } & TaskDelegationInput,
 ): readonly string[] {
   const conflicts: string[] = [];
   if (existing.sessionId !== input.sessionId) {
@@ -4436,6 +4663,15 @@ function compareTaskCreateInput(
   }
   if (!jsonLikeEqual(existing.input, input.input ?? null)) {
     conflicts.push("input");
+  }
+  if ((existing.assigneeParticipantId ?? null) !== (input.assigneeParticipantId ?? null)) {
+    conflicts.push("assigneeParticipantId");
+  }
+  if ((existing.parentTaskId ?? null) !== (input.parentTaskId ?? null)) {
+    conflicts.push("parentTaskId");
+  }
+  if ((existing.scopeLabel ?? null) !== (input.scopeLabel ?? null)) {
+    conflicts.push("scopeLabel");
   }
   conflicts.push(...compareScheduleIdentity(existing.schedule ?? null, input.schedule));
   return conflicts;
@@ -4902,6 +5138,7 @@ function toTaskRecord(row: DbTaskRow | ExpiredTaskClaimRow | PgTaskRow | undefin
     throw new Error("Missing task row");
   }
   return {
+    assigneeParticipantId: row.assigneeParticipantId,
     cancelledAt: row.cancelledAt?.toISOString() ?? null,
     claimExpiredAt: row.claimExpiredAt?.toISOString() ?? null,
     claimExpiredBy: row.claimExpiredBy,
@@ -4916,10 +5153,12 @@ function toTaskRecord(row: DbTaskRow | ExpiredTaskClaimRow | PgTaskRow | undefin
     input: row.input ?? null,
     kind: row.kind,
     objective: row.objective,
+    parentTaskId: row.parentTaskId,
     releasedAt: row.releasedAt?.toISOString() ?? null,
     releasedBy: row.releasedBy,
     result: row.result ?? null,
     schedule: toTaskScheduleIdentity(row),
+    scopeLabel: row.scopeLabel ?? null,
     sessionId: row.sessionId,
     taskId: row.taskId,
   };

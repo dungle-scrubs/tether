@@ -17,6 +17,7 @@ import {
   type AuthRuntime,
 } from "./auth/enforcement.js";
 import type { AuthSocketRegistry, AuthSocketStreamKind } from "./auth/socket-registry.js";
+import { describeTaskGrantEnforcementDenial } from "./auth/task-grants-policy.js";
 import type { AuthContext } from "./auth/token.js";
 import type { ControlEpochGuard } from "./db.js";
 import { sleepUnrefEffect } from "./effect-runtime.js";
@@ -1158,6 +1159,17 @@ function handleParsedWebSocketMessage(
         sessionId,
         taskId: parsed.taskId,
       });
+      // A grant denial reports the typed reason; race losses keep the
+      // established null-task result. Both commit zero events.
+      if (result.status === "denied") {
+        sendCommandError(
+          socket,
+          parsed.requestId,
+          describeTaskGrantEnforcementDenial(result.reason),
+          { reason: result.reason },
+        );
+        return;
+      }
       broadcastEvents(hub, result.events);
       sendCommandResult(socket, parsed.requestId, webSocketOperation.taskClaim, {
         task: result.task,
@@ -1381,6 +1393,14 @@ function sendWebSocketTaskMutationResult(
     sendCommandResult(socket, requestId, command, { task: result.task });
     return;
   }
+  // Complete/fail/release/cancel never deny (claim-ownership fence only); the
+  // branch keeps the shared sender exhaustive for grant-denying operations.
+  if (result.status === "denied") {
+    sendCommandError(socket, requestId, describeTaskGrantEnforcementDenial(result.reason), {
+      reason: result.reason,
+    });
+    return;
+  }
   broadcastEvents(hub, result.events);
   sendCommandResult(socket, requestId, command, { task: result.task });
 }
@@ -1422,6 +1442,12 @@ function sendWebSocketTaskClaimRefreshResult(
 ): void {
   if (result.status === "rejected") {
     sendCommandError(socket, requestId, "Task claim is missing, expired, or terminal");
+    return;
+  }
+  if (result.status === "denied") {
+    sendCommandError(socket, requestId, describeTaskGrantEnforcementDenial(result.reason), {
+      reason: result.reason,
+    });
     return;
   }
   sendCommandResult(socket, requestId, command, { task: result.task });

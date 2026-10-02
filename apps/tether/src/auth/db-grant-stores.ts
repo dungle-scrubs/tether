@@ -4,7 +4,7 @@ import type { PoolClient, QueryConfig } from "pg";
 
 import type { DatabasePool } from "../db.js";
 import type * as schema from "../schema.js";
-import { authGrantAuditEvents, authGrants, authTickets } from "../schema.js";
+import { authGrantAuditEvents, authGrants, authTickets, taskGrants } from "../schema.js";
 import {
   authGrantRevocationNotificationChannel,
   serializeAuthGrantRevocationNotification,
@@ -21,11 +21,17 @@ import type {
   AuthTicketRecord,
   AuthTicketStore,
   CreateAuthGrantWithAuditInput,
+  CreateTaskGrantWithAuditInput,
   RevokeAuthGrantResult,
   RevokeAuthGrantWithAuditInput,
+  RevokeTaskGrantResult,
+  RevokeTaskGrantWithAuditInput,
+  TaskGrantAction,
+  TaskGrantAuditRecord,
+  TaskGrantRecord,
 } from "./grant-stores.js";
 import { AuthPersistenceError, type AuthPersistenceErrorCode } from "./grant-stores.js";
-import { authGrantAuditReasonCodes, authGrantSources } from "./grant-stores.js";
+import { authGrantAuditReasonCodes, authGrantSources, taskGrantActions } from "./grant-stores.js";
 import { maximumAuthTicketAdmissionLifetimeMilliseconds } from "./grant-stores.js";
 import { type AuthAudience, maximumAuthGrantLifetimeSeconds } from "./grant-token.js";
 import type { AuthRole } from "./token.js";
@@ -43,8 +49,12 @@ export function createAuthPersistenceStores(database: DatabasePool): AuthPersist
   return {
     audits: createAuditStore(database.db),
     createGrantWithAudit: (input) => createGrantWithAudit(database, input),
+    createTaskGrantWithAudit: (input) => createTaskGrantWithAudit(database, input),
     grants: createGrantStore(database),
     revokeGrantWithAudit: (input) => revokeGrantWithAudit(database, input),
+    revokeTaskGrantWithAudit: (input) => revokeTaskGrantWithAudit(database, input),
+    taskGrantAudits: createTaskGrantAuditStore(database.db),
+    taskGrants: createTaskGrantStore(database),
     tickets: createTicketStore(database.db),
   };
 }
@@ -110,6 +120,182 @@ export async function insertAuthGrantWithAuditOnClient(
 export function validateAuthGrantCreationInput(input: CreateAuthGrantWithAuditInput): void {
   validateGrantRecord(input.grant);
   validateAuditInput(input.audit, "grant.created");
+}
+
+/** Atomically creates a task grant and its required audit without exposing a transaction callback. */
+async function createTaskGrantWithAudit(
+  database: DatabasePool,
+  input: CreateTaskGrantWithAuditInput,
+): Promise<void> {
+  await runAuthStoreOperation(async () => {
+    const client = await database.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await insertTaskGrantWithAuditOnClient(client, input);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }, "task_grant_create_failed");
+}
+
+/** Inserts a validated task grant and its creation audit on a caller-owned transaction. */
+export async function insertTaskGrantWithAuditOnClient(
+  client: PoolClient,
+  input: CreateTaskGrantWithAuditInput,
+): Promise<void> {
+  validateTaskGrantCreationInput(input);
+  await client.query(
+    `INSERT INTO task_grants (action, created_audit_id, expires_at, issued_at, issuer, jti, kind_allowlist, revoked_at, scope_label_allowlist, session_scope, subject)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, NULL, $8::jsonb, $9, $10)`,
+    [
+      input.grant.action,
+      input.grant.createdAuditId,
+      input.grant.expiresAt,
+      input.grant.issuedAt,
+      input.grant.issuer,
+      input.grant.jti,
+      JSON.stringify(input.grant.kindAllowlist),
+      JSON.stringify(input.grant.scopeLabelAllowlist),
+      input.grant.sessionScope,
+      input.grant.subject,
+    ],
+  );
+  await client.query(
+    `INSERT INTO auth_grant_audit_events (action, actor_subject, audit_id, grant_jti, metadata, occurred_at, reason_code, task_grant_jti)
+     VALUES ($1, $2, $3, NULL, $4::jsonb, $5, $6, $7)`,
+    [
+      input.audit.action,
+      input.audit.actorSubject,
+      input.audit.auditId,
+      JSON.stringify(input.audit.metadata),
+      input.audit.occurredAt,
+      input.audit.reasonCode,
+      input.grant.jti,
+    ],
+  );
+}
+
+/** Validates one task-grant-and-audit creation before any persistence adapter serializes it. */
+export function validateTaskGrantCreationInput(input: CreateTaskGrantWithAuditInput): void {
+  validateTaskGrantRecord(input.grant);
+  validateTaskGrantAuditInput(input.audit, "task_grant.created");
+}
+
+/** Atomically revokes one task grant and appends one audit only for the first revocation. */
+async function revokeTaskGrantWithAudit(
+  database: DatabasePool,
+  input: RevokeTaskGrantWithAuditInput,
+): Promise<RevokeTaskGrantResult> {
+  validateTaskGrantAuditInput(input.audit, "task_grant.revoked");
+  return runAuthStoreOperation(
+    () =>
+      database.db.transaction(async (transaction) => {
+        const revoked = await transaction
+          .update(taskGrants)
+          .set({ revokedAt: input.revokedAt })
+          .where(and(eq(taskGrants.jti, input.jti), isNull(taskGrants.revokedAt)))
+          .returning();
+        const revokedGrant = revoked[0];
+        if (revokedGrant !== undefined) {
+          await transaction.insert(authGrantAuditEvents).values({
+            ...input.audit,
+            grantJti: null,
+            taskGrantJti: input.jti,
+          });
+          return { grant: parseTaskGrantRecord(revokedGrant), status: "revoked" };
+        }
+        const existing = await transaction
+          .select()
+          .from(taskGrants)
+          .where(eq(taskGrants.jti, input.jti))
+          .limit(1);
+        const existingGrant = existing[0];
+        return existingGrant === undefined
+          ? { grant: null, status: "not_found" }
+          : {
+              grant: parseTaskGrantRecord(existingGrant),
+              status: "already_revoked",
+            };
+      }),
+    "task_grant_revoke_failed",
+  );
+}
+
+/** Creates the durable task-grant read adapter. */
+function createTaskGrantStore(database: DatabasePool): AuthPersistenceStores["taskGrants"] {
+  return {
+    findByJti: async (jti) => {
+      const rows = await runAuthStoreOperation(
+        () => database.db.select().from(taskGrants).where(eq(taskGrants.jti, jti)).limit(1),
+        "task_grant_read_failed",
+      );
+      const row = rows[0];
+      return row === undefined ? null : parseTaskGrantRecord(row);
+    },
+    list: async (limit) => {
+      if (!Number.isSafeInteger(limit) || limit <= 0 || limit > maximumGrantListLimit) {
+        throw new AuthPersistenceError("task_grant_limit_invalid");
+      }
+      const rows = await runAuthStoreOperation(
+        () =>
+          database.db
+            .select()
+            .from(taskGrants)
+            .orderBy(desc(taskGrants.issuedAt), desc(taskGrants.jti))
+            .limit(limit),
+        "task_grant_list_failed",
+      );
+      return rows.map(parseTaskGrantRecord);
+    },
+    listLiveForSubject: async (subject, action, now) => {
+      const rows = await runAuthStoreOperation(
+        () =>
+          database.db
+            .select()
+            .from(taskGrants)
+            .where(
+              and(
+                eq(taskGrants.subject, subject),
+                eq(taskGrants.action, action),
+                isNull(taskGrants.revokedAt),
+                gt(taskGrants.expiresAt, now),
+              ),
+            )
+            .orderBy(desc(taskGrants.issuedAt), desc(taskGrants.jti))
+            .limit(maximumGrantListLimit),
+        "task_grant_read_failed",
+      );
+      return rows.map(parseTaskGrantRecord);
+    },
+  };
+}
+
+/** Creates the bounded task-grant-audit read adapter over the shared audit table. */
+function createTaskGrantAuditStore(
+  database: AuthStoreDatabase,
+): AuthPersistenceStores["taskGrantAudits"] {
+  return {
+    listForTaskGrant: async (taskGrantJti, limit) => {
+      if (!Number.isSafeInteger(limit) || limit <= 0 || limit > maximumAuditListLimit) {
+        throw new AuthPersistenceError("auth_audit_limit_invalid");
+      }
+      const rows = await runAuthStoreOperation(
+        () =>
+          database
+            .select()
+            .from(authGrantAuditEvents)
+            .where(eq(authGrantAuditEvents.taskGrantJti, taskGrantJti))
+            .orderBy(asc(authGrantAuditEvents.occurredAt), asc(authGrantAuditEvents.auditId))
+            .limit(limit),
+        "auth_audit_list_failed",
+      );
+      return rows.map(parseTaskGrantAuditRecord);
+    },
+  };
 }
 
 /** Atomically revokes one grant and appends one audit only for the first revocation. */
@@ -334,7 +520,10 @@ function createAuditStore(database: AuthStoreDatabase): AuthPersistenceStores["a
             .limit(limit),
         "auth_audit_list_failed",
       );
-      return rows as readonly AuthGrantAuditRecord[];
+      return rows.flatMap((row) => {
+        const record = parseGrantAuditRecord(row);
+        return record === null ? [] : [record];
+      });
     },
   };
 }
@@ -463,6 +652,54 @@ function validateGrantRecord(record: AuthGrantRecord): void {
   }
 }
 
+/** Validates every bounded task-grant audit field before a query can serialize it. */
+function validateTaskGrantAuditInput(
+  audit: CreateTaskGrantWithAuditInput["audit"] | RevokeTaskGrantWithAuditInput["audit"],
+  expectedAction: "task_grant.created" | "task_grant.revoked",
+): void {
+  validateAuditMetadata(audit.metadata);
+  if (
+    audit.action !== expectedAction ||
+    !authGrantAuditReasonCodes.includes(audit.reasonCode) ||
+    audit.auditId.length === 0 ||
+    audit.auditId.length > 128 ||
+    audit.actorSubject.length === 0 ||
+    audit.actorSubject.length > 255
+  ) {
+    throw new AuthPersistenceError("auth_metadata_invalid");
+  }
+}
+
+/** Validates a complete task grant before it can reach Drizzle error serialization. */
+function validateTaskGrantRecord(record: TaskGrantRecord): void {
+  const lifetimeMilliseconds = record.expiresAt.getTime() - record.issuedAt.getTime();
+  if (
+    !(taskGrantActions as readonly string[]).includes(record.action) ||
+    lifetimeMilliseconds <= 0 ||
+    lifetimeMilliseconds > maximumAuthGrantLifetimeSeconds * 1_000 ||
+    record.jti.length === 0 ||
+    record.jti.length > 128 ||
+    record.subject.length === 0 ||
+    record.subject.length > 255 ||
+    record.sessionScope.length === 0 ||
+    record.sessionScope.length > 255 ||
+    record.issuer.length === 0 ||
+    record.issuer.length > 512 ||
+    record.createdAuditId.length === 0 ||
+    record.createdAuditId.length > 128 ||
+    !isStringArray(record.kindAllowlist) ||
+    !isStringArray(record.scopeLabelAllowlist) ||
+    (record.revokedAt !== null && record.revokedAt < record.issuedAt)
+  ) {
+    throw new AuthPersistenceError("task_grant_create_failed");
+  }
+}
+
+/** Narrows a persisted allowlist to its string entries. */
+function isStringArray(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+
 /** Validates a complete ticket before it can reach Drizzle error serialization. */
 function validateTicketRecord(record: AuthTicketRecord): void {
   validateTicketHash(record.ticketHash);
@@ -493,6 +730,52 @@ function parseGrantRecord(row: typeof authGrants.$inferSelect): AuthGrantRecord 
     audience: row.audience as AuthAudience,
     metadata: row.metadata as AuthGrantMetadata,
     role: row.role as AuthRole,
+  };
+}
+
+/** Parses a database task-grant row into its narrow domain record. */
+function parseTaskGrantRecord(row: typeof taskGrants.$inferSelect): TaskGrantRecord {
+  return {
+    ...row,
+    action: row.action as TaskGrantAction,
+    kindAllowlist: [...row.kindAllowlist],
+    scopeLabelAllowlist: [...row.scopeLabelAllowlist],
+  };
+}
+
+/** Parses one shared-audit row into its task-grant audit record. */
+function parseTaskGrantAuditRecord(
+  row: typeof authGrantAuditEvents.$inferSelect,
+): TaskGrantAuditRecord {
+  if (row.taskGrantJti === null) {
+    throw new AuthPersistenceError("auth_audit_list_failed");
+  }
+  return {
+    action: row.action as TaskGrantAuditRecord["action"],
+    actorSubject: row.actorSubject,
+    auditId: row.auditId,
+    metadata: row.metadata as AuthGrantAuditMetadata,
+    occurredAt: row.occurredAt,
+    reasonCode: row.reasonCode as TaskGrantAuditRecord["reasonCode"],
+    taskGrantJti: row.taskGrantJti,
+  };
+}
+
+/** Parses one shared-audit row into its grant audit record, skipping task-grant rows. */
+function parseGrantAuditRecord(
+  row: typeof authGrantAuditEvents.$inferSelect,
+): AuthGrantAuditRecord | null {
+  if (row.grantJti === null) {
+    return null;
+  }
+  return {
+    action: row.action as AuthGrantAuditRecord["action"],
+    actorSubject: row.actorSubject,
+    auditId: row.auditId,
+    grantJti: row.grantJti,
+    metadata: row.metadata as AuthGrantAuditMetadata,
+    occurredAt: row.occurredAt,
+    reasonCode: row.reasonCode as AuthGrantAuditRecord["reasonCode"],
   };
 }
 

@@ -190,6 +190,13 @@
       "when": 1785608647560,
       "tag": "0026_blushing_mole_man",
       "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1789451046256,
+      "tag": "0027_steady_task_grants",
+      "breakpoints": true
     }
   ]
 }
