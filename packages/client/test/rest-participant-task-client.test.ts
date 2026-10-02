@@ -231,6 +231,25 @@ describe("RestParticipantTaskClient", () => {
     });
   });
 
+  it("claims a task wrapped in the bare {task} envelope (newer server)", async () => {
+    const enveloped = fetchJson(200, { task: taskRecord });
+    await expect(enveloped.client.claimTask("sess_1", "task_1")).resolves.toMatchObject({
+      taskId: "task_1",
+    });
+  });
+
+  it("refreshes a claim across wrapped and bare-envelope shapes", async () => {
+    const wrapped = fetchJson(200, { status: "claimed", task: taskRecord });
+    await expect(
+      wrapped.client.refreshClaim("sess_1", "task_1", { claimId: "claim_1" }),
+    ).resolves.toMatchObject({ taskId: "task_1" });
+
+    const enveloped = fetchJson(200, { task: taskRecord });
+    await expect(
+      enveloped.client.refreshClaim("sess_1", "task_1", { claimId: "claim_1" }),
+    ).resolves.toMatchObject({ taskId: "task_1" });
+  });
+
   it("reads a task and returns null on 404", async () => {
     const found = fetchJson(200, taskRecord);
     await expect(found.client.readTask("sess_1", "task_1")).resolves.toMatchObject({
