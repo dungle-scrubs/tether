@@ -1,7 +1,12 @@
-import { pathToFileURL } from "node:url";
-
 import { z } from "zod";
 
+import {
+  boundedCliErrorCode,
+  isCliEntrypoint,
+  parseCliFlagValues,
+  readRequiredCliValue,
+  runCliEntrypoint,
+} from "./cli-flags.js";
 import {
   createPool,
   ensureBootstrapSession,
@@ -22,13 +27,18 @@ export interface SessionBootstrapCliOptions {
 }
 
 const sessionIdSchema = z.string().trim().min(1).max(255);
+const sessionBootstrapCliFlags = ["--identity", "--session"] as const;
+const sessionBootstrapCliErrorPrefix = "session_bootstrap";
 
 /** Parses the exact loopback deployment bootstrap contract. */
 export function parseSessionBootstrapCliOptions(
   args: readonly string[],
   env: SessionBootstrapCliEnvironment = process.env,
 ): SessionBootstrapCliOptions {
-  const values = parseFlagValues(args);
+  const values = parseCliFlagValues(args, {
+    allowedFlags: sessionBootstrapCliFlags,
+    invalidMessage: "session_bootstrap_arguments_invalid",
+  });
   if (values.size !== 2) throw new Error("session_bootstrap_arguments_invalid");
   const identityKey = readRequired(values.get("identity"), "identity");
   if (Buffer.byteLength(identityKey, "utf8") > 512) {
@@ -68,46 +78,14 @@ export async function runSessionBootstrapCli(
 /** Projects all command failures to bounded diagnostics without database details. */
 export function projectSessionBootstrapCliError(error: unknown): string {
   if (error instanceof SessionBootstrapIdentityConflictError) return error.code;
-  return error instanceof Error && /^session_bootstrap_[a-z0-9_]+$/u.test(error.message)
-    ? error.message
-    : "session_bootstrap_failed";
-}
-
-/** Parses strict `--identity value --session value` arguments. */
-function parseFlagValues(args: readonly string[]): ReadonlyMap<string, string> {
-  const values = new Map<string, string>();
-  for (let index = 0; index < args.length; index += 2) {
-    const flag = args[index];
-    const value = args[index + 1];
-    if (
-      (flag !== "--identity" && flag !== "--session") ||
-      value === undefined ||
-      value.startsWith("--") ||
-      values.has(flag.slice(2))
-    ) {
-      throw new Error("session_bootstrap_arguments_invalid");
-    }
-    values.set(flag.slice(2), value);
-  }
-  return values;
+  return boundedCliErrorCode(error, sessionBootstrapCliErrorPrefix);
 }
 
 /** Reads one required nonempty CLI or environment value. */
 function readRequired(value: string | undefined, name: string): string {
-  const trimmed = value?.trim();
-  if (!trimmed) throw new Error(`session_bootstrap_${name}_required`);
-  return trimmed;
+  return readRequiredCliValue(value, name, sessionBootstrapCliErrorPrefix);
 }
 
-async function main(): Promise<void> {
-  try {
-    await runSessionBootstrapCli();
-  } catch (error) {
-    process.stderr.write(`${projectSessionBootstrapCliError(error)}\n`);
-    process.exitCode = 1;
-  }
-}
-
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  void main();
+if (isCliEntrypoint(import.meta.url)) {
+  void runCliEntrypoint(runSessionBootstrapCli, projectSessionBootstrapCliError);
 }

@@ -1,3 +1,17 @@
+/** Stable failure raised before any request, when the client itself is unusable. */
+export class BrowserOperatorConfigurationError extends Error {
+  /** Stable client configuration rejection reason. */
+  readonly reason: string;
+
+  constructor(input: { readonly cause?: unknown; readonly reason: string }) {
+    super(`Browser operator client is misconfigured: ${input.reason}`, {
+      ...(input.cause === undefined ? {} : { cause: input.cause }),
+    });
+    this.name = "BrowserOperatorConfigurationError";
+    this.reason = input.reason;
+  }
+}
+
 /** Stable failure raised for a rejected or malformed browser operator response. */
 export class BrowserOperatorHttpError extends Error {
   /** Browser-safe operation name. */

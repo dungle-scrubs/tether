@@ -31,12 +31,9 @@
     "format:check": "biome format --config-path=../../tooling/biome.json .",
     "lint": "biome lint --config-path=../../tooling/biome.json .",
     "prepublishOnly": "pnpm run build",
-    "pretest": "node scripts/ensure-test-build.mjs",
-    "preverify:package": "pnpm --filter @dungle-scrubs/tether-protocol build && pnpm run build",
     "test": "vitest run --config vitest.config.ts",
     "verify:package": "node scripts/verify-package.mjs",
-    "verify:package:prepared": "node scripts/verify-package.mjs",
-    "typecheck": "tsc -p tsconfig.json --noEmit && pnpm run build && tsc -p tsconfig.test.json"
+    "typecheck": "tsc -p tsconfig.test.json"
   },
   "dependencies": {
     "@dungle-scrubs/tether-protocol": "workspace:*"

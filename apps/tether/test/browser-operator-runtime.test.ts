@@ -7,9 +7,11 @@ import {
   type BrowserOperatorAuthorityErrorCode,
   createBrowserOperatorRuntime,
 } from "../src/auth/browser-operator-runtime.js";
-import { browserSessionCookieName, hashBrowserCredential } from "../src/auth/browser-pairing.js";
+import { browserSessionCookieName } from "../src/auth/browser-pairing.js";
 import type { BrowserPairingStore } from "../src/auth/browser-pairing-stores.js";
 import type { AuthRuntime } from "../src/auth/enforcement.js";
+import { hashOpaqueCredential } from "../src/auth/opaque-credential.js";
+import { createStore as createPairingStore, createScope } from "./fixtures/browser-pairing.js";
 
 const csrfToken = "C".repeat(43);
 const bearer = "tgr2.payload.signature";
@@ -144,27 +146,15 @@ function createRequest(headers: {
 }
 
 function createStore(): BrowserPairingStore {
-  return {
-    confirm: vi.fn<BrowserPairingStore["confirm"]>(async () => ({ status: "not_found" })),
-    create: vi.fn<BrowserPairingStore["create"]>(async () => ({ status: "rate_limited" })),
-    exchange: vi.fn<BrowserPairingStore["exchange"]>(async () => ({ status: "not_found" })),
+  return createPairingStore({
     findBrowserAuthority: vi.fn<BrowserPairingStore["findBrowserAuthority"]>(async () => ({
-      scope: {
-        actions: ["approve"],
-        commands: ["scan"],
-        permissions: ["approval.submit", "browser-session.read"],
-        scopeKeys: ["account-primary:inbox"],
-        sessionIds: ["sess_email"],
-        targetKinds: ["message"],
-      },
+      scope: createScope({ permissions: ["approval.submit", "browser-session.read"] }),
       session: {
         createdAt: new Date("2026-08-01T00:00:00.000Z"),
-        csrfTokenHash: hashBrowserCredential(csrfToken),
+        csrfTokenHash: hashOpaqueCredential(csrfToken),
         grantJti: "grant_browser",
         origin: "https://hub.example.test",
       },
     })),
-    findBrowserSession: vi.fn(async () => null),
-    inspect: vi.fn(async () => null),
-  };
+  });
 }

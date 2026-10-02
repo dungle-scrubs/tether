@@ -25,7 +25,12 @@ import {
   sendControlLeaseConflict,
   sendJson,
 } from "./http-route-runtime.js";
-import { defineHttpRoute, type HttpRouteSpec, matchHttpRoute } from "./http-route-spec.js";
+import {
+  defineHttpRoute,
+  type HttpRouteSpec,
+  matchHttpRoute,
+  routeMatchParam,
+} from "./http-route-spec.js";
 import type { SubscriptionHub } from "./hub.js";
 import {
   cancelTaskSchema,
@@ -884,14 +889,6 @@ function renderTaskApprovalRejection(reason: TaskApprovalRejectionReason): strin
     default:
       return "Task approval was rejected";
   }
-}
-
-function routeMatchParam(match: RegExpMatchArray, index: number): string {
-  const value = match[index];
-  if (value === undefined || value.length === 0) {
-    throw new Error(`Missing route parameter at index ${index}`);
-  }
-  return value;
 }
 
 function parseTaskListStatus(status: string | null): TaskListStatus | null {

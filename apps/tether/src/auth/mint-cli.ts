@@ -1,7 +1,6 @@
-import { pathToFileURL } from "node:url";
-
 import { z } from "zod";
 
+import { isCliEntrypoint, parseCliFlagValues } from "../cli-flags.js";
 import { mintAuthToken, type AuthRole, authRoles } from "./token.js";
 
 const defaultTokenTtlSeconds = 30 * 24 * 60 * 60;
@@ -22,13 +21,17 @@ export interface MintCliOptions {
 }
 
 const cliRoleSchema = z.enum(authRoles);
+const mintCliFlags = ["--kid", "--participant", "--role", "--session", "--ttl"] as const;
 
 /** Parses `tether-mint` arguments and environment into validated mint options. */
 export function parseMintCliOptions(
   args: readonly string[],
   env: MintCliEnvironment = process.env,
 ): MintCliOptions {
-  const values = parseFlagValues(args);
+  const values = parseCliFlagValues(args, {
+    allowedFlags: mintCliFlags,
+    invalidMessage: "Expected --participant, --session, --role, and optional --ttl/--kid",
+  });
   const participantId = readRequiredFlag(values, "participant");
   const sessionId = readRequiredFlag(values, "session");
   const role = cliRoleSchema.parse(readRequiredFlag(values, "role"));
@@ -77,20 +80,6 @@ async function main(): Promise<void> {
   }
 }
 
-/** Parses `--name value` pairs into a map and rejects unknown positional args. */
-function parseFlagValues(args: readonly string[]): ReadonlyMap<string, string> {
-  const values = new Map<string, string>();
-  for (let index = 0; index < args.length; index += 2) {
-    const flag = args[index];
-    const value = args[index + 1];
-    if (!flag?.startsWith("--") || value === undefined || value.startsWith("--")) {
-      throw new Error("Expected --participant, --session, --role, and optional --ttl/--kid");
-    }
-    values.set(flag.slice(2), value);
-  }
-  return values;
-}
-
 /** Reads a required CLI flag value from the parsed map. */
 function readRequiredFlag(values: ReadonlyMap<string, string>, name: string): string {
   const value = values.get(name)?.trim();
@@ -116,6 +105,6 @@ function parseTtlSeconds(value: string): number {
   return ttlSeconds;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isCliEntrypoint(import.meta.url)) {
   void main();
 }

@@ -1,10 +1,8 @@
 import type { BrowserSessionSnapshot } from "@dungle-scrubs/tether-protocol";
 import { describe, expect, it } from "vitest";
 
-import {
-  browserOperatorHttpRoutes,
-  fitBrowserSnapshotWithinByteBudget,
-} from "../src/http-browser-operator-route-handlers.js";
+import { fitBrowserSnapshotWithinByteBudget } from "../src/browser-snapshot-budget.js";
+import { browserOperatorHttpRoutes } from "../src/http-browser-operator-route-handlers.js";
 import { matchHttpRoute } from "../src/http-route-spec.js";
 
 describe("browser operator HTTP routes", () => {

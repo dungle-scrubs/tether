@@ -48,30 +48,20 @@ describe("browser operator protocol", () => {
       targetKinds: [],
     };
     expect(
-      browserOperatorSessionSchema.safeParse({
+      browserOperatorSessionSchema.parse({
         expiresAt: "2026-08-02T00:00:00.000Z",
         grantJti: "grant_browser",
         scope,
         status: "active",
         subject: "operator@example.test",
-      }).success,
-    ).toBe(false);
+      }).scope.sessionIds,
+    ).toEqual(["sess_email"]);
     expect(
       browserOperatorSessionSchema.safeParse({
         expiresAt: "2026-08-02T00:00:00.000Z",
         grantJti: "grant_browser",
         scope,
         sessionIds: ["sess_email"],
-        status: "active",
-        subject: "operator@example.test",
-      }).success,
-    ).toBe(true);
-    expect(
-      browserOperatorSessionSchema.safeParse({
-        expiresAt: "2026-08-02T00:00:00.000Z",
-        grantJti: "grant_browser",
-        scope,
-        sessionIds: ["sess_other"],
         status: "active",
         subject: "operator@example.test",
       }).success,

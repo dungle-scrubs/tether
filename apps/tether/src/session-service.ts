@@ -1,3 +1,4 @@
+import { operatorTaskKind } from "@dungle-scrubs/tether-protocol";
 import { Context, Effect, Layer } from "effect";
 
 import { ServerConfigService } from "./config.js";
@@ -5,7 +6,8 @@ import { type DatabasePool, DatabaseService } from "./db.js";
 import { createSessionPersistenceStores } from "./db-stores.js";
 import { ModuleObservability, readModuleObservabilityOptions } from "./observability.js";
 import type { AppendSessionEventInput } from "./protocol.js";
-import { RestControlPolicy, type RestControlOutcomeName } from "./rest-control-policy.js";
+import { type RestControlOutcomeName, RestControlPolicy } from "./rest-control-policy.js";
+import { SessionScalabilityDiagnostics } from "./session-scalability-diagnostics.js";
 import {
   type ControlEpochGuard,
   type PublicSessionEnsureResult,
@@ -28,8 +30,6 @@ import {
 import { createSessionControlEffects } from "./session-service-control-effects.js";
 import { createSessionCoreEffects } from "./session-service-core-effects.js";
 import { createSessionReadEffects } from "./session-service-read-effects.js";
-import { SessionScalabilityDiagnostics } from "./session-scalability-diagnostics.js";
-import { createSessionSummaryStore } from "./session-summary-store.js";
 import {
   assertBroadcastEventsWithObservability,
   catchAtomicEpochStale,
@@ -49,6 +49,7 @@ import {
   taskApprovalTraceInput,
   taskParticipantTraceInput,
 } from "./session-service-task-effects.js";
+import { createSessionSummaryStore } from "./session-summary-store.js";
 import type { SessionEvent } from "./types.js";
 
 const restTaskRouteNames = {
@@ -520,7 +521,7 @@ function makeSessionServiceEffect(
           kind:
             input.operatorAuthority === undefined
               ? input.kind
-              : `operator.${input.operatorAuthority.request.command}`,
+              : operatorTaskKind(input.operatorAuthority.request.command),
           sessionId:
             input.operatorAuthority === undefined
               ? input.sessionId

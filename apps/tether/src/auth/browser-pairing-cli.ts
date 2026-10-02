@@ -1,13 +1,19 @@
-import { pathToFileURL } from "node:url";
-
 import {
   browserPairingNonceSchema,
   createBrowserPairingRequestSchema,
+  exactHttpOriginSchema,
   operatorGrantScopeSchema,
   publicBrowserPairingRequestSchema,
 } from "@dungle-scrubs/tether-protocol";
 import { z } from "zod";
 
+import {
+  boundedCliErrorCode,
+  isCliEntrypoint,
+  parseCliFlagValues,
+  readRequiredCliValue,
+  runCliEntrypoint,
+} from "../cli-flags.js";
 import { createPool, migrate } from "../db.js";
 import { createBrowserPairingRequest, toPublicPairingRequest } from "./browser-pairing.js";
 import { createBrowserPairingStore } from "./browser-pairing-stores.js";
@@ -44,27 +50,16 @@ const requestIdSchema = publicBrowserPairingRequestSchema.shape.requestId;
 const actorSubjectSchema = z.string().min(1).max(255);
 const operatorSubjectSchema = createBrowserPairingRequestSchema.shape.operatorSubject;
 const verificationPhraseSchema = publicBrowserPairingRequestSchema.shape.verificationPhrase;
-const originSchema = z
-  .string()
-  .max(512)
-  .transform((value, context) => {
-    try {
-      const parsed = new URL(value);
-      if (
-        (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
-        parsed.origin !== value ||
-        parsed.username !== "" ||
-        parsed.password !== ""
-      ) {
-        context.addIssue({ code: "custom", message: "Expected an exact HTTP origin" });
-        return z.NEVER;
-      }
-      return parsed.origin;
-    } catch {
-      context.addIssue({ code: "custom", message: "Expected an exact HTTP origin" });
-      return z.NEVER;
-    }
-  });
+const browserPairingCliFlags = [
+  "--actor",
+  "--nonce",
+  "--operator",
+  "--origin",
+  "--phrase",
+  "--request",
+  "--scope",
+] as const;
+const browserPairingCliErrorPrefix = "browser_pairing";
 
 /** Parses one explicit inspect or confirm operation without loading server auth secrets. */
 export function parseBrowserPairingCliOptions(
@@ -75,7 +70,10 @@ export function parseBrowserPairingCliOptions(
   if (command !== "confirm" && command !== "create" && command !== "inspect") {
     throw new Error("browser_pairing_command_invalid");
   }
-  const values = parseFlagValues(flagArgs);
+  const values = parseCliFlagValues(flagArgs, {
+    allowedFlags: browserPairingCliFlags,
+    invalidMessage: "browser_pairing_arguments_invalid",
+  });
   const databaseUrl = readRequiredValue(env.DATABASE_URL, "database_url");
   if (command === "create") {
     if (values.size !== 4) throw new Error("browser_pairing_arguments_invalid");
@@ -85,7 +83,7 @@ export function parseBrowserPairingCliOptions(
       operatorSubject: operatorSubjectSchema.parse(
         readRequiredValue(values.get("operator"), "operator"),
       ),
-      origin: originSchema.parse(readRequiredValue(values.get("origin"), "origin")),
+      origin: exactHttpOriginSchema.parse(readRequiredValue(values.get("origin"), "origin")),
       publicNonce: browserPairingNonceSchema.parse(readRequiredValue(values.get("nonce"), "nonce")),
       requestedScope: operatorGrantScopeSchema.parse(
         JSON.parse(readRequiredValue(values.get("scope"), "scope")) as unknown,
@@ -164,54 +162,13 @@ export async function runBrowserPairingCli(
   writeOutput(`${output}\n`);
 }
 
-/** Parses strict `--name value` arguments. */
-function parseFlagValues(args: readonly string[]): ReadonlyMap<string, string> {
-  const values = new Map<string, string>();
-  for (let index = 0; index < args.length; index += 2) {
-    const flag = args[index];
-    const value = args[index + 1];
-    if (
-      (flag !== "--actor" &&
-        flag !== "--nonce" &&
-        flag !== "--operator" &&
-        flag !== "--origin" &&
-        flag !== "--phrase" &&
-        flag !== "--request" &&
-        flag !== "--scope") ||
-      value === undefined ||
-      value.startsWith("--") ||
-      values.has(flag.slice(2))
-    ) {
-      throw new Error("browser_pairing_arguments_invalid");
-    }
-    values.set(flag.slice(2), value);
-  }
-  return values;
-}
-
 /** Reads one required nonempty CLI or environment value. */
 function readRequiredValue(value: string | undefined, name: string): string {
-  const trimmed = value?.trim();
-  if (!trimmed) throw new Error(`browser_pairing_${name}_required`);
-  return trimmed;
+  return readRequiredCliValue(value, name, browserPairingCliErrorPrefix);
 }
 
-/** Collapses unexpected details into a bounded CLI error code. */
-function boundedErrorCode(error: unknown): string {
-  return error instanceof Error && /^browser_pairing_[a-z0-9_]+$/u.test(error.message)
-    ? error.message
-    : "browser_pairing_failed";
-}
-
-async function main(): Promise<void> {
-  try {
-    await runBrowserPairingCli();
-  } catch (error) {
-    process.stderr.write(`${boundedErrorCode(error)}\n`);
-    process.exitCode = 1;
-  }
-}
-
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  void main();
+if (isCliEntrypoint(import.meta.url)) {
+  void runCliEntrypoint(runBrowserPairingCli, (error) =>
+    boundedCliErrorCode(error, browserPairingCliErrorPrefix),
+  );
 }

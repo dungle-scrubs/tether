@@ -29,6 +29,20 @@ export {
   RestParticipantControlError,
 } from "./rest-participant-control-client.js";
 export type {
+  AppendTaskEventCall,
+  FencedTaskCall,
+  ListEventsQuery,
+  RecordTaskApprovalCall,
+  RestParticipantTaskClientConfig,
+  RestParticipantTaskClientOptions,
+  RestParticipantTaskErrorCode,
+  RestParticipantTaskFetch,
+} from "./rest-participant-task-client.js";
+export {
+  RestParticipantTaskClient,
+  RestParticipantTaskError,
+} from "./rest-participant-task-client.js";
+export type {
   SessionEventStreamClientConfig,
   SessionEventStreamClientDebugInfo,
   SessionEventStreamWebSocketFactory,

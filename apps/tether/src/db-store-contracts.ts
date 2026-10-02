@@ -6,15 +6,15 @@ import type {
   EnsureScheduledRunInput,
   EnsureScheduledRunResult,
   HeartbeatParticipantWithEventResult,
+  OperatorCommandTaskAuthority,
   ParticipantRegistration,
+  PermanentSessionDeleteResult,
   PersistedEventAppendResult,
   PersistedParticipantRegistrationResult,
   PersistedTaskApprovalResult,
-  PermanentSessionDeleteResult,
   PersistedTaskClaimResult,
   PersistedTaskCreateResult,
   PersistedTaskEventResult,
-  OperatorCommandTaskAuthority,
   RestControlAcquisition,
   RestControlLeaseRelease,
   ScheduledTaskIdentityInput,
@@ -28,6 +28,7 @@ import type {
   ApprovalTarget,
   ClientSessionBindingRecord,
   ControlLeaseSnapshot,
+  ParticipantListOptions,
   ParticipantRecord,
   ParticipantRuntimeKind,
   ParticipantRuntimeSnapshot,
@@ -36,6 +37,7 @@ import type {
   SessionEventListOptions,
   SessionListItem,
   SessionRecord,
+  TaskListOptions,
   TaskListStatus,
   TaskRecord,
   TaskSnapshot,
@@ -204,10 +206,7 @@ export interface ParticipantStore {
   }) => Promise<HeartbeatParticipantWithEventResult>;
   readonly list: (
     sessionId: string,
-    options?: {
-      readonly before?: Pick<ParticipantRecord, "lastSeenAt" | "participantId"> | undefined;
-      readonly limit?: number | undefined;
-    },
+    options?: ParticipantListOptions,
   ) => Promise<ParticipantRecord[]>;
   readonly listRuntimeSnapshots: (sessionId: string) => Promise<ParticipantRuntimeSnapshot[]>;
   readonly upsert: (input: {
@@ -317,10 +316,7 @@ export interface TaskStore {
   readonly list: (
     sessionId: string,
     status?: TaskListStatus,
-    options?: {
-      readonly before?: Pick<TaskRecord, "createdAt" | "taskId"> | undefined;
-      readonly limit?: number | undefined;
-    },
+    options?: TaskListOptions,
   ) => Promise<TaskRecord[]>;
   readonly listSnapshots: (sessionId: string) => Promise<TaskSnapshot[]>;
   readonly refreshClaim: (

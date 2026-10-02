@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 
-import type { OperatorGrantScope } from "@dungle-scrubs/tether-protocol";
 import { describe, expect, it, vi } from "vitest";
 
 import { createBrowserPairingLifecycle } from "../src/auth/browser-pairing.js";
@@ -8,6 +7,7 @@ import type {
   BrowserPairingRequestRecord,
   BrowserPairingStore,
 } from "../src/auth/browser-pairing-stores.js";
+import { createScope, createStore } from "./fixtures/browser-pairing.js";
 
 const now = new Date("2026-08-01T02:00:00.000Z");
 const exchangeSecret = "E".repeat(43);
@@ -108,29 +108,3 @@ describe("browser pairing lifecycle", () => {
     expect(store.inspect).not.toHaveBeenCalled();
   });
 });
-
-function createScope(): OperatorGrantScope {
-  return {
-    actions: ["approve"],
-    commands: ["scan"],
-    permissions: ["approval.submit", "session.read"],
-    scopeKeys: ["account-primary:inbox"],
-    sessionIds: ["sess_email"],
-    targetKinds: ["message"],
-  };
-}
-
-function createStore(overrides: Partial<BrowserPairingStore> = {}): BrowserPairingStore {
-  return {
-    confirm: vi.fn<BrowserPairingStore["confirm"]>(async () => ({ status: "not_found" })),
-    create: vi.fn<BrowserPairingStore["create"]>(async ({ request }) => ({
-      request,
-      status: "created",
-    })),
-    exchange: vi.fn<BrowserPairingStore["exchange"]>(async () => ({ status: "not_found" })),
-    findBrowserAuthority: vi.fn(async () => null),
-    findBrowserSession: vi.fn(async () => null),
-    inspect: vi.fn(async () => null),
-    ...overrides,
-  };
-}

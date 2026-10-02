@@ -1,19 +1,19 @@
-import type { Effect } from "effect";
 import type {
   SessionScalabilityDebugRecord,
   SessionScalabilityHealthWarning,
 } from "@dungle-scrubs/tether-protocol";
+import type { Effect } from "effect";
 
 import type {
   ApprovalTargetManifestErrorReason,
   ControlEpochGuard,
   ControlLeaseClaim,
+  OperatorCommandTaskAuthority,
+  OperatorGrantAuthorityErrorReason,
   ParticipantRegistration,
   PermanentSessionDeleteResult,
   PersistedEventAppendResult,
   PersistedTaskCreateResult,
-  OperatorGrantAuthorityErrorReason,
-  OperatorCommandTaskAuthority,
   ScheduledTaskIdentityInput,
   TaskDelegationInput,
 } from "./db.js";
@@ -35,6 +35,7 @@ import type {
   ClientSessionBindingRecord,
   ControlChannel,
   ControlLeaseSnapshot,
+  ParticipantListOptions,
   ParticipantRecord,
   ParticipantRuntimeKind,
   ParticipantRuntimeSnapshot,
@@ -49,8 +50,9 @@ import type {
   SessionEventListOptions,
   SessionListItem,
   SessionRecord,
-  TaskListStatus,
   TaskApprovalRecord,
+  TaskListOptions,
+  TaskListStatus,
   TaskRecord,
   TaskSnapshot,
 } from "./types.js";
@@ -231,19 +233,13 @@ export interface SessionServiceEffect {
   /** Lists visible participants for a session. */
   readonly listParticipants: (
     sessionId: string,
-    options?: {
-      readonly before?: Pick<ParticipantRecord, "lastSeenAt" | "participantId"> | undefined;
-      readonly limit?: number | undefined;
-    },
+    options?: ParticipantListOptions,
   ) => Effect.Effect<ParticipantRecord[], SessionServiceFailure>;
   /** Lists durable tasks for a session and lifecycle filter. */
   readonly listTasks: (
     sessionId: string,
     status?: TaskListStatus,
-    options?: {
-      readonly before?: Pick<TaskRecord, "createdAt" | "taskId"> | undefined;
-      readonly limit?: number | undefined;
-    },
+    options?: TaskListOptions,
   ) => Effect.Effect<TaskRecord[], SessionServiceFailure>;
   /** Lists normalized participant task contracts advertised in one session. */
   readonly listParticipantTaskContracts: (

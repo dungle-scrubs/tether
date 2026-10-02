@@ -1,12 +1,16 @@
 import type { OperatorGrantScope } from "@dungle-scrubs/tether-protocol";
 import { asc, inArray, lt } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/node-postgres";
 import type pg from "pg";
 
-import type { DatabasePool } from "../db.js";
+import { acquireTransactionAdvisoryLock, type DatabasePool } from "../db.js";
 import { browserPairingExchangeFailures } from "../schema.js";
 import { insertAuthGrantWithAuditOnClient } from "./db-grant-stores.js";
 import type { AuthGrantLifecycleAuditInput, AuthGrantRecord } from "./grant-stores.js";
 import { opaqueCredentialHashesEqual } from "./opaque-credential.js";
+
+/** Age past which one recorded exchange failure no longer restrains its source. */
+const failureRetentionWindowMs = 10 * 60 * 1_000;
 
 /** Durable pairing request containing only credential hashes. */
 export interface BrowserPairingRequestRecord {
@@ -111,35 +115,38 @@ export function createBrowserPairingStore(database: DatabasePool): BrowserPairin
   return {
     confirm: (input) => confirmPairing(database, input),
     create: (input) => createPairing(database, input),
-    exchange: async (input) => {
-      await pruneExpiredPairingFailures(database, input.attemptedAt);
-      return exchangePairing(database, input);
-    },
+    exchange: (input) => exchangePairing(database, input),
     findBrowserAuthority: (grantJti) => findBrowserAuthority(database, grantJti),
     findBrowserSession: (grantJti) => findBrowserSession(database, grantJti),
     inspect: (requestId) => inspectPairing(database, requestId),
   };
 }
 
-/** Deletes only expired abuse counters in a bounded batch. */
+/**
+ * Deletes only expired abuse counters, as one bounded statement issued on the
+ * caller's open transaction. Expired rows are disjoint from the window the
+ * exchange counts, so retention housekeeping cannot change an admission
+ * decision.
+ */
 async function pruneExpiredPairingFailures(
-  database: DatabasePool,
+  client: pg.PoolClient,
   attemptedAt: Date,
 ): Promise<void> {
-  const cutoff = new Date(attemptedAt.getTime() - 10 * 60 * 1_000);
-  const expired = await database.db
-    .select({ failureId: browserPairingExchangeFailures.failureId })
-    .from(browserPairingExchangeFailures)
-    .where(lt(browserPairingExchangeFailures.createdAt, cutoff))
-    .orderBy(asc(browserPairingExchangeFailures.createdAt))
-    .limit(1_000);
-  if (expired.length === 0) return;
-  await database.db.delete(browserPairingExchangeFailures).where(
-    inArray(
-      browserPairingExchangeFailures.failureId,
-      expired.map((row) => row.failureId),
-    ),
-  );
+  const cutoff = new Date(attemptedAt.getTime() - failureRetentionWindowMs);
+  const database = drizzle(client);
+  await database
+    .delete(browserPairingExchangeFailures)
+    .where(
+      inArray(
+        browserPairingExchangeFailures.failureId,
+        database
+          .select({ failureId: browserPairingExchangeFailures.failureId })
+          .from(browserPairingExchangeFailures)
+          .where(lt(browserPairingExchangeFailures.createdAt, cutoff))
+          .orderBy(asc(browserPairingExchangeFailures.createdAt))
+          .limit(1_000),
+      ),
+    );
 }
 
 /** Reads one request without exposing its stored secret hash. */
@@ -151,11 +158,6 @@ async function inspectPairing(
     requestId,
   ]);
   return result.rows[0] ?? null;
-}
-
-/** Serializes rate-limit accounting for one already-hashed transport source. */
-async function lockPairingSource(client: pg.PoolClient, sourceAddressHash: string): Promise<void> {
-  await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [sourceAddressHash]);
 }
 
 /** Creates one request unless its source exceeded the bounded creation window. */
@@ -170,7 +172,11 @@ async function createPairing(
   try {
     await client.query("BEGIN");
     if (input.request.sourceAddressHash !== null) {
-      await lockPairingSource(client, input.request.sourceAddressHash);
+      await acquireTransactionAdvisoryLock(
+        client,
+        "browser-pairing-source",
+        input.request.sourceAddressHash,
+      );
       const count = await client.query<{ readonly count: number }>(
         `SELECT count(*)::int AS count FROM browser_pairing_requests
          WHERE source_address_hash = $1 AND created_at >= $2`,
@@ -272,9 +278,16 @@ async function exchangePairing(
   const client = await database.pool.connect();
   try {
     await client.query("BEGIN");
+    await pruneExpiredPairingFailures(client, input.attemptedAt);
     if (input.attemptSourceAddressHash !== null) {
-      await lockPairingSource(client, input.attemptSourceAddressHash);
-      const failureWindowStartedAt = new Date(input.attemptedAt.getTime() - 10 * 60 * 1_000);
+      await acquireTransactionAdvisoryLock(
+        client,
+        "browser-pairing-source",
+        input.attemptSourceAddressHash,
+      );
+      const failureWindowStartedAt = new Date(
+        input.attemptedAt.getTime() - failureRetentionWindowMs,
+      );
       const failures = await client.query<{ readonly count: number }>(
         `SELECT count(*)::int AS count
          FROM browser_pairing_exchange_failures

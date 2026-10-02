@@ -1196,7 +1196,7 @@ e2e("tether e2e", () => {
       expect(self).toMatchObject({
         body: {
           grantJti: exchanged.body.grantJti,
-          sessionIds: [sessionId],
+          scope: { sessionIds: [sessionId] },
           status: "active",
         },
         status: 200,

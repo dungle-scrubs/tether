@@ -614,7 +614,7 @@ export class TaskClaimExpirationDeadlockError extends Error {
 }
 
 /** Acquires a transaction-scoped advisory lock for a two-part identity key. */
-async function acquireTransactionAdvisoryLock(
+export async function acquireTransactionAdvisoryLock(
   client: TransactionClient,
   leftKey: string,
   rightKey: string,

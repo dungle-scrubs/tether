@@ -41,3 +41,12 @@ export function matchHttpRoute(
   }
   return pathname.match(spec.pattern);
 }
+
+/** Reads a required regex capture without accepting a missing or empty resource id. */
+export function routeMatchParam(match: RegExpMatchArray, index: number): string {
+  const value = match[index];
+  if (value === undefined || value.length === 0) {
+    throw new Error(`Missing route parameter at index ${index}`);
+  }
+  return value;
+}

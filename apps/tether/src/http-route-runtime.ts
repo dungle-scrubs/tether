@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 
 import { Effect } from "effect";
 import { ZodError, type z } from "zod";
-import { browserCsrfHeaderName } from "@dungle-scrubs/tether-protocol";
+import { browserCsrfHeaderName, isExactHttpOrigin } from "@dungle-scrubs/tether-protocol";
 
 import { authErrorPayload, authErrorStatus } from "./auth/enforcement.js";
 import type { AuthError } from "./auth/token.js";
@@ -391,35 +391,20 @@ function normalizeRouteError(error: unknown): HttpRouteErrorLogDetails["error"] 
   };
 }
 
-/** Parses a comma-delimited exact-origin allowlist. */
+/** Parses a comma-delimited exact-origin allowlist under the protocol-owned rule. */
 function parseAllowedOrigins(value: string | undefined): readonly string[] {
   if (!value) {
     return [];
   }
-  const configured = value
-    .split(",")
-    .map((origin) => origin.trim())
-    .filter((origin) => origin.length > 0);
   const origins = new Set<string>();
-  for (const rawOrigin of configured) {
-    let parsed: URL;
-    try {
-      parsed = new URL(rawOrigin);
-    } catch {
+  for (const origin of value.split(",").map((entry) => entry.trim())) {
+    if (origin.length === 0) {
+      continue;
+    }
+    if (!isExactHttpOrigin(origin)) {
       throw new Error("browser_allowed_origin_invalid");
     }
-    if (
-      (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
-      parsed.origin === "null" ||
-      parsed.username !== "" ||
-      parsed.password !== "" ||
-      parsed.pathname !== "/" ||
-      parsed.search !== "" ||
-      parsed.hash !== ""
-    ) {
-      throw new Error("browser_allowed_origin_invalid");
-    }
-    origins.add(parsed.origin);
+    origins.add(origin);
   }
   return [...origins];
 }
