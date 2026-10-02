@@ -262,6 +262,13 @@ export class RestParticipantTaskClient {
     if (wrapped.success) {
       return wrapped.data.task;
     }
+    // Server generations differ: the deployed gateway answers claims with
+    // the wrapped { status, task } shape, newer checkouts with the bare
+    // { task } envelope. Accept all three shapes.
+    const enveloped = readTaskResponseSchema.safeParse(body);
+    if (enveloped.success && enveloped.data.task !== null) {
+      return enveloped.data.task;
+    }
     return parseTask(body, this.#error.bind(this), "claim");
   }
 
@@ -273,6 +280,14 @@ export class RestParticipantTaskClient {
       `/sessions/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(taskId)}/claim/refresh`,
       this.#fencedBody(call),
     );
+    const wrapped = wrappedTaskResponseSchema.safeParse(body);
+    if (wrapped.success && wrapped.data.task !== null) {
+      return wrapped.data.task;
+    }
+    const enveloped = readTaskResponseSchema.safeParse(body);
+    if (enveloped.success && enveloped.data.task !== null) {
+      return enveloped.data.task;
+    }
     const parsed = parseTask(body, this.#error.bind(this), "refresh-claim");
     if (parsed === null) {
       throw this.#error("INVALID_RESPONSE", "refresh-claim");
