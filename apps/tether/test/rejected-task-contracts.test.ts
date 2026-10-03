@@ -69,6 +69,7 @@ describe("rejected task contracts", () => {
       ...participant("part_protocol"),
       capabilities,
       rejectedContracts: diagnostics,
+      rejectedContractsTruncated: 0,
     };
     expect(participantRecordSchema.parse(record)).toEqual(record);
     expect(JSON.stringify(diagnostics)).not.toContain("SYNTHETIC_BAD_ENUM");
@@ -81,14 +82,124 @@ describe("rejected task contracts", () => {
       renewAfterMs: 1000,
       participant: record,
       rejectedContracts: diagnostics,
+      rejectedContractsTruncated: 7,
     };
+    expect(restControlAcquisitionResponseSchema.parse(response).rejectedContractsTruncated).toBe(7);
+    expect(restControlRenewalResponseSchema.parse(response).rejectedContractsTruncated).toBe(7);
     expect(restControlAcquisitionResponseSchema.parse(response).rejectedContracts).toEqual(
       diagnostics,
     );
     expect(restControlRenewalResponseSchema.parse(response).rejectedContracts).toEqual(diagnostics);
   });
 
-  it("suppresses repeated heartbeat diagnostics for five minutes and isolates participant and session identities", () => {
+  it("omits task kinds beyond 200 UTF-8 bytes from records and warning data", () => {
+    const log = vi.fn();
+    const project = createParticipantContractDiagnostics({ log }, () => 0);
+    const contracts = ["a".repeat(200), "a".repeat(201), "é".repeat(100), "é".repeat(101)].map(
+      (taskKind) => ({ ...invalid, taskKind }),
+    );
+    const record = project({ ...participant("part_task_kind_size"), capabilities: { contracts } });
+    expect(record.rejectedContracts?.map((item) => item.taskKind)).toEqual([
+      "a".repeat(200),
+      undefined,
+      "é".repeat(100),
+      undefined,
+    ]);
+    const serialized = JSON.stringify(log.mock.calls);
+    expect(serialized).not.toContain("a".repeat(201));
+    expect(serialized).not.toContain("é".repeat(101));
+  });
+
+  it("bounds examined contracts, reported rejections and issues with explicit truncation counts", () => {
+    const log = vi.fn();
+    const project = createParticipantContractDiagnostics({ log }, () => 0);
+    const contracts = Array.from({ length: 10_000 }, () => ({}));
+    Object.defineProperty(contracts, 128, {
+      get() {
+        throw new Error("diagnostics examined past the limit");
+      },
+    });
+    const record = project({ ...participant("part_caps"), capabilities: { contracts } });
+    expect(record.rejectedContracts).toHaveLength(32);
+    expect(record).toMatchObject({ rejectedContractsTruncated: 9968 });
+    expect(participantRecordSchema.parse(record).rejectedContractsTruncated).toBe(9968);
+    expect(record.rejectedContracts?.[0]).toMatchObject({
+      issues: expect.any(Array),
+      truncated: 1,
+    });
+    expect(record.rejectedContracts?.[0]?.issues).toHaveLength(8);
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0]?.[0].data).toMatchObject({ truncated: 9968 });
+    expect(JSON.stringify(record.rejectedContracts).length).toBeLessThan(20_000);
+  });
+
+  it("deduplicates whole participant rejection sets beyond the old 4096-entry capacity", () => {
+    const log = vi.fn();
+    const project = createParticipantContractDiagnostics({ log }, () => 0);
+    const records = Array.from({ length: 1100 }, (_, index) => ({
+      ...participant(`part_capacity_${index}`),
+      sessionId: `sess_capacity_${index % 50}`,
+      capabilities: { contracts: [invalid, invalid, invalid, invalid] },
+    }));
+    for (const record of records) project(record);
+    expect(log).toHaveBeenCalledTimes(1100);
+    for (const record of records) project(record);
+    expect(log).toHaveBeenCalledTimes(1100);
+    project({
+      ...participant("part_capacity_0"),
+      sessionId: "sess_capacity_0",
+      capabilities: { contracts: [invalid] },
+    });
+    expect(log).toHaveBeenCalledTimes(1101);
+  });
+
+  it("does not scan the warning cache when projecting a participant without rejections", () => {
+    const project = createParticipantContractDiagnostics({ log: vi.fn() }, () => 0);
+    for (let index = 0; index < 100; index += 1) project(participant(`part_hot_path_${index}`));
+    const iterate = vi.spyOn(Map.prototype, Symbol.iterator);
+    let iterations: number;
+    try {
+      project({ ...participant("part_valid_hot_path"), capabilities: { contracts: [valid] } });
+      iterations = iterate.mock.calls.length;
+    } finally {
+      iterate.mockRestore();
+    }
+    expect(iterations).toBe(0);
+  });
+
+  it("rate limits warning-cache overflow instead of flooding on repeated heartbeat cycles", () => {
+    let now = 0;
+    const log = vi.fn();
+    const project = createParticipantContractDiagnostics({ log }, () => now);
+    const records = Array.from({ length: 4200 }, (_, index) =>
+      participant(`part_overflow_${index}`),
+    );
+    for (const record of records) project(record);
+    for (const record of records) project(record);
+    expect(log).toHaveBeenCalledTimes(4096);
+    now = 60_000;
+    project(participant("part_overflow_4199"));
+    expect(log).toHaveBeenCalledTimes(4097);
+    project(participant("part_overflow_4199"));
+    expect(log).toHaveBeenCalledTimes(4097);
+  });
+
+  it("notices changes to examined rejections even beyond the reported subset", () => {
+    const log = vi.fn();
+    const project = createParticipantContractDiagnostics({ log }, () => 0);
+    const record = {
+      ...participant("part_fingerprint"),
+      capabilities: { contracts: Array.from({ length: 128 }, () => invalid) },
+    };
+    project(record);
+    project({
+      ...record,
+      capabilities: { contracts: [...record.capabilities.contracts.slice(0, 127), {}] },
+    });
+    expect(log).toHaveBeenCalledTimes(2);
+  });
+
+  it("suppresses unchanged diagnostics indefinitely and isolates participant and session identities", () => {
     let now = 0;
     const log = vi.fn();
     const project = createParticipantContractDiagnostics({ log }, () => now);
@@ -101,10 +212,15 @@ describe("rejected task contracts", () => {
     expect(log).toHaveBeenCalledTimes(3);
     now = 300_000;
     project(record);
-    expect(log).toHaveBeenCalledTimes(4);
+    expect(log).toHaveBeenCalledTimes(3);
+    now = 86_400_000;
+    project(record);
+    expect(log).toHaveBeenCalledTimes(3);
     expect(project({ ...record, capabilities: { contracts: [valid] } }).rejectedContracts).toEqual(
       [],
     );
+    project(record);
+    expect(log).toHaveBeenCalledTimes(4);
   });
 
   it("excludes invalid contracts and warns once with paths and codes but no payload values", () => {
@@ -127,7 +243,12 @@ describe("rejected task contracts", () => {
       expect(entry).toMatchObject({
         level: "warn",
         message: "participant.contract_rejected",
-        data: { ...rejection[0], participantId: record.participantId, sessionId: record.sessionId },
+        data: {
+          rejectedContracts: rejection,
+          truncated: 0,
+          participantId: record.participantId,
+          sessionId: record.sessionId,
+        },
       });
       expect(JSON.stringify(warn.mock.calls)).not.toContain("SYNTHETIC_PAYLOAD_DO_NOT_LOG");
       expect(entry.data).not.toHaveProperty("description");
@@ -137,12 +258,19 @@ describe("rejected task contracts", () => {
   });
 
   it.each([
-    "register",
-    "heartbeat",
-  ] as const)("reports rejection diagnostics in the %s HTTP success response and readable participant record", async (operation) => {
+    ["register", false],
+    ["heartbeat", false],
+    ["register", true],
+    ["heartbeat", true],
+  ] as const)("reports rejection diagnostics in the %s HTTP success response and readable participant record (large: %s)", async (operation, large) => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      const record = participant(`part_http_${operation}`);
+      const record = participant(`part_http_${operation}_${large}`);
+      if (large) record.capabilities.contracts = Array.from({ length: 1000 }, () => invalid);
+      const expectedRejections = large
+        ? Array.from({ length: 32 }, (_, index) => ({ ...rejection[0], index }))
+        : rejection;
+      const truncated = large ? 968 : 0;
       const result = {
         acquisitionId: "acq_synthetic",
         acquisitionStatus: "acquired",
@@ -197,10 +325,16 @@ describe("rejected task contracts", () => {
         acquisitionId: "acq_synthetic",
       });
       expect(response.statusCode).toBe(operation === "register" ? 201 : 200);
-      expect(response.body.rejectedContracts).toEqual(rejection);
-      expect(response.body.participant).toMatchObject({ rejectedContracts: rejection });
+      expect(response.body.rejectedContracts).toEqual(expectedRejections);
+      expect(response.body.rejectedContractsTruncated).toBe(truncated);
+      expect(response.body.participant).toMatchObject({
+        rejectedContracts: expectedRejections,
+        rejectedContractsTruncated: truncated,
+      });
       await run("GET", "", {});
-      expect(response.body.participants).toEqual([{ ...record, rejectedContracts: rejection }]);
+      expect(response.body.participants).toEqual([
+        { ...record, rejectedContracts: expectedRejections, rejectedContractsTruncated: truncated },
+      ]);
       expect(warn).toHaveBeenCalledTimes(1);
     } finally {
       warn.mockRestore();

@@ -26,7 +26,9 @@ export type RestParticipantControlFetch = (input: URL, init: RequestInit) => Pro
 /** Installed participant control context for one session. */
 export interface RestParticipantControlContext {
   /** Rejections reported by the latest acquisition or renewal response. */
-  readonly rejectedContracts?: readonly RejectedTaskContract[];
+  readonly rejectedContracts?: readonly RejectedTaskContract[] | undefined;
+  /** Omitted rejections plus unexamined entries, which may be valid. */
+  readonly rejectedContractsTruncated?: number | undefined;
   readonly acquisitionId: string;
   readonly controlEpoch: number;
   readonly instanceId: string;
@@ -385,6 +387,7 @@ export class RestParticipantControlClient {
         const context: RestParticipantControlContext = {
           acquisitionId: parsed.data.acquisitionId,
           rejectedContracts: parsed.data.rejectedContracts,
+          rejectedContractsTruncated: parsed.data.rejectedContractsTruncated,
           controlEpoch: parsed.data.controlEpoch,
           instanceId: this.#instanceId,
           leaseExpiresAt: parsed.data.leaseExpiresAt,
@@ -440,6 +443,7 @@ export class RestParticipantControlClient {
         const renewed: RestParticipantControlContext = {
           ...context,
           rejectedContracts: parsed.data.rejectedContracts,
+          rejectedContractsTruncated: parsed.data.rejectedContractsTruncated,
           leaseExpiresAt: parsed.data.leaseExpiresAt,
           renewAfterMs: parsed.data.renewAfterMs,
         };

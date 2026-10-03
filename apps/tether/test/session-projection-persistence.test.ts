@@ -3,6 +3,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { getTableConfig } from "drizzle-orm/pg-core";
 import type pg from "pg";
 import { describe, expect, it, vi } from "vitest";
+import { createParticipantContractDiagnostics } from "../src/participant-contract-diagnostics.js";
 
 import {
   createSessionProjectionStore,
@@ -183,22 +184,51 @@ describe("Session Projection persistence", () => {
     expect(commitsEventAndProjection(heartbeatClient.queries)).toBe(true);
   });
 
-  it("projects rejected contracts from persisted participant capabilities", async () => {
+  it.each([
+    "joined",
+    "updated",
+    "heartbeat",
+  ] as const)("keeps derived diagnostics out of durable participant %s events", async (operation) => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const capabilities = {
         contracts: [{ taskKind: "synthetic.invalid", description: "SYNTHETIC_PRIVATE_PAYLOAD" }],
       };
-      const client = new ParticipantEventTransactionClient(capabilities);
-      const result = await upsertParticipantWithEvent(client.database, {
+      const client = new ParticipantEventTransactionClient(
+        capabilities,
+        operation === "updated" ? { contracts: [{}] } : undefined,
+      );
+      const input = {
         capabilities,
         displayName: "Projection worker",
         eventSourceId: "src_projection_persistence_test",
         participantId: "part_projection",
         runtimeKind: "worker",
         sessionId: "sess_projection_persistence",
-      });
-      expect(result.registration.participant.rejectedContracts).toEqual([
+      };
+      const result =
+        operation === "heartbeat"
+          ? await heartbeatParticipantWithEvent(client.database, input)
+          : await upsertParticipantWithEvent(client.database, input);
+      const events = "events" in result ? result.events : "event" in result ? [result.event] : [];
+      expect(events).toHaveLength(1);
+      expect(events[0]?.type).toBe(`participant.${operation}`);
+      const event = events[0];
+      if (!event) throw new Error("Expected a participant event");
+      const payload = event.payload;
+      expect(payload.participant).not.toHaveProperty("rejectedContracts");
+      expect(payload.participant).not.toHaveProperty("rejectedContractsTruncated");
+      if (operation === "updated") {
+        expect(payload.previousParticipant).not.toHaveProperty("rejectedContracts");
+        expect(payload.previousParticipant).not.toHaveProperty("rejectedContractsTruncated");
+      }
+      expect(warn).not.toHaveBeenCalled();
+      const log = vi.fn();
+      const project = createParticipantContractDiagnostics({ log });
+      const participant =
+        "registration" in result ? result.registration.participant : result.participant;
+      if (!participant) throw new Error("Expected a persisted participant");
+      expect(project(participant).rejectedContracts).toEqual([
         {
           index: 0,
           taskKind: "synthetic.invalid",
@@ -207,8 +237,8 @@ describe("Session Projection persistence", () => {
           ]),
         },
       ]);
-      expect(warn).toHaveBeenCalledTimes(1);
-      expect(JSON.stringify(warn.mock.calls)).not.toContain("SYNTHETIC_PRIVATE_PAYLOAD");
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(log.mock.calls)).not.toContain("SYNTHETIC_PRIVATE_PAYLOAD");
     } finally {
       warn.mockRestore();
     }
@@ -459,7 +489,10 @@ class NewSessionTransactionClient implements SessionProjectionTransaction {
 }
 
 class ParticipantEventTransactionClient implements SessionProjectionTransaction {
-  constructor(private readonly capabilities: Record<string, unknown> = { role: "worker" }) {}
+  constructor(
+    private readonly capabilities: Record<string, unknown> = { role: "worker" },
+    private readonly previousCapabilities?: Record<string, unknown>,
+  ) {}
   readonly database = {
     pool: { connect: async () => this },
   } as unknown as DatabasePool;
@@ -474,7 +507,14 @@ class ParticipantEventTransactionClient implements SessionProjectionTransaction 
       return { rows: [{ exists: true }] as unknown as TRow[] };
     }
     if (sql.includes("FROM participants") && sql.includes("FOR UPDATE")) {
-      return { rows: [] };
+      return {
+        rows:
+          this.previousCapabilities === undefined
+            ? []
+            : ([
+                { ...participantDatabaseRow(), capabilities: this.previousCapabilities },
+              ] as unknown as TRow[]),
+      };
     }
     if (sql.includes("INSERT INTO participants") || sql.includes("UPDATE participants")) {
       return {

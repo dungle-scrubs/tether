@@ -132,3 +132,32 @@ HTTP 200 with `ok: true` and adds `REST_CONTROL_COMPATIBILITY_ENABLED`.
 `/debug/server` exposes bounded per-route REST control outcomes. These surfaces
 use stable route names and never include tokens, participant identity,
 Acquisition IDs, epochs, request payloads, or database details.
+
+### Rejected task contracts
+
+Registration and heartbeat success responses include `rejectedContracts`, also
+available on records returned by `GET /sessions/{sessionId}/participants`.
+Each rejection contains the capability-array index, validation issue paths and
+codes, and `taskKind` when it is a string of at most 200 UTF-8 bytes. No other
+payload values or validation messages are included. Invalid advertisements stay
+excluded from task-contract discovery; valid advertisements are unchanged.
+
+Diagnostics examine at most 128 contracts, report at most 32 rejections, and
+retain at most 8 issues per rejection. `rejectedContractsTruncated` counts known
+rejections omitted plus unexamined entries, which may be valid. A rejection's
+optional `truncated` counts omitted validation issues. These limits affect only
+diagnostics, not discovery or admission. Correct the reported entries and
+republish capabilities to reveal further diagnostics.
+
+The REST control client exposes both fields from its latest acquisition or
+renewal response. An absent `rejectedContracts` means the server did not report
+diagnostics; an empty array with a zero truncation count means none were rejected.
+Derived diagnostics are not stored in participant lifecycle events.
+
+The structured `participant.contract_rejected` warning contains session and
+participant ids and the same bounded diagnostic data. Each process retains up
+to 4,096 participant rejection fingerprints, covering all examined rejections.
+An unchanged retained fingerprint does not expire; a change or a return to
+invalid capabilities after correction can warn again. LRU eviction and process
+restart can permit another warning. A process-wide limit of 4,096 warnings per
+minute also bounds overflow cycles; response diagnostics are never suppressed.

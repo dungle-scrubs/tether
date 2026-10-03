@@ -38,20 +38,57 @@ describe("RestParticipantControlClient", () => {
                 participant: {},
                 renewAfterMs: 30_000,
                 rejectedContracts: [],
+                rejectedContractsTruncated: 0,
               }),
             );
           }
           const body = await acquisitionResponse("acq_1", 1).json();
-          return new Response(JSON.stringify({ ...body, rejectedContracts }));
+          return new Response(
+            JSON.stringify({ ...body, rejectedContracts, rejectedContractsTruncated: 7 }),
+          );
         },
       },
     );
     expect((await client.context("sess_1")).rejectedContracts).toEqual(rejectedContracts);
+    expect((await client.context("sess_1")).rejectedContractsTruncated).toBe(7);
     timers.fireNext();
     await vi.waitFor(async () => {
       expect((await client.context("sess_1")).rejectedContracts).toEqual([]);
+      expect((await client.context("sess_1")).rejectedContractsTruncated).toBe(0);
     });
     await client.stop();
+  });
+
+  it("preserves unreported diagnostics from older acquisition and renewal responses", async () => {
+    const requests: CapturedRequest[] = [];
+    const timers = new FakeTimerScheduler();
+    const client = new RestParticipantControlClient(
+      {
+        instanceId: "inst_1",
+        participantId: "part_1",
+        runtimeKind: "generic_agent",
+        serviceUrl: "http://tether.test",
+      },
+      {
+        acquisitionIdFactory: () => "acq_1",
+        now: () => Date.parse("2026-07-16T12:00:00.000Z"),
+        timers,
+        fetch: createControlFetch(requests),
+      },
+    );
+    try {
+      expect((await client.context("sess_legacy")).rejectedContracts).toBeUndefined();
+      timers.fireNext();
+      await vi.waitFor(async () => {
+        expect(requests).toHaveLength(2);
+        expect((await client.context("sess_legacy")).leaseExpiresAt).toBe(
+          "2026-07-16T12:02:00.000Z",
+        );
+      });
+      expect((await client.context("sess_legacy")).rejectedContracts).toBeUndefined();
+    } finally {
+      await client.stop();
+    }
   });
 
   it("joins concurrent context calls into one acquisition", async () => {

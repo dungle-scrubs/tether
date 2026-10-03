@@ -1,4 +1,4 @@
-import { rejectedTaskContracts } from "@dungle-scrubs/tether-protocol";
+import { rejectedTaskContractDiagnostics } from "@dungle-scrubs/tether-protocol";
 import { ConsoleStructuredLogger, type StructuredLogger } from "./observability.js";
 import type { ParticipantRecord } from "./types.js";
 
@@ -7,37 +7,48 @@ export function createParticipantContractDiagnostics(
   logger: StructuredLogger = new ConsoleStructuredLogger(),
   now: () => number = Date.now,
 ) {
-  const warned = new Map<string, number>();
-  const suppressionMs = 5 * 60_000;
-  const maxWarnings = 4096;
+  const warned = new Map<string, string>();
+  const maxParticipants = 4096;
+  const maxWarningsPerMinute = 4096;
+  let windowStart = now();
+  let warningsInWindow = 0;
   return (participant: ParticipantRecord): ParticipantRecord => {
-    const rejectedContracts = rejectedTaskContracts(participant.capabilities);
-    const timestamp = now();
-    for (const [key, expiresAt] of warned) {
-      if (expiresAt <= timestamp) {
-        warned.delete(key);
+    const diagnostics = rejectedTaskContractDiagnostics(participant.capabilities);
+    const { rejectedContracts, truncated } = diagnostics;
+    const key = JSON.stringify([participant.sessionId, participant.participantId]);
+    const { fingerprint } = diagnostics;
+    const previous = warned.get(key);
+    if (rejectedContracts.length === 0) {
+      warned.delete(key);
+    } else if (previous === fingerprint) {
+      // Refresh LRU order without expiring unchanged diagnostics or scanning the cache.
+      warned.delete(key);
+      warned.set(key, fingerprint);
+    } else {
+      const timestamp = now();
+      if (timestamp - windowStart >= 60_000) {
+        windowStart = timestamp;
+        warningsInWindow = 0;
       }
-    }
-    for (const rejection of rejectedContracts) {
-      const data = {
-        ...rejection,
-        participantId: participant.participantId,
-        sessionId: participant.sessionId,
-      };
-      const key = JSON.stringify(data);
-      if (warned.has(key)) {
-        continue;
+      // An overflow cycle must stay bounded even when more participants than the cache repeat.
+      if (warningsInWindow >= maxWarningsPerMinute) {
+        return { ...participant, rejectedContracts, rejectedContractsTruncated: truncated };
       }
-      if (warned.size >= maxWarnings) {
+      warningsInWindow += 1;
+      warned.delete(key);
+      if (warned.size >= maxParticipants) {
         const oldest = warned.keys().next().value;
-        if (oldest !== undefined) {
-          warned.delete(oldest);
-        }
+        if (oldest !== undefined) warned.delete(oldest);
       }
-      warned.set(key, timestamp + suppressionMs);
+      warned.set(key, fingerprint);
       logger.log({
         at: new Date(timestamp).toISOString(),
-        data,
+        data: {
+          participantId: participant.participantId,
+          sessionId: participant.sessionId,
+          rejectedContracts,
+          truncated,
+        },
         level: "warn",
         message: "participant.contract_rejected",
         moduleName: "ParticipantContracts",
@@ -45,7 +56,7 @@ export function createParticipantContractDiagnostics(
         traceId: "",
       });
     }
-    return { ...participant, rejectedContracts };
+    return { ...participant, rejectedContracts, rejectedContractsTruncated: truncated };
   };
 }
 

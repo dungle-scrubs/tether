@@ -396,6 +396,7 @@ export function handleSessionHttpRoute(
         leaseExpiresAt: result.leaseExpiresAt,
         participant,
         rejectedContracts: participant.rejectedContracts,
+        rejectedContractsTruncated: participant.rejectedContractsTruncated,
         registrationStatus: result.registrationStatus,
         renewAfterMs: result.renewAfterMs,
       });
@@ -480,6 +481,7 @@ export function handleSessionHttpRoute(
         leaseExpiresAt: result.leaseExpiresAt,
         participant,
         rejectedContracts: participant.rejectedContracts,
+        rejectedContractsTruncated: participant.rejectedContractsTruncated,
         renewAfterMs: result.renewAfterMs,
       });
       return true;

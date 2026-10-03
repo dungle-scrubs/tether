@@ -78,37 +78,72 @@ export const rejectedTaskContractSchema = z.object({
     }),
   ),
   taskKind: z.string().optional(),
+  /** Number of validation issues omitted from this rejection. */
+  truncated: z.number().int().nonnegative().optional(),
 });
 
 export type RejectedTaskContract = z.infer<typeof rejectedTaskContractSchema>;
+
+/** Resource limits for derived diagnostics, not contract discovery or admission. */
+export const taskContractDiagnosticLimits = {
+  examined: 128,
+  rejections: 32,
+  issues: 8,
+  taskKindBytes: 200,
+} as const;
+
+/** Bounded diagnostics; truncated includes unexamined entries, which may be valid. */
+export function rejectedTaskContractDiagnostics(capabilities: Readonly<Record<string, unknown>>): {
+  rejectedContracts: RejectedTaskContract[];
+  truncated: number;
+  /** Process-local warning identity over all examined rejection diagnostics. */
+  fingerprint: string;
+} {
+  const contracts = capabilities.contracts;
+  const rejectedContracts: RejectedTaskContract[] = [];
+  if (!Array.isArray(contracts)) return { rejectedContracts, truncated: 0, fingerprint: "" };
+  const examined = Math.min(contracts.length, taskContractDiagnosticLimits.examined);
+  let truncated = contracts.length - examined;
+  for (let index = 0; index < examined; index += 1) {
+    const contract: unknown = contracts[index];
+    const parsed = taskContractSummarySchema.safeParse(contract);
+    if (parsed.success) continue;
+    const taskKind =
+      isPlainRecord(contract) &&
+      typeof contract.taskKind === "string" &&
+      utf8ByteLength(contract.taskKind) <= taskContractDiagnosticLimits.taskKindBytes
+        ? contract.taskKind
+        : undefined;
+    const omittedIssues = Math.max(
+      0,
+      parsed.error.issues.length - taskContractDiagnosticLimits.issues,
+    );
+    rejectedContracts.push({
+      index,
+      issues: parsed.error.issues
+        .slice(0, taskContractDiagnosticLimits.issues)
+        .map(({ code, path }) => ({
+          code,
+          path: path.map((part) => (typeof part === "symbol" ? String(part) : part)),
+        })),
+      ...(taskKind === undefined ? {} : { taskKind }),
+      ...(omittedIssues === 0 ? {} : { truncated: omittedIssues }),
+    });
+  }
+  const fingerprint = fnv1a64Hex(JSON.stringify([rejectedContracts, truncated]));
+  truncated += Math.max(0, rejectedContracts.length - taskContractDiagnosticLimits.rejections);
+  return {
+    rejectedContracts: rejectedContracts.slice(0, taskContractDiagnosticLimits.rejections),
+    truncated,
+    fingerprint,
+  };
+}
 
 /** Validates advertisements without returning payload values or Zod messages. */
 export function rejectedTaskContracts(
   capabilities: Readonly<Record<string, unknown>>,
 ): RejectedTaskContract[] {
-  if (!Array.isArray(capabilities.contracts)) {
-    return [];
-  }
-  return capabilities.contracts.flatMap((contract, index) => {
-    const parsed = taskContractSummarySchema.safeParse(contract);
-    if (parsed.success) {
-      return [];
-    }
-    const taskKind =
-      isPlainRecord(contract) && typeof contract.taskKind === "string"
-        ? contract.taskKind
-        : undefined;
-    return [
-      {
-        index,
-        issues: parsed.error.issues.map(({ code, path }) => ({
-          code,
-          path: path.map((part) => (typeof part === "symbol" ? String(part) : part)),
-        })),
-        ...(taskKind === undefined ? {} : { taskKind }),
-      },
-    ];
-  });
+  return rejectedTaskContractDiagnostics(capabilities).rejectedContracts;
 }
 
 /** Runtime validator for full task contract advertisements. */
