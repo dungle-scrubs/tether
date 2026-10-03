@@ -66,6 +66,11 @@ describe("session event retention cutoff", () => {
       "apps/tether/src/hub.ts:nextSeq",
       "apps/tether/src/hub.ts:sessionId",
       "apps/tether/src/hub.ts:socket",
+      // Reviewed: process-local warning correction, LRU refresh and capacity eviction.
+      "apps/tether/src/participant-contract-diagnostics.ts:key",
+      "apps/tether/src/participant-contract-diagnostics.ts:key",
+      "apps/tether/src/participant-contract-diagnostics.ts:key",
+      "apps/tether/src/participant-contract-diagnostics.ts:oldest",
       "apps/tether/src/session-event-fanout.ts:notification.sessionId",
       "apps/tether/src/session-event-fanout.ts:sessionId",
       "apps/tether/src/session-scalability-runtime-state.ts:key",

@@ -1,9 +1,10 @@
 import { z } from "zod";
 
 import { approvalDecisionSchema, taskResultSchema } from "./approval-targets.js";
-import type { CandidateScheduleIdentity } from "./task-contracts.js";
+import type { CandidateScheduleIdentity, RejectedTaskContract } from "./task-contracts.js";
 import {
   candidateScheduleIdentitySchema,
+  rejectedTaskContractSchema,
   taskAssigneeParticipantIdSchema,
   taskParentTaskIdSchema,
   taskScopeLabelSchema,
@@ -124,6 +125,10 @@ export interface SessionEvent {
 
 /** Visible participant presence record. */
 export interface ParticipantRecord {
+  /** Validation diagnostics; absent on records from older servers. */
+  readonly rejectedContracts?: readonly RejectedTaskContract[] | undefined;
+  /** Omitted rejections plus unexamined entries, which may be valid. */
+  readonly rejectedContractsTruncated?: number | undefined;
   readonly capabilities: Record<string, unknown>;
   readonly displayName: string;
   readonly joinedAt: string;
@@ -558,6 +563,8 @@ export const participantRuntimeKindSchema = z
 export const participantRecordSchema: z.ZodType<ParticipantRecord> = z
   .object({
     capabilities: z.record(z.string(), z.unknown()),
+    rejectedContracts: z.array(rejectedTaskContractSchema).optional(),
+    rejectedContractsTruncated: z.number().int().nonnegative().optional(),
     displayName: z.string(),
     joinedAt: z.string(),
     lastSeenAt: z.string(),
