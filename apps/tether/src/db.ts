@@ -39,6 +39,7 @@ import { migrateDatabase } from "./database-migration.js";
 import {
   createSessionProjectionStore,
   listSessionProjectionInventory,
+  repairIncompleteSessionProjections,
 } from "./db-session-projections.js";
 import {
   type AppendSessionEventInput,
@@ -263,6 +264,9 @@ export const DatabaseLive = Layer.scoped(
       (pool) => Effect.promise(() => pool.end()),
     );
     yield* Effect.tryPromise(() => migrate(database));
+    yield* Effect.tryPromise(() =>
+      repairIncompleteSessionProjections(database.pool, { batchSize: 500 }),
+    );
     return database;
   }),
 );

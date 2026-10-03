@@ -8,6 +8,7 @@
  * not HTTP or process-local Host Presence assembly.
  */
 
+import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
 import type pg from "pg";
@@ -24,6 +25,7 @@ import {
   type SessionProjectionForkLineage,
   type SessionProjectionTangentLineage,
 } from "./session-projection.js";
+import { ConsoleStructuredLogger } from "./observability.js";
 import type { SessionBindingSummary, SessionEvent, SessionListItem } from "./types.js";
 import { sessionScalabilityRuntimeState } from "./session-scalability-runtime-state.js";
 
@@ -235,6 +237,68 @@ export async function listSessionProjectionInventory(
       ON binding_lists.session_id = session.session_id
   `);
   return rows.rows.map(toSessionProjectionInventoryItem).sort(compareInventoryActivity);
+}
+
+/** Repairs legacy coverage without weakening strict projection-backed reads. */
+export async function repairIncompleteSessionProjections(
+  pool: SessionProjectionTransaction,
+  input: { readonly batchSize: number },
+): Promise<{ readonly repaired: number; readonly current: number; readonly stale: number }> {
+  assertPositiveBatchSize(input.batchSize);
+  const logger = new ConsoleStructuredLogger();
+  const traceId = randomUUID();
+  const currentRows = await pool.query<{ readonly count: string }>(
+    `SELECT count(*) AS count FROM sessions AS session
+     JOIN session_projections AS projection ON projection.session_id = session.session_id
+     WHERE projection.reducer_version = $1`,
+    [SESSION_PROJECTION_REDUCER_VERSION],
+  );
+  const candidates = await pool.query<{
+    readonly sessionId: string;
+    readonly reducerVersion: number | null;
+  }>(
+    `SELECT session.session_id AS "sessionId", projection.reducer_version AS "reducerVersion"
+     FROM sessions AS session
+     LEFT JOIN session_projections AS projection ON projection.session_id = session.session_id
+     WHERE projection.session_id IS NULL OR projection.reducer_version <> $1
+     ORDER BY session.session_id`,
+    [SESSION_PROJECTION_REDUCER_VERSION],
+  );
+  const counts = { repaired: 0, current: Number(currentRows.rows[0]?.count ?? 0), stale: 0 };
+  let failed = 0;
+  const log = (level: "info" | "warn", message: string): void => {
+    logger.log({
+      at: new Date().toISOString(),
+      data: { ...counts, failed },
+      level,
+      message,
+      moduleName: "session-projection",
+      operation: "repairIncompleteSessionProjections",
+      traceId,
+    });
+  };
+  for (const { sessionId, reducerVersion } of candidates.rows) {
+    try {
+      // A version upgrade must fold past the old coverage before its CAS can install it.
+      const backfillInput = { ...input, sessionId, rebuildFromStart: reducerVersion !== null };
+      let result = await backfillSessionProjection(pool, backfillInput);
+      if (result.outcome === "stale") {
+        result = await backfillSessionProjection(pool, backfillInput);
+      }
+      if (result.outcome === "written") {
+        counts.repaired += 1;
+      } else if (result.outcome === "unchanged") {
+        counts.current += 1;
+      } else {
+        counts.stale += 1;
+      }
+    } catch {
+      failed += 1;
+      log("warn", "session_projection.repair_failed");
+    }
+  }
+  log("info", "session_projection.repair_completed");
+  return counts;
 }
 
 /** Verifies a stored projection against a bounded, fresh deterministic fold. */
