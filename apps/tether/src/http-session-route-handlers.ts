@@ -40,6 +40,7 @@ import {
 import { parseEventListLimit, type ResourceLimits } from "./resource-limits.js";
 import { listEventPageWithinByteBudget } from "./http-event-pagination.js";
 import { authorizeClientPublishedEvent } from "./session-event-publish-policy.js";
+import { projectParticipantContractDiagnostics } from "./participant-contract-diagnostics.js";
 import type { SessionServiceEffect } from "./session-service.js";
 
 interface SessionHttpRouteHandlerInput {
@@ -334,7 +335,9 @@ export function handleSessionHttpRoute(
         return true;
       }
       const participants = yield* service.listParticipants(route.sessionId);
-      sendJson(response, 200, { participants });
+      sendJson(response, 200, {
+        participants: participants.map(projectParticipantContractDiagnostics),
+      });
       return true;
     }
     if (route?.resource === "participant-register") {
@@ -385,12 +388,14 @@ export function handleSessionHttpRoute(
         return true;
       }
       broadcastEvents(hub, result.events);
+      const participant = projectParticipantContractDiagnostics(result.participant);
       sendJson(response, result.acquisitionStatus === "replayed" ? 200 : 201, {
         ...(result.acquisitionId.length > 0 ? { acquisitionId: result.acquisitionId } : {}),
         acquisitionStatus: result.acquisitionStatus,
         controlEpoch: result.controlEpoch,
         leaseExpiresAt: result.leaseExpiresAt,
-        participant: result.participant,
+        participant,
+        rejectedContracts: participant.rejectedContracts,
         registrationStatus: result.registrationStatus,
         renewAfterMs: result.renewAfterMs,
       });
@@ -469,10 +474,12 @@ export function handleSessionHttpRoute(
         return true;
       }
       broadcastEvents(hub, result.events);
+      const participant = projectParticipantContractDiagnostics(result.participant);
       sendJson(response, 200, {
         controlEpoch: result.controlEpoch,
         leaseExpiresAt: result.leaseExpiresAt,
-        participant: result.participant,
+        participant,
+        rejectedContracts: participant.rejectedContracts,
         renewAfterMs: result.renewAfterMs,
       });
       return true;

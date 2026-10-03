@@ -12,6 +12,7 @@ packages/client/.pack/
 
 .claude/
 .plans/
+.scratch/
 
 # Agent tooling and instructions (kept out of the public tree)
 AGENTS.md

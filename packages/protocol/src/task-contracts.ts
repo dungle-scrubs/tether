@@ -68,6 +68,49 @@ export const taskContractSummarySchema = taskContractEnvelopeSchema.extend({
   title: z.string().min(1),
 });
 
+/** Payload-free diagnostics for one rejected capability contract. */
+export const rejectedTaskContractSchema = z.object({
+  index: z.number().int().nonnegative(),
+  issues: z.array(
+    z.object({
+      code: z.string().min(1),
+      path: z.array(z.union([z.string(), z.number()])),
+    }),
+  ),
+  taskKind: z.string().optional(),
+});
+
+export type RejectedTaskContract = z.infer<typeof rejectedTaskContractSchema>;
+
+/** Validates advertisements without returning payload values or Zod messages. */
+export function rejectedTaskContracts(
+  capabilities: Readonly<Record<string, unknown>>,
+): RejectedTaskContract[] {
+  if (!Array.isArray(capabilities.contracts)) {
+    return [];
+  }
+  return capabilities.contracts.flatMap((contract, index) => {
+    const parsed = taskContractSummarySchema.safeParse(contract);
+    if (parsed.success) {
+      return [];
+    }
+    const taskKind =
+      isPlainRecord(contract) && typeof contract.taskKind === "string"
+        ? contract.taskKind
+        : undefined;
+    return [
+      {
+        index,
+        issues: parsed.error.issues.map(({ code, path }) => ({
+          code,
+          path: path.map((part) => (typeof part === "symbol" ? String(part) : part)),
+        })),
+        ...(taskKind === undefined ? {} : { taskKind }),
+      },
+    ];
+  });
+}
+
 /** Runtime validator for full task contract advertisements. */
 export const taskContractAdvertisementSchema = z.object({
   common: taskContractEnvelopeSchema,

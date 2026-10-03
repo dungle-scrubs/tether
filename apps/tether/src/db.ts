@@ -24,6 +24,7 @@ import { Context, Effect, Layer } from "effect";
 import pg from "pg";
 
 import { approvalTargetKey } from "./approval-target-key.js";
+import { projectParticipantContractDiagnostics } from "./participant-contract-diagnostics.js";
 import {
   enforceTaskGrantPolicyWithClient,
   TaskGrantDeniedError,
@@ -5138,7 +5139,7 @@ function toParticipantRecord(
   if (!row) {
     throw new Error("Missing participant row");
   }
-  return {
+  return projectParticipantContractDiagnostics({
     capabilities: row.capabilities,
     displayName: row.displayName,
     joinedAt: row.joinedAt.toISOString(),
@@ -5146,7 +5147,7 @@ function toParticipantRecord(
     participantId: row.participantId,
     runtimeKind: row.runtimeKind,
     sessionId: row.sessionId,
-  };
+  });
 }
 
 /**

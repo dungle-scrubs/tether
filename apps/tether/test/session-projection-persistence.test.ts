@@ -2,7 +2,7 @@ import { readdir, readFile } from "node:fs/promises";
 
 import { getTableConfig } from "drizzle-orm/pg-core";
 import type pg from "pg";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   createSessionProjectionStore,
@@ -181,6 +181,37 @@ describe("Session Projection persistence", () => {
     expect(heartbeat.participant).not.toBeNull();
     expect(commitsEventAndProjection(registrationClient.queries)).toBe(true);
     expect(commitsEventAndProjection(heartbeatClient.queries)).toBe(true);
+  });
+
+  it("projects rejected contracts from persisted participant capabilities", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const capabilities = {
+        contracts: [{ taskKind: "synthetic.invalid", description: "SYNTHETIC_PRIVATE_PAYLOAD" }],
+      };
+      const client = new ParticipantEventTransactionClient(capabilities);
+      const result = await upsertParticipantWithEvent(client.database, {
+        capabilities,
+        displayName: "Projection worker",
+        eventSourceId: "src_projection_persistence_test",
+        participantId: "part_projection",
+        runtimeKind: "worker",
+        sessionId: "sess_projection_persistence",
+      });
+      expect(result.registration.participant.rejectedContracts).toEqual([
+        {
+          index: 0,
+          taskKind: "synthetic.invalid",
+          issues: expect.arrayContaining([
+            { path: ["participantRuntimeKind"], code: "invalid_type" },
+          ]),
+        },
+      ]);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(warn.mock.calls)).not.toContain("SYNTHETIC_PRIVATE_PAYLOAD");
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("commits task lifecycle and approval projections atomically", async () => {
@@ -428,6 +459,7 @@ class NewSessionTransactionClient implements SessionProjectionTransaction {
 }
 
 class ParticipantEventTransactionClient implements SessionProjectionTransaction {
+  constructor(private readonly capabilities: Record<string, unknown> = { role: "worker" }) {}
   readonly database = {
     pool: { connect: async () => this },
   } as unknown as DatabasePool;
@@ -445,7 +477,11 @@ class ParticipantEventTransactionClient implements SessionProjectionTransaction 
       return { rows: [] };
     }
     if (sql.includes("INSERT INTO participants") || sql.includes("UPDATE participants")) {
-      return { rows: [participantDatabaseRow()] as unknown as TRow[] };
+      return {
+        rows: [
+          { ...participantDatabaseRow(), capabilities: this.capabilities },
+        ] as unknown as TRow[],
+      };
     }
     if (sql.includes("UPDATE session_event_sequences")) {
       return { rows: [{ seq: "1" }] as unknown as TRow[] };

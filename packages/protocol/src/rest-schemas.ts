@@ -9,6 +9,7 @@ import { sessionEventSchema } from "./event-builders.js";
 import { controlChannelSchema, participantRuntimeKindSchema } from "./records.js";
 import {
   recurringWorkScopeKeySchema,
+  rejectedTaskContractSchema,
   taskAssigneeParticipantIdSchema,
   taskParentTaskIdSchema,
   taskScopeLabelSchema,
@@ -128,6 +129,7 @@ export const restControlAcquisitionResponseSchema = z.object({
   controlEpoch: controlEpochSchema,
   leaseExpiresAt: z.string().datetime({ offset: true }),
   participant: z.record(z.string(), z.unknown()),
+  rejectedContracts: z.array(rejectedTaskContractSchema).default([]),
   registrationStatus: z.union([z.literal("joined"), z.literal("refreshed"), z.literal("updated")]),
   renewAfterMs: z.number().int().positive(),
 });
@@ -147,6 +149,7 @@ export const restControlRenewalResponseSchema = z.object({
   controlEpoch: controlEpochSchema,
   leaseExpiresAt: z.string().datetime({ offset: true }),
   participant: z.record(z.string(), z.unknown()),
+  rejectedContracts: z.array(rejectedTaskContractSchema).default([]),
   renewAfterMs: z.number().int().positive(),
 });
 

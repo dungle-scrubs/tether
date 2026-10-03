@@ -1,6 +1,7 @@
 import { taskContractSummarySchema } from "@dungle-scrubs/tether-protocol";
 import type { SessionSummaryRecord } from "@dungle-scrubs/tether-protocol";
 
+import { projectParticipantContractDiagnostics } from "./participant-contract-diagnostics.js";
 import type { SessionContextBudgetClass } from "./session-context-maintenance-policy.js";
 import type {
   ParticipantRecord,
@@ -58,6 +59,7 @@ export function buildParticipantTaskContracts(
 ): ParticipantTaskContractRecord[] {
   return participants
     .flatMap((participant) => {
+      projectParticipantContractDiagnostics(participant);
       const contracts = participant.capabilities.contracts;
       if (!Array.isArray(contracts)) {
         return [];
