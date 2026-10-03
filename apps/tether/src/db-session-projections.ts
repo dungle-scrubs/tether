@@ -247,24 +247,20 @@ export async function repairIncompleteSessionProjections(
   assertPositiveBatchSize(input.batchSize);
   const logger = new ConsoleStructuredLogger();
   const traceId = randomUUID();
-  const currentRows = await pool.query<{ readonly count: string }>(
-    `SELECT count(*) AS count FROM sessions AS session
-     JOIN session_projections AS projection ON projection.session_id = session.session_id
-     WHERE projection.reducer_version = $1`,
-    [SESSION_PROJECTION_REDUCER_VERSION],
-  );
-  const candidates = await pool.query<{
+  const inventory = await pool.query<{
     readonly sessionId: string;
-    readonly reducerVersion: number | null;
+    readonly incomplete: boolean;
   }>(
-    `SELECT session.session_id AS "sessionId", projection.reducer_version AS "reducerVersion"
+    `SELECT session.session_id AS "sessionId",
+       (projection.session_id IS NULL OR projection.reducer_version <> $1
+        OR projection.covers_seq_to <> COALESCE(sequence.next_seq - 1, 0)) AS incomplete
      FROM sessions AS session
      LEFT JOIN session_projections AS projection ON projection.session_id = session.session_id
-     WHERE projection.session_id IS NULL OR projection.reducer_version <> $1
+     LEFT JOIN session_event_sequences AS sequence ON sequence.session_id = session.session_id
      ORDER BY session.session_id`,
     [SESSION_PROJECTION_REDUCER_VERSION],
   );
-  const counts = { repaired: 0, current: Number(currentRows.rows[0]?.count ?? 0), stale: 0 };
+  const counts = { repaired: 0, current: 0, stale: 0 };
   let failed = 0;
   const log = (level: "info" | "warn", message: string): void => {
     logger.log({
@@ -277,10 +273,14 @@ export async function repairIncompleteSessionProjections(
       traceId,
     });
   };
-  for (const { sessionId, reducerVersion } of candidates.rows) {
+  for (const { sessionId, incomplete } of inventory.rows) {
+    if (!incomplete) {
+      counts.current += 1;
+      continue;
+    }
     try {
-      // A version upgrade must fold past the old coverage before its CAS can install it.
-      const backfillInput = { ...input, sessionId, rebuildFromStart: reducerVersion !== null };
+      // Publish only the complete fold, never a prefix that deletion could trust.
+      const backfillInput = { ...input, sessionId, rebuildFromStart: true };
       let result = await backfillSessionProjection(pool, backfillInput);
       if (result.outcome === "stale") {
         result = await backfillSessionProjection(pool, backfillInput);
@@ -292,9 +292,13 @@ export async function repairIncompleteSessionProjections(
       } else {
         counts.stale += 1;
       }
-    } catch {
+    } catch (error) {
       failed += 1;
-      log("warn", "session_projection.repair_failed");
+      const code =
+        typeof error === "object" && error !== null && "code" in error && error.code === "23503"
+          ? "fk_violation"
+          : "query_failed";
+      log("warn", `session_projection.repair_failed.${code}`);
     }
   }
   log("info", "session_projection.repair_completed");

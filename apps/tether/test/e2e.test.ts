@@ -4370,6 +4370,229 @@ e2e("tether e2e", () => {
       expect(after.rows).toEqual(before.rows);
     });
 
+    async function appendLegacyHistory(database: DatabasePool): Promise<void> {
+      for (const [index, archived] of [true, false].entries()) {
+        await appendEvent(
+          database,
+          {
+            eventId: `evt_atomic_repair_${index}`,
+            payload: { archived },
+            producerId: "projection-repair-fixture",
+            sessionId: "sess_legacy_projection",
+            type: "session.archived",
+          },
+          { sourceId: "src_projection_repair_fixture" },
+        );
+      }
+      await appendEvent(
+        database,
+        {
+          eventId: "evt_atomic_repair_title",
+          payload: { title: "Final fold" },
+          producerId: "projection-repair-fixture",
+          sessionId: "sess_legacy_projection",
+          type: "session.title",
+        },
+        { sourceId: "src_projection_repair_fixture" },
+      );
+    }
+
+    it("never publishes a partial fold when the second batch fails", async () => {
+      const { database } = await legacyDatabase();
+      await appendLegacyHistory(database);
+      await removeProjection(database);
+      let reads = 0;
+      const client: SessionProjectionTransaction = {
+        async query<TRow extends pg.QueryResultRow = pg.QueryResultRow>(
+          sql: string,
+          values?: readonly unknown[],
+        ) {
+          if (sql.includes("FROM session_events") && ++reads === 2) {
+            throw new Error("synthetic second-batch failure");
+          }
+          return database.pool.query<TRow>(sql, values ? [...values] : undefined);
+        },
+      };
+      expect(await repairIncompleteSessionProjections(client, { batchSize: 1 })).toEqual({
+        repaired: 0,
+        current: 0,
+        stale: 0,
+      });
+      expect((await database.pool.query(`SELECT * FROM session_projections`)).rows).toEqual([]);
+      await expect(listSessions(database)).rejects.toBeInstanceOf(SessionProjectionCutoverError);
+      expect(await repairIncompleteSessionProjections(database.pool, { batchSize: 1 })).toEqual({
+        repaired: 1,
+        current: 0,
+        stale: 0,
+      });
+      expect((await listSessions(database))[0]).toMatchObject({
+        archived: false,
+        eventCount: 3,
+        title: "Final fold",
+      });
+      expect(await deleteSession(database, "sess_legacy_projection")).toMatchObject({
+        reason: "not-archived",
+      });
+    });
+
+    it("repairs current-version partial coverage left by an interrupted backfill", async () => {
+      const { database } = await legacyDatabase();
+      await appendLegacyHistory(database);
+      await removeProjection(database);
+      let reads = 0;
+      const client: SessionProjectionTransaction = {
+        async query<TRow extends pg.QueryResultRow = pg.QueryResultRow>(
+          sql: string,
+          values?: readonly unknown[],
+        ) {
+          if (sql.includes("FROM session_events") && ++reads === 2) {
+            throw new Error("synthetic interrupted resumable backfill");
+          }
+          return database.pool.query<TRow>(sql, values ? [...values] : undefined);
+        },
+      };
+      await expect(
+        backfillSessionProjection(client, { sessionId: "sess_legacy_projection", batchSize: 1 }),
+      ).rejects.toThrow("synthetic interrupted");
+      expect(
+        (await database.pool.query(`SELECT covers_seq_to FROM session_projections`)).rows,
+      ).toEqual([{ covers_seq_to: "1" }]);
+      expect(await repairIncompleteSessionProjections(database.pool, { batchSize: 1 })).toEqual({
+        repaired: 1,
+        current: 0,
+        stale: 0,
+      });
+      expect(
+        await verifySessionProjection(database.pool, {
+          sessionId: "sess_legacy_projection",
+          batchSize: 1,
+        }),
+      ).toMatchObject({ status: "current", freshEventCount: 3 });
+      expect((await listSessions(database))[0]).toMatchObject({
+        archived: false,
+        title: "Final fold",
+      });
+      expect(await deleteSession(database, "sess_legacy_projection")).toMatchObject({
+        reason: "not-archived",
+      });
+    });
+
+    it("counts every selected session when live repair races the inventory scan", async () => {
+      const { database } = await legacyDatabase();
+      await removeProjection(database);
+      let scans = 0;
+      const client: SessionProjectionTransaction = {
+        async query<TRow extends pg.QueryResultRow = pg.QueryResultRow>(
+          sql: string,
+          values?: readonly unknown[],
+        ) {
+          const result = await database.pool.query<TRow>(sql, values ? [...values] : undefined);
+          if (sql.includes("FROM sessions AS session")) {
+            scans += 1;
+            if (scans === 1) {
+              await appendLegacyHistory(database);
+            }
+          }
+          return result;
+        },
+      };
+      const counts = await repairIncompleteSessionProjections(client, { batchSize: 1 });
+      expect(counts.repaired + counts.current + counts.stale).toBe(1);
+      expect(scans).toBe(1);
+      expect(
+        await verifySessionProjection(database.pool, {
+          sessionId: "sess_legacy_projection",
+          batchSize: 1,
+        }),
+      ).toMatchObject({ status: "current" });
+    });
+
+    it("logs a fixed FK failure code if a selected session is deleted", async () => {
+      const { database } = await legacyDatabase();
+      await createDbSession(database, "sess_next_projection");
+      await database.pool.query(`DELETE FROM session_projections`);
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      onTestFinished(() => warning.mockRestore());
+      let deleted = false;
+      const client: SessionProjectionTransaction = {
+        async query<TRow extends pg.QueryResultRow = pg.QueryResultRow>(
+          sql: string,
+          values?: readonly unknown[],
+        ) {
+          if (!deleted && sql.includes("INSERT INTO session_projections")) {
+            deleted = true;
+            await database.pool.query(
+              `DELETE FROM sessions WHERE session_id = 'sess_legacy_projection'`,
+            );
+          }
+          return database.pool.query<TRow>(sql, values ? [...values] : undefined);
+        },
+      };
+      expect(await repairIncompleteSessionProjections(client, { batchSize: 1 })).toEqual({
+        repaired: 1,
+        current: 0,
+        stale: 0,
+      });
+      expect(JSON.parse(String(warning.mock.calls[0]?.[0]))).toMatchObject({
+        message: "session_projection.repair_failed.fk_violation",
+        data: { failed: 1 },
+      });
+      expect(JSON.stringify(warning.mock.calls)).not.toContain("sess_legacy_projection");
+      expect((await listSessions(database))[0]?.sessionId).toBe("sess_next_projection");
+    });
+
+    it("boots despite an inventory scan failure and leaves live repair available", async () => {
+      const { database, url } = await legacyDatabase();
+      await removeProjection(database);
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const original = pg.Pool.prototype.query;
+      let failures = 0;
+      const query = vi.spyOn(pg.Pool.prototype, "query").mockImplementation(function (
+        this: pg.Pool,
+        ...args: unknown[]
+      ) {
+        if (typeof args[0] === "string" && args[0].includes("FROM sessions AS session")) {
+          failures += 1;
+          return Promise.reject(new Error("synthetic scan failure must not be logged"));
+        }
+        return Reflect.apply(original, this, args);
+      } as typeof original);
+      onTestFinished(() => {
+        query.mockRestore();
+        warning.mockRestore();
+      });
+      const runtime = ManagedRuntime.make(
+        DatabaseLive.pipe(
+          Layer.provide(
+            Layer.succeed(
+              ServerConfigService,
+              readConfig({ DATABASE_URL: url, AUTH_MODE: "disabled", RUNTIME_TOPOLOGY: "single" }),
+            ),
+          ),
+        ),
+      );
+      onTestFinished(() => runtime.dispose());
+      const booted = await runtime.runPromise(DatabaseService);
+      query.mockRestore();
+      expect(failures).toBe(1);
+      expect(JSON.parse(String(warning.mock.calls[0]?.[0]))).toMatchObject({
+        message: "session_projection.repair_scan_failed.query_failed",
+        data: { failed: 1 },
+      });
+      expect(JSON.stringify(warning.mock.calls)).not.toContain("synthetic scan failure");
+      await appendLegacyHistory(booted);
+      const bootUrl = await listen(booted);
+      const inventory = await requestStatusFrom<SessionListResponse>(bootUrl, "/sessions");
+      expect(inventory.status).toBe(200);
+      expect(inventory.body.sessions).toEqual([
+        expect.objectContaining({
+          sessionId: "sess_legacy_projection",
+          eventCount: 3,
+          title: "Final fold",
+        }),
+      ]);
+    });
+
     it("rebuilds a different reducer version from historic events", async () => {
       const { database } = await legacyDatabase();
       await appendEvent(
@@ -4487,7 +4710,7 @@ e2e("tether e2e", () => {
       expect(warning).toHaveBeenCalledOnce();
       const failure = JSON.parse(String(warning.mock.calls[0]?.[0]));
       expect(failure).toMatchObject({
-        message: "session_projection.repair_failed",
+        message: "session_projection.repair_failed.query_failed",
         data: { repaired: 0, current: 0, stale: 0, failed: 1 },
       });
       expect(JSON.parse(String(info.mock.calls[0]?.[0]))).toMatchObject({

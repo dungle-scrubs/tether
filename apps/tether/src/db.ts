@@ -60,6 +60,7 @@ import {
   parsePositiveSafeInteger,
   targetManifestSchema,
 } from "./protocol.js";
+import { ConsoleStructuredLogger } from "./observability.js";
 import * as schema from "./schema.js";
 import {
   clientSessionBindings,
@@ -266,6 +267,20 @@ export const DatabaseLive = Layer.scoped(
     yield* Effect.tryPromise(() => migrate(database));
     yield* Effect.tryPromise(() =>
       repairIncompleteSessionProjections(database.pool, { batchSize: 500 }),
+    ).pipe(
+      Effect.catchAll(() =>
+        Effect.sync(() => {
+          new ConsoleStructuredLogger().log({
+            at: new Date().toISOString(),
+            data: { failed: 1 },
+            level: "warn",
+            message: "session_projection.repair_scan_failed.query_failed",
+            moduleName: "session-projection",
+            operation: "repairIncompleteSessionProjections",
+            traceId: randomUUID(),
+          });
+        }),
+      ),
     );
     return database;
   }),
