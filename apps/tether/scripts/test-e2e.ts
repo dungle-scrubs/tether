@@ -7,6 +7,7 @@ import { stringify as stringifyYaml } from "yaml";
 
 import {
   type ChildProcess,
+  parseE2ETestFileArguments,
   type ResourceLabels,
   runE2E,
   type SpawnOptions,
@@ -59,10 +60,8 @@ function spawn(command: string, args: readonly string[], options: SpawnOptions):
   };
 }
 
-const overrideDir = mkdtempSync(join(tmpdir(), "tether-e2e-"));
-
 /** Writes a compose override that stamps E2E labels onto containers and volumes. */
-function writeComposeOverride(labels: ResourceLabels): string {
+function writeComposeOverride(labels: ResourceLabels, overrideDir: string): string {
   const overridePath = join(overrideDir, "labels.compose.yml");
   const document = {
     services: {
@@ -89,20 +88,34 @@ function registerSignalHandler(handler: (signal: TerminationSignal) => void): vo
   });
 }
 
-const exitCode = await runE2E({
-  spawn,
-  env: currentEnv(),
-  registerSignalHandler,
-  writeComposeOverride,
-  removeComposeOverride,
-  log: (message) => {
-    process.stderr.write(`${message}\n`);
-  },
-  now: () => Date.now(),
-  runId: randomUUID(),
-  composeFile: "../../docker-compose.yml",
-  databasePassword: "e2e-local-postgres-password",
-});
+/** Rejects invalid selection before provisioning and preserves natural output flushing. */
+async function main(): Promise<void> {
+  const selection = parseE2ETestFileArguments(process.argv.slice(2));
+  if (!selection.ok) {
+    process.stderr.write(`${selection.reason}\n`);
+    process.exitCode = 2;
+    return;
+  }
+  const overrideDir = mkdtempSync(join(tmpdir(), "tether-e2e-"));
+  try {
+    process.exitCode = await runE2E({
+      composeFile: "../../docker-compose.yml",
+      databasePassword: "e2e-local-postgres-password",
+      env: currentEnv(),
+      log: (message) => {
+        process.stderr.write(`${message}\n`);
+      },
+      now: () => Date.now(),
+      registerSignalHandler,
+      removeComposeOverride,
+      runId: randomUUID(),
+      spawn,
+      testFiles: selection.testFiles,
+      writeComposeOverride: (labels) => writeComposeOverride(labels, overrideDir),
+    });
+  } finally {
+    rmSync(overrideDir, { force: true, recursive: true });
+  }
+}
 
-rmSync(overrideDir, { force: true, recursive: true });
-process.exit(exitCode);
+await main();
