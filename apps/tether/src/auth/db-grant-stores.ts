@@ -15,6 +15,7 @@ import type {
   AuthGrantMetadata,
   AuthGrantRecord,
   AuthGrantRevocationStore,
+  AuthGrantSessionInventoryInput,
   AuthGrantStore,
   AuthPersistenceStores,
   AuthTicketAdmissionMetadata,
@@ -31,7 +32,12 @@ import type {
   TaskGrantRecord,
 } from "./grant-stores.js";
 import { AuthPersistenceError, type AuthPersistenceErrorCode } from "./grant-stores.js";
-import { authGrantAuditReasonCodes, authGrantSources, taskGrantActions } from "./grant-stores.js";
+import {
+  authGrantAuditReasonCodes,
+  authGrantSources,
+  serviceWideAuthGrantScope,
+  taskGrantActions,
+} from "./grant-stores.js";
 import { maximumAuthTicketAdmissionLifetimeMilliseconds } from "./grant-stores.js";
 import { type AuthAudience, maximumAuthGrantLifetimeSeconds } from "./grant-token.js";
 import type { AuthRole } from "./token.js";
@@ -372,7 +378,63 @@ function createGrantStore(database: DatabasePool): AuthGrantRevocationStore & Au
       );
       return rows.map(parseGrantRecord);
     },
+    listForSessionInventory: async (input) => listGrantsForSessionInventory(database, input),
   };
+}
+
+/**
+ * Runs one parameterized uncapped inventory read for a session scope plus
+ * service-wide `*` rows, deterministically ordered. Deliberately keeps the
+ * existing indexes: auth_grants is a small operator-owned table, a sequential
+ * scan is acceptable for a host-local inventory, and no new migration or index
+ * is introduced for this read.
+ */
+async function listGrantsForSessionInventory(
+  database: DatabasePool,
+  input: AuthGrantSessionInventoryInput,
+): Promise<readonly AuthGrantRecord[]> {
+  validateAuthGrantInventoryInput(input);
+  const result = await runAuthStoreOperation(
+    () =>
+      database.pool.query<typeof authGrants.$inferSelect>({
+        text: `
+          SELECT
+            audience,
+            expires_at AS "expiresAt",
+            issued_at AS "issuedAt",
+            issuer,
+            jti,
+            kid,
+            metadata,
+            revoked_at AS "revokedAt",
+            role,
+            session_scope AS "sessionScope",
+            subject
+          FROM auth_grants
+          WHERE session_scope = ANY($1::text[])
+            AND ($2::text IS NULL OR subject = $2::text)
+          ORDER BY issued_at DESC, jti DESC
+        `,
+        values: [[input.sessionScope, serviceWideAuthGrantScope], input.subject],
+      }),
+    "auth_grant_list_failed",
+  );
+  return result.rows.map(parseGrantRecord);
+}
+
+/** Validates one session inventory read before any query can serialize it. */
+export function validateAuthGrantInventoryInput(input: AuthGrantSessionInventoryInput): void {
+  if (
+    typeof input.sessionScope !== "string" ||
+    input.sessionScope.length === 0 ||
+    input.sessionScope.length > 255 ||
+    (input.subject !== null &&
+      (typeof input.subject !== "string" ||
+        input.subject.length === 0 ||
+        input.subject.length > 255))
+  ) {
+    throw new AuthPersistenceError("auth_grant_scope_invalid");
+  }
 }
 
 /** Runs one cancellation-aware grant batch read on a disposable pool client. */

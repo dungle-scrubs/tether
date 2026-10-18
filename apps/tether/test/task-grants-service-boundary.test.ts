@@ -871,6 +871,7 @@ describe("service boundary: only service-scoped admins mint task grants", () => 
         findByJti: async () => null,
         findManyByJti: async () => [],
         list: async () => [],
+        listForSessionInventory: async () => [],
       },
       revokeGrantWithAudit: vi.fn(async () => ({ grant: null, status: "not_found" }) as const),
       revokeTaskGrantWithAudit: vi.fn(async () => ({ grant: null, status: "not_found" }) as const),

@@ -46,6 +46,8 @@ export interface CreateAuthGrantInput {
   readonly sessionScope: string;
   /** Bounded origin recorded with the grant. */
   readonly source: AuthGrantSource;
+  /** Optional awaited public-identity checkpoint before persistence starts. */
+  readonly onPrepared?: (grant: PublicAuthGrant) => Promise<void>;
   /** Durable identity receiving the grant. */
   readonly subject: string;
   /** Optional lifetime in seconds, bounded to seven days. */
@@ -132,6 +134,7 @@ export function createAuthGrantLifecycle(options: AuthGrantLifecycleOptions): Au
         sessionScope: claims.sessionScope,
         subject: claims.sub,
       };
+      await input.onPrepared?.(toPublicAuthGrant(grant));
       await options.stores.createGrantWithAudit({
         audit: {
           action: "grant.created",
