@@ -1,5 +1,29 @@
 # @dungle-scrubs/tether-protocol
 
+## 0.4.0
+
+### Minor Changes
+
+- 8e090b8: Deduplicate the browser operator session wire shape and share transport helpers.
+
+  - `browserOperatorSessionSchema` no longer carries a top-level `sessionIds`
+    copy of `scope.sessionIds`; the `/operator/browser-session` response emits
+    the list once, under `scope`.
+  - `BrowserOperatorClient` throws the new `BrowserOperatorConfigurationError`
+    for local precondition failures (missing CSRF token, invalid service URL)
+    instead of a fake `BrowserOperatorHttpError` with status 0.
+  - Browser session stream pause reasons stay in the protocol-owned recovery
+    taxonomy, falling back to `server_stream_error` for unknown server reasons.
+  - New shared protocol exports: `buildSessionStreamUrl`,
+    `serialDeliveryFailureReason`, `utf8ByteLength`, `exactHttpOriginSchema`,
+    `participantRecordSchema`, `defaultReconnectDelayPolicy`,
+    `boundedReconnectDelayMs`; client and browser packages delegate to them.
+  - `taskResultSchema` output is now a loose object with a typed optional
+    `targetManifest` instead of `Record<string, unknown>`.
+
+- 1163dae: Expose bounded, payload-free rejected task contract diagnostics and truncation counts in participant read records and REST control responses, and retain them in the REST control client context. Preserve absent diagnostics from older servers and keep derived diagnostics out of durable participant events.
+- ff9906f: Add fine-grained task authorization: separate task.create and task.claim actions with kind allowlists and optional explicit assignee, parent linkage as lineage only, typed claim denials distinct from race rejection. Default off with no policy rows; strict when rows exist.
+
 ## 0.3.0
 
 ### Minor Changes
