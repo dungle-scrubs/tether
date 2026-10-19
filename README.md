@@ -1,128 +1,172 @@
 # Tether
 
-Tether is a public coordination service for durable sessions, event streams,
-participants, tasks, approvals, and external client bindings.
+Agents and applications stay informed without manual updates.
 
-## Why use Tether
-
-Tether holds no intelligence of its own, and it requires none from its
-participants. A participant can be a language model, a plain deterministic
-script, or any mix of the two - Tether only coordinates them.
-
-Participants are muscles. Tether is the substrate they share:
-
-- **One durable, replayable event stream.** Every agent action and decision
-  lands in one append-only log, decoupled from where it happened, so a
-  cross-cutting agent can observe the whole without being coupled to any host.
-- **A read-only passive-observer mode.** An analytical agent watches the full
-  stream while holding no control lease, so it can never interfere with the
-  workers it observes.
-- **Durable tasks** with atomic claim, lease, and supersession, plus a
-  deterministic scheduler - autonomy that survives restarts, never double-acts,
-  and de-dupes. Any agent can hand work to another as a task.
-- **One human channel with a real approval protocol**, built once and reused by
-  every agent.
-
-The leverage is a shared nervous system, a single human interface, reliable
-autonomy, and composability where one agent's output is another's input.
-
-## Examples
-
-- **Memory agent.** A passive observer builds a cross-project knowledge graph
-  and writes memories back as durable events, nudging when you enter a context
-  rather than on a clock.
-- **Skill miner.** Detect repeated manual sequences across sessions, gate an
-  automation behind approval, and generate a reusable skill.
-- **Daily briefing agent.** A scheduled digest of what got done, what is
-  blocked, and what is awaiting you.
-- **Cost and routing agent.** Watch token spend, latency, and outcomes per
-  agent, then tune model routing.
-- **Watchdog agent.** Turn stuck-task, stale-lease, and expired-canary state
-  into proactive alerts.
-- **Universal front door.** A single entry point: free text in, dispatched as a
-  scoped task to the right agent.
-
-## Roadmap
-
-- Ship model-backed example participants and clients as working references,
-  including **Claude Code**, **Codex**, and **Pi**.
-- Ship small deterministic examples that need no model at all:
-  - a **heartbeat** participant that emits an event on a timer,
-  - a **webhook receiver** that turns inbound requests into tasks,
-  - a **file watcher** that opens a task when a path changes,
-  - an **approval relay** that forwards pending approvals to a chat and writes
-    the response back.
-- Publish usage instructions for the packages: a quickstart and integration
-  guide for `@dungle-scrubs/tether-client`, `@dungle-scrubs/tether-client-bridge`,
-  and `@dungle-scrubs/tether-protocol`, covering connecting a participant,
-  claiming tasks, streaming session events, and binding external clients.
-
-## Workspace
-
-- `apps/tether`: HTTP and WebSocket service, database schema, migrations, and
-  service tests.
-- [REST Control Epoch migration](apps/tether/docs/rest-control-migration.md):
-  deployment order, direct lifecycle examples, bridge upgrade, rollback
-  constraints, and compatibility diagnostics.
-- [Multi-replica runtime contract](apps/tether/docs/multi-replica-runtime.md):
-  durable guarantees, Replica Scope limits, readiness, and the support matrix.
-- `packages/protocol`: shared protocol records, validators, and event builders.
-- `packages/client`: participant runtime client for REST and WebSocket
-  integration.
-- `packages/client-bridge`: helpers for binding external client conversations
-  to Tether sessions and task APIs.
-
-## Local Setup
-
-Install dependencies:
+Share a durable conversation across coding agents, scripts, and applications instead of relaying updates through one interactive session. Each participant follows the same event stream and catches up on what it missed after a disconnect or restart. Your participants run independently. Tether keeps their shared conversation, tasks, and approvals in PostgreSQL.
 
 ```sh
-pnpm install
+export TETHER_URL=http://127.0.0.1:3025
+curl -fsS "$TETHER_URL/sessions" -H 'content-type: application/json' \
+  -d '{"sessionId":"demo"}' >/dev/null
+ACQUISITION_ID="readme-watcher-$(date +%s)-$$"
+CONTROL_EPOCH=$(curl -fsS "$TETHER_URL/sessions/demo/participants" \
+  -H 'content-type: application/json' \
+  -d "{\"acquisitionId\":\"$ACQUISITION_ID\",\"instanceId\":\"watcher-1\",\"participantId\":\"watcher\",\"runtimeKind\":\"generic_agent\"}" | jq -r '.controlEpoch')
+curl -fsS "$TETHER_URL/sessions/demo/events" -H 'content-type: application/json' \
+  -d "{\"producerId\":\"watcher\",\"instanceId\":\"watcher-1\",\"controlEpoch\":$CONTROL_EPOCH,\"type\":\"file.changed\",\"payload\":{\"path\":\"README.md\"}}" >/dev/null
+for consumer in agent dashboard; do
+  printf '%s: ' "$consumer"
+  curl -fsS "$TETHER_URL/sessions/demo/events?after=0" \
+    | jq -c '[.events[] | select(.type == "file.changed")][-1].payload'
+done
+# agent: {"path":"README.md"}
+# dashboard: {"path":"README.md"}
 ```
 
-Copy the public environment template and set local secrets:
+## Install
+
+Run the example against the local demo below. You need Git, Docker with Compose, `curl`, and `jq`. The container uses Node.js 22 and PostgreSQL 17.
+
+This demo disables authentication. Keep both published ports on `127.0.0.1`, and use it only for local experiments. For an authenticated service, see [authentication and deployment](docs/reference.md#authentication-and-deployment).
 
 ```sh
+git clone https://github.com/dungle-scrubs/tether.git
+cd tether
 cp .env.example .env
 ```
 
-Start Postgres and the app with Docker Compose:
+Edit `.env` before starting:
+
+- Set `AUTH_MODE=disabled` for this local demo.
+- Set `POSTGRES_PASSWORD` to a local password.
+- Set `DATABASE_URL` to `postgres://tether:<password>@postgres:5432/tether`, using that password, URL-encoded. The hostname `postgres` is inside the Compose network.
+
+Leave `APP_HOST_BIND` and `POSTGRES_HOST_BIND` at their loopback defaults, and `RUNTIME_TOPOLOGY=single`.
 
 ```sh
 docker compose up -d --build
+curl -fsS http://127.0.0.1:3025/ready | jq '.ready'
+# true
 ```
 
-Run the service without Docker:
+The service and its dashboard are at `http://127.0.0.1:3025/ui`. PostgreSQL is published on `127.0.0.1:54329`. You can now run the top example.
+
+## Usage
+
+The shell examples use the local demo with authentication disabled and `TETHER_URL` from the top example. Authenticated requests also need an `Authorization: Bearer ...` header.
+
+### Create a shared conversation
 
 ```sh
-pnpm dev
+curl -fsS "$TETHER_URL/sessions" -H 'content-type: application/json' \
+  -d '{"sessionId":"demo"}' | jq -r '.session.sessionId'
+# demo
 ```
 
-The service listens on `127.0.0.1:3025` by default. The operator UI script uses
-the registered local UI port:
+Creating the same session again returns the existing conversation. Give unrelated conversations different session IDs.
+
+### Catch up after a disconnect
 
 ```sh
-pnpm ui
+AFTER=0
+while :; do
+  PAGE=$(curl -fsS "$TETHER_URL/sessions/demo/events?after=$AFTER")
+  printf '%s\n' "$PAGE" | jq -c '.events[] | {seq, type, payload}'
+  AFTER=$(printf '%s\n' "$PAGE" | jq -r '.pagination.nextAfterSeq')
+  [ "$(printf '%s\n' "$PAGE" | jq -r '.pagination.hasMore')" = false ] && break
+done
 ```
 
-## Authentication
+Persist the last sequence you have processed, and use it instead of `0` on the next run. Follow `pagination.nextAfterSeq` until `hasMore` is false, because event pages have count and byte limits.
 
-Set `AUTH_MODE=required` for local and deployed services. Mint a scoped token
-for an operator or integration:
+### Read history with an observer
+
+After [building the SDKs](#contributing), run this from the repository root:
 
 ```sh
-pnpm --filter tether mint --participant part_cli --session '*' --role admin
+pnpm --filter tether exec node --input-type=module -e '
+const { SessionEventStreamClient } = await import("@dungle-scrubs/tether-client");
+const stream = await SessionEventStreamClient.connect({
+  serviceUrl: process.env.TETHER_URL,
+  sessionId: "demo",
+  afterSeq: 0,
+});
+try {
+  stream.onEvent(event => {
+    if (event.type === "file.changed") console.log(event.payload.path);
+  });
+  await stream.waitForReplayComplete();
+} finally {
+  stream.close();
+  await stream.waitForClose();
+}
+'
+# README.md
 ```
 
-Use `SERVICE_AUTH_TOKEN` for trusted local scripts. Browser or third-party
-clients should receive scoped `observer` or `participant` tokens for the
-session they need.
+This observer reads history and exits. To keep following live events, keep the connection open instead of closing it after replay. Passive observers hold no participant control lease.
 
-## Validation
+Participants that claim tasks use `runParticipantRuntime`. The [client guide](packages/client/README.md) covers task execution, cancellation, reconnects, and durable cursors.
 
-Run the public checks before opening a change:
+### Concepts
+
+A session is a durable conversation, with events ordered by a per-session sequence number. Readers can process the same events independently.
+
+Publishing participants hold finite control leases. Keep an acquisition ID stable across retries of one registration, and use a new ID for the next acquisition. Use the returned `controlEpoch`, renew according to `renewAfterMs`, and release control on shutdown. Do not reuse an expired acquisition or replay an uncertain mutation blindly. The [REST control guide](apps/tether/docs/rest-control-migration.md) covers acquisition, heartbeat, and release.
+
+Delivery is at least once, not exactly once. Make external side effects idempotent using a stable key such as an event ID or task ID.
+
+## Reference
+
+### API and packages
+
+The main HTTP operations are:
+
+```text
+POST /sessions                         create or return a conversation
+GET  /sessions/{id}/events?after={seq}   read event history
+POST /sessions/{id}/participants        acquire participant control
+POST /sessions/{id}/events              publish with the current control epoch
+GET  /sessions/{id}/stream              WebSocket replay and live events
+POST /sessions/{id}/tasks               create work for another participant
+```
+
+| Package | Use |
+| --- | --- |
+| `@dungle-scrubs/tether-protocol` | Shared records, validators, and event builders |
+| `@dungle-scrubs/tether-client` | Participant runtimes and passive observers |
+| `@dungle-scrubs/tether-client-bridge` | External conversation bindings and task clients |
+| `@dungle-scrubs/tether-browser` | Browser-safe operator client |
+
+The SDKs publish to GitHub Packages, which requires authentication even for public packages. See the [full reference](docs/reference.md) for registry setup, route details, configuration defaults, CLI commands, and releases.
+
+### Configuration and security
+
+Native processes read their environment. Compose forwards the settings declared in `docker-compose.yml`; adding an arbitrary key to `.env` does not automatically forward it.
+
+```text
+AUTH_MODE=required
+AUTH_ISSUER=your-service-issuer
+AUTH_SIGNING_SECRET=<secret supplied by your secret manager>
+DATABASE_URL=<PostgreSQL connection string>
+RUNTIME_TOPOLOGY=single
+```
+
+`AUTH_MODE` defaults to `required`. `RUNTIME_TOPOLOGY` is mandatory natively, accepts `single` or `multi`, and defaults to `single` in Compose. The native port defaults to 3025, but the native server binds all interfaces. Compose publishes to loopback by default.
+
+Authenticated callers use scoped grants. The legacy `mint` CLI produces tokens rejected by default. Keep bearer grants and signing keys out of logs and browser code. Follow [SECURITY.md](SECURITY.md) for vulnerability reports.
+
+The administrative CLIs exit with `0` on success and `1` on failure. For HTTP errors and the gated grant-issuance flow, see the [full reference](docs/reference.md).
+
+Multiple replicas share PostgreSQL for durable state, but Host Presence remains replica-local. See the [multi-replica runtime contract](apps/tether/docs/multi-replica-runtime.md) before deploying more than one replica.
+
+## Contributing
+
+Use Node.js 22 and the pinned package manager, `pnpm@11.1.3`:
 
 ```sh
+corepack enable
+pnpm install
 pnpm run build
 pnpm lint
 pnpm typecheck
@@ -130,97 +174,16 @@ pnpm test
 pnpm test:e2e
 ```
 
-Validate compose changes with disposable required values:
+The end-to-end suite starts its own Docker Compose project. For native development, build the workspace first, export the required environment settings, and run `pnpm dev`. Use `127.0.0.1:54329` in the database URL when connecting to Compose's PostgreSQL from the host. The native server binds all interfaces, so retain authentication and restrict network access. `pnpm ui` runs the same service on port 17421.
 
-```sh
-POSTGRES_PASSWORD=compose-test DATABASE_URL=postgres://tether:compose-test@postgres:5432/tether docker compose config
-```
+This repository owns the service and provider-neutral SDKs. Provider-specific adapters, private workflows, and machine runbooks belong outside this tree. See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions and [release details](docs/reference.md#releases) for Changesets. Do not edit generated package changelogs.
 
-## Public Boundary
+## Status
 
-This repository owns the service boundary and provider-neutral SDKs. Adapter
-runtime code, private provider workflows, local machine runbooks, and
-provider-specific command catalogs belong outside this public tree. Public
-bridges should integrate through the published SDKs instead of duplicating
-WebSocket replay, task claiming, session binding, or protocol record shapes:
+Tether supplies coordination, not intelligence or a runtime that executes your participants.
 
-```sh
-pnpm add @dungle-scrubs/tether-client @dungle-scrubs/tether-client-bridge @dungle-scrubs/tether-protocol
-```
+Planned examples include Claude Code, Codex, and Pi integrations, plus deterministic heartbeat, webhook, file-watcher, and approval-relay participants. Memory agents, briefing digests, cost watchers, and watchdogs are possible consumers, not bundled applications. Package integration guides remain incomplete.
 
-- `@dungle-scrubs/tether-protocol`: shared protocol records and validators.
-- `@dungle-scrubs/tether-client`: participant runtime client for REST and
-  WebSocket integration.
-- `@dungle-scrubs/tether-client-bridge`: external client conversation and
-  session binding helpers.
+## License
 
-The `tether` service app and the workspace root stay private and are not
-published.
-
-## Releases
-
-Published packages are versioned with
-[Changesets](https://github.com/changesets/changesets). `CHANGELOG.md` files
-under `packages/*` are generated by Changesets; do not edit them by hand.
-
-### Day to day
-
-With every change to a published package, add a changeset and commit it with
-your code:
-
-```sh
-pnpm changeset
-```
-
-### Automated release (CI)
-
-The `release` workflow (`.github/workflows/release.yml`) runs on every push to
-`main`:
-
-1. When unreleased changesets exist, it opens or updates a **"chore: version
-   packages"** pull request that applies the pending bumps and changelogs.
-2. Merging that pull request triggers the workflow again; with no changesets
-   left, it builds the packages and publishes them to npm.
-
-Publishing uses npm **OIDC trusted publishing** with provenance - no npm token
-is stored in the repository.
-
-### One-time bootstrap
-
-OIDC trusted publishing can only be configured for packages that already exist
-on npm, so each package needs one manual first publish. Use `pnpm publish` (not
-`npm publish`) so the `workspace:*` internal dependency ranges are rewritten to
-real versions in the published tarballs. Run it in an interactive terminal so
-npm can prompt for two-factor authentication:
-
-```sh
-npm login
-# protocol first: the client packages depend on it
-pnpm --filter @dungle-scrubs/tether-protocol publish --access public
-pnpm --filter @dungle-scrubs/tether-client-bridge publish --access public
-pnpm --filter @dungle-scrubs/tether-client publish --access public
-```
-
-Add `--no-git-checks` if you publish before committing (pnpm otherwise refuses
-on a dirty working tree). These first publishes run from your machine and carry
-no provenance; provenance is added automatically once releases run through the
-CI workflow.
-
-Then, for each package on npmjs.com, open **Settings > Trusted Publisher >
-GitHub Actions** and set:
-
-- Organization/user: `dungle-scrubs`
-- Repository: `tether`
-- Workflow filename: `release.yml`
-
-After that, all future releases flow through the version pull request described
-above.
-
-### Manual release (fallback)
-
-The same steps can be run locally without CI:
-
-```sh
-pnpm version-packages   # apply changesets: bump versions, write changelogs
-pnpm release            # build packages, then changeset publish
-```
+[MIT](LICENSE)
