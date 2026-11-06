@@ -92,7 +92,23 @@
   },
   "./participant-runtime-client.test.ts": {
     "declarations": [],
-    "documentation": []
+    "documentation": [
+      "[\"packages/client/test/participant-runtime-client.test.ts\",\"jsdoc\",\"PropertySignature\",\"commandTimeoutMs\",\"TypeAliasDeclaration:PrivateCommandRuntimeClient/PropertySignature:commandTimeoutMs\"]",
+      "[\"packages/client/test/participant-runtime-client.test.ts\",\"jsdoc\",\"PropertySignature\",\"currentControlEpoch\",\"TypeAliasDeclaration:PrivateCursorRuntimeClient/PropertySignature:currentControlEpoch\"]",
+      "[\"packages/client/test/participant-runtime-client.test.ts\",\"jsdoc\",\"PropertySignature\",\"currentControlEpoch\",\"TypeAliasDeclaration:PrivateReplayRuntimeClient/PropertySignature:currentControlEpoch\"]",
+      "[\"packages/client/test/participant-runtime-client.test.ts\",\"jsdoc\",\"PropertySignature\",\"op\",\"TypeAliasDeclaration:PrivateCommandRuntimeClient/PropertySignature:pendingCommands/PropertySignature:op\"]",
+      "[\"packages/client/test/participant-runtime-client.test.ts\",\"jsdoc\",\"PropertySignature\",\"pendingCommands\",\"TypeAliasDeclaration:PrivateCommandRuntimeClient/PropertySignature:pendingCommands\"]",
+      "[\"packages/client/test/participant-runtime-client.test.ts\",\"jsdoc\",\"PropertySignature\",\"recentEvents\",\"TypeAliasDeclaration:PrivateCursorRuntimeClient/PropertySignature:recentEvents\"]",
+      "[\"packages/client/test/participant-runtime-client.test.ts\",\"jsdoc\",\"PropertySignature\",\"reconnectFailureCount\",\"TypeAliasDeclaration:PrivateReconnectRuntimeClient/PropertySignature:reconnectFailureCount\"]",
+      "[\"packages/client/test/participant-runtime-client.test.ts\",\"jsdoc\",\"PropertySignature\",\"reconnectPromise\",\"TypeAliasDeclaration:PrivateReconnectRuntimeClient/PropertySignature:reconnectPromise\"]",
+      "[\"packages/client/test/participant-runtime-client.test.ts\",\"jsdoc\",\"PropertySignature\",\"reconnectSuccessCount\",\"TypeAliasDeclaration:PrivateReconnectRuntimeClient/PropertySignature:reconnectSuccessCount\"]",
+      "[\"packages/client/test/participant-runtime-client.test.ts\",\"jsdoc\",\"PropertySignature\",\"reject\",\"TypeAliasDeclaration:PrivateCommandRuntimeClient/PropertySignature:pendingCommands/PropertySignature:reject\"]",
+      "[\"packages/client/test/participant-runtime-client.test.ts\",\"jsdoc\",\"PropertySignature\",\"requestId\",\"TypeAliasDeclaration:PrivateCommandRuntimeClient/PropertySignature:pendingCommands/PropertySignature:requestId\"]",
+      "[\"packages/client/test/participant-runtime-client.test.ts\",\"jsdoc\",\"PropertySignature\",\"resolve\",\"TypeAliasDeclaration:PrivateCommandRuntimeClient/PropertySignature:pendingCommands/PropertySignature:resolve\"]",
+      "[\"packages/client/test/participant-runtime-client.test.ts\",\"jsdoc\",\"PropertySignature\",\"stopped\",\"TypeAliasDeclaration:PrivateReconnectRuntimeClient/PropertySignature:stopped\"]",
+      "[\"packages/client/test/participant-runtime-client.test.ts\",\"jsdoc\",\"PropertySignature\",\"taskId\",\"TypeAliasDeclaration:PrivateCommandRuntimeClient/PropertySignature:pendingCommands/PropertySignature:taskId\"]",
+      "[\"packages/client/test/participant-runtime-client.test.ts\",\"jsdoc\",\"PropertySignature\",\"timeout\",\"TypeAliasDeclaration:PrivateCommandRuntimeClient/PropertySignature:pendingCommands/PropertySignature:timeout\"]"
+    ]
   },
   "./rest-participant-task-client.test.ts": {
     "declarations": [],

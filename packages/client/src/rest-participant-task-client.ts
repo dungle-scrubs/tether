@@ -75,6 +75,7 @@ const recoveryReadPolicy = Symbol("participant-rest-read-policy");
 
 /** The private symbol keeps constructor dependencies separate from recovery ownership. */
 type InternalRestTaskClientOptions = RestParticipantTaskClientOptions & {
+  /** Recovery-owned cancellation, deadlines and admission policy. */
   readonly [recoveryReadPolicy]?: RestTaskReadPolicy;
 };
 
@@ -103,12 +104,23 @@ export type RestParticipantTaskErrorCode =
 
 /** Resource metadata is mandatory only for its matching failure variant. */
 type RestTaskFailureInput = {
+  /** REST operation whose request failed. */
   readonly operation: string;
+
+  /** Known HTTP status, absent for transport failures. */
   readonly status?: number | null;
 } & (
-  | { readonly code: "RESOURCE_LIMIT"; readonly resourceLimit: RestTaskResourceLimit }
   | {
+      /** Failure classification for this variant. */
+      readonly code: "RESOURCE_LIMIT";
+      /** Complete resource metadata, forbidden on non-resource failures. */
+      readonly resourceLimit: RestTaskResourceLimit;
+    }
+  | {
+      /** Failure classification for this variant. */
       readonly code: Exclude<RestParticipantTaskErrorCode, "RESOURCE_LIMIT">;
+
+      /** Complete resource metadata, forbidden on non-resource failures. */
       readonly resourceLimit?: never;
     }
 );

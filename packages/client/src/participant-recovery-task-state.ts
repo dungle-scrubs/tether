@@ -20,18 +20,38 @@ interface QueuedRecoveryTask {
 type RecoveryTaskSlot =
   | QueuedRecoveryTask
   | {
+      /** Discriminator for this retained delivery or task state. */
       readonly kind: "running";
+
+      /** Canonical task record reserved by this state. */
       readonly task: TaskRecord;
+
+      /** Connection generation that admitted this reservation. */
       readonly generation: number;
+
+      /** Bytes held by the running task independently of its replacement. */
       readonly activeBytes: number;
+
+      /** Next claimable incarnation retained until current execution settles. */
       readonly next: QueuedRecoveryTask | null;
+
+      /** Total retained bytes charged to this reservation. */
       readonly bytes: number;
+
+      /** Snapshot generation whose concurrent lifecycle update must win. */
       readonly touchedGeneration: number | null;
     }
   | {
+      /** Discriminator for this retained delivery or task state. */
       readonly kind: "touched";
+
+      /** Connection generation that admitted this reservation. */
       readonly generation: number;
+
+      /** Total retained bytes charged to this reservation. */
       readonly bytes: number;
+
+      /** Snapshot generation whose concurrent lifecycle update must win. */
       readonly touchedGeneration: number;
     };
 

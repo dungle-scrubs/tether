@@ -38,12 +38,30 @@ export class ParticipantRestReplayError extends Error {
 }
 
 type HeldFrame =
-  | { readonly event: SessionEvent; readonly byteCost: number; readonly kind: "event" }
-  | { readonly byteCost: number; readonly kind: "marker" };
+  | {
+      /** Canonical event retained until ordered delivery. */
+      readonly event: SessionEvent;
+      /** Retained UTF-8 envelope cost charged to delivery. */
+      readonly byteCost: number;
+      /** Discriminator for this retained delivery or task state. */
+      readonly kind: "event";
+    }
+  | {
+      /** Retained UTF-8 envelope cost charged to delivery. */
+      readonly byteCost: number;
+      /** Discriminator for this retained delivery or task state. */
+      readonly kind: "marker";
+    };
 
 /** Validated page with one computed delivery cost per event. */
 type ValidatedHistoryPage = EventListResponse & {
-  readonly frames: readonly { readonly event: SessionEvent; readonly byteCost: number }[];
+  /** Validated event envelopes with their admission costs. */
+  readonly frames: readonly {
+    /** Canonical event retained until ordered delivery. */
+    readonly event: SessionEvent;
+    /** Retained UTF-8 envelope cost charged to delivery. */
+    readonly byteCost: number;
+  }[];
 };
 
 const taskPayloadSchemas = new Map<string, ZodType<{ readonly task: TaskRecord }>>([

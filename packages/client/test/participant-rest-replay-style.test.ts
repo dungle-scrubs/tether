@@ -49,7 +49,7 @@ function findingScope(node: ts.Node, source: ts.SourceFile): string {
   return owners.join("/");
 }
 
-/** Recognizes named functions and fields on exported interface contracts. */
+/** Recognizes named functions, exported interface fields and type-alias members. */
 function documentationTarget(node: ts.Node): ts.Node | null {
   if (
     (ts.isFunctionDeclaration(node) ||
@@ -69,6 +69,7 @@ function documentationTarget(node: ts.Node): ts.Node | null {
   if (ts.isPropertySignature(node)) {
     let owner: ts.Node | undefined = node.parent;
     while (owner && !ts.isSourceFile(owner)) {
+      if (ts.isTypeAliasDeclaration(owner)) return node;
       if (ts.isInterfaceDeclaration(owner)) {
         return owner.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)
           ? node
@@ -147,16 +148,18 @@ const baseline = JSON.parse(
 describe("REST replay module conventions", () => {
   for (const module of checkedModules) {
     const path = fileURLToPath(new URL(module, import.meta.url));
-    const findings = analyzeModule(path);
+    let findings: ReturnType<typeof analyzeModule> | undefined;
+    /** Loads and analyzes this module only when its first convention assertion runs. */
+    const moduleFindings = () => (findings ??= analyzeModule(path));
     it(`${module} declares module dependencies before use`, () => {
       expect(
-        findings.declarations,
+        moduleFindings().declarations,
         "Move each dependency above every referencing declaration. Remove fixed identities from the baseline; never replace them with new violations.",
       ).toEqual(baseline[module]?.declarations ?? []);
     });
     it(`${module} documents named functions and methods`, () => {
       expect(
-        findings.documentation,
+        moduleFindings().documentation,
         "Add JSDoc to named declarations and exported contract fields. Remove fixed identities from the baseline; never admit new undocumented declarations.",
       ).toEqual(baseline[module]?.documentation ?? []);
     });
