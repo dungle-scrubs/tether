@@ -87,9 +87,7 @@
       "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"reason\",\"InterfaceDeclaration:RecordTaskApprovalCall/PropertySignature:reason\"]",
       "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"serviceUrl\",\"InterfaceDeclaration:RestParticipantTaskClientConfig/PropertySignature:serviceUrl\"]",
       "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"target\",\"InterfaceDeclaration:RecordTaskApprovalCall/PropertySignature:target\"]",
-      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"type\",\"InterfaceDeclaration:AppendTaskEventCall/PropertySignature:type\"]",
-      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"VariableDeclaration\",\"aborted\",\"FunctionDeclaration:awaitRead/VariableDeclaration:aborted\"]",
-      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"VariableDeclaration\",\"cancel\",\"FunctionDeclaration:readJsonBody/VariableDeclaration:cancel\"]"
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"type\",\"InterfaceDeclaration:AppendTaskEventCall/PropertySignature:type\"]"
     ]
   },
   "./participant-runtime-client.test.ts": {

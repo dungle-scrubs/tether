@@ -147,18 +147,16 @@ const baseline = JSON.parse(
 describe("REST replay module conventions", () => {
   for (const module of checkedModules) {
     const path = fileURLToPath(new URL(module, import.meta.url));
+    const findings = analyzeModule(path);
     it(`${module} declares module dependencies before use`, () => {
       expect(
-        analyzeModule(path).declarations,
+        findings.declarations,
         "Move each dependency above every referencing declaration. Remove fixed identities from the baseline; never replace them with new violations.",
       ).toEqual(baseline[module]?.declarations ?? []);
     });
-  }
-  for (const module of checkedModules) {
     it(`${module} documents named functions and methods`, () => {
-      const path = fileURLToPath(new URL(module, import.meta.url));
       expect(
-        analyzeModule(path).documentation,
+        findings.documentation,
         "Add JSDoc to named declarations and exported contract fields. Remove fixed identities from the baseline; never admit new undocumented declarations.",
       ).toEqual(baseline[module]?.documentation ?? []);
     });

@@ -208,6 +208,7 @@ function readTransportError(
 function awaitRead<T>(pending: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
   if (!signal) return pending;
   return new Promise((resolve, reject) => {
+    /** Rejects promptly when this request loses its generation owner. */
     const aborted = () => {
       signal.removeEventListener("abort", aborted);
       reject(new Error("REST participant read aborted"));
@@ -238,6 +239,7 @@ async function readJsonBody(
   if (policy) {
     const reader = response.body?.getReader();
     if (!reader) return null;
+    /** Cancels buffered and pending body chunks when the request is abandoned. */
     const cancel = () => {
       void reader.cancel().catch(() => undefined);
     };
