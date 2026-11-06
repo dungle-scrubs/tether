@@ -116,16 +116,16 @@ type RestTaskFailureInput = {
   readonly status?: number | null;
 } & (
   | {
-      /** Failure classification for this variant. */
+      /** Resource-policy rejection requiring the resource's observed and allowed units. */
       readonly code: "RESOURCE_LIMIT";
-      /** Complete resource metadata, forbidden on non-resource failures. */
+      /** Required resource, configured limit and rejected observation. */
       readonly resourceLimit: RestTaskResourceLimit;
     }
   | {
-      /** Failure classification for this variant. */
+      /** Transport or server classification without resource-policy metadata. */
       readonly code: Exclude<RestParticipantTaskErrorCode, "RESOURCE_LIMIT">;
 
-      /** Complete resource metadata, forbidden on non-resource failures. */
+      /** Resource metadata is unavailable for this non-resource variant. */
       readonly resourceLimit?: never;
     }
 );
@@ -394,6 +394,7 @@ export class RestParticipantTaskClient {
   readonly #observability: ModuleObservability;
   readonly #participantId: string;
   readonly #serviceUrl: string;
+  /** Private automatic-recovery read policy; absent for ordinary REST callers. */
   readonly #readPolicy: RestTaskReadPolicy | undefined;
 
   /** Binds participant identity and optional recovery-owned request limits. */
@@ -633,7 +634,6 @@ export class RestParticipantTaskClient {
     );
   }
 
-  /** Appends one participant-originated session event. */
   /**
    * Appends one participant-originated session event. The wire body is
    * exactly the caller's fields: events are not fenced, so no identity

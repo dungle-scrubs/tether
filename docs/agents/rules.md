@@ -7,6 +7,6 @@ The replay module has zero remaining findings. Type-alias member coverage includ
 | Convention | Enforcement |
 | --- | --- |
 | Module-level dependencies are declared before use. | `packages/client/test/participant-rest-replay-style.test.ts` resolves local symbols and compares every referencing-site identity with the recorded baseline. Its error requires moving dependencies above use and removing fixed baseline entries. |
-| Named functions, constructors, methods, exported interface fields and object members of type aliases use JSDoc. | The same test checks syntax nodes, including named function-valued variables, nested exported interface fields and object members of type aliases. Its error requires adding JSDoc and removing fixed baseline entries. |
+| Named functions, constructors, methods, class properties, exported interface fields, interface method members and object members of type aliases use JSDoc. | The same test checks syntax nodes, including named function-valued variables, class properties, nested exported interface fields and property or method members of type aliases and interfaces. Its error requires adding JSDoc and removing fixed baseline entries. |
 
 These checks run with the client's existing test command and the root test task graph.

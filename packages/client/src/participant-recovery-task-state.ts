@@ -20,7 +20,7 @@ interface QueuedRecoveryTask {
 type RecoveryTaskSlot =
   | QueuedRecoveryTask
   | {
-      /** Discriminator for this retained delivery or task state. */
+      /** Retains the active execution reservation until its claim flow settles. */
       readonly kind: "running";
 
       /** Canonical task record reserved by this state. */
@@ -42,7 +42,7 @@ type RecoveryTaskSlot =
       readonly touchedGeneration: number | null;
     }
   | {
-      /** Discriminator for this retained delivery or task state. */
+      /** Retains a lifecycle tombstone that must override a concurrent snapshot. */
       readonly kind: "touched";
 
       /** Connection generation that admitted this reservation. */
@@ -57,8 +57,11 @@ type RecoveryTaskSlot =
 
 /** Owns all REST candidate, running and snapshot-touch reservations. */
 export class RecoveryTaskState {
+  /** Exclusive reservations indexed by canonical task identity. */
   private readonly slots = new Map<string, RecoveryTaskSlot>();
+  /** Total bytes reserved by all retained task states. */
   private bytes = 0;
+  /** Generation whose snapshot is currently merging with lifecycle updates. */
   private snapshotGeneration: number | null = null;
 
   /** Uses the existing delivery policy without adding a runtime tuning surface. */

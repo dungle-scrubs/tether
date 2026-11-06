@@ -58,7 +58,9 @@ type ReplayFailureArgs =
 
 /** Internal replay failures carry only bounded policy and sequence metadata. */
 export class ParticipantRestReplayError extends Error {
+  /** Bounded terminal classification for the failed replay. */
   readonly reason: ReplayFailureArgs[0];
+  /** Public bounded policy and sequence metadata for the terminal reason. */
   readonly safeDetails: Readonly<Record<string, number>>;
 
   /** Records bounded failure metadata without retaining a response payload. */
@@ -94,13 +96,13 @@ type HeldFrame =
       readonly event: SessionEvent;
       /** Retained UTF-8 envelope cost charged to delivery. */
       readonly byteCost: number;
-      /** Discriminator for this retained delivery or task state. */
+      /** Holds an event until preceding history has been admitted. */
       readonly kind: "event";
     }
   | {
       /** Retained UTF-8 envelope cost charged to delivery. */
       readonly byteCost: number;
-      /** Discriminator for this retained delivery or task state. */
+      /** Holds the replay-complete marker behind its preceding wire events. */
       readonly kind: "marker";
     };
 
@@ -155,14 +157,23 @@ export function isTransientRestReplayFailure(error: unknown): error is RestParti
 
 /** One generation's bounded REST history and ordered WebSocket handoff. */
 export class ParticipantRestReplay {
+  /** Cancels all REST reads and progress waits owned by this generation. */
   private readonly controller = new AbortController();
+  /** Recovery-owned REST reader with this generation's cancellation policy. */
   private readonly rest: RestParticipantTaskClient;
+  /** Ordered wire events and marker awaiting the history handoff. */
   private readonly held: HeldFrame[] = [];
+  /** Bytes reserved by held wire frames. */
   private heldBytes = 0;
+  /** Signals receipt of the wire replay marker and its fenced epoch. */
   private wireReady = false;
+  /** Last contiguous wire sequence held or admitted in this generation. */
   private wireSeq: number;
+  /** Holds wire frames until history and the replay handoff are ready. */
   private bootstrapping = true;
+  /** Progress callbacks waiting for capacity or handler settlement. */
   private readonly waiters = new Set<() => void>();
+  /** Normal history request size within the delivery item policy. */
   private readonly pageLimit: number;
   /** Highest request size still admissible after a failure in this generation. */
   private historyLimitCeiling: number;

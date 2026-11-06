@@ -49,7 +49,7 @@ function findingScope(node: ts.Node, source: ts.SourceFile): string {
   return owners.join("/");
 }
 
-/** Recognizes named functions, exported interface fields and type-alias members. */
+/** Recognizes named functions, class properties and contract property or method members. */
 function documentationTarget(node: ts.Node): ts.Node | null {
   if (
     (ts.isFunctionDeclaration(node) ||
@@ -66,12 +66,14 @@ function documentationTarget(node: ts.Node): ts.Node | null {
     (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))
   )
     return node.parent.parent;
-  if (ts.isPropertySignature(node)) {
+  if (ts.isPropertyDeclaration(node)) return node;
+  if (ts.isPropertySignature(node) || ts.isMethodSignature(node)) {
     let owner: ts.Node | undefined = node.parent;
     while (owner && !ts.isSourceFile(owner)) {
       if (ts.isTypeAliasDeclaration(owner)) return node;
       if (ts.isInterfaceDeclaration(owner)) {
-        return owner.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)
+        return ts.isMethodSignature(node) ||
+          owner.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)
           ? node
           : null;
       }

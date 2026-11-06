@@ -662,7 +662,9 @@ export class ParticipantRuntimeClient {
   private static readonly maxRecentEvents = 80;
   private readonly closeHandlers = new Set<() => void>();
   private closePromise: Promise<void> = Promise.resolve();
+  /** Completes closure when bootstrap ends before a socket exists. */
   private resolveTransportClose: (() => void) | null = null;
+  /** Distinguishes unsocketed bootstrap from a transport whose close event is pending. */
   private transportHasSocket = false;
   private connectionGeneration = 0;
   private delivery: SerialEventDelivery<SessionEvent>;
@@ -702,6 +704,7 @@ export class ParticipantRuntimeClient {
   private replayCompleteSettled = true;
   private pausedReason: ParticipantRuntimePausedReason | null = null;
   private preparedTransport: PreparedParticipantTransport | null = null;
+  /** REST history owner for the current connection generation, or null in WebSocket mode. */
   private restReplay: ParticipantRestReplay | null = null;
   /** Single retry-policy counter, independent of the cumulative public diagnostic metric. */
   private recoveryFailureCount = 0;
