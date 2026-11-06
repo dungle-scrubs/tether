@@ -2301,6 +2301,46 @@ describe("ParticipantRuntimeClient command correlation", () => {
   });
 });
 
+function restHistoryEvent(seq: number): SessionEvent {
+  return {
+    createdAt: "2026-06-05T00:00:00.000Z",
+    eventId: `evt_history_${seq}`,
+    payload: {},
+    producerId: "fixture",
+    seq,
+    sessionId: baseConfig.sessionId,
+    type: "fixture.history",
+  };
+}
+
+/** Synthetic bounded REST response with no server or calendar dependencies. */
+function restHistoryPage(after: number, limit: number, head: number) {
+  const count = Math.max(0, Math.min(limit, head - after));
+  const events = Array.from({ length: count }, (_, i) => restHistoryEvent(after + i + 1));
+  return {
+    events,
+    pagination: {
+      afterSeq: after,
+      hasMore: after + count < head,
+      limit,
+      nextAfterSeq: after + count,
+      returned: count,
+    },
+  };
+}
+
+function emitFencedReplay(socket: ParticipantFakeWebSocket): void {
+  socket.emit(
+    "message",
+    JSON.stringify({
+      op: "replay.complete",
+      controlEpoch: 7,
+      participantId: baseConfig.participantId,
+      instanceId: baseConfig.instanceId,
+    }),
+  );
+}
+
 describe("ParticipantRuntimeClient REST replay", () => {
   const clients: ParticipantRuntimeClient[] = [];
 
@@ -2936,46 +2976,6 @@ describe("ParticipantRuntimeClient REST replay", () => {
     expect(f.writes).toEqual([]);
   });
 });
-
-/** Synthetic bounded REST response with no server or calendar dependencies. */
-function restHistoryPage(after: number, limit: number, head: number) {
-  const count = Math.max(0, Math.min(limit, head - after));
-  const events = Array.from({ length: count }, (_, i) => restHistoryEvent(after + i + 1));
-  return {
-    events,
-    pagination: {
-      afterSeq: after,
-      hasMore: after + count < head,
-      limit,
-      nextAfterSeq: after + count,
-      returned: count,
-    },
-  };
-}
-
-function restHistoryEvent(seq: number): SessionEvent {
-  return {
-    createdAt: "2026-06-05T00:00:00.000Z",
-    eventId: `evt_history_${seq}`,
-    payload: {},
-    producerId: "fixture",
-    seq,
-    sessionId: baseConfig.sessionId,
-    type: "fixture.history",
-  };
-}
-
-function emitFencedReplay(socket: ParticipantFakeWebSocket): void {
-  socket.emit(
-    "message",
-    JSON.stringify({
-      op: "replay.complete",
-      controlEpoch: 7,
-      participantId: baseConfig.participantId,
-      instanceId: baseConfig.instanceId,
-    }),
-  );
-}
 
 describe("ParticipantRuntimeClient replay wait", () => {
   it("rejects replay waiters when the server emits an error before replay completion", async () => {

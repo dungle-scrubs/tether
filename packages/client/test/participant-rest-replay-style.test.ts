@@ -1,21 +1,18 @@
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
-const modulePath = fileURLToPath(new URL("../src/participant-rest-replay.ts", import.meta.url));
-const program = ts.createProgram([modulePath], { noLib: true, noResolve: true });
-const source = program.getSourceFile(modulePath);
-if (!source) throw new Error("REST replay source was not loaded");
-const moduleFile = source;
-const checker = program.getTypeChecker();
-const positions = new Map<ts.Node, number>(
-  moduleFile.statements.map((statement, index): [ts.Node, number] => [statement, index]),
-);
+const checkedModules = [
+  { path: "../src/participant-rest-replay.ts", declarationBaseline: 0 },
+  // Incremental baseline measured at pre-feature commit 085c182, not a waiver for new helpers.
+  { path: "./participant-runtime-client.test.ts", declarationBaseline: 27 },
+];
 
 /** Finds the module-level declaration containing a node. */
-function moduleStatement(node: ts.Node): ts.Node {
+function moduleStatement(node: ts.Node, source: ts.SourceFile): ts.Node {
   let current = node;
-  while (current.parent && current.parent !== moduleFile) current = current.parent;
+  while (current.parent && current.parent !== source) current = current.parent;
   return current;
 }
 
@@ -25,28 +22,34 @@ function visit(node: ts.Node, check: (node: ts.Node) => void): void {
   ts.forEachChild(node, (child) => visit(child, check));
 }
 
-/** Checks the existing module declaration-order rule with lexical symbol resolution. */
-function declarationFindings(): readonly string[] {
-  const findings = new Set<string>();
-  visit(moduleFile, (node) => {
-    if (!ts.isIdentifier(node)) return;
-    const declaration = checker
-      .getSymbolAtLocation(node)
-      ?.declarations?.find((candidate) => candidate.getSourceFile() === moduleFile);
-    if (!declaration) return;
-    const declaredAt = positions.get(moduleStatement(declaration));
-    const usedAt = positions.get(moduleStatement(node));
-    if (declaredAt !== undefined && usedAt !== undefined && declaredAt > usedAt) {
-      findings.add(`Declare ${node.text} before the module declaration that uses it`);
+/** Resolves symbols in one source file, including archived source supplied by correction proofs. */
+function analyzeModule(path: string, text = readFileSync(path, "utf8")) {
+  const options = { noLib: true, noResolve: true };
+  const host = ts.createCompilerHost(options);
+  host.getSourceFile = (filename, languageVersion) =>
+    filename === path ? ts.createSourceFile(filename, text, languageVersion, true) : undefined;
+  const program = ts.createProgram([path], options, host);
+  const source = program.getSourceFile(path);
+  if (!source) throw new Error(`Convention source was not loaded: ${path}`);
+  const checker = program.getTypeChecker();
+  const positions = new Map<ts.Node, number>(
+    source.statements.map((statement, index) => [statement, index]),
+  );
+  const declarations = new Set<string>();
+  const documentation: string[] = [];
+  visit(source, (node) => {
+    if (ts.isIdentifier(node)) {
+      const declaration = checker
+        .getSymbolAtLocation(node)
+        ?.declarations?.find((candidate) => candidate.getSourceFile() === source);
+      if (declaration) {
+        const declaredAt = positions.get(moduleStatement(declaration, source));
+        const usedAt = positions.get(moduleStatement(node, source));
+        if (declaredAt !== undefined && usedAt !== undefined && declaredAt > usedAt) {
+          declarations.add(`Declare ${node.text} before the module declaration that uses it`);
+        }
+      }
     }
-  });
-  return [...findings];
-}
-
-/** Checks JSDoc on named functions and methods, leaving inline callbacks alone. */
-function documentationFindings(): readonly string[] {
-  const findings: string[] = [];
-  visit(moduleFile, (node) => {
     if (
       (ts.isFunctionDeclaration(node) ||
         ts.isMethodDeclaration(node) ||
@@ -56,18 +59,26 @@ function documentationFindings(): readonly string[] {
       node.body &&
       ts.getJSDocCommentsAndTags(node).length === 0
     ) {
-      findings.push(`Add JSDoc to ${node.name?.getText(moduleFile) ?? "constructor"}`);
+      documentation.push(`Add JSDoc to ${node.name?.getText(source) ?? "constructor"}`);
     }
   });
-  return findings;
+  return { declarations: [...declarations], documentation };
 }
 
 describe("REST replay module conventions", () => {
-  it("declares module dependencies before use", () => {
-    expect(declarationFindings()).toEqual([]);
-  });
+  for (const module of checkedModules) {
+    const path = fileURLToPath(new URL(module.path, import.meta.url));
+    it(`${module.path} declares module dependencies before use`, () => {
+      const findings = analyzeModule(path).declarations;
+      expect(
+        findings.length,
+        `${findings.join("\n")}\nMove dependencies above first use; do not increase the pre-feature baseline.`,
+      ).toBeLessThanOrEqual(module.declarationBaseline);
+    });
+  }
 
   it("documents named functions and methods", () => {
-    expect(documentationFindings()).toEqual([]);
+    const path = fileURLToPath(new URL(checkedModules[0]?.path ?? "", import.meta.url));
+    expect(analyzeModule(path).documentation).toEqual([]);
   });
 });
