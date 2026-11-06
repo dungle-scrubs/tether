@@ -14,6 +14,12 @@ import {
   type TaskCancellationContext,
 } from "./participant-claimable-task-runner.js";
 import { ParticipantCursorWriter } from "./participant-cursor-writer.js";
+import {
+  isTransientRestReplayFailure,
+  ParticipantRestReplay,
+  ParticipantRestReplayError,
+  type ParticipantOverflowDetails,
+} from "./participant-rest-replay.js";
 import { runParticipantTaskClaimFlow } from "./participant-task-claim-flow.js";
 import {
   type AppendSessionEventInput,
@@ -31,6 +37,7 @@ import {
   type WebSocketCommandMessage,
   webSocketOperation,
 } from "./protocol.js";
+import { RestParticipantTaskError } from "./rest-participant-task-client.js";
 import { SerialEventDelivery, type SerialEventDeliveryOutcome } from "./serial-event-delivery.js";
 import type { ParticipantRuntimeKind, SessionEvent, TaskRecord } from "./types.js";
 
@@ -267,7 +274,8 @@ export type ParticipantRuntimePausedReason =
   | "invalid_server_envelope"
   | "non_contiguous_event"
   | "replay_gap_unrepaired"
-  | "replay_window_exceeded";
+  | "replay_window_exceeded"
+  | "rest_replay_failed";
 
 /**
  * Result returned by an adapter-specific task executor after task work finishes.
@@ -401,6 +409,8 @@ export interface ParticipantRuntimeClientConfig {
     /** Maximum reconnect delay after repeated failures. */
     readonly maxDelayMs?: number;
   };
+  /** Historical replay transport. Defaults to the existing bounded WebSocket replay. */
+  readonly replayMode?: "websocket" | "rest";
   /** Runtime implementation kind, such as `generic_agent` or `codex`. */
   readonly runtimeKind: ParticipantRuntimeKind;
   /** Base URL of the Tether HTTP service. */
@@ -506,7 +516,7 @@ export interface ParticipantRuntimeClientDebugInfo extends BoundaryDebugInfo {
   readonly pendingCursorSeq: number | null;
   /** Terminal reason requiring explicit reconnect, or null while active. */
   readonly pausedReason: ParticipantRuntimePausedReason | null;
-  /** Number of failed reconnect attempts since startup. */
+  /** Number of failed reconnect opens since startup, excluding post-open recovery reads. */
   readonly reconnectFailureCount: number;
   /** Number of successful reconnects since startup. */
   readonly reconnectSuccessCount: number;
@@ -635,6 +645,18 @@ function writeDefaultRuntimeError(
   );
 }
 
+/** Converts consecutive failures to the first zero-based retry index they carry. */
+function recoveryDelayIndex(failures: number): number {
+  return Math.max(0, failures - 1);
+}
+
+/**
+ * Maps a non-negative loop delay index to the shared bounded reconnect policy.
+ */
+function reconnectDelayMs(attempt: number, config: ParticipantRuntimeClientConfig): number {
+  return boundedReconnectDelayMs(Math.max(0, attempt), config.reconnect);
+}
+
 /**
  * Reusable WebSocket runtime client for external participants. It owns replay
  * buffering, command correlation, task claiming, claim refresh, cancellation,
@@ -645,6 +667,10 @@ export class ParticipantRuntimeClient {
   private static readonly maxRecentEvents = 80;
   private readonly closeHandlers = new Set<() => void>();
   private closePromise: Promise<void> = Promise.resolve();
+  /** Completes closure when bootstrap ends before a socket exists. */
+  private resolveTransportClose: (() => void) | null = null;
+  /** Distinguishes unsocketed bootstrap from a transport whose close event is pending. */
+  private transportHasSocket = false;
   private connectionGeneration = 0;
   private delivery: SerialEventDelivery<SessionEvent>;
   private deliveryFailureCount = 0;
@@ -683,6 +709,12 @@ export class ParticipantRuntimeClient {
   private replayCompleteSettled = true;
   private pausedReason: ParticipantRuntimePausedReason | null = null;
   private preparedTransport: PreparedParticipantTransport | null = null;
+  /** REST history owner for the current connection generation, or null in WebSocket mode. */
+  private restReplay: ParticipantRestReplay | null = null;
+  /** REST open and post-open failures carried into later loops, separate from public diagnostics. */
+  private recoveryFailureCount = 0;
+  /** Task-loop users complete recovery only after their canonical snapshot succeeds. */
+  private restTaskRecoveryUsers = 0;
   private socket: WebSocket | null = null;
   private stopped = false;
   private shutdownPromise: Promise<void> | null = null;
@@ -693,6 +725,16 @@ export class ParticipantRuntimeClient {
    * Attaches protocol message handling to an already-created WebSocket.
    */
   private constructor(private readonly config: ParticipantRuntimeClientConfig) {
+    if (
+      config.replayMode !== undefined &&
+      config.replayMode !== "websocket" &&
+      config.replayMode !== "rest"
+    ) {
+      throw new ParticipantRuntimeClientConfigurationError(
+        "replayMode",
+        "Participant runtime replayMode must be websocket or rest",
+      );
+    }
     this.lastHandledSeq = config.afterSeq;
     this.cursorWriter = this.createCursorWriter(config.afterSeq);
     this.commandTimeoutMs = resolveCommandTimeoutMs(config.commandTimeoutMs);
@@ -754,15 +796,43 @@ export class ParticipantRuntimeClient {
     const prepared = this.preparedTransport ?? this.prepareTransport(this.lastHandledSeq);
     this.preparedTransport = null;
     try {
-      await this.attachPreparedTransport(prepared);
+      const restReplay = this.restReplay;
+      const transportHead = restReplay ? await restReplay.discoverHead() : prepared.afterSeq;
+      if (
+        this.stopped ||
+        prepared.generation !== this.connectionGeneration ||
+        this.pausedReason !== null
+      ) {
+        throw new Error("Participant transport generation ended before socket open");
+      }
+      await this.attachPreparedTransport({ ...prepared, afterSeq: transportHead });
+      if (restReplay) {
+        void restReplay.replay(transportHead).catch((error: unknown) => {
+          this.failRestReplay(error, prepared.generation, restReplay);
+        });
+      }
     } catch (error) {
       const openError =
         error instanceof Error ? error : new Error("Participant socket open failed");
-      this.settleReplayCompleteError(openError);
-      if (!this.socket) {
-        prepared.resolveClose();
+      let reportedError: Error = openError;
+      if (prepared.generation === this.connectionGeneration) {
+        if (this.restReplay && !this.stopped) {
+          if (isTransientRestReplayFailure(openError)) {
+            if (!this.restReplay.aborted && this.pausedReason === null) {
+              void this.endGeneration(openError);
+              if (!this.reconnectPromise) this.emitError(openError);
+            }
+          } else {
+            reportedError =
+              this.failRestReplay(openError, prepared.generation, this.restReplay) ?? openError;
+          }
+        } else {
+          this.settleReplayCompleteError(openError);
+        }
       }
-      throw openError;
+      if (!this.transportHasSocket || prepared.generation !== this.connectionGeneration)
+        prepared.resolveClose();
+      throw reportedError;
     }
     return this;
   }
@@ -816,12 +886,18 @@ export class ParticipantRuntimeClient {
    */
   close(): void {
     this.stopped = true;
+    if (this.restReplay) {
+      this.restReplay.abort();
+      this.settleReplayCompleteError(
+        new Error("Participant runtime stopped before replay completed"),
+      );
+    }
     this.delivery.stop();
     this.persistCursor();
     if (this.socket) {
       this.socket.close();
-    } else {
-      this.preparedTransport?.resolveClose();
+    } else if (!this.transportHasSocket) {
+      this.resolveTransportClose?.();
     }
   }
 
@@ -959,6 +1035,11 @@ export class ParticipantRuntimeClient {
     this.pausedReason = null;
     this.deliveryRecoveryAttempts = 0;
     this.deliveryRecoverySeq = null;
+    if (this.restReplay) {
+      this.restReplay.abort();
+      this.settleReplayCompleteError(new Error("Participant REST replay transport replaced"));
+      if (!this.transportHasSocket) this.resolveTransportClose?.();
+    }
     this.socket?.close();
     await this.waitForClose().catch(() => undefined);
     await this.requestReconnect(0);
@@ -999,22 +1080,41 @@ export class ParticipantRuntimeClient {
    * one-shot replay work completes or the socket closes.
    */
   async runClaimableTasks(options: ParticipantRuntimeTaskLoopOptions): Promise<void> {
-    await Effect.runPromise(
-      buildParticipantClaimableTaskLoop(
-        {
-          close: () => this.close(),
-          connectionGeneration: () => this.connectionGeneration,
-          isPaused: () => this.pausedReason !== null,
-          isStopped: () => this.stopped,
-          onEvent: (handler) => this.onEvent(handler),
-          reconnectAfterClose: () => this.requestReconnect(),
-          runTaskClaimFlow: (input) => this.runTaskClaimFlow(input),
-          waitForClose: () => this.waitForClose(),
-          waitForReplayComplete: () => this.waitForReplayComplete(),
-        },
-        options,
-      ),
-    );
+    const restRecovery = Boolean(this.restReplay);
+    if (restRecovery) this.restTaskRecoveryUsers += 1;
+    try {
+      await Effect.runPromise(
+        buildParticipantClaimableTaskLoop(
+          {
+            close: () => this.close(),
+            connectionGeneration: () => this.connectionGeneration,
+            isPaused: () => this.pausedReason !== null,
+            isStopped: () => this.stopped,
+            ...(this.restReplay
+              ? {
+                  taskRecovery: {
+                    load: () => this.loadReplayTasks(),
+                    maxQueueBytes: this.maxDeliveryQueueBytes,
+                    maxQueueSize: this.maxDeliveryQueueSize,
+                    fail: (error: ParticipantRestReplayError) => {
+                      const replay = this.restReplay;
+                      if (replay) this.failRestReplay(error, this.connectionGeneration, replay);
+                    },
+                  },
+                }
+              : {}),
+            onEvent: (handler) => this.onEvent(handler),
+            reconnectAfterClose: () => this.requestReconnect(),
+            runTaskClaimFlow: (input) => this.runTaskClaimFlow(input),
+            waitForClose: () => this.waitForClose(),
+            waitForReplayComplete: () => this.waitForReplayComplete(),
+          },
+          options,
+        ),
+      );
+    } finally {
+      if (restRecovery) this.restTaskRecoveryUsers -= 1;
+    }
   }
 
   /**
@@ -1071,7 +1171,20 @@ export class ParticipantRuntimeClient {
   private prepareTransport(afterSeq: number): PreparedParticipantTransport {
     const generation = this.connectionGeneration + 1;
     this.connectionGeneration = generation;
+    this.restReplay?.abort();
     this.replaceDelivery(afterSeq, generation);
+    this.restReplay =
+      this.config.replayMode === "rest"
+        ? new ParticipantRestReplay({
+            afterSeq,
+            config: this.config,
+            delivery: this.delivery,
+            lastHandledSeq: () => this.lastHandledSeq,
+            maxQueueBytes: this.maxDeliveryQueueBytes,
+            maxQueueSize: this.maxDeliveryQueueSize,
+            timeoutMs: this.commandTimeoutMs,
+          })
+        : null;
     this.currentControlEpoch = null;
     this.replayCompleteSettled = false;
     const replayComplete = new Promise<void>((resolve, reject) => {
@@ -1084,6 +1197,8 @@ export class ParticipantRuntimeClient {
     this.closePromise = new Promise((resolve) => {
       resolveClose = resolve;
     });
+    this.resolveTransportClose = resolveClose;
+    this.transportHasSocket = false;
     const prepared = { afterSeq, generation, resolveClose };
     this.preparedTransport = prepared;
     return prepared;
@@ -1099,9 +1214,12 @@ export class ParticipantRuntimeClient {
       }),
     );
     this.socket = socket;
+    this.transportHasSocket = true;
     socket.once("close", () => {
       if (this.connectionGeneration === generation && this.socket === socket) {
         this.socket = null;
+        this.restReplay?.abort();
+        if (this.restReplay) this.delivery.stop();
         this.settleReplayCompleteError(new Error("WebSocket closed before replay completed"));
         this.rejectPendingCommands(new Error("WebSocket closed"));
         for (const handler of this.closeHandlers) {
@@ -1112,6 +1230,7 @@ export class ParticipantRuntimeClient {
     });
     socket.on("error", (error) => {
       if (this.connectionGeneration === generation) {
+        this.restReplay?.abort();
         this.settleReplayCompleteError(error);
         this.rejectPendingCommands(error);
         this.emitError(error);
@@ -1139,12 +1258,24 @@ export class ParticipantRuntimeClient {
     await Effect.runPromise(this.buildReconnectWithBackoff(initialDelayMs));
   }
 
+  /** Records a failed REST open or post-open transient read for later recovery loops. */
+  private recordRecoveryFailure(): void {
+    this.recoveryFailureCount += 1;
+  }
+
+  /** Resets retry policy only after acknowledged progress or completed recovery. */
+  private recordRecoveryProgress(): void {
+    this.recoveryFailureCount = 0;
+  }
+
   /** Coalesces every reconnect caller behind one transport-owner promise. */
   private requestReconnect(initialDelayMs: number | null = null): Promise<void> {
     if (this.reconnectPromise) {
       return this.reconnectPromise;
     }
-    const reconnect = this.reconnectWithBackoff(initialDelayMs);
+    const reconnect = this.restReplay
+      ? this.delivery.waitForSettlement().then(() => this.reconnectWithBackoff(initialDelayMs))
+      : this.reconnectWithBackoff(initialDelayMs);
     this.reconnectPromise = reconnect;
     const clearOwner = (): void => {
       if (this.reconnectPromise === reconnect) {
@@ -1162,12 +1293,15 @@ export class ParticipantRuntimeClient {
     initialDelayMs: number | null = null,
   ): Effect.Effect<void, never> {
     return Effect.gen(this, function* () {
+      const carried = this.restReplay ? this.recoveryFailureCount : 0;
+      const offset = recoveryDelayIndex(carried);
       let attempt = 0;
-      let delayMs = initialDelayMs ?? reconnectDelayMs(attempt, this.config);
+      let delayMs = initialDelayMs ?? reconnectDelayMs(attempt + offset, this.config);
       while (!this.stopped && this.pausedReason === null) {
         if (delayMs > 0) {
           yield* sleepUnrefEffect(delayMs);
         }
+        if (this.stopped || this.pausedReason !== null) return;
         const opened = yield* Effect.either(
           Effect.tryPromise({
             catch: (error) => error,
@@ -1180,9 +1314,10 @@ export class ParticipantRuntimeClient {
         }
         const error = opened.left;
         this.reconnectFailureCount += 1;
+        if (this.restReplay) this.recordRecoveryFailure();
         this.emitError(error instanceof Error ? error : new Error("Reconnect failed"));
         attempt += 1;
-        delayMs = reconnectDelayMs(attempt, this.config);
+        delayMs = reconnectDelayMs(attempt + offset, this.config);
       }
     });
   }
@@ -1205,7 +1340,10 @@ export class ParticipantRuntimeClient {
     data: WebSocket.RawData,
     generation: number = this.connectionGeneration,
   ): void {
-    if (generation !== this.connectionGeneration) {
+    if (
+      generation !== this.connectionGeneration ||
+      (this.restReplay && (this.stopped || this.pausedReason !== null))
+    ) {
       return;
     }
     let parsed: unknown;
@@ -1231,7 +1369,9 @@ export class ParticipantRuntimeClient {
       }
       const envelope = classified.envelope;
       if (envelope.op === webSocketOperation.event) {
-        this.delivery.enqueueEvent(envelope.event, frameByteLength);
+        if (!this.restReplay?.holdEvent(envelope.event, frameByteLength)) {
+          this.delivery.enqueueEvent(envelope.event, frameByteLength);
+        }
         return;
       }
       if (envelope.op === webSocketOperation.commandResult) {
@@ -1288,13 +1428,69 @@ export class ParticipantRuntimeClient {
         ) {
           this.currentControlEpoch = envelope.controlEpoch;
         }
-        this.delivery.enqueueReplayComplete();
+        if (!this.restReplay?.holdMarker(this.currentControlEpoch !== null)) {
+          this.delivery.enqueueReplayComplete();
+        }
       }
     } catch (error) {
-      this.emitError(
-        error instanceof Error ? error : new Error("Failed to handle WebSocket message"),
-      );
+      if (this.restReplay) {
+        this.failRestReplay(error, generation, this.restReplay);
+      } else {
+        this.emitError(
+          error instanceof Error ? error : new Error("Failed to handle WebSocket message"),
+        );
+      }
     }
+  }
+
+  /** Reads active candidates only for the current REST replay generation. */
+  private async loadReplayTasks(): Promise<readonly TaskRecord[]> {
+    const replay = this.restReplay;
+    const generation = this.connectionGeneration;
+    if (!replay) return [];
+    try {
+      const tasks = await replay.loadActiveTasks();
+      this.recordRecoveryProgress();
+      return tasks;
+    } catch (error) {
+      throw this.failRestReplay(error, generation, replay) ?? error;
+    }
+  }
+
+  /** Stops failed REST bootstrap without retaining or logging a response payload. */
+  private failRestReplay(
+    error: unknown,
+    generation: number,
+    replay: ParticipantRestReplay,
+  ): ParticipantRuntimeTerminalStreamError | null {
+    if (
+      generation !== this.connectionGeneration ||
+      replay !== this.restReplay ||
+      replay.aborted ||
+      this.stopped ||
+      this.pausedReason !== null
+    )
+      return null;
+    if (isTransientRestReplayFailure(error)) {
+      this.recordRecoveryFailure();
+      this.emitError(error);
+      this.endGenerationAndReconnect(error, generation, null);
+      return null;
+    }
+    let reason: ParticipantRuntimePausedReason = "rest_replay_failed";
+    let details: Readonly<Record<string, number>> = {};
+    if (error instanceof ParticipantRestReplayError) {
+      reason = error.reason;
+      details = error.safeDetails;
+    }
+    return this.enterPausedState(
+      reason,
+      error instanceof ParticipantRestReplayError || error instanceof RestParticipantTaskError
+        ? error
+        : undefined,
+      details,
+      generation,
+    );
   }
 
   /** Creates the participant's shared serial delivery state machine. */
@@ -1339,7 +1535,7 @@ export class ParticipantRuntimeClient {
           {
             maxQueueBytes: outcome.maxQueueBytes,
             observedQueueBytes: outcome.observedQueueBytes,
-          },
+          } satisfies ParticipantOverflowDetails["delivery_byte_overflow"],
           generation,
         );
         return;
@@ -1350,14 +1546,16 @@ export class ParticipantRuntimeClient {
           {
             maxQueueSize: outcome.maxQueueSize,
             observedQueueSize: outcome.observedQueueSize,
-          },
+          } satisfies ParticipantOverflowDetails["delivery_queue_overflow"],
           generation,
         );
         return;
       case "duplicate-ignored":
         return;
       case "event-handled":
+        if (outcome.event.seq > this.lastHandledSeq) this.recordRecoveryProgress();
         this.recordHandledEvent(outcome.event);
+        this.restReplay?.notifyProgress();
         if (this.deliveryRecoverySeq === outcome.event.seq) {
           this.deliveryRecoveryAttempts = 0;
           this.deliveryRecoverySeq = null;
@@ -1398,6 +1596,7 @@ export class ParticipantRuntimeClient {
         );
         return;
       case "replay-complete":
+        if (this.restTaskRecoveryUsers === 0) this.recordRecoveryProgress();
         this.settleReplayComplete();
         return;
     }
@@ -1451,7 +1650,10 @@ export class ParticipantRuntimeClient {
       return;
     }
     this.recoveryCount += 1;
-    const delayMs = reconnectDelayMs(this.deliveryRecoveryAttempts - 1, this.config);
+    const delayMs = reconnectDelayMs(
+      recoveryDelayIndex(this.deliveryRecoveryAttempts),
+      this.config,
+    );
     this.observability.debug("recoverDelivery", "participant_event_delivery.recovering", {
       attempt: this.deliveryRecoveryAttempts,
       delayMs,
@@ -1459,20 +1661,39 @@ export class ParticipantRuntimeClient {
       handledSeq: this.lastHandledSeq,
       seq: input.event.seq,
     });
+    this.endGenerationAndReconnect(error, generation, delayMs);
+  }
+
+  /** Tears down one failed generation, including reads, queued delivery and command outcomes. */
+  private endGeneration(error: Error): Promise<void> {
+    const replay = this.restReplay;
+    replay?.abort();
+    this.delivery.stop();
     this.settleReplayCompleteError(error);
     this.rejectPendingCommandsAsUnknown(error);
-    // Await the delivery settlement barrier alongside socket closure so a
-    // timed-out handler that is still running can never overlap its own
-    // replayed invocation on the replacement transport.
-    const settlingDelivery = this.delivery;
+    const delivery = this.delivery;
     const socket = this.socket;
-    const closePromise = this.closePromise;
+    const close = this.closePromise;
     this.socket = null;
     socket?.close();
-    void Promise.all([
-      closePromise.catch(() => undefined),
-      settlingDelivery.waitForSettlement(),
-    ]).then(() => this.requestReconnect(delayMs));
+    /** REST requestReconnect owns settlement; WebSocket handler recovery retains its barrier. */
+    return replay
+      ? close
+      : Promise.all([close, delivery.waitForSettlement()]).then(() => undefined);
+  }
+
+  /** Ends failed delivery and rejoins the existing reconnect owner after socket closure. */
+  private endGenerationAndReconnect(
+    error: Error,
+    generation: number,
+    delayMs: number | null,
+  ): void {
+    const ended = this.endGeneration(error);
+    void ended.then(async () => {
+      await this.reconnectPromise?.catch(() => undefined);
+      if (!this.stopped && this.pausedReason === null && generation === this.connectionGeneration)
+        await this.requestReconnect(delayMs);
+    });
   }
 
   /** Enters terminal Paused State without opening another socket. */
@@ -1481,11 +1702,13 @@ export class ParticipantRuntimeClient {
     cause: unknown,
     safeDetails: Readonly<Record<string, number | string | null>>,
     generation: number,
-  ): void {
+  ): ParticipantRuntimeTerminalStreamError | null {
     if (generation !== this.connectionGeneration || this.pausedReason !== null) {
-      return;
+      return null;
     }
     this.pausedReason = reason;
+    this.restReplay?.abort();
+    if (this.restReplay) this.delivery.stop();
     const error = new ParticipantRuntimeTerminalStreamError({
       ...(cause === undefined ? {} : { cause }),
       reason,
@@ -1502,6 +1725,7 @@ export class ParticipantRuntimeClient {
     const socket = this.socket;
     this.socket = null;
     socket?.close();
+    return error;
   }
 
   /**
@@ -1815,13 +2039,6 @@ export function buildParticipantRuntimeStreamUrl(config: ParticipantRuntimeClien
     url.searchParams.set("access_token", authToken);
   }
   return url.toString();
-}
-
-/**
- * Computes bounded exponential reconnect backoff from client configuration.
- */
-function reconnectDelayMs(attempt: number, config: ParticipantRuntimeClientConfig): number {
-  return boundedReconnectDelayMs(attempt, config.reconnect);
 }
 
 /** Applies one overall deadline to graceful participant shutdown settlement. */

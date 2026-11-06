@@ -37,6 +37,9 @@ import {
   readModuleObservabilityOptions,
 } from "./observability.js";
 
+/** Fixed HTTP envelope allowance, independent of event and task admission budgets. */
+export const restResponseEnvelopeAllowance = 4_096;
+
 /** Fetch-compatible function used by the REST task client. */
 export type RestParticipantTaskFetch = (input: URL, init: RequestInit) => Promise<Response>;
 
@@ -55,6 +58,45 @@ export interface RestParticipantTaskClientOptions {
   readonly observability?: ModuleObservabilityOptions;
 }
 
+/** Read limits are supplied only by the recovery module's internal construction path. */
+interface RestTaskReadPolicy {
+  /** Maximum decoded response bytes before buffering or parsing. */
+  readonly maxBytes: number;
+  /** Maximum raw active rows before protocol parsing. */
+  readonly maxActiveTasks: number;
+  /** Cancellation belongs to the transport generation. */
+  readonly signal: AbortSignal;
+  /** One deadline covers the fetch and streamed response body. */
+  readonly timeoutMs: number;
+}
+
+/** Recovery policy cannot be supplied through an exported options property. */
+const recoveryReadPolicy = Symbol("participant-rest-read-policy");
+
+/** Discards an unused response without reading its body or delaying its status. */
+function discardBody(response: Response): void {
+  void response.body?.cancel().catch(() => undefined);
+}
+
+/** The private symbol keeps constructor dependencies separate from recovery ownership. */
+type InternalRestTaskClientOptions = RestParticipantTaskClientOptions & {
+  /** Recovery-owned cancellation, deadlines and admission policy. */
+  readonly [recoveryReadPolicy]?: RestTaskReadPolicy;
+};
+
+/** Units constrained by the automatic recovery reader. */
+type RestTaskReadResource = "response_bytes" | "active_tasks";
+
+/** One complete resource failure, never a partially populated trio. */
+interface RestTaskResourceLimit {
+  /** Whether response bytes or active task identities exceeded policy. */
+  readonly resource: RestTaskReadResource;
+  /** Configured maximum in the resource's units. */
+  readonly limit: number;
+  /** Observed units at rejection. */
+  readonly observed: number;
+}
+
 /** Stable failure classifications surfaced to callers. */
 export type RestParticipantTaskErrorCode =
   | "AUTHENTICATION"
@@ -62,29 +104,80 @@ export type RestParticipantTaskErrorCode =
   | "INVALID_RESPONSE"
   | "NOT_FOUND"
   | "PERSISTENCE"
+  | "RESOURCE_LIMIT"
   | "TRANSPORT";
+
+/** Resource metadata is mandatory only for its matching failure variant. */
+type RestTaskFailureInput = {
+  /** REST operation whose request failed. */
+  readonly operation: string;
+
+  /** Known HTTP status, absent for transport failures. */
+  readonly status?: number | null;
+} & (
+  | {
+      /** Resource-policy rejection requiring the resource's observed and allowed units. */
+      readonly code: "RESOURCE_LIMIT";
+      /** Required resource, configured limit and rejected observation. */
+      readonly resourceLimit: RestTaskResourceLimit;
+    }
+  | {
+      /** Transport or server classification without resource-policy metadata. */
+      readonly code: Exclude<RestParticipantTaskErrorCode, "RESOURCE_LIMIT">;
+
+      /** Resource metadata is unavailable for this non-resource variant. */
+      readonly resourceLimit?: never;
+    }
+);
+
+/** Distributes the input variants into their public code and normalized details shape. */
+type RestTaskFailure<Failure extends RestTaskFailureInput = RestTaskFailureInput> =
+  Failure extends RestTaskFailureInput
+    ? {
+        /** Classification correlated with this input variant's metadata. */
+        readonly code: Failure["code"];
+        /** Bounded operation context with a normalized status and variant-specific resource data. */
+        readonly details: Omit<Failure, "code" | "status"> & {
+          /** Known status or null when no HTTP response was available. */
+          readonly status: number | null;
+        };
+      }
+    : never;
 
 /** Typed, operation-scoped REST task-route failure. */
 export class RestParticipantTaskError extends Error {
-  readonly code: RestParticipantTaskErrorCode;
-  readonly details: {
-    readonly operation: string;
-    readonly status: number | null;
-  };
+  /** Enumerable public classification retained for spread and JSON compatibility. */
+  readonly code: RestTaskFailure["code"];
+  /** Enumerable bounded operation and resource metadata, assigned once from the input. */
+  readonly details: RestTaskFailure["details"];
 
-  constructor(input: {
-    readonly code: RestParticipantTaskErrorCode;
-    readonly operation: string;
-    readonly status?: number | null;
-  }) {
+  /** Retains bounded operation metadata without the response body or credentials. */
+  constructor(input: RestTaskFailureInput) {
     super(`REST participant task ${input.operation} failed: ${input.code}`);
     this.code = input.code;
     this.details = {
       operation: input.operation,
       status: input.status ?? null,
+      ...(input.code === "RESOURCE_LIMIT"
+        ? {
+            resourceLimit: {
+              resource: input.resourceLimit.resource,
+              limit: input.resourceLimit.limit,
+              observed: input.resourceLimit.observed,
+            },
+          }
+        : {}),
     };
     this.name = "RestParticipantTaskError";
   }
+}
+
+/** Narrows required resource details using the public classification and derived union. */
+export function isRestParticipantResourceLimit(
+  error: unknown,
+): error is RestParticipantTaskError &
+  Extract<RestTaskFailure, { readonly code: "RESOURCE_LIMIT" }> {
+  return error instanceof RestParticipantTaskError && error.code === "RESOURCE_LIMIT";
 }
 
 /** Options shared by every fenced mutation. */
@@ -129,6 +222,148 @@ type TaskOperation =
   | "refresh-claim"
   | "release";
 
+/** Timeout provenance stays internal and cannot retain errors beyond their callers' lifetimes. */
+const readTimeoutErrors = new WeakSet<RestParticipantTaskError>();
+
+/** Identifies a request deadline without confusing generation cancellation with timeout. */
+export function isRestParticipantReadTimeout(error: unknown): boolean {
+  return error instanceof RestParticipantTaskError && readTimeoutErrors.has(error);
+}
+
+/** Creates a typed transport error and records only a genuine live-owner read timeout. */
+function readTransportError(
+  operation: TaskOperation,
+  signal: AbortSignal | undefined,
+  ownerSignal: AbortSignal | undefined,
+): RestParticipantTaskError {
+  const error = new RestParticipantTaskError({ code: "TRANSPORT", operation });
+  const cause: unknown = signal?.reason;
+  if (
+    signal?.aborted &&
+    !ownerSignal?.aborted &&
+    cause instanceof DOMException &&
+    cause.name === "TimeoutError"
+  )
+    readTimeoutErrors.add(error);
+  return error;
+}
+
+/** Races a read against its owner without leaving a rejected late promise unobserved. */
+function awaitRead<T>(pending: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return pending;
+  return new Promise((resolve, reject) => {
+    /** Rejects promptly when this request loses its generation owner. */
+    const aborted = () => {
+      signal.removeEventListener("abort", aborted);
+      reject(new Error("REST participant read aborted"));
+    };
+    pending.then(
+      (value) => {
+        signal.removeEventListener("abort", aborted);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", aborted);
+        reject(error);
+      },
+    );
+    if (signal.aborted) aborted();
+    else signal.addEventListener("abort", aborted, { once: true });
+  });
+}
+
+/** Reads decoded response bytes under the recovery budget, cancelling before buffering excess. */
+async function readJsonBody(
+  response: Response,
+  operation: TaskOperation,
+  policy?: Pick<RestTaskReadPolicy, "maxBytes">,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  let text = "";
+  if (policy) {
+    const reader = response.body?.getReader();
+    if (!reader) return null;
+    /** Cancels buffered and pending body chunks when the request is abandoned. */
+    const cancel = () => {
+      void reader.cancel().catch(() => undefined);
+    };
+    signal?.addEventListener("abort", cancel, { once: true });
+    let observed = 0;
+    const decoder = new TextDecoder();
+    try {
+      for (;;) {
+        signal?.throwIfAborted();
+        const chunk = await awaitRead(reader.read(), signal);
+        signal?.throwIfAborted();
+        if (chunk.done) break;
+        observed += chunk.value.byteLength;
+        if (observed > policy.maxBytes) {
+          throw new RestParticipantTaskError({
+            code: "RESOURCE_LIMIT",
+            operation,
+            resourceLimit: { resource: "response_bytes", limit: policy.maxBytes, observed },
+          });
+        }
+        text += decoder.decode(chunk.value, { stream: true });
+      }
+      text += decoder.decode();
+    } catch (error) {
+      cancel();
+      if (error instanceof RestParticipantTaskError) throw error;
+      throw new RestParticipantTaskError({ code: "TRANSPORT", operation });
+    } finally {
+      signal?.removeEventListener("abort", cancel);
+      reader.releaseLock();
+    }
+  } else {
+    try {
+      text = await response.text();
+    } catch {
+      throw new RestParticipantTaskError({ code: "TRANSPORT", operation });
+    }
+  }
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+/** Parses one task-or-null response body with the shared protocol schema. */
+function parseTask(
+  body: unknown,
+  error: (
+    code: Exclude<RestParticipantTaskErrorCode, "RESOURCE_LIMIT">,
+    operation: TaskOperation,
+  ) => Error,
+  operation: TaskOperation,
+): TaskRecord | null {
+  if (body === null) {
+    return null;
+  }
+  const parsed = taskRecordSchema.safeParse(body);
+  if (!parsed.success) {
+    throw error("INVALID_RESPONSE", operation);
+  }
+  return parsed.data;
+}
+
+/** Maps public HTTP status to a bounded client failure. */
+function mapTaskServerError(
+  status: number,
+): Exclude<RestParticipantTaskErrorCode, "RESOURCE_LIMIT"> {
+  if (status === 401 || status === 403) {
+    return "AUTHENTICATION";
+  }
+  if (status === 404) {
+    return "NOT_FOUND";
+  }
+  if (status === 409) {
+    return "CLAIM_CONFLICT";
+  }
+  return status >= 500 ? "PERSISTENCE" : "INVALID_RESPONSE";
+}
+
 /** Reusable REST task-route client for one participant identity. */
 export class RestParticipantTaskClient {
   readonly #authToken: string | null;
@@ -137,7 +372,10 @@ export class RestParticipantTaskClient {
   readonly #observability: ModuleObservability;
   readonly #participantId: string;
   readonly #serviceUrl: string;
+  /** Private automatic-recovery read policy; absent for ordinary REST callers. */
+  readonly #readPolicy: RestTaskReadPolicy | undefined;
 
+  /** Binds participant identity and optional recovery-owned request limits. */
   constructor(
     config: RestParticipantTaskClientConfig,
     options: RestParticipantTaskClientOptions = {},
@@ -149,6 +387,7 @@ export class RestParticipantTaskClient {
       options.observability ?? readModuleObservabilityOptions("RestParticipantTaskClient"),
     );
     this.#participantId = config.participantId;
+    this.#readPolicy = (options as InternalRestTaskClientOptions)[recoveryReadPolicy];
     this.#serviceUrl = config.serviceUrl.replace(/\/$/u, "");
   }
 
@@ -156,7 +395,9 @@ export class RestParticipantTaskClient {
    * Lists active (claimable) tasks for a session. Rows that fail the
    * protocol schema are dropped, not fatal: one malformed row must not
    * starve the healthy rows behind it (harnesses#32). The caller sees
-   * how many rows were dropped.
+   * how many rows were dropped. Participant REST replay deliberately rejects a
+   * nonzero invalidRowCount; its optional read policy also bounds response bytes
+   * and raw row count before per-row validation.
    */
   async listActiveTasks(sessionId: string): Promise<{
     readonly invalidRowCount: number;
@@ -170,6 +411,17 @@ export class RestParticipantTaskClient {
     const rows = z.object({ tasks: z.array(z.unknown()) }).safeParse(body);
     if (!rows.success) {
       throw this.#error("INVALID_RESPONSE", "list-active");
+    }
+    if (this.#readPolicy && rows.data.tasks.length > this.#readPolicy.maxActiveTasks) {
+      throw new RestParticipantTaskError({
+        code: "RESOURCE_LIMIT",
+        operation: "list-active",
+        resourceLimit: {
+          resource: "active_tasks",
+          limit: this.#readPolicy.maxActiveTasks,
+          observed: rows.data.tasks.length,
+        },
+      });
     }
     const tasks: TaskRecord[] = [];
     let invalidRowCount = 0;
@@ -360,7 +612,6 @@ export class RestParticipantTaskClient {
     );
   }
 
-  /** Appends one participant-originated session event. */
   /**
    * Appends one participant-originated session event. The wire body is
    * exactly the caller's fields: events are not fenced, so no identity
@@ -404,7 +655,11 @@ export class RestParticipantTaskClient {
     return parsed.data;
   }
 
-  #error(code: RestParticipantTaskErrorCode, operation: TaskOperation, status?: number | null) {
+  #error(
+    code: Exclude<RestParticipantTaskErrorCode, "RESOURCE_LIMIT">,
+    operation: TaskOperation,
+    status?: number | null,
+  ) {
     return new RestParticipantTaskError({
       code,
       operation,
@@ -430,6 +685,7 @@ export class RestParticipantTaskClient {
     };
   }
 
+  /** Executes one operation under its caller's optional cancellation and response budget. */
   async #request(
     operation: TaskOperation,
     method: "GET" | "POST",
@@ -440,23 +696,49 @@ export class RestParticipantTaskClient {
       operation,
       { operation },
       async () => {
+        const signal = this.#readPolicy
+          ? AbortSignal.any([
+              this.#readPolicy.signal,
+              AbortSignal.timeout(this.#readPolicy.timeoutMs),
+            ])
+          : undefined;
         let response: Response;
         try {
-          response = await this.#fetch(new URL(path, `${this.#serviceUrl}/`), {
-            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-            headers: {
-              ...(body === undefined ? {} : { "content-type": "application/json" }),
-              ...(this.#authToken ? { authorization: `Bearer ${this.#authToken}` } : {}),
-            },
-            method,
-          });
+          response = await awaitRead(
+            this.#fetch(new URL(path, `${this.#serviceUrl}/`), {
+              ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+              headers: {
+                ...(body === undefined ? {} : { "content-type": "application/json" }),
+                ...(this.#authToken ? { authorization: `Bearer ${this.#authToken}` } : {}),
+              },
+              method,
+              ...(signal === undefined ? {} : { signal }),
+            }).then((response) => {
+              if (signal?.aborted) {
+                discardBody(response);
+                signal.throwIfAborted();
+              }
+              return response;
+            }),
+            signal,
+          );
         } catch {
-          throw this.#error("TRANSPORT", operation);
+          throw readTransportError(operation, signal, this.#readPolicy?.signal);
         }
-        const responseBody = await readJsonBody(response);
         if (!response.ok) {
+          discardBody(response);
           throw this.#error(mapTaskServerError(response.status), operation, response.status);
         }
+        const responseBody = await readJsonBody(
+          response,
+          operation,
+          this.#readPolicy,
+          signal,
+        ).catch((error: unknown) => {
+          if (error instanceof RestParticipantTaskError && error.code === "TRANSPORT")
+            throw readTransportError(operation, signal, this.#readPolicy?.signal);
+          throw error;
+        });
         if (response.status === 204) {
           return { body: null, status: response.status };
         }
@@ -467,46 +749,11 @@ export class RestParticipantTaskClient {
   }
 }
 
-/** Parses one task-or-null response body with the shared protocol schema. */
-function parseTask(
-  body: unknown,
-  error: (code: RestParticipantTaskErrorCode, operation: TaskOperation) => Error,
-  operation: TaskOperation,
-): TaskRecord | null {
-  if (body === null) {
-    return null;
-  }
-  const parsed = taskRecordSchema.safeParse(body);
-  if (!parsed.success) {
-    throw error("INVALID_RESPONSE", operation);
-  }
-  return parsed.data;
-}
-
-async function readJsonBody(response: Response): Promise<unknown> {
-  let text: string;
-  try {
-    text = await response.text();
-  } catch {
-    throw new Error("Response body transport failed");
-  }
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return null;
-  }
-}
-
-/** Maps public HTTP status to a bounded client failure. */
-function mapTaskServerError(status: number): RestParticipantTaskErrorCode {
-  if (status === 401 || status === 403) {
-    return "AUTHENTICATION";
-  }
-  if (status === 404) {
-    return "NOT_FOUND";
-  }
-  if (status === 409) {
-    return "CLAIM_CONFLICT";
-  }
-  return status >= 500 ? "PERSISTENCE" : "INVALID_RESPONSE";
+/** Constructs recovery-owned reads without exposing policy through either package entry. */
+export function createReplayRestTaskClient(
+  config: RestParticipantTaskClientConfig,
+  policy: RestTaskReadPolicy,
+): RestParticipantTaskClient {
+  const options: InternalRestTaskClientOptions = { [recoveryReadPolicy]: policy };
+  return new RestParticipantTaskClient(config, options);
 }

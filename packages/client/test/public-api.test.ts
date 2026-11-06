@@ -1,6 +1,39 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 
 import * as Client from "../src/index.js";
+import type { ParticipantRestReplayError } from "../src/participant-rest-replay.js";
+
+/** The public options type must not expose recovery-owned transport limits. */
+const publicTaskOptions: Client.RestParticipantTaskClientOptions = {};
+// @ts-expect-error Recovery read policy is an internal construction detail.
+void publicTaskOptions.readPolicy;
+
+/** Resource failures require complete metadata, while other variants do not accept it. */
+type RestTaskFailureInput = ConstructorParameters<typeof Client.RestParticipantTaskError>[0];
+// @ts-expect-error RESOURCE_LIMIT cannot omit its resource metadata.
+const incompleteResourceFailure: RestTaskFailureInput = {
+  code: "RESOURCE_LIMIT",
+  operation: "read",
+};
+const transportWithResource = {
+  code: "TRANSPORT",
+  operation: "read",
+  resourceLimit: { resource: "response_bytes", limit: 1, observed: 2 },
+} as const;
+// @ts-expect-error Transport failures cannot masquerade as resource-policy failures.
+const mismatchedResourceFailure: RestTaskFailureInput = transportWithResource;
+void incompleteResourceFailure;
+void mismatchedResourceFailure;
+
+/** Overflow reasons require their original metadata keys at every construction site. */
+type ReplayFailureArgs = ConstructorParameters<typeof ParticipantRestReplayError>;
+const renamedOverflowDetails = { limit: 1, observed: 2 };
+// @ts-expect-error Count overflow requires maxQueueSize and observedQueueSize.
+const invalidCountOverflow: ReplayFailureArgs = ["delivery_queue_overflow", renamedOverflowDetails];
+// @ts-expect-error Byte overflow requires maxQueueBytes and observedQueueBytes.
+const invalidByteOverflow: ReplayFailureArgs = ["delivery_byte_overflow", renamedOverflowDetails];
+void invalidCountOverflow;
+void invalidByteOverflow;
 
 type PromiseReturning<TArgs extends readonly unknown[], TValue> = (
   ...args: TArgs
@@ -62,6 +95,22 @@ const sessionEventStreamPromiseContract: SessionEventStreamPromiseContract = {
 };
 
 describe("@dungle-scrubs/tether-client public API", () => {
+  it("preserves REST error code and details as enumerable own fields", () => {
+    const error = new Client.RestParticipantTaskError({
+      code: "TRANSPORT",
+      operation: "list-events",
+    });
+    const expected = {
+      code: "TRANSPORT",
+      details: { operation: "list-events", status: null },
+      name: "RestParticipantTaskError",
+    };
+    expect(JSON.parse(JSON.stringify(error))).toEqual(expected);
+    expect({ ...error }).toEqual(expected);
+    expect(Object.hasOwn(error, "code")).toBe(true);
+    expect(Object.hasOwn(error, "details")).toBe(true);
+    expect(error).not.toHaveProperty("failure");
+  });
   it("keeps participant runtime APIs Promise-based", () => {
     expect(Object.keys(participantRuntimePromiseContract).sort()).toEqual([
       "claimTask",

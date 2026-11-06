@@ -1,7 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { ok } from "node:assert/strict";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  createReplayRestTaskClient,
+  isRestParticipantResourceLimit,
   RestParticipantTaskClient,
+  RestParticipantTaskError,
   type RestParticipantTaskFetch,
 } from "../src/rest-participant-task-client.js";
 
@@ -78,7 +82,230 @@ function posted(requests: CapturedRequest[], path: string): Record<string, unkno
   return hit.body as Record<string, unknown>;
 }
 
+/** Uses only an injected synthetic response with the runtime's internal read policy. */
+function boundedTaskClient(
+  response: Response,
+  input: Partial<Parameters<typeof createReplayRestTaskClient>[1]> = {},
+): RestParticipantTaskClient {
+  vi.stubGlobal("fetch", async () => response);
+  return createReplayRestTaskClient(
+    { authToken: null, participantId: "part_1", serviceUrl: "https://fixture.invalid" },
+    {
+      maxBytes: input.maxBytes ?? 10_000,
+      maxActiveTasks: input.maxActiveTasks ?? 10,
+      signal: input.signal ?? new AbortController().signal,
+      timeoutMs: input.timeoutMs ?? 1_000,
+    },
+  );
+}
+
 describe("RestParticipantTaskClient", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it("cancels an error response without reading or parsing its body", async () => {
+    let pulls = 0;
+    let cancellations = 0;
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        pull: (controller) => {
+          pulls += 1;
+          controller.enqueue(new Uint8Array(1_000));
+        },
+        cancel: () => {
+          cancellations += 1;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const client = new RestParticipantTaskClient(
+      { authToken: null, participantId: "part_1", serviceUrl: "https://fixture.invalid" },
+      { fetch: async () => new Response(stream, { status: 503 }) },
+    );
+    await expect(client.listActiveTasks("sess_1")).rejects.toMatchObject({
+      code: "PERSISTENCE",
+      details: { status: 503 },
+    });
+    expect(pulls).toBe(0);
+    expect(cancellations).toBe(1);
+  });
+
+  it("reports required resource details and narrows them through the public code", () => {
+    const error = new RestParticipantTaskError({
+      code: "RESOURCE_LIMIT",
+      operation: "list-active",
+      resourceLimit: { resource: "active_tasks", limit: 2, observed: 3 },
+    });
+    expect(error.code).toBe("RESOURCE_LIMIT");
+    expect(error.details).toEqual({
+      operation: "list-active",
+      status: null,
+      resourceLimit: { resource: "active_tasks", limit: 2, observed: 3 },
+    });
+    ok(isRestParticipantResourceLimit(error));
+    expect(error.details.resourceLimit.observed).toBe(3);
+    expect(error).not.toHaveProperty("failure");
+  });
+
+  it("bundles a resource limit into one bounded details object", async () => {
+    const failure = boundedTaskClient(new Response(new Uint8Array(80)), {
+      maxBytes: 64,
+    }).listActiveTasks("sess_1");
+    await expect(failure).rejects.toMatchObject({ code: "RESOURCE_LIMIT" });
+    await expect(failure).rejects.toHaveProperty("details", {
+      operation: "list-active",
+      status: null,
+      resourceLimit: { resource: "response_bytes", limit: 64, observed: 80 },
+    });
+  });
+
+  it.each([
+    { status: 401, code: "AUTHENTICATION" },
+    { status: 503, code: "PERSISTENCE" },
+    { status: 501, code: "PERSISTENCE" },
+  ])("maps HTTP $status before discarding an oversized error body", async ({ status, code }) => {
+    const bytes = new TextEncoder().encode("x".repeat(8_000));
+    let offset = 0;
+    let pulls = 0;
+    let cancellations = 0;
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        pull: (controller) => {
+          pulls += 1;
+          const chunk = bytes.subarray(offset, offset + 1_000);
+          offset += chunk.length;
+          if (chunk.length === 0) controller.close();
+          else controller.enqueue(chunk);
+        },
+        cancel: () => {
+          cancellations += 1;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const client = boundedTaskClient(new Response(stream, { status }), { maxBytes: 64 });
+    await expect(client.listActiveTasks("sess_1")).rejects.toMatchObject({
+      code,
+      details: { operation: "list-active", status },
+    });
+    expect(pulls).toBe(0);
+    expect(cancellations).toBe(1);
+  });
+
+  it("cancels an over-budget body while reading chunks before buffering or parsing it", async () => {
+    const bytes = new TextEncoder().encode(JSON.stringify({ tasks: [taskRecord] }));
+    let offset = 0;
+    let pulls = 0;
+    let cancellations = 0;
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        pull: (controller) => {
+          pulls += 1;
+          const chunk = bytes.subarray(offset, offset + 40);
+          offset += chunk.length;
+          if (chunk.length === 0) controller.close();
+          else controller.enqueue(chunk);
+        },
+        cancel: () => {
+          cancellations += 1;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const client = boundedTaskClient(new Response(stream), { maxBytes: 64 });
+    await expect(client.listActiveTasks("sess_1")).rejects.toMatchObject({
+      code: "RESOURCE_LIMIT",
+      details: {
+        operation: "list-active",
+        resourceLimit: { resource: "response_bytes", limit: 64, observed: 80 },
+      },
+    });
+    expect(cancellations).toBe(1);
+    expect(pulls).toBe(2);
+  });
+
+  it("aborts and cancels a stalled response body without waiting for it to finish", async () => {
+    const cancellation = new AbortController();
+    let pulled = false;
+    let cancelled = false;
+    let finish: (() => void) | undefined;
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        start: (controller) => {
+          finish = () => controller.close();
+        },
+        pull: () => {
+          pulled = true;
+        },
+        cancel: () => {
+          cancelled = true;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const request = boundedTaskClient(new Response(stream), {
+      signal: cancellation.signal,
+    }).listActiveTasks("sess_1");
+    request.catch(() => undefined);
+    try {
+      for (let i = 0; i < 50 && !pulled; i += 1) await Promise.resolve();
+      expect(pulled).toBe(true);
+      cancellation.abort();
+      for (let i = 0; i < 50 && !cancelled; i += 1) await Promise.resolve();
+      expect(cancelled).toBe(true);
+      await expect(request).rejects.toMatchObject({
+        code: "TRANSPORT",
+        details: { operation: "list-active" },
+      });
+    } finally {
+      if (!cancelled) finish?.();
+    }
+  });
+
+  it("preserves typed transport errors when a response body stream fails", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        controller.error(new Error("synthetic body failure"));
+      },
+    });
+    await expect(
+      boundedTaskClient(new Response(stream)).listActiveTasks("sess_1"),
+    ).rejects.toMatchObject({
+      name: "RestParticipantTaskError",
+      code: "TRANSPORT",
+      details: { operation: "list-active" },
+    });
+  });
+
+  it("decodes split UTF-8 chunks without counting characters instead of response bytes", async () => {
+    const bytes = new TextEncoder().encode(
+      JSON.stringify({ tasks: [{ ...taskRecord, objective: "é🗓" }] }),
+    );
+    let offset = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull: (controller) => {
+        if (offset === bytes.length) controller.close();
+        else controller.enqueue(bytes.subarray(offset, ++offset));
+      },
+    });
+    const result = await boundedTaskClient(new Response(stream), {
+      maxBytes: bytes.length,
+    }).listActiveTasks("sess_1");
+    expect(result.tasks[0]?.objective).toBe("é🗓");
+    expect(result.invalidRowCount).toBe(0);
+  });
+  it("checks raw task count before parsing rows while leaving tolerant callers unchanged", async () => {
+    const body = { tasks: [taskRecord, { malformed: "synthetic" }] };
+    const bounded = boundedTaskClient(Response.json(body), { maxActiveTasks: 1 });
+    await expect(bounded.listActiveTasks("sess_1")).rejects.toMatchObject({
+      code: "RESOURCE_LIMIT",
+      details: { resourceLimit: { resource: "active_tasks", limit: 1, observed: 2 } },
+    });
+    const legacy = fetchJson(200, body);
+    await expect(legacy.client.listActiveTasks("sess_1")).resolves.toMatchObject({
+      invalidRowCount: 1,
+      tasks: [taskRecord],
+    });
+  });
+
   it("claims a task with the fenced identity and parses the wrapped record", async () => {
     const { client, requests } = fetchJson(200, {
       status: "claimed",
