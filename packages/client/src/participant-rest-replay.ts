@@ -19,6 +19,7 @@ import type { SessionEvent, TaskRecord } from "./types.js";
 
 /** Internal replay failures carry only bounded policy and sequence metadata. */
 export class ParticipantRestReplayError extends Error {
+  /** Records bounded failure metadata without retaining a response payload. */
   constructor(
     readonly reason:
       | "delivery_byte_overflow"
@@ -47,6 +48,22 @@ const taskPayloadSchemas = new Map<string, ZodType<{ readonly task: TaskRecord }
   [sessionEventType.approvalRecorded, taskApprovalRecordedPayloadSchema],
 ]);
 
+/** Counts the same event envelope retained by serial delivery. */
+function eventByteCost(event: SessionEvent): number {
+  return Buffer.byteLength(JSON.stringify({ event, op: "event" }));
+}
+
+/** Only canonical lifecycle payloads can update REST replay's task candidates. */
+export function taskFromReplayStateEvent(event: SessionEvent): TaskRecord | null {
+  const schema = taskPayloadSchemas.get(event.type);
+  if (!schema) return null;
+  const parsed = schema.safeParse(event.payload);
+  if (!parsed.success || parsed.data.task.sessionId !== event.sessionId) {
+    throw new ParticipantRestReplayError("invalid_server_envelope");
+  }
+  return parsed.data.task;
+}
+
 /** One generation's bounded REST history and ordered WebSocket handoff. */
 export class ParticipantRestReplay {
   private readonly controller = new AbortController();
@@ -59,6 +76,7 @@ export class ParticipantRestReplay {
   private readonly waiters = new Set<() => void>();
   private readonly pageLimit: number;
 
+  /** Binds replay to one generation's delivery state and existing resource limits. */
   constructor(
     private readonly options: {
       readonly afterSeq: number;
@@ -209,12 +227,14 @@ export class ParticipantRestReplay {
     this.heldBytes = 0;
   }
 
+  /** Rejects work after its generation has ended. */
   private assertActive(): void {
     if (this.controller.signal.aborted) {
       throw new RestParticipantTaskError({ code: "TRANSPORT", operation: "replay" });
     }
   }
 
+  /** Validates pagination, contiguous sequences and shared queue budgets at ingress. */
   private async readPage(after: number, limit = this.pageLimit): Promise<EventListResponse> {
     this.assertActive();
     const page = await this.rest.listEvents(this.options.config.sessionId, {
@@ -254,6 +274,7 @@ export class ParticipantRestReplay {
     return page;
   }
 
+  /** Includes held wire frames and serial delivery in the same finite budget. */
   private checkBudget(items: number, bytes: number): void {
     const delivery = this.options.delivery.debugInfo();
     const observedQueueSize = delivery.queueSize + this.held.length + items;
@@ -272,6 +293,7 @@ export class ParticipantRestReplay {
     }
   }
 
+  /** Waits for delivery progress while remaining cancellable by the generation owner. */
   private waitUntil(predicate: () => boolean): Promise<void> {
     this.assertActive();
     if (predicate()) return Promise.resolve();
@@ -296,6 +318,7 @@ export class ParticipantRestReplay {
     });
   }
 
+  /** Bounds the wait for command authority with the existing command timeout. */
   private async waitForWire(): Promise<void> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<never>((_resolve, reject) => {
@@ -311,19 +334,4 @@ export class ParticipantRestReplay {
       clearTimeout(timer);
     }
   }
-}
-
-function eventByteCost(event: SessionEvent): number {
-  return Buffer.byteLength(JSON.stringify({ event, op: "event" }));
-}
-
-/** Only canonical lifecycle payloads can update REST replay's task candidates. */
-export function taskFromReplayStateEvent(event: SessionEvent): TaskRecord | null {
-  const schema = taskPayloadSchemas.get(event.type);
-  if (!schema) return null;
-  const parsed = schema.safeParse(event.payload);
-  if (!parsed.success || parsed.data.task.sessionId !== event.sessionId) {
-    throw new ParticipantRestReplayError("invalid_server_envelope");
-  }
-  return parsed.data.task;
 }
