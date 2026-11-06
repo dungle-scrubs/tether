@@ -1,5 +1,6 @@
 import { Effect } from "effect";
 
+import { taskFromReplayStateEvent } from "./participant-rest-replay.js";
 import { taskFromClaimableEvent } from "./protocol.js";
 import { TaskCancellationRegistry } from "./task-cancellation-registry.js";
 import type {
@@ -28,6 +29,8 @@ export interface ParticipantClaimableTaskRunnerClient {
   readonly isStopped: () => boolean;
   /** Returns whether terminal delivery policy requires explicit remediation. */
   readonly isPaused: () => boolean;
+  /** REST mode only: loads canonical active candidates before dispatch. */
+  readonly loadReplayTasks?: () => Promise<readonly TaskRecord[]>;
   /** Registers a live/replayed event handler. */
   readonly onEvent: (handler: (event: SessionEvent) => void) => () => void;
   /** Reconnects the participant stream using the client's configured backoff. */
@@ -56,6 +59,7 @@ export function buildParticipantClaimableTaskLoop(
   const replayTasks = new Map<string, { readonly generation: number; readonly task: TaskRecord }>();
   let replayReadyGeneration: number | null = null;
   let replayEpoch = 0;
+  let snapshotTouched: { readonly generation: number; readonly ids: Set<string> } | null = null;
 
   const startTask = (task: TaskRecord): void => {
     if (cancellations.isCancelled(task.taskId)) {
@@ -79,13 +83,28 @@ export function buildParticipantClaimableTaskLoop(
 
   const subscribe = (): (() => void) =>
     client.onEvent((event) => {
+      let selected: boolean | undefined;
+      if (client.loadReplayTasks) {
+        const task = taskFromReplayStateEvent(event);
+        if (task) {
+          if (snapshotTouched?.generation === client.connectionGeneration()) {
+            snapshotTouched.ids.add(task.taskId);
+          }
+          selected = isDispatchableClaimableTask(task) && options.shouldClaimTask(task);
+          if (!selected) replayTasks.delete(task.taskId);
+        }
+      }
       const cancelledTaskId = cancellations.observe(event);
       if (cancelledTaskId) {
         replayTasks.delete(cancelledTaskId);
         return;
       }
       const task = taskFromClaimableEvent(event);
-      if (!task || !isDispatchableClaimableTask(task) || !options.shouldClaimTask(task)) {
+      if (
+        !task ||
+        !isDispatchableClaimableTask(task) ||
+        !(selected ?? options.shouldClaimTask(task))
+      ) {
         return;
       }
       const eventGeneration = client.connectionGeneration();
@@ -101,6 +120,7 @@ export function buildParticipantClaimableTaskLoop(
 
   const runLoop = async (): Promise<void> => {
     while (!client.isStopped()) {
+      if (client.isPaused()) throw new Error("Participant task loop entered Paused State");
       const currentEpoch = replayEpoch + 1;
       const currentGeneration = client.connectionGeneration();
       replayEpoch = currentEpoch;
@@ -108,6 +128,41 @@ export function buildParticipantClaimableTaskLoop(
       const replayReady = client.waitForReplayComplete().then(
         async () => {
           try {
+            if (client.loadReplayTasks) {
+              if (
+                currentEpoch !== replayEpoch ||
+                currentGeneration !== client.connectionGeneration() ||
+                client.isStopped() ||
+                client.isPaused()
+              ) {
+                return { kind: "replay-stale", replayEpoch: currentEpoch } as const;
+              }
+              const touched = { generation: currentGeneration, ids: new Set<string>() };
+              snapshotTouched = touched;
+              try {
+                const tasks = await client.loadReplayTasks();
+                if (
+                  currentEpoch !== replayEpoch ||
+                  currentGeneration !== client.connectionGeneration() ||
+                  client.isStopped() ||
+                  client.isPaused()
+                ) {
+                  return { kind: "replay-stale", replayEpoch: currentEpoch } as const;
+                }
+                for (const task of tasks) {
+                  if (
+                    !touched.ids.has(task.taskId) &&
+                    !cancellations.isCancelled(task.taskId) &&
+                    isDispatchableClaimableTask(task) &&
+                    options.shouldClaimTask(task)
+                  ) {
+                    replayTasks.set(task.taskId, { generation: currentGeneration, task });
+                  }
+                }
+              } finally {
+                if (snapshotTouched === touched) snapshotTouched = null;
+              }
+            }
             await options.replayBarrier?.();
           } catch (error) {
             return { error, kind: "barrier-failed", replayEpoch: currentEpoch } as const;
@@ -121,6 +176,10 @@ export function buildParticipantClaimableTaskLoop(
         .then(() => ({ kind: "closed", replayEpoch: currentEpoch }) as const);
       const firstResult = await Promise.race([replayReady, closeReady]);
 
+      if (firstResult.kind === "replay-stale") {
+        discardReplayTasks(currentGeneration);
+        continue;
+      }
       if (firstResult.kind === "barrier-failed") {
         throw firstResult.error;
       }
@@ -132,7 +191,13 @@ export function buildParticipantClaimableTaskLoop(
         }
         await closeReady;
       } else if (firstResult.kind === "replay-ready") {
-        if (firstResult.replayEpoch !== replayEpoch) {
+        if (
+          firstResult.replayEpoch !== replayEpoch ||
+          currentGeneration !== client.connectionGeneration() ||
+          client.isStopped() ||
+          client.isPaused()
+        ) {
+          discardReplayTasks(currentGeneration);
           continue;
         }
         replayReadyGeneration = currentGeneration;
@@ -157,6 +222,9 @@ export function buildParticipantClaimableTaskLoop(
         discardReplayTasks(currentGeneration);
       }
       if (!client.isStopped()) {
+        if (client.isPaused()) {
+          throw new Error("Participant task loop entered Paused State");
+        }
         await client.reconnectAfterClose();
       }
     }
