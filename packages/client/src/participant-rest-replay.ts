@@ -37,6 +37,11 @@ type HeldFrame =
   | { readonly event: SessionEvent; readonly byteCost: number; readonly kind: "event" }
   | { readonly byteCost: number; readonly kind: "marker" };
 
+/** Validated page with one computed delivery cost per event. */
+type ValidatedHistoryPage = EventListResponse & {
+  readonly frames: readonly { readonly event: SessionEvent; readonly byteCost: number }[];
+};
+
 const taskPayloadSchemas = new Map<string, ZodType<{ readonly task: TaskRecord }>>([
   [sessionEventType.taskCreated, taskCreatedPayloadSchema],
   [sessionEventType.taskClaimExpired, taskClaimExpiredPayloadSchema],
@@ -47,6 +52,14 @@ const taskPayloadSchemas = new Map<string, ZodType<{ readonly task: TaskRecord }
   [sessionEventType.controlCancel, taskCancelledPayloadSchema],
   [sessionEventType.approvalRecorded, taskApprovalRecordedPayloadSchema],
 ]);
+
+// Only HTTP envelope metadata gets this allowance; event and task admission budgets stay unchanged.
+const responseEnvelopeAllowance = 4_096;
+
+/** Counts a retained canonical task record for the recovery-state owner. */
+export function replayTaskByteCost(task: TaskRecord): number {
+  return Buffer.byteLength(JSON.stringify(task));
+}
 
 /** Counts the same event envelope retained by serial delivery. */
 function eventByteCost(event: SessionEvent): number {
@@ -62,6 +75,17 @@ export function taskFromReplayStateEvent(event: SessionEvent): TaskRecord | null
     throw new ParticipantRestReplayError("invalid_server_envelope");
   }
   return parsed.data.task;
+}
+
+/** Classifies only temporary read failures for the existing transport reconnect owner. */
+export function isTransientRestReplayFailure(error: unknown): error is RestParticipantTaskError {
+  return (
+    error instanceof RestParticipantTaskError &&
+    (error.code === "TRANSPORT" ||
+      error.code === "PERSISTENCE" ||
+      error.details.status === 429 ||
+      error.details.status === 408)
+  );
 }
 
 /** One generation's bounded REST history and ordered WebSocket handoff. */
@@ -92,29 +116,49 @@ export class ParticipantRestReplay {
     // Leave room for the wire marker at the normal page boundary.
     this.pageLimit = Math.min(500, Math.max(1, options.maxQueueSize - 1));
     this.rest = new RestParticipantTaskClient(options.config, {
-      fetch: async (url, init) => {
-        const signal = AbortSignal.any([
-          this.controller.signal,
-          AbortSignal.timeout(options.timeoutMs),
-        ]);
-        const response = await fetch(url, { ...init, signal });
-        signal.throwIfAborted();
-        return response;
+      readPolicy: {
+        maxBytes: options.maxQueueBytes + responseEnvelopeAllowance,
+        maxActiveTasks: options.maxQueueSize,
+        signal: this.controller.signal,
+        timeoutMs: options.timeoutMs,
       },
     });
   }
 
-  /** Finds a finite head, retaining no history across pages and acknowledging nothing. */
+  /** Finds a witnessed head with probes bounded by the safe-integer sequence domain. */
   async discoverHead(): Promise<number> {
-    let after = this.options.afterSeq;
-    for (;;) {
-      const page = await this.readPage(after);
-      after = page.pagination.nextAfterSeq;
-      if (!page.pagination.hasMore) {
-        this.wireSeq = after;
-        return after;
+    const floor = this.options.afterSeq;
+    if (!Number.isSafeInteger(floor) || floor < 0) {
+      throw new ParticipantRestReplayError("invalid_server_envelope");
+    }
+    const first = await this.readPage(floor, 1);
+    let witnessed = first.events[0]?.seq ?? floor;
+    if (first.events.length > 0) {
+      const span = Number.MAX_SAFE_INTEGER - floor;
+      let offset = 1;
+      let upper: number;
+      for (;;) {
+        const after = floor + offset;
+        const page = await this.readPage(after, 1);
+        if (page.events.length === 0) {
+          upper = after;
+          break;
+        }
+        witnessed = page.events[0]?.seq ?? witnessed;
+        offset = offset >= Math.ceil(span / 2) ? span : offset * 2;
+      }
+      // Once an absent upper boundary is found, concurrent appends cannot expand this interval.
+      while (witnessed < upper) {
+        const after = witnessed + Math.floor((upper - witnessed) / 2);
+        const page = await this.readPage(after, 1);
+        const event = page.events[0];
+        if (event) witnessed = event.seq;
+        else upper = after;
       }
     }
+    this.assertActive();
+    this.wireSeq = witnessed;
+    return witnessed;
   }
 
   /** Waits for command authority, then delivers history through the ordinary handler path. */
@@ -124,7 +168,7 @@ export class ParticipantRestReplay {
     while (after < head) {
       const availableSlots =
         this.options.maxQueueSize - this.held.length - this.options.delivery.debugInfo().queueSize;
-      const page = await this.readPage(
+      const page = await this.readHistoryPage(
         after,
         Math.min(this.pageLimit, head - after, Math.max(1, availableSlots)),
       );
@@ -135,9 +179,9 @@ export class ParticipantRestReplay {
       ) {
         throw new ParticipantRestReplayError("invalid_server_envelope");
       }
-      for (const event of events) {
+      for (const frame of page.frames) {
         this.assertActive();
-        this.options.delivery.enqueueEvent(event, eventByteCost(event));
+        this.options.delivery.enqueueEvent(frame.event, frame.byteCost);
       }
       after = events.at(-1)?.seq ?? after;
       // Settlement alone can resolve before a handler is attached. Require the handled cursor.
@@ -207,6 +251,16 @@ export class ParticipantRestReplay {
     ) {
       throw new RestParticipantTaskError({ code: "INVALID_RESPONSE", operation: "list-active" });
     }
+    let bytes = 0;
+    for (const task of snapshot.tasks) {
+      bytes += replayTaskByteCost(task);
+      if (bytes > this.options.maxQueueBytes) {
+        throw new ParticipantRestReplayError("delivery_byte_overflow", {
+          maxQueueBytes: this.options.maxQueueBytes,
+          observedQueueBytes: bytes,
+        });
+      }
+    }
     return snapshot.tasks;
   }
 
@@ -234,8 +288,30 @@ export class ParticipantRestReplay {
     }
   }
 
+  /** Retries only byte-heavy multi-event pages, at the same unacknowledged cursor. */
+  private async readHistoryPage(
+    after: number,
+    initialLimit: number,
+  ): Promise<ValidatedHistoryPage> {
+    let limit = initialLimit;
+    for (;;) {
+      try {
+        return await this.readPage(after, limit);
+      } catch (error) {
+        const byteOverflow =
+          (error instanceof ParticipantRestReplayError &&
+            error.reason === "delivery_byte_overflow") ||
+          (error instanceof RestParticipantTaskError &&
+            error.code === "RESOURCE_LIMIT" &&
+            error.details.resource === "response_bytes");
+        if (!byteOverflow || limit === 1) throw error;
+        limit = Math.max(1, Math.floor(limit / 2));
+      }
+    }
+  }
+
   /** Validates pagination, contiguous sequences and shared queue budgets at ingress. */
-  private async readPage(after: number, limit = this.pageLimit): Promise<EventListResponse> {
+  private async readPage(after: number, limit = this.pageLimit): Promise<ValidatedHistoryPage> {
     this.assertActive();
     const page = await this.rest.listEvents(this.options.config.sessionId, {
       after,
@@ -253,8 +329,11 @@ export class ParticipantRestReplay {
     ) {
       throw new ParticipantRestReplayError("invalid_server_envelope");
     }
-    let expected = after + 1;
+    let expected = after;
     for (const event of events) {
+      if (expected === Number.MAX_SAFE_INTEGER)
+        throw new ParticipantRestReplayError("invalid_server_envelope");
+      expected += 1;
       if (!Number.isSafeInteger(event.seq) || event.seq !== expected) {
         throw new ParticipantRestReplayError("non_contiguous_event", {
           expectedSeq: expected,
@@ -265,13 +344,13 @@ export class ParticipantRestReplay {
         throw new ParticipantRestReplayError("invalid_server_envelope");
       }
       taskFromReplayStateEvent(event);
-      expected += 1;
     }
+    const frames = events.map((event) => ({ event, byteCost: eventByteCost(event) }));
     this.checkBudget(
-      events.length,
-      events.reduce((bytes, event) => bytes + eventByteCost(event), 0),
+      frames.length,
+      frames.reduce((bytes, frame) => bytes + frame.byteCost, 0),
     );
-    return page;
+    return { ...page, frames };
   }
 
   /** Includes held wire frames and serial delivery in the same finite budget. */

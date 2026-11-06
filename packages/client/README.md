@@ -115,23 +115,40 @@ Set `replayMode: "rest"` in `runParticipantRuntime` or
 `ParticipantRuntimeClient.create` configuration when history exceeds the server's
 WebSocket replay window. The default, `"websocket"`, keeps the existing behavior.
 
-REST mode scans bounded event pages to discover a history head, then opens the
+REST mode discovers a witnessed history head with single-event exponential and
+binary probes bounded by the safe-integer sequence domain, then opens the
 WebSocket at that head. After the wire replay marker supplies the control epoch,
-it reads history again and delivers each page through the serial event handlers.
-The scan does not advance the handled or durable cursor. Command responses remain
-available while a historical handler awaits a publish or task command.
+it delivers history through the serial event handlers. Discovery never advances
+the handled or durable cursor. A valid page that exceeds available bytes retries
+with fewer rows at the same cursor; a single event must still fit. Command
+responses remain available while a historical handler awaits a command.
+
+Direct clients must register an `onEvent` subscriber before opening. REST replay
+waits for actual handler success, including when a subscriber attaches late.
+`runParticipantRuntime` installs its task subscriber before opening.
 
 Live event frames and replay markers retain their arrival order behind history.
 History pages and held frames share the configured delivery item and byte limits.
 `waitForReplayComplete()` resolves only after historical handlers and the queued
 wire replay marker complete. The task runner also loads the active-task snapshot
 before its post-replay hook and task dispatch. This recovers pending tasks whose
-request events precede a persisted cursor. Claims still use the existing server
-claim and fencing rules.
+request events precede a persisted cursor. REST task execution is serial, with
+one active claim flow. Pending candidates, running work, and snapshot-touched IDs
+share a task-state budget using the existing delivery count and byte limits.
+Responses are bounded while reading, and oversized snapshots fail before dispatch.
+Claims still use the existing server claim, refresh, and cancellation fences.
+
+REST replay rejects any malformed snapshot row to avoid silently losing pending
+work. Direct `RestParticipantTaskClient.listActiveTasks` callers retain their
+existing tolerant behavior and receive `invalidRowCount`.
 
 REST requests and the wait for wire control use `commandTimeoutMs`. Ending a
-connection generation aborts its REST requests. Invalid pages, sequence gaps,
-malformed task rows, and queue overflow pause the runtime without skipping work.
+connection generation aborts its REST requests, including stalled bodies.
+Transport and body-read failures, temporary service errors, and HTTP 429 or 408
+recover through the existing reconnect backoff from the handled cursor. Direct
+`open()` still rejects startup errors. Authentication failures, invalid pages,
+sequence gaps, malformed task rows, and resource overflow pause without skipping
+work.
 A gap beyond the WebSocket replay window still fails closed. REST mode does not
 provide exactly-once effects or increase any delivery limit.
 
@@ -175,7 +192,7 @@ not skip the failed event or reconnect indefinitely.
 Use the exported typed errors for safe control flow and logging:
 
 - `ParticipantRuntimeEventDeliveryError` for handler rejection or timeout.
-- `ParticipantRuntimeTerminalStreamError` for Paused State and terminal replay failures, including `rest_replay_failed` for REST transport or response failures.
+- `ParticipantRuntimeTerminalStreamError` for Paused State and terminal replay failures, including `rest_replay_failed` for REST authentication or malformed-response failures.
 - `ParticipantRuntimeCursorPersistError` after one bounded cursor-write cycle exhausts.
 - `ParticipantRuntimeCommandOutcomeUnknownError` when recovery interrupts a command whose server-side outcome may already have occurred. Do not blindly retry that command.
 - `ParticipantRuntimeShutdownError` when graceful delivery, socket, or cursor settlement remains incomplete.

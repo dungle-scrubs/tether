@@ -14,7 +14,11 @@ import {
   type TaskCancellationContext,
 } from "./participant-claimable-task-runner.js";
 import { ParticipantCursorWriter } from "./participant-cursor-writer.js";
-import { ParticipantRestReplay, ParticipantRestReplayError } from "./participant-rest-replay.js";
+import {
+  isTransientRestReplayFailure,
+  ParticipantRestReplay,
+  ParticipantRestReplayError,
+} from "./participant-rest-replay.js";
 import { runParticipantTaskClaimFlow } from "./participant-task-claim-flow.js";
 import {
   type AppendSessionEventInput,
@@ -794,7 +798,8 @@ export class ParticipantRuntimeClient {
       if (prepared.generation === this.connectionGeneration) {
         if (this.restReplay && !this.stopped) {
           reportedError =
-            this.failRestReplay(openError, prepared.generation, this.restReplay) ?? openError;
+            this.failRestReplay(openError, prepared.generation, this.restReplay, false) ??
+            openError;
         } else {
           this.settleReplayCompleteError(openError);
         }
@@ -1056,7 +1061,19 @@ export class ParticipantRuntimeClient {
           connectionGeneration: () => this.connectionGeneration,
           isPaused: () => this.pausedReason !== null,
           isStopped: () => this.stopped,
-          ...(this.restReplay ? { loadReplayTasks: () => this.loadReplayTasks() } : {}),
+          ...(this.restReplay
+            ? {
+                taskRecovery: {
+                  load: () => this.loadReplayTasks(),
+                  maxQueueBytes: this.maxDeliveryQueueBytes,
+                  maxQueueSize: this.maxDeliveryQueueSize,
+                  fail: (error: ParticipantRestReplayError) => {
+                    const replay = this.restReplay;
+                    if (replay) this.failRestReplay(error, this.connectionGeneration, replay);
+                  },
+                },
+              }
+            : {}),
           onEvent: (handler) => this.onEvent(handler),
           reconnectAfterClose: () => this.requestReconnect(),
           runTaskClaimFlow: (input) => this.runTaskClaimFlow(input),
@@ -1240,6 +1257,7 @@ export class ParticipantRuntimeClient {
         if (delayMs > 0) {
           yield* sleepUnrefEffect(delayMs);
         }
+        if (this.restReplay && (this.stopped || this.pausedReason !== null)) return;
         const opened = yield* Effect.either(
           Effect.tryPromise({
             catch: (error) => error,
@@ -1397,6 +1415,7 @@ export class ParticipantRuntimeClient {
     error: unknown,
     generation: number,
     replay: ParticipantRestReplay,
+    reconnect = true,
   ): ParticipantRuntimeTerminalStreamError | null {
     if (
       generation !== this.connectionGeneration ||
@@ -1406,12 +1425,56 @@ export class ParticipantRuntimeClient {
       this.pausedReason !== null
     )
       return null;
+    if (isTransientRestReplayFailure(error)) {
+      replay.abort();
+      this.delivery.stop();
+      this.settleReplayCompleteError(error);
+      this.rejectPendingCommandsAsUnknown(error);
+      const socket = this.socket;
+      const close = this.closePromise;
+      const delivery = this.delivery;
+      this.socket = null;
+      socket?.close();
+      if (!this.transportHasSocket) this.resolveTransportClose?.();
+      this.emitError(error);
+      if (reconnect) {
+        void Promise.all([close, delivery.waitForSettlement()]).then(async () => {
+          if (
+            this.stopped ||
+            this.pausedReason !== null ||
+            generation !== this.connectionGeneration
+          )
+            return;
+          // An open owner may still be settling. Enqueue behind it instead of losing this retry.
+          await this.reconnectPromise?.catch(() => undefined);
+          if (
+            !this.stopped &&
+            this.pausedReason === null &&
+            generation === this.connectionGeneration
+          )
+            await this.requestReconnect();
+        });
+      }
+      return null;
+    }
+    let reason: ParticipantRuntimePausedReason = "rest_replay_failed";
+    let details: Readonly<Record<string, number>> = {};
+    if (error instanceof ParticipantRestReplayError) {
+      reason = error.reason;
+      details = error.safeDetails;
+    } else if (error instanceof RestParticipantTaskError && error.code === "RESOURCE_LIMIT") {
+      reason =
+        error.details.resource === "active_tasks"
+          ? "delivery_queue_overflow"
+          : "delivery_byte_overflow";
+      details = { limit: error.details.limit ?? 0, observed: error.details.observed ?? 0 };
+    }
     return this.enterPausedState(
-      error instanceof ParticipantRestReplayError ? error.reason : "rest_replay_failed",
+      reason,
       error instanceof ParticipantRestReplayError || error instanceof RestParticipantTaskError
         ? error
         : undefined,
-      error instanceof ParticipantRestReplayError ? error.safeDetails : {},
+      details,
       generation,
     );
   }

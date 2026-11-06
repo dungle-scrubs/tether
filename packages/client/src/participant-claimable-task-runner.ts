@@ -1,6 +1,11 @@
 import { Effect } from "effect";
 
-import { taskFromReplayStateEvent } from "./participant-rest-replay.js";
+import {
+  isTransientRestReplayFailure,
+  ParticipantRestReplayError,
+  replayTaskByteCost,
+  taskFromReplayStateEvent,
+} from "./participant-rest-replay.js";
 import { taskFromClaimableEvent } from "./protocol.js";
 import { TaskCancellationRegistry } from "./task-cancellation-registry.js";
 import type {
@@ -29,8 +34,13 @@ export interface ParticipantClaimableTaskRunnerClient {
   readonly isStopped: () => boolean;
   /** Returns whether terminal delivery policy requires explicit remediation. */
   readonly isPaused: () => boolean;
-  /** REST mode only: loads canonical active candidates before dispatch. */
-  readonly loadReplayTasks?: () => Promise<readonly TaskRecord[]>;
+  /** REST recovery owns finite task state and loads candidates before dispatch. */
+  readonly taskRecovery?: {
+    readonly load: () => Promise<readonly TaskRecord[]>;
+    readonly maxQueueBytes: number;
+    readonly maxQueueSize: number;
+    readonly fail: (error: ParticipantRestReplayError) => void;
+  };
   /** Registers a live/replayed event handler. */
   readonly onEvent: (handler: (event: SessionEvent) => void) => () => void;
   /** Reconnects the participant stream using the client's configured backoff. */
@@ -48,213 +58,184 @@ export interface ParticipantClaimableTaskRunnerClient {
   readonly waitForReplayComplete: () => Promise<void>;
 }
 
-/** Builds the replay/live claimable-task loop for one participant runtime. */
-export function buildParticipantClaimableTaskLoop(
-  client: ParticipantClaimableTaskRunnerClient,
-  options: ParticipantRuntimeTaskLoopOptions,
-): Effect.Effect<void, unknown> {
-  const cancellations = new TaskCancellationRegistry();
-  const processing = new Set<string>();
-  const pendingWork = new Set<Promise<void>>();
-  const replayTasks = new Map<string, { readonly generation: number; readonly task: TaskRecord }>();
-  let replayReadyGeneration: number | null = null;
-  let replayEpoch = 0;
-  let snapshotTouched: { readonly generation: number; readonly ids: Set<string> } | null = null;
+/** One queued task's reservation, shared by replay, snapshot and live admission. */
+interface QueuedRecoveryTask {
+  readonly kind: "queued";
+  readonly task: TaskRecord;
+  readonly generation: number;
+  readonly bytes: number;
+  readonly touchedGeneration: number | null;
+}
 
-  const startTask = (task: TaskRecord): void => {
-    if (cancellations.isCancelled(task.taskId)) {
-      return;
+/** Exclusive states retained under a single task-id reservation. */
+type RecoveryTaskSlot =
+  | QueuedRecoveryTask
+  | {
+      readonly kind: "running";
+      readonly task: TaskRecord;
+      readonly generation: number;
+      readonly activeBytes: number;
+      readonly next: QueuedRecoveryTask | null;
+      readonly bytes: number;
+      readonly touchedGeneration: number | null;
     }
-    const work = processTask(
-      client,
-      options.executor,
-      options.claimRefreshMs,
-      cancellations,
-      processing,
-      task,
-    );
-    pendingWork.add(work);
-    void work
-      .catch((error: unknown) => {
-        console.error(error);
-      })
-      .finally(() => pendingWork.delete(work));
-  };
+  | {
+      readonly kind: "touched";
+      readonly generation: number;
+      readonly bytes: number;
+      readonly touchedGeneration: number;
+    };
 
-  const subscribe = (): (() => void) =>
-    client.onEvent((event) => {
-      let selected: boolean | undefined;
-      if (client.loadReplayTasks) {
-        const task = taskFromReplayStateEvent(event);
-        if (task) {
-          if (snapshotTouched?.generation === client.connectionGeneration()) {
-            snapshotTouched.ids.add(task.taskId);
-          }
-          selected = isDispatchableClaimableTask(task) && options.shouldClaimTask(task);
-          if (!selected) replayTasks.delete(task.taskId);
-        }
-      }
-      const cancelledTaskId = cancellations.observe(event);
-      if (cancelledTaskId) {
-        replayTasks.delete(cancelledTaskId);
-        return;
-      }
-      const task = taskFromClaimableEvent(event);
-      if (
-        !task ||
-        !isDispatchableClaimableTask(task) ||
-        !(selected ?? options.shouldClaimTask(task))
-      ) {
-        return;
-      }
-      const eventGeneration = client.connectionGeneration();
-      if (replayReadyGeneration !== eventGeneration) {
-        replayTasks.set(task.taskId, {
-          generation: eventGeneration,
-          task,
-        });
-        return;
-      }
-      startTask(task);
-    });
+/** Owns all REST candidate, running and snapshot-touch reservations. */
+class RecoveryTaskState {
+  private readonly slots = new Map<string, RecoveryTaskSlot>();
+  private bytes = 0;
+  private snapshotGeneration: number | null = null;
 
-  const runLoop = async (): Promise<void> => {
-    while (!client.isStopped()) {
-      if (client.isPaused()) throw new Error("Participant task loop entered Paused State");
-      const currentEpoch = replayEpoch + 1;
-      const currentGeneration = client.connectionGeneration();
-      replayEpoch = currentEpoch;
-      replayReadyGeneration = null;
-      const replayReady = client.waitForReplayComplete().then(
-        async () => {
-          try {
-            if (client.loadReplayTasks) {
-              if (
-                currentEpoch !== replayEpoch ||
-                currentGeneration !== client.connectionGeneration() ||
-                client.isStopped() ||
-                client.isPaused()
-              ) {
-                return { kind: "replay-stale", replayEpoch: currentEpoch } as const;
-              }
-              const touched = { generation: currentGeneration, ids: new Set<string>() };
-              snapshotTouched = touched;
-              try {
-                const tasks = await client.loadReplayTasks();
-                if (
-                  currentEpoch !== replayEpoch ||
-                  currentGeneration !== client.connectionGeneration() ||
-                  client.isStopped() ||
-                  client.isPaused()
-                ) {
-                  return { kind: "replay-stale", replayEpoch: currentEpoch } as const;
-                }
-                for (const task of tasks) {
-                  if (
-                    !touched.ids.has(task.taskId) &&
-                    !cancellations.isCancelled(task.taskId) &&
-                    isDispatchableClaimableTask(task) &&
-                    options.shouldClaimTask(task)
-                  ) {
-                    replayTasks.set(task.taskId, { generation: currentGeneration, task });
-                  }
-                }
-              } finally {
-                if (snapshotTouched === touched) snapshotTouched = null;
-              }
-            }
-            await options.replayBarrier?.();
-          } catch (error) {
-            return { error, kind: "barrier-failed", replayEpoch: currentEpoch } as const;
-          }
-          return { kind: "replay-ready", replayEpoch: currentEpoch } as const;
-        },
-        (error: unknown) => ({ error, kind: "replay-failed", replayEpoch: currentEpoch }) as const,
-      );
-      const closeReady = client
-        .waitForClose()
-        .then(() => ({ kind: "closed", replayEpoch: currentEpoch }) as const);
-      const firstResult = await Promise.race([replayReady, closeReady]);
+  /** Uses the existing delivery policy without adding a runtime tuning surface. */
+  constructor(
+    private readonly limits: { readonly maxQueueBytes: number; readonly maxQueueSize: number },
+  ) {}
 
-      if (firstResult.kind === "replay-stale") {
-        discardReplayTasks(currentGeneration);
-        continue;
-      }
-      if (firstResult.kind === "barrier-failed") {
-        throw firstResult.error;
-      }
-      if (firstResult.kind === "replay-failed") {
-        replayEpoch += 1;
-        discardReplayTasks(currentGeneration);
-        if (client.isPaused()) {
-          throw firstResult.error;
-        }
-        await closeReady;
-      } else if (firstResult.kind === "replay-ready") {
-        if (
-          firstResult.replayEpoch !== replayEpoch ||
-          currentGeneration !== client.connectionGeneration() ||
-          client.isStopped() ||
-          client.isPaused()
-        ) {
-          discardReplayTasks(currentGeneration);
-          continue;
-        }
-        replayReadyGeneration = currentGeneration;
-        for (const replayTask of replayTasks.values()) {
-          if (replayTask.generation === currentGeneration) {
-            startTask(replayTask.task);
-          }
-        }
-        discardReplayTasks(currentGeneration);
-        if (options.once) {
-          await Promise.allSettled([...pendingWork]);
-          client.close();
-          return;
-        }
-        await closeReady;
-        replayEpoch += 1;
-        replayReadyGeneration = null;
-        discardReplayTasks(currentGeneration);
-      } else {
-        replayEpoch += 1;
-        replayReadyGeneration = null;
-        discardReplayTasks(currentGeneration);
-      }
-      if (!client.isStopped()) {
-        if (client.isPaused()) {
-          throw new Error("Participant task loop entered Paused State");
-        }
-        await client.reconnectAfterClose();
-      }
+  /** Creates one canonical queued reservation with a precomputed cost. */
+  private queued(
+    task: TaskRecord,
+    generation: number,
+    touchedGeneration: number | null,
+  ): QueuedRecoveryTask {
+    return { kind: "queued", task, generation, bytes: replayTaskByteCost(task), touchedGeneration };
+  }
+
+  /** Checks a replacement's net charge before retaining it. */
+  private put(taskId: string, slot: RecoveryTaskSlot): void {
+    const previous = this.slots.get(taskId);
+    const observedQueueSize = this.slots.size + (previous ? 0 : 1);
+    if (observedQueueSize > this.limits.maxQueueSize) {
+      throw new ParticipantRestReplayError("delivery_queue_overflow", {
+        maxQueueSize: this.limits.maxQueueSize,
+        observedQueueSize,
+      });
     }
-  };
+    const observedQueueBytes = this.bytes - (previous?.bytes ?? 0) + slot.bytes;
+    if (observedQueueBytes > this.limits.maxQueueBytes) {
+      throw new ParticipantRestReplayError("delivery_byte_overflow", {
+        maxQueueBytes: this.limits.maxQueueBytes,
+        observedQueueBytes,
+      });
+    }
+    this.slots.set(taskId, slot);
+    this.bytes = observedQueueBytes;
+  }
 
-  const loop = Effect.tryPromise({
-    catch: (error) => error,
-    try: runLoop,
-  });
+  /** Releases exactly the reservation currently owned by one task id. */
+  private remove(taskId: string): void {
+    const slot = this.slots.get(taskId);
+    if (!slot) return;
+    this.bytes -= slot.bytes;
+    this.slots.delete(taskId);
+  }
 
-  /** Discards only replay work owned by one superseded transport generation. */
-  function discardReplayTasks(generation: number): void {
-    for (const [taskId, replayTask] of replayTasks) {
-      if (replayTask.generation === generation) {
-        replayTasks.delete(taskId);
-      }
+  /** Observes canonical lifecycle state while preserving running claim ownership. */
+  observe(task: TaskRecord, generation: number, claimable: boolean, selected: boolean): void {
+    const previous = this.slots.get(task.taskId);
+    const touchedGeneration = this.snapshotGeneration === generation ? generation : null;
+    if (previous?.kind === "running") {
+      const next =
+        selected && (claimable || previous.next) ? this.queued(task, generation, null) : null;
+      this.put(task.taskId, {
+        ...previous,
+        next,
+        bytes: previous.activeBytes + (next?.bytes ?? 0),
+        touchedGeneration,
+      });
+    } else if (selected && (claimable || previous?.kind === "queued")) {
+      this.put(task.taskId, this.queued(task, generation, touchedGeneration));
+    } else if (touchedGeneration !== null) {
+      this.put(task.taskId, {
+        kind: "touched",
+        generation,
+        touchedGeneration,
+        bytes: Buffer.byteLength(JSON.stringify(task.taskId)),
+      });
+    } else {
+      this.remove(task.taskId);
     }
   }
 
-  return Effect.acquireUseRelease(
-    Effect.sync(subscribe),
-    () => loop,
-    (unsubscribe) => Effect.sync(unsubscribe),
-  );
+  /** Starts one generation's snapshot window without a separate unbounded touched-id set. */
+  beginSnapshot(generation: number): void {
+    this.snapshotGeneration = generation;
+  }
+
+  /** Merges only rows not superseded by live state or a running claim. */
+  seed(task: TaskRecord, generation: number): void {
+    const previous = this.slots.get(task.taskId);
+    if (previous?.kind === "running" || previous?.touchedGeneration === generation) return;
+    this.put(task.taskId, this.queued(task, generation, null));
+  }
+
+  /** Releases snapshot tombstones and flags, without touching a newer snapshot. */
+  endSnapshot(generation: number): void {
+    if (this.snapshotGeneration === generation) this.snapshotGeneration = null;
+    for (const [taskId, slot] of this.slots) {
+      if (slot.touchedGeneration !== generation) continue;
+      if (slot.kind === "touched") this.remove(taskId);
+      else this.slots.set(taskId, { ...slot, touchedGeneration: null });
+    }
+  }
+
+  /** Takes the oldest eligible queued task; its reservation remains charged while running. */
+  take(generation: number): TaskRecord | null {
+    for (const [taskId, slot] of this.slots) {
+      if (slot.kind !== "queued" || slot.generation !== generation) continue;
+      this.slots.set(taskId, { ...slot, kind: "running", activeBytes: slot.bytes, next: null });
+      return slot.task;
+    }
+    return null;
+  }
+
+  /** Releases settled running work or retains its later claimable lifecycle update. */
+  complete(taskId: string): void {
+    const slot = this.slots.get(taskId);
+    if (slot?.kind !== "running") return;
+    if (slot.next) this.put(taskId, { ...slot.next, touchedGeneration: slot.touchedGeneration });
+    else this.remove(taskId);
+  }
+
+  /** Returns whether this generation has work waiting behind the active claim. */
+  hasPending(generation: number): boolean {
+    for (const slot of this.slots.values()) {
+      if (slot.kind === "queued" && slot.generation === generation) return true;
+      if (slot.kind === "running" && slot.next?.generation === generation) return true;
+    }
+    return false;
+  }
+
+  /** Discards stale queued work while retaining the one running claim's reservation. */
+  discard(generation: number): void {
+    if (this.snapshotGeneration === generation) this.snapshotGeneration = null;
+    for (const [taskId, slot] of this.slots) {
+      if (slot.kind !== "running") {
+        if (slot.generation === generation) this.remove(taskId);
+      } else {
+        const next = slot.next?.generation === generation ? null : slot.next;
+        this.put(taskId, {
+          ...slot,
+          next,
+          bytes: slot.activeBytes + (next?.bytes ?? 0),
+          touchedGeneration: slot.touchedGeneration === generation ? null : slot.touchedGeneration,
+        });
+      }
+    }
+  }
 }
 
+/** Filters terminal rows before custom selection or task dispatch. */
 function isDispatchableClaimableTask(task: TaskRecord): boolean {
   return !task.completedAt && !task.failedAt && !task.cancelledAt;
 }
 
+/** Uses the existing claim flow and cancellation registry for either transport mode. */
 async function processTask(
   client: Pick<ParticipantClaimableTaskRunnerClient, "runTaskClaimFlow">,
   executor: ParticipantTaskExecutor,
@@ -263,9 +244,7 @@ async function processTask(
   processing: Set<string>,
   task: TaskRecord,
 ): Promise<void> {
-  if (processing.has(task.taskId) || cancellations.isCancelled(task.taskId)) {
-    return;
-  }
+  if (processing.has(task.taskId) || cancellations.isCancelled(task.taskId)) return;
   const signal = cancellations.begin(task.taskId);
   processing.add(task.taskId);
   try {
@@ -283,4 +262,260 @@ async function processTask(
     cancellations.end(task.taskId);
     processing.delete(task.taskId);
   }
+}
+
+/** Builds the replay/live claimable-task loop for one participant runtime. */
+export function buildParticipantClaimableTaskLoop(
+  client: ParticipantClaimableTaskRunnerClient,
+  options: ParticipantRuntimeTaskLoopOptions,
+): Effect.Effect<void, unknown> {
+  const cancellations = new TaskCancellationRegistry();
+  const processing = new Set<string>();
+  const pendingWork = new Set<Promise<void>>();
+  const replayTasks = new Map<string, { readonly generation: number; readonly task: TaskRecord }>();
+  const recovery = client.taskRecovery;
+  const restTasks = recovery ? new RecoveryTaskState(recovery) : null;
+  let activeWork: Promise<void> | null = null;
+  let restIdleWake: (() => void) | null = null;
+  let replayReadyGeneration: number | null = null;
+  let replayEpoch = 0;
+
+  const startTask = (task: TaskRecord): void => {
+    if (cancellations.isCancelled(task.taskId)) return;
+    const work = processTask(
+      client,
+      options.executor,
+      options.claimRefreshMs,
+      cancellations,
+      processing,
+      task,
+    );
+    pendingWork.add(work);
+    void work
+      .catch((error: unknown) => console.error(error))
+      .finally(() => pendingWork.delete(work));
+  };
+
+  const pumpRestTasks = (): void => {
+    if (
+      !restTasks ||
+      activeWork ||
+      replayReadyGeneration === null ||
+      client.isStopped() ||
+      client.isPaused()
+    )
+      return;
+    const task = restTasks.take(replayReadyGeneration);
+    if (!task) {
+      restIdleWake?.();
+      return;
+    }
+    const work = processTask(
+      client,
+      options.executor,
+      options.claimRefreshMs,
+      cancellations,
+      processing,
+      task,
+    );
+    activeWork = work;
+    void work
+      .catch((error: unknown) => console.error(error))
+      .finally(() => {
+        restTasks.complete(task.taskId);
+        activeWork = null;
+        pumpRestTasks();
+        restIdleWake?.();
+      });
+  };
+
+  // One cancellable idle waiter belongs to the current once-mode loop, never to each queued task.
+  const waitForRestIdle = () => {
+    let resolve = (): void => undefined;
+    const promise = new Promise<void>((done) => {
+      resolve = done;
+    });
+    const wake = () => {
+      if (!activeWork && !restTasks?.hasPending(client.connectionGeneration())) {
+        if (restIdleWake === wake) restIdleWake = null;
+        resolve();
+      }
+    };
+    restIdleWake = wake;
+    wake();
+    return {
+      promise,
+      cancel: () => {
+        if (restIdleWake === wake) restIdleWake = null;
+      },
+    };
+  };
+
+  const subscribe = (): (() => void) =>
+    client.onEvent((event) => {
+      const cancelledTaskId = cancellations.observe(event);
+      if (restTasks && recovery) {
+        const task = taskFromReplayStateEvent(event);
+        if (task) {
+          try {
+            restTasks.observe(
+              task,
+              client.connectionGeneration(),
+              taskFromClaimableEvent(event) !== null,
+              !cancelledTaskId &&
+                isDispatchableClaimableTask(task) &&
+                options.shouldClaimTask(task),
+            );
+          } catch (error) {
+            if (error instanceof ParticipantRestReplayError) recovery.fail(error);
+            throw error;
+          }
+        }
+        pumpRestTasks();
+        return;
+      }
+      if (cancelledTaskId) {
+        replayTasks.delete(cancelledTaskId);
+        return;
+      }
+      const task = taskFromClaimableEvent(event);
+      if (!task || !isDispatchableClaimableTask(task) || !options.shouldClaimTask(task)) return;
+      const generation = client.connectionGeneration();
+      if (replayReadyGeneration !== generation) replayTasks.set(task.taskId, { generation, task });
+      else startTask(task);
+    });
+
+  /** Discards only queued work owned by one superseded transport generation. */
+  function discardReplayTasks(generation: number): void {
+    restTasks?.discard(generation);
+    for (const [taskId, task] of replayTasks)
+      if (task.generation === generation) replayTasks.delete(taskId);
+    restIdleWake?.();
+  }
+
+  const runLoop = async (): Promise<void> => {
+    while (!client.isStopped()) {
+      if (client.isPaused()) throw new Error("Participant task loop entered Paused State");
+      const currentEpoch = ++replayEpoch;
+      const generation = client.connectionGeneration();
+      replayReadyGeneration = null;
+      const replayReady = client.waitForReplayComplete().then(
+        async () => {
+          try {
+            if (recovery && restTasks) {
+              if (
+                currentEpoch !== replayEpoch ||
+                generation !== client.connectionGeneration() ||
+                client.isStopped() ||
+                client.isPaused()
+              )
+                return { kind: "replay-stale", replayEpoch: currentEpoch } as const;
+              restTasks.beginSnapshot(generation);
+              try {
+                const tasks = await recovery.load();
+                if (
+                  currentEpoch !== replayEpoch ||
+                  generation !== client.connectionGeneration() ||
+                  client.isStopped() ||
+                  client.isPaused()
+                )
+                  return { kind: "replay-stale", replayEpoch: currentEpoch } as const;
+                for (const task of tasks) {
+                  if (
+                    !cancellations.isCancelled(task.taskId) &&
+                    isDispatchableClaimableTask(task) &&
+                    options.shouldClaimTask(task)
+                  )
+                    restTasks.seed(task, generation);
+                }
+              } catch (error) {
+                if (error instanceof ParticipantRestReplayError) recovery.fail(error);
+                if (isTransientRestReplayFailure(error))
+                  return { kind: "replay-failed", error, replayEpoch: currentEpoch } as const;
+                throw error;
+              } finally {
+                restTasks.endSnapshot(generation);
+              }
+            }
+            await options.replayBarrier?.();
+            return { kind: "replay-ready", replayEpoch: currentEpoch } as const;
+          } catch (error) {
+            return { kind: "barrier-failed", error, replayEpoch: currentEpoch } as const;
+          }
+        },
+        (error: unknown) => ({ kind: "replay-failed", error, replayEpoch: currentEpoch }) as const,
+      );
+      const closeReady = client
+        .waitForClose()
+        .then(() => ({ kind: "closed", replayEpoch: currentEpoch }) as const);
+      const first = await Promise.race([replayReady, closeReady]);
+      if (first.kind === "replay-stale") {
+        discardReplayTasks(generation);
+        continue;
+      }
+      if (first.kind === "barrier-failed") throw first.error;
+      if (first.kind === "replay-failed") {
+        replayEpoch += 1;
+        discardReplayTasks(generation);
+        if (client.isPaused()) throw first.error;
+        await closeReady;
+      } else if (first.kind === "replay-ready") {
+        if (
+          first.replayEpoch !== replayEpoch ||
+          generation !== client.connectionGeneration() ||
+          client.isStopped() ||
+          client.isPaused()
+        ) {
+          discardReplayTasks(generation);
+          continue;
+        }
+        replayReadyGeneration = generation;
+        if (restTasks) pumpRestTasks();
+        else {
+          for (const task of replayTasks.values())
+            if (task.generation === generation) startTask(task.task);
+          discardReplayTasks(generation);
+        }
+        if (options.once) {
+          if (restTasks) {
+            const idle = waitForRestIdle();
+            try {
+              const settled = await Promise.race([
+                idle.promise.then(() => ({ kind: "idle" }) as const),
+                closeReady,
+              ]);
+              if (settled.kind === "idle") {
+                client.close();
+                return;
+              }
+            } finally {
+              idle.cancel();
+            }
+          } else {
+            await Promise.allSettled([...pendingWork]);
+            client.close();
+            return;
+          }
+        }
+        await closeReady;
+        replayEpoch += 1;
+        replayReadyGeneration = null;
+        discardReplayTasks(generation);
+      } else {
+        replayEpoch += 1;
+        replayReadyGeneration = null;
+        discardReplayTasks(generation);
+      }
+      if (!client.isStopped()) {
+        if (client.isPaused()) throw new Error("Participant task loop entered Paused State");
+        await client.reconnectAfterClose();
+      }
+    }
+  };
+
+  return Effect.acquireUseRelease(
+    Effect.sync(subscribe),
+    () => Effect.tryPromise({ catch: (error) => error, try: runLoop }),
+    (unsubscribe) => Effect.sync(unsubscribe),
+  );
 }
