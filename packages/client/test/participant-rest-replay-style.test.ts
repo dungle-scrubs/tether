@@ -71,12 +71,7 @@ function documentationTarget(node: ts.Node): ts.Node | null {
     let owner: ts.Node | undefined = node.parent;
     while (owner && !ts.isSourceFile(owner)) {
       if (ts.isTypeAliasDeclaration(owner)) return node;
-      if (ts.isInterfaceDeclaration(owner)) {
-        return ts.isMethodSignature(node) ||
-          owner.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)
-          ? node
-          : null;
-      }
+      if (ts.isInterfaceDeclaration(owner)) return node;
       owner = owner.parent;
     }
   }

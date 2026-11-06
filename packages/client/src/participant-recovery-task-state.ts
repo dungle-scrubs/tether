@@ -9,10 +9,15 @@ function replayTaskByteCost(task: TaskRecord): number {
 
 /** One queued task's reservation, shared by replay, snapshot and live admission. */
 interface QueuedRecoveryTask {
+  /** Reserves a candidate awaiting serial claim execution. */
   readonly kind: "queued";
+  /** Canonical task record admitted by replay, snapshot or live delivery. */
   readonly task: TaskRecord;
+  /** Connection generation that admitted the candidate. */
   readonly generation: number;
+  /** Retained task record bytes charged to the shared budget. */
   readonly bytes: number;
+  /** Snapshot generation whose concurrent lifecycle update must win. */
   readonly touchedGeneration: number | null;
 }
 

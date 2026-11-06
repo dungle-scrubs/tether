@@ -104,6 +104,7 @@ export function checkRecoveryBudget(
     });
 }
 
+/** Wire events or the replay marker retained until the history handoff is complete. */
 type HeldFrame =
   | {
       /** Canonical event retained until ordered delivery. */
@@ -131,6 +132,7 @@ type ValidatedHistoryPage = EventListResponse & {
   }[];
 };
 
+/** Canonical lifecycle payload validators used to reconcile recovered task candidates. */
 const taskPayloadSchemas = new Map<string, ZodType<{ readonly task: TaskRecord }>>([
   [sessionEventType.taskCreated, taskCreatedPayloadSchema],
   [sessionEventType.taskClaimExpired, taskClaimExpiredPayloadSchema],
@@ -167,6 +169,23 @@ export function isTransientRestReplayFailure(error: unknown): error is RestParti
     error instanceof RestParticipantTaskError &&
     (error.code === "TRANSPORT" || transientRestStatuses.has(error.details.status ?? 0))
   );
+}
+
+/** Generation ownership, delivery policy and command authority for REST replay. */
+interface ParticipantRestReplayOptions extends RecoveryBudget {
+  /** Highest handled sequence from which this generation resumes. */
+  readonly afterSeq: number;
+  /** Participant identity and target session for recovery reads. */
+  readonly config: RestParticipantTaskClientConfig & {
+    /** Session whose finite history and active tasks are recovered. */
+    readonly sessionId: string;
+  };
+  /** Ordinary serial delivery owner sharing this replay's admission budget. */
+  readonly delivery: SerialEventDelivery<SessionEvent>;
+  /** Reads acknowledged handler progress without seeding it from transport state. */
+  readonly lastHandledSeq: () => number;
+  /** Deadline for each bounded recovery request. */
+  readonly timeoutMs: number;
 }
 
 /** One generation's bounded REST history and ordered WebSocket handoff. */
@@ -222,15 +241,7 @@ export class ParticipantRestReplay {
   };
 
   /** Binds replay to one generation's delivery state and existing resource limits. */
-  constructor(
-    private readonly options: RecoveryBudget & {
-      readonly afterSeq: number;
-      readonly config: RestParticipantTaskClientConfig & { readonly sessionId: string };
-      readonly delivery: SerialEventDelivery<SessionEvent>;
-      readonly lastHandledSeq: () => number;
-      readonly timeoutMs: number;
-    },
-  ) {
+  constructor(private readonly options: ParticipantRestReplayOptions) {
     this.wireSeq = options.afterSeq;
     // Leave room for the wire marker at the normal page boundary.
     this.pageLimit = Math.min(500, Math.max(1, options.maxQueueSize - 1));
