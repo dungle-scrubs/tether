@@ -1,8 +1,6 @@
 import { ok } from "node:assert/strict";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { checkRecoveryBudget } from "../src/participant-rest-replay.js";
-
 import {
   createReplayRestTaskClient,
   isRestParticipantResourceLimit,
@@ -102,14 +100,6 @@ function boundedTaskClient(
 }
 
 describe("RestParticipantTaskClient", () => {
-  it("reports count overflow before bytes when admission exceeds both budgets", () => {
-    expect(() => checkRecoveryBudget({ maxQueueSize: 2, maxQueueBytes: 10 }, 3, 11)).toThrowError(
-      expect.objectContaining({
-        reason: "delivery_queue_overflow",
-        safeDetails: { maxQueueSize: 2, observedQueueSize: 3 },
-      }),
-    );
-  });
   afterEach(() => vi.unstubAllGlobals());
   it("cancels an error response without reading or parsing its body", async () => {
     let pulls = 0;

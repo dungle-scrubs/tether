@@ -123,8 +123,8 @@ the handled or durable cursor. A history read that exceeds available bytes or
 item slots, or reaches its deadline, retries with half the rows at the same
 cursor. The accepted limit carries forward and can double within the available
 slots, but stays below every size that overflowed in that generation. A timeout
-halves the retry and holds that limit for four successful pages before growth
-resumes. At one row, a deadline failure uses
+halves the retry and holds that limit until its successful-page window completes
+before growth resumes. At one row, a deadline failure uses
 reconnect backoff; resource overflow pauses. Command responses remain available
 while a historical handler awaits a command.
 

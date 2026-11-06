@@ -188,6 +188,17 @@ interface ParticipantRestReplayOptions extends RecoveryBudget {
   readonly timeoutMs: number;
 }
 
+/** Consecutive successful pages required before probing above a timed-out size. */
+const timeoutSuccessWindow = 4;
+
+/** A reduced request limit and its progress through the timeout recovery window. */
+interface TimeoutHold {
+  /** Largest request allowed until the success window completes. */
+  readonly ceiling: number;
+  /** Consecutive accepted pages since the most recent failed read. */
+  successes: number;
+}
+
 /** One generation's bounded REST history and ordered WebSocket handoff. */
 export class ParticipantRestReplay {
   /** Cancels all REST reads and progress waits owned by this generation. */
@@ -210,10 +221,8 @@ export class ParticipantRestReplay {
   private readonly pageLimit: number;
   /** Highest request size still admissible after a failure in this generation. */
   private historyLimitCeiling: number;
-  /** Halved retry size held until four consecutive history pages succeed. */
-  private timeoutLimitCeiling: number | null = null;
-  /** Successful pages since the last read failure while a timeout ceiling is active. */
-  private timeoutPageSuccesses = 0;
+  /** Active reduced-size policy and progress, absent outside timeout recovery. */
+  private timeoutHold: TimeoutHold | null = null;
 
   /** Normalizes bounded HTTP reads while preserving transport timeout provenance. */
   private readonly replayReadFailure = (error: unknown): never => {
@@ -302,13 +311,11 @@ export class ParticipantRestReplay {
         after,
         Math.min(historyLimit, head - after, Math.max(1, availableSlots)),
       );
-      if (this.timeoutLimitCeiling !== null && ++this.timeoutPageSuccesses === 4) {
-        this.timeoutLimitCeiling = null;
-        this.timeoutPageSuccesses = 0;
-      }
+      if (this.timeoutHold && ++this.timeoutHold.successes === timeoutSuccessWindow)
+        this.timeoutHold = null;
       historyLimit = Math.min(
         this.historyLimitCeiling,
-        this.timeoutLimitCeiling ?? this.pageLimit,
+        this.timeoutHold?.ceiling ?? this.pageLimit,
         page.pagination.limit * 2,
       );
       const events = page.events;
@@ -434,11 +441,16 @@ export class ParticipantRestReplay {
           error instanceof ParticipantRestReplayError &&
           (error.reason === "delivery_byte_overflow" || error.reason === "delivery_queue_overflow");
         if ((!overflow && !isRestParticipantReadTimeout(error)) || limit === 1) throw error;
-        this.timeoutPageSuccesses = 0;
-        if (overflow) this.historyLimitCeiling = Math.min(this.historyLimitCeiling, limit - 1);
+        if (overflow) {
+          this.historyLimitCeiling = Math.min(this.historyLimitCeiling, limit - 1);
+          if (this.timeoutHold) this.timeoutHold.successes = 0;
+        }
         limit = Math.max(1, Math.floor(limit / 2));
         if (!overflow)
-          this.timeoutLimitCeiling = Math.min(this.timeoutLimitCeiling ?? this.pageLimit, limit);
+          this.timeoutHold = {
+            ceiling: Math.min(this.timeoutHold?.ceiling ?? this.pageLimit, limit),
+            successes: 0,
+          };
       }
     }
   }

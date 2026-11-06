@@ -2919,6 +2919,27 @@ function reconnectClock(): () => void {
   };
 }
 
+/** Records upgrade attempts and optionally supplies wire authority at the synthetic boundary. */
+function recordingSocketFactory(
+  attempts: number[],
+  refused: (attempt: number) => boolean,
+  sockets: ParticipantFakeWebSocket[] = [],
+  replayReady: (attempt: number) => boolean = () => false,
+): NonNullable<ParticipantRuntimeClientConfig["webSocketFactory"]> {
+  return (url) => {
+    attempts.push(Date.now());
+    const attempt = attempts.length;
+    const socket = new ParticipantFakeWebSocket(
+      url,
+      refused(attempt) ? new Error("synthetic refused upgrade") : undefined,
+    );
+    sockets.push(socket);
+    if (replayReady(attempt))
+      socket.once("open", () => queueMicrotask(() => emitFencedReplay(socket)));
+    return socket as unknown as WebSocket;
+  };
+}
+
 describe("ParticipantRuntimeClient REST replay", () => {
   const clients: ParticipantRuntimeClient[] = [];
 
@@ -3250,7 +3271,49 @@ describe("ParticipantRuntimeClient REST replay", () => {
     expect(f.writes).toEqual([1, 2, 3, 4]);
   });
 
-  it("waits for four successful history pages between probes above a timed-out limit", async () => {
+  it("restarts the timeout success window when a held-size request times out", async () => {
+    let heldTimeout = false;
+    const f = await fixture({
+      head: 40,
+      config: { commandTimeoutMs: 5, eventDelivery: { maxQueueSize: 9 } },
+      page: (after, limit, _call, signal, phase) => {
+        if (phase === "history" && (limit > 4 || (after === 8 && limit === 4 && !heldTimeout))) {
+          if (limit === 4) heldTimeout = true;
+          return new Promise<never>((_resolve, reject) => {
+            signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+          });
+        }
+        return restHistoryPage(after, limit, 40);
+      },
+    });
+    const handled: number[] = [];
+    f.client.onEvent((event) => {
+      handled.push(event.seq);
+    });
+    try {
+      emitFencedReplay(await f.open());
+      await f.client.waitForReplayComplete();
+      const tuples = f.requests
+        .filter(({ phase }) => phase === "history")
+        .map(({ after, limit }) => [after, limit]);
+      const restarted = tuples.findIndex(([after, limit]) => after === 8 && limit === 2);
+      expect(heldTimeout).toBe(true);
+      expect(restarted).toBeGreaterThan(0);
+      expect(tuples.slice(restarted, restarted + 5)).toEqual([
+        [8, 2],
+        [10, 2],
+        [12, 2],
+        [14, 2],
+        [16, 4],
+      ]);
+      expect(handled).toEqual(Array.from({ length: 40 }, (_, index) => index + 1));
+      expect(f.client.debugInfo().lastHandledSeq).toBe(40);
+    } finally {
+      await f.client.closeAndWait();
+    }
+  });
+
+  it("waits for the history success window before probing a timed-out limit", async () => {
     let successes = 0;
     const timedOutAfter: number[] = [];
     const f = await fixture({
@@ -3301,7 +3364,7 @@ describe("ParticipantRuntimeClient REST replay", () => {
     }
   });
 
-  it("retains the halved limit until four pages succeed after a transient timeout", async () => {
+  it("retains the halved limit until the timeout success window completes", async () => {
     let timedOut = false;
     const f = await fixture({
       head: 20,
@@ -3678,20 +3741,17 @@ describe("ParticipantRuntimeClient REST replay", () => {
 
   it("counts refused opens but not post-open REST snapshot failures in reconnect diagnostics", async () => {
     const restoreClock = reconnectClock();
-    let attempts = 0;
+    const attempts: number[] = [];
     let snapshots = 0;
     const f = await fixture({
       config: {
         reconnect: { baseDelayMs: 100, maxDelayMs: 800 },
-        webSocketFactory: (url) => {
-          attempts += 1;
-          const socket = new ParticipantFakeWebSocket(
-            url,
-            attempts === 2 ? new Error("synthetic refused upgrade") : undefined,
-          );
-          socket.once("open", () => queueMicrotask(() => emitFencedReplay(socket)));
-          return socket as unknown as WebSocket;
-        },
+        webSocketFactory: recordingSocketFactory(
+          attempts,
+          (attempt) => attempt === 2,
+          [],
+          () => true,
+        ),
       },
       tasks: () => (++snapshots === 1 ? Response.json({}, { status: 503 }) : { tasks: [] }),
     });
@@ -3729,17 +3789,12 @@ describe("ParticipantRuntimeClient REST replay", () => {
     const f = await fixture({
       config: {
         reconnect: { baseDelayMs: 100, maxDelayMs: 800 },
-        webSocketFactory: (url) => {
-          attempts.push(Date.now());
-          const socket = new ParticipantFakeWebSocket(
-            url,
-            attempts.length > 1 ? new Error("synthetic refused upgrade") : undefined,
-          );
-          sockets.push(socket);
-          if (attempts.length === 1)
-            socket.once("open", () => queueMicrotask(() => emitFencedReplay(socket)));
-          return socket as unknown as WebSocket;
-        },
+        webSocketFactory: recordingSocketFactory(
+          attempts,
+          (attempt) => attempt > 1,
+          sockets,
+          (attempt) => attempt === 1,
+        ),
       },
       tasks: () => {
         snapshots += 1;
@@ -3771,22 +3826,55 @@ describe("ParticipantRuntimeClient REST replay", () => {
     }
   });
 
+  it("carries refused REST opens into the next post-open recovery delay", async () => {
+    const restoreClock = reconnectClock();
+    const attempts: number[] = [];
+    const f = await fixture({
+      config: {
+        reconnect: { baseDelayMs: 100, maxDelayMs: 800 },
+        webSocketFactory: recordingSocketFactory(
+          attempts,
+          (attempt) => ![1, 4].includes(attempt),
+          [],
+          () => true,
+        ),
+      },
+      tasks: () => Response.json({}, { status: 503 }),
+    });
+    const loop = f.client.runClaimableTasks({
+      claimRefreshMs: 1_000,
+      executor: createExecutor(),
+      once: false,
+      shouldClaimTask: () => true,
+    });
+    loop.catch(() => undefined);
+    try {
+      await f.client.open();
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(attempts).toEqual([0, 100, 300, 700, 1_500]);
+      expect(f.client.debugInfo().reconnectFailureCount).toBe(3);
+    } finally {
+      f.client.close();
+      await vi.advanceTimersByTimeAsync(800);
+      await loop;
+      await f.client.closeAndWait();
+      restoreClock();
+    }
+  });
+
   it("grows one recovery backoff across a snapshot failure followed by refused WebSocket upgrades", async () => {
     const restoreClock = reconnectClock();
     const attempts: number[] = [];
     const f = await fixture({
       config: {
         reconnect: { baseDelayMs: 100, maxDelayMs: 800 },
-        webSocketFactory: (url) => {
-          attempts.push(Date.now());
-          const socket = new ParticipantFakeWebSocket(
-            url,
-            attempts.length > 1 ? new Error("synthetic refused upgrade") : undefined,
-          );
-          if (attempts.length === 1)
-            socket.once("open", () => queueMicrotask(() => emitFencedReplay(socket)));
-          return socket as unknown as WebSocket;
-        },
+        webSocketFactory: recordingSocketFactory(
+          attempts,
+          (attempt) => attempt > 1,
+          [],
+          (attempt) => attempt === 1,
+        ),
       },
       tasks: () => Response.json({ error: "synthetic service unavailable" }, { status: 503 }),
     });
@@ -3820,12 +3908,12 @@ describe("ParticipantRuntimeClient REST replay", () => {
     const f = await fixture({
       config: {
         reconnect: { baseDelayMs: 100, maxDelayMs: 400 },
-        webSocketFactory: (url) => {
-          const socket = new ParticipantFakeWebSocket(url);
-          sockets.push(socket);
-          socket.once("open", () => queueMicrotask(() => emitFencedReplay(socket)));
-          return socket as unknown as WebSocket;
-        },
+        webSocketFactory: recordingSocketFactory(
+          [],
+          () => false,
+          sockets,
+          () => true,
+        ),
       },
       tasks: () => {
         snapshots.push(Date.now());
@@ -4251,15 +4339,7 @@ describe("ParticipantRuntimeClient REST replay", () => {
     const client = await ParticipantRuntimeClient.create({
       ...baseConfig,
       reconnect: { baseDelayMs: 100, maxDelayMs: 800 },
-      webSocketFactory: (url) => {
-        attempts.push(Date.now());
-        const socket = new ParticipantFakeWebSocket(
-          url,
-          attempts.length === 2 ? new Error("synthetic refused upgrade") : undefined,
-        );
-        sockets.push(socket);
-        return socket as unknown as WebSocket;
-      },
+      webSocketFactory: recordingSocketFactory(attempts, (attempt) => attempt === 2, sockets),
     });
     client.onError(() => undefined);
     client.onEvent(async () => {
@@ -4289,17 +4369,12 @@ describe("ParticipantRuntimeClient REST replay", () => {
     const client = await ParticipantRuntimeClient.create({
       ...baseConfig,
       reconnect: { baseDelayMs: 100, maxDelayMs: 800 },
-      webSocketFactory: (url) => {
-        attempts.push(Date.now());
-        const socket = new ParticipantFakeWebSocket(
-          url,
-          attempts.length >= 2 ? new Error("synthetic refused upgrade") : undefined,
-        );
-        sockets.push(socket);
-        if (attempts.length === 1)
-          socket.once("open", () => queueMicrotask(() => emitFencedReplay(socket)));
-        return socket as unknown as WebSocket;
-      },
+      webSocketFactory: recordingSocketFactory(
+        attempts,
+        (attempt) => attempt >= 2,
+        sockets,
+        (attempt) => attempt === 1,
+      ),
     });
     client.onError(() => undefined);
     const handled: number[] = [];
@@ -4340,18 +4415,12 @@ describe("ParticipantRuntimeClient REST replay", () => {
     const client = await ParticipantRuntimeClient.create({
       ...baseConfig,
       reconnect: { baseDelayMs: 100, maxDelayMs: 800 },
-      webSocketFactory: (url) => {
-        attempts.push(Date.now());
-        const refused = [2, 3, 5].includes(attempts.length);
-        const socket = new ParticipantFakeWebSocket(
-          url,
-          refused ? new Error("synthetic refused upgrade") : undefined,
-        );
-        sockets.push(socket);
-        if (attempts.length === 1)
-          socket.once("open", () => queueMicrotask(() => emitFencedReplay(socket)));
-        return socket as unknown as WebSocket;
-      },
+      webSocketFactory: recordingSocketFactory(
+        attempts,
+        (attempt) => [2, 3, 5].includes(attempt),
+        sockets,
+        (attempt) => attempt === 1,
+      ),
     });
     client.onError(() => undefined);
     const loop = client.runClaimableTasks({

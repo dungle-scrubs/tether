@@ -11,6 +11,7 @@ const checkedModules = [
   "../src/participant-recovery-task-state.ts",
   "../src/rest-participant-task-client.ts",
   "./participant-runtime-client.test.ts",
+  "./participant-rest-replay.test.ts",
   "./rest-participant-task-client.test.ts",
   "./public-api.test.ts",
   "./participant-rest-replay-style.test.ts",
