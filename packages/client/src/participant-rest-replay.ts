@@ -18,24 +18,38 @@ import {
   type RestParticipantTaskClientConfig,
   restResponseEnvelopeAllowance,
 } from "./rest-participant-task-client.js";
-import { replayMarkerByteCost, type SerialEventDelivery } from "./serial-event-delivery.js";
+import {
+  replayMarkerByteCost,
+  type SerialEventDelivery,
+  type SerialEventDeliveryOptions,
+  type SerialEventDeliveryOutcome,
+} from "./serial-event-delivery.js";
 import type { SessionEvent, TaskRecord } from "./types.js";
 
-/** Original overflow metadata, correlated with its terminal reason. */
+/** Shared retained-item and byte policy, owned by serial event delivery. */
+export type RecoveryBudget = Pick<
+  SerialEventDeliveryOptions<SessionEvent>,
+  "maxQueueSize" | "maxQueueBytes"
+>;
+
+/** Removes the protocol outcome discriminator while retaining its canonical metadata. */
+type OverflowDetails<Kind extends SerialEventDeliveryOutcome<SessionEvent>["kind"]> = Omit<
+  Extract<
+    SerialEventDeliveryOutcome<SessionEvent>,
+    {
+      /** Protocol outcome whose metadata is being reused. */
+      readonly kind: Kind;
+    }
+  >,
+  "kind"
+>;
+
+/** Overflow metadata derived from the ordinary delivery outcomes for each terminal reason. */
 export type ParticipantOverflowDetails = {
-  /** Count admission failed before retaining the rejected item. */
-  readonly delivery_queue_overflow: {
-    /** Configured retained item limit. */
-    readonly maxQueueSize: number;
-    /** Items that admission would retain. */
-    readonly observedQueueSize: number;
-  };
-  /** Byte admission failed before retaining the rejected payload. */
-  readonly delivery_byte_overflow: {
-    /** Configured retained byte limit. */
-    readonly maxQueueBytes: number;
-    /** Bytes observed at rejection. */
-    readonly observedQueueBytes: number;
+  /** Count admission uses the exact ordinary-delivery metadata fields. */
+  readonly delivery_queue_overflow: OverflowDetails<"delivery-queue-overflow">;
+  /** HTTP byte rejection additionally identifies its independent response read cap. */
+  readonly delivery_byte_overflow: OverflowDetails<"delivery-byte-overflow"> & {
     /** Separate HTTP response cap when the response reader rejected the body. */
     readonly maxResponseBytes?: number;
   };
@@ -74,7 +88,7 @@ export class ParticipantRestReplayError extends Error {
 
 /** Checks the shared count-first admission policy for history and task reservations. */
 export function checkRecoveryBudget(
-  limits: { readonly maxQueueSize: number; readonly maxQueueBytes: number },
+  limits: RecoveryBudget,
   observedQueueSize: number,
   observedQueueBytes: number,
 ): void {
@@ -177,11 +191,15 @@ export class ParticipantRestReplay {
   private readonly pageLimit: number;
   /** Highest request size still admissible after a failure in this generation. */
   private historyLimitCeiling: number;
+  /** Halved retry size held until four consecutive history pages succeed. */
+  private timeoutLimitCeiling: number | null = null;
+  /** Successful pages since the last read failure while a timeout ceiling is active. */
+  private timeoutPageSuccesses = 0;
 
   /** Normalizes bounded HTTP reads while preserving transport timeout provenance. */
   private readonly replayReadFailure = (error: unknown): never => {
     if (isRestParticipantResourceLimit(error)) {
-      const resource = error.failure.details.resourceLimit;
+      const resource = error.details.resourceLimit;
       switch (resource.resource) {
         case "active_tasks":
           throw new ParticipantRestReplayError("delivery_queue_overflow", {
@@ -205,13 +223,11 @@ export class ParticipantRestReplay {
 
   /** Binds replay to one generation's delivery state and existing resource limits. */
   constructor(
-    private readonly options: {
+    private readonly options: RecoveryBudget & {
       readonly afterSeq: number;
       readonly config: RestParticipantTaskClientConfig & { readonly sessionId: string };
       readonly delivery: SerialEventDelivery<SessionEvent>;
       readonly lastHandledSeq: () => number;
-      readonly maxQueueBytes: number;
-      readonly maxQueueSize: number;
       readonly timeoutMs: number;
     },
   ) {
@@ -275,7 +291,15 @@ export class ParticipantRestReplay {
         after,
         Math.min(historyLimit, head - after, Math.max(1, availableSlots)),
       );
-      historyLimit = Math.min(this.historyLimitCeiling, page.pagination.limit * 2);
+      if (this.timeoutLimitCeiling !== null && ++this.timeoutPageSuccesses === 4) {
+        this.timeoutLimitCeiling = null;
+        this.timeoutPageSuccesses = 0;
+      }
+      historyLimit = Math.min(
+        this.historyLimitCeiling,
+        this.timeoutLimitCeiling ?? this.pageLimit,
+        page.pagination.limit * 2,
+      );
       const events = page.events;
       if (
         events.length === 0 ||
@@ -399,8 +423,11 @@ export class ParticipantRestReplay {
           error instanceof ParticipantRestReplayError &&
           (error.reason === "delivery_byte_overflow" || error.reason === "delivery_queue_overflow");
         if ((!overflow && !isRestParticipantReadTimeout(error)) || limit === 1) throw error;
+        this.timeoutPageSuccesses = 0;
         if (overflow) this.historyLimitCeiling = Math.min(this.historyLimitCeiling, limit - 1);
         limit = Math.max(1, Math.floor(limit / 2));
+        if (!overflow)
+          this.timeoutLimitCeiling = Math.min(this.timeoutLimitCeiling ?? this.pageLimit, limit);
       }
     }
   }

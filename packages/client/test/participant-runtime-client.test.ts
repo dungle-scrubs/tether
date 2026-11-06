@@ -2908,6 +2908,17 @@ function replyToTaskCommands(socket: ParticipantFakeWebSocket, tasks: readonly T
   });
 }
 
+/** Gives schedule cases one deterministic clock and restores its random source afterward. */
+function reconnectClock(): () => void {
+  const random = vi.spyOn(Math, "random").mockReturnValue(1);
+  vi.useFakeTimers();
+  vi.setSystemTime(0);
+  return () => {
+    vi.useRealTimers();
+    random.mockRestore();
+  };
+}
+
 describe("ParticipantRuntimeClient REST replay", () => {
   const clients: ParticipantRuntimeClient[] = [];
 
@@ -3239,7 +3250,58 @@ describe("ParticipantRuntimeClient REST replay", () => {
     expect(f.writes).toEqual([1, 2, 3, 4]);
   });
 
-  it("resumes page growth after a transient timeout halves one history request", async () => {
+  it("waits for four successful history pages between probes above a timed-out limit", async () => {
+    let successes = 0;
+    const timedOutAfter: number[] = [];
+    const f = await fixture({
+      head: 40,
+      config: { commandTimeoutMs: 5, eventDelivery: { maxQueueSize: 9 } },
+      page: (after, limit, _call, signal, phase) => {
+        if (phase === "history" && limit > 4) {
+          timedOutAfter.push(successes);
+          return new Promise<never>((_resolve, reject) => {
+            signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+          });
+        }
+        if (phase === "history") successes += 1;
+        return restHistoryPage(after, limit, 40);
+      },
+    });
+    const handled: number[] = [];
+    f.client.onEvent((event) => {
+      handled.push(event.seq);
+    });
+    try {
+      emitFencedReplay(await f.open());
+      await f.client.waitForReplayComplete();
+      expect(timedOutAfter).toEqual([0, 4, 8]);
+      expect(
+        f.requests
+          .filter(({ phase }) => phase === "history")
+          .map(({ after, limit }) => [after, limit]),
+      ).toEqual([
+        [0, 8],
+        [0, 4],
+        [4, 4],
+        [8, 4],
+        [12, 4],
+        [16, 8],
+        [16, 4],
+        [20, 4],
+        [24, 4],
+        [28, 4],
+        [32, 8],
+        [32, 4],
+        [36, 4],
+      ]);
+      expect(handled).toEqual(Array.from({ length: 40 }, (_, index) => index + 1));
+      expect(f.sockets).toHaveLength(1);
+    } finally {
+      await f.client.closeAndWait();
+    }
+  });
+
+  it("retains the halved limit until four pages succeed after a transient timeout", async () => {
     let timedOut = false;
     const f = await fixture({
       head: 20,
@@ -3268,8 +3330,10 @@ describe("ParticipantRuntimeClient REST replay", () => {
       ).toEqual([
         [0, 8],
         [0, 4],
-        [4, 8],
-        [12, 8],
+        [4, 4],
+        [8, 4],
+        [12, 4],
+        [16, 4],
       ]);
       expect(handled).toEqual(Array.from({ length: 20 }, (_, index) => index + 1));
       expect(f.sockets).toHaveLength(1);
@@ -3550,18 +3614,16 @@ describe("ParticipantRuntimeClient REST replay", () => {
   });
 
   it("resets recovery delay after a handled cursor advance before another history failure", async () => {
-    vi.spyOn(Math, "random").mockReturnValue(1);
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
-    let refusedDiscovery = 0;
+    const restoreClock = reconnectClock();
+    let refusedPrelude = 0;
     let refusedHistory = false;
     const handled: number[] = [];
     const f = await fixture({
       config: { reconnect: { baseDelayMs: 100, maxDelayMs: 800 } },
       page: (after, limit, _call, _signal, phase) => {
-        if (phase === "discovery" && refusedDiscovery < 2) {
-          refusedDiscovery += 1;
-          return Response.json({ error: "synthetic temporary discovery refusal" }, { status: 503 });
+        if (phase === "history" && after === 0 && refusedPrelude < 2) {
+          refusedPrelude += 1;
+          return Response.json({ error: "synthetic temporary history refusal" }, { status: 503 });
         }
         if (phase === "history" && after === 0) return restHistoryPage(after, 1, 2);
         if (phase === "history" && after === 1 && !refusedHistory) {
@@ -3575,11 +3637,17 @@ describe("ParticipantRuntimeClient REST replay", () => {
       handled.push(event.seq);
     });
     try {
-      const connecting = f.client.reconnect();
-      await vi.advanceTimersByTimeAsync(300);
-      await connecting;
-      expect(f.sockets).toHaveLength(1);
-      const socket = f.sockets[0];
+      emitFencedReplay(await f.open());
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(100);
+      const second = f.sockets[1];
+      if (!second) throw new Error("Missing second post-open recovery socket");
+      emitFencedReplay(second);
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(200);
+      expect(refusedPrelude).toBe(2);
+      expect(f.sockets).toHaveLength(3);
+      const socket = f.sockets[2];
       if (!socket) throw new Error("Missing progress recovery socket");
       const replay = f.client.waitForReplayComplete();
       replay.catch(() => undefined);
@@ -3592,10 +3660,10 @@ describe("ParticipantRuntimeClient REST replay", () => {
         details: { status: 503, operation: "list-events" },
       });
       await vi.advanceTimersByTimeAsync(99);
-      expect(f.sockets).toHaveLength(1);
+      expect(f.sockets).toHaveLength(3);
       await vi.advanceTimersByTimeAsync(1);
-      expect(f.sockets).toHaveLength(2);
-      const replacement = f.sockets[1];
+      expect(f.sockets).toHaveLength(4);
+      const replacement = f.sockets[3];
       if (!replacement) throw new Error("Missing cursor-progress replacement socket");
       emitFencedReplay(replacement);
       await f.client.waitForReplayComplete();
@@ -3604,14 +3672,12 @@ describe("ParticipantRuntimeClient REST replay", () => {
     } finally {
       await f.client.closeAndWait();
       await vi.advanceTimersByTimeAsync(800);
-      vi.useRealTimers();
+      restoreClock();
     }
   });
 
   it("counts refused opens but not post-open REST snapshot failures in reconnect diagnostics", async () => {
-    vi.spyOn(Math, "random").mockReturnValue(1);
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    const restoreClock = reconnectClock();
     let attempts = 0;
     let snapshots = 0;
     const f = await fixture({
@@ -3651,14 +3717,62 @@ describe("ParticipantRuntimeClient REST replay", () => {
       await vi.advanceTimersByTimeAsync(800);
       await loop;
       await f.client.closeAndWait();
-      vi.useRealTimers();
+      restoreClock();
+    }
+  });
+
+  it("grows REST wire-loss retry delays across refused reopens", async () => {
+    const restoreClock = reconnectClock();
+    const attempts: number[] = [];
+    const sockets: ParticipantFakeWebSocket[] = [];
+    let snapshots = 0;
+    const f = await fixture({
+      config: {
+        reconnect: { baseDelayMs: 100, maxDelayMs: 800 },
+        webSocketFactory: (url) => {
+          attempts.push(Date.now());
+          const socket = new ParticipantFakeWebSocket(
+            url,
+            attempts.length > 1 ? new Error("synthetic refused upgrade") : undefined,
+          );
+          sockets.push(socket);
+          if (attempts.length === 1)
+            socket.once("open", () => queueMicrotask(() => emitFencedReplay(socket)));
+          return socket as unknown as WebSocket;
+        },
+      },
+      tasks: () => {
+        snapshots += 1;
+        return { tasks: [] };
+      },
+    });
+    const loop = f.client.runClaimableTasks({
+      claimRefreshMs: 1_000,
+      executor: createExecutor(),
+      once: false,
+      shouldClaimTask: () => true,
+    });
+    loop.catch(() => undefined);
+    try {
+      await f.client.open();
+      await flushMicrotasks();
+      expect(snapshots).toBe(1);
+      sockets[0]?.emitClose();
+      await vi.advanceTimersByTimeAsync(700);
+      expect(attempts).toEqual([0, 100, 300, 700]);
+      expect(f.client.debugInfo().reconnectFailureCount).toBe(3);
+      expect(f.writes).toEqual([]);
+    } finally {
+      f.client.close();
+      await vi.advanceTimersByTimeAsync(800);
+      await loop;
+      await f.client.closeAndWait();
+      restoreClock();
     }
   });
 
   it("grows one recovery backoff across a snapshot failure followed by refused WebSocket upgrades", async () => {
-    vi.spyOn(Math, "random").mockReturnValue(1);
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    const restoreClock = reconnectClock();
     const attempts: number[] = [];
     const f = await fixture({
       config: {
@@ -3694,14 +3808,12 @@ describe("ParticipantRuntimeClient REST replay", () => {
       await f.client.closeAndWait();
       await vi.advanceTimersByTimeAsync(800);
       await loop;
-      vi.useRealTimers();
+      restoreClock();
     }
   });
 
   it("grows snapshot transient backoff across successful wire opens until real recovery", async () => {
-    vi.spyOn(Math, "random").mockReturnValue(1);
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    const restoreClock = reconnectClock();
     const snapshots: number[] = [];
     const sockets: ParticipantFakeWebSocket[] = [];
     let unavailable = true;
@@ -3748,7 +3860,7 @@ describe("ParticipantRuntimeClient REST replay", () => {
       await f.client.closeAndWait();
       await vi.advanceTimersByTimeAsync(400);
       await loop;
-      vi.useRealTimers();
+      restoreClock();
     }
   });
 
@@ -4133,9 +4245,7 @@ describe("ParticipantRuntimeClient REST replay", () => {
   });
 
   it("preserves the WebSocket delivery-recovery handoff delay after a refused upgrade", async () => {
-    vi.spyOn(Math, "random").mockReturnValue(1);
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    const restoreClock = reconnectClock();
     const attempts: number[] = [];
     const sockets: ParticipantFakeWebSocket[] = [];
     const client = await ParticipantRuntimeClient.create({
@@ -4168,14 +4278,63 @@ describe("ParticipantRuntimeClient REST replay", () => {
       client.close();
       await vi.advanceTimersByTimeAsync(800);
       await client.closeAndWait();
-      vi.useRealTimers();
+      restoreClock();
+    }
+  });
+
+  it("preserves WebSocket retry growth when queued delivery finishes during backoff", async () => {
+    const restoreClock = reconnectClock();
+    const attempts: number[] = [];
+    const sockets: ParticipantFakeWebSocket[] = [];
+    const client = await ParticipantRuntimeClient.create({
+      ...baseConfig,
+      reconnect: { baseDelayMs: 100, maxDelayMs: 800 },
+      webSocketFactory: (url) => {
+        attempts.push(Date.now());
+        const socket = new ParticipantFakeWebSocket(
+          url,
+          attempts.length >= 2 ? new Error("synthetic refused upgrade") : undefined,
+        );
+        sockets.push(socket);
+        if (attempts.length === 1)
+          socket.once("open", () => queueMicrotask(() => emitFencedReplay(socket)));
+        return socket as unknown as WebSocket;
+      },
+    });
+    client.onError(() => undefined);
+    const handled: number[] = [];
+    client.onEvent(async (event) => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      handled.push(event.seq);
+    });
+    const loop = client.runClaimableTasks({
+      claimRefreshMs: 1_000,
+      executor: createExecutor(),
+      once: false,
+      shouldClaimTask: () => true,
+    });
+    loop.catch(() => undefined);
+    try {
+      await client.open();
+      await flushMicrotasks();
+      sockets[0]?.emitServerEvent(restHistoryEvent(1));
+      await flushMicrotasks();
+      sockets[0]?.emitClose();
+      await vi.advanceTimersByTimeAsync(700);
+      expect(attempts).toEqual([0, 100, 300, 700]);
+      expect(handled).toEqual([1]);
+      expect(client.debugInfo().lastHandledSeq).toBe(1);
+    } finally {
+      client.close();
+      await vi.advanceTimersByTimeAsync(800);
+      await loop;
+      await client.closeAndWait();
+      restoreClock();
     }
   });
 
   it("preserves default WebSocket outage delays and restarts them after a successful open", async () => {
-    vi.spyOn(Math, "random").mockReturnValue(1);
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
+    const restoreClock = reconnectClock();
     const attempts: number[] = [];
     const sockets: ParticipantFakeWebSocket[] = [];
     const client = await ParticipantRuntimeClient.create({
@@ -4218,7 +4377,7 @@ describe("ParticipantRuntimeClient REST replay", () => {
       await vi.advanceTimersByTimeAsync(800);
       await loop;
       await client.closeAndWait();
-      vi.useRealTimers();
+      restoreClock();
     }
   });
 

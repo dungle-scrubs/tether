@@ -1,7 +1,7 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 
 import * as Client from "../src/index.js";
-import { ParticipantRestReplayError } from "../src/participant-rest-replay.js";
+import type { ParticipantRestReplayError } from "../src/participant-rest-replay.js";
 
 /** The public options type must not expose recovery-owned transport limits. */
 const publicTaskOptions: Client.RestParticipantTaskClientOptions = {};
@@ -95,6 +95,22 @@ const sessionEventStreamPromiseContract: SessionEventStreamPromiseContract = {
 };
 
 describe("@dungle-scrubs/tether-client public API", () => {
+  it("preserves REST error code and details as enumerable own fields", () => {
+    const error = new Client.RestParticipantTaskError({
+      code: "TRANSPORT",
+      operation: "list-events",
+    });
+    const expected = {
+      code: "TRANSPORT",
+      details: { operation: "list-events", status: null },
+      name: "RestParticipantTaskError",
+    };
+    expect(JSON.parse(JSON.stringify(error))).toEqual(expected);
+    expect({ ...error }).toEqual(expected);
+    expect(Object.hasOwn(error, "code")).toBe(true);
+    expect(Object.hasOwn(error, "details")).toBe(true);
+    expect(error).not.toHaveProperty("failure");
+  });
   it("keeps participant runtime APIs Promise-based", () => {
     expect(Object.keys(participantRuntimePromiseContract).sort()).toEqual([
       "claimTask",

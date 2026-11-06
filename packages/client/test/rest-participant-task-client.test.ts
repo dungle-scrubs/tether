@@ -1,7 +1,11 @@
+import { ok } from "node:assert/strict";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { checkRecoveryBudget } from "../src/participant-rest-replay.js";
 
 import {
   createReplayRestTaskClient,
+  isRestParticipantResourceLimit,
   RestParticipantTaskClient,
   RestParticipantTaskError,
   type RestParticipantTaskFetch,
@@ -98,6 +102,14 @@ function boundedTaskClient(
 }
 
 describe("RestParticipantTaskClient", () => {
+  it("reports count overflow before bytes when admission exceeds both budgets", () => {
+    expect(() => checkRecoveryBudget({ maxQueueSize: 2, maxQueueBytes: 10 }, 3, 11)).toThrowError(
+      expect.objectContaining({
+        reason: "delivery_queue_overflow",
+        safeDetails: { maxQueueSize: 2, observedQueueSize: 3 },
+      }),
+    );
+  });
   afterEach(() => vi.unstubAllGlobals());
   it("cancels an error response without reading or parsing its body", async () => {
     let pulls = 0;
@@ -126,24 +138,21 @@ describe("RestParticipantTaskClient", () => {
     expect(cancellations).toBe(1);
   });
 
-  it("stores resource failure metadata under its discriminated failure value", () => {
+  it("reports required resource details and narrows them through the public code", () => {
     const error = new RestParticipantTaskError({
       code: "RESOURCE_LIMIT",
       operation: "list-active",
       resourceLimit: { resource: "active_tasks", limit: 2, observed: 3 },
     });
-    expect(error.failure).toEqual({
-      code: "RESOURCE_LIMIT",
-      details: {
-        operation: "list-active",
-        status: null,
-        resourceLimit: { resource: "active_tasks", limit: 2, observed: 3 },
-      },
-    });
     expect(error.code).toBe("RESOURCE_LIMIT");
-    expect(error.details).toBe(error.failure.details);
-    if (error.failure.code === "RESOURCE_LIMIT")
-      expect(error.failure.details.resourceLimit.observed).toBe(3);
+    expect(error.details).toEqual({
+      operation: "list-active",
+      status: null,
+      resourceLimit: { resource: "active_tasks", limit: 2, observed: 3 },
+    });
+    ok(isRestParticipantResourceLimit(error));
+    expect(error.details.resourceLimit.observed).toBe(3);
+    expect(error).not.toHaveProperty("failure");
   });
 
   it("bundles a resource limit into one bounded details object", async () => {

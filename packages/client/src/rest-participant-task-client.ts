@@ -130,76 +130,54 @@ type RestTaskFailureInput = {
     }
 );
 
-/** Common bounded context retained by every failure variant. */
-type RestTaskFailureDetails = {
-  /** REST operation that failed. */
-  readonly operation: string;
-  /** Known status or null when no response was available. */
-  readonly status: number | null;
-};
-
-/** The stored failure keeps its discriminator and required metadata together. */
-type RestTaskFailure =
-  | {
-      /** Resource-policy rejection rather than a transport or server failure. */
-      readonly code: "RESOURCE_LIMIT";
-      /** Complete policy metadata alongside the common operation context. */
-      readonly details: RestTaskFailureDetails & {
-        /** Resource, configured limit and rejected observation in the same units. */
-        readonly resourceLimit: RestTaskResourceLimit;
-      };
-    }
-  | {
-      /** Non-resource failures have no resource-policy metadata. */
-      readonly code: Exclude<RestParticipantTaskErrorCode, "RESOURCE_LIMIT">;
-      /** Operation context for the classified failure. */
-      readonly details: RestTaskFailureDetails;
-    };
+/** Distributes the input variants into their public code and normalized details shape. */
+type RestTaskFailure<Failure extends RestTaskFailureInput = RestTaskFailureInput> =
+  Failure extends RestTaskFailureInput
+    ? {
+        /** Classification correlated with this input variant's metadata. */
+        readonly code: Failure["code"];
+        /** Bounded operation context with a normalized status and variant-specific resource data. */
+        readonly details: Omit<Failure, "code" | "status"> & {
+          /** Known status or null when no HTTP response was available. */
+          readonly status: number | null;
+        };
+      }
+    : never;
 
 /** Typed, operation-scoped REST task-route failure. */
 export class RestParticipantTaskError extends Error {
-  /** Single stored owner of the failure discriminator and its correlated details. */
-  readonly failure: RestTaskFailure;
+  /** Enumerable public classification retained for spread and JSON compatibility. */
+  readonly code: RestTaskFailure["code"];
+  /** Enumerable bounded operation and resource metadata, assigned once from the input. */
+  readonly details: RestTaskFailure["details"];
 
   /** Retains bounded operation metadata without the response body or credentials. */
   constructor(input: RestTaskFailureInput) {
     super(`REST participant task ${input.operation} failed: ${input.code}`);
-    const context = { operation: input.operation, status: input.status ?? null };
-    this.failure =
-      input.code === "RESOURCE_LIMIT"
+    this.code = input.code;
+    this.details = {
+      operation: input.operation,
+      status: input.status ?? null,
+      ...(input.code === "RESOURCE_LIMIT"
         ? {
-            code: input.code,
-            details: {
-              ...context,
-              resourceLimit: {
-                resource: input.resourceLimit.resource,
-                limit: input.resourceLimit.limit,
-                observed: input.resourceLimit.observed,
-              },
+            resourceLimit: {
+              resource: input.resourceLimit.resource,
+              limit: input.resourceLimit.limit,
+              observed: input.resourceLimit.observed,
             },
           }
-        : { code: input.code, details: context };
+        : {}),
+    };
     this.name = "RestParticipantTaskError";
-  }
-
-  /** Preserves the public classification while reading its single stored owner. */
-  get code(): RestParticipantTaskErrorCode {
-    return this.failure.code;
-  }
-
-  /** Preserves the public details object without independently stored metadata. */
-  get details(): RestTaskFailure["details"] {
-    return this.failure.details;
   }
 }
 
-/** Narrows the stored resource variant without restating its details shape. */
+/** Narrows required resource details using the public classification and derived union. */
 export function isRestParticipantResourceLimit(
   error: unknown,
-): error is RestParticipantTaskError & {
-  readonly failure: Extract<RestTaskFailure, { readonly code: "RESOURCE_LIMIT" }>;
-} {
-  return error instanceof RestParticipantTaskError && error.failure.code === "RESOURCE_LIMIT";
+): error is RestParticipantTaskError &
+  Extract<RestTaskFailure, { readonly code: "RESOURCE_LIMIT" }> {
+  return error instanceof RestParticipantTaskError && error.code === "RESOURCE_LIMIT";
 }
 
 /** Options shared by every fenced mutation. */

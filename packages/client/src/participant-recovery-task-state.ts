@@ -1,5 +1,5 @@
 /** Owns REST task reservations under a budget independently equal to serial delivery. */
-import { checkRecoveryBudget } from "./participant-rest-replay.js";
+import { checkRecoveryBudget, type RecoveryBudget } from "./participant-rest-replay.js";
 import type { TaskRecord } from "./types.js";
 
 /** Counts a retained canonical task record for the recovery-state owner. */
@@ -65,9 +65,7 @@ export class RecoveryTaskState {
   private snapshotGeneration: number | null = null;
 
   /** Uses the existing delivery policy without adding a runtime tuning surface. */
-  constructor(
-    private readonly limits: { readonly maxQueueBytes: number; readonly maxQueueSize: number },
-  ) {}
+  constructor(private readonly limits: RecoveryBudget) {}
 
   /** Creates one canonical queued reservation with a precomputed cost. */
   private queued(

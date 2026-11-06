@@ -646,10 +646,10 @@ function writeDefaultRuntimeError(
 }
 
 /**
- * Maps consecutive failed cycles to the shared zero-based backoff policy.
+ * Maps a non-negative loop delay index to the shared bounded reconnect policy.
  */
-function reconnectDelayMs(failures: number, config: ParticipantRuntimeClientConfig): number {
-  return boundedReconnectDelayMs(failures - 1, config.reconnect);
+function reconnectDelayMs(attempt: number, config: ParticipantRuntimeClientConfig): number {
+  return boundedReconnectDelayMs(Math.max(0, attempt), config.reconnect);
 }
 
 /**
@@ -706,7 +706,7 @@ export class ParticipantRuntimeClient {
   private preparedTransport: PreparedParticipantTransport | null = null;
   /** REST history owner for the current connection generation, or null in WebSocket mode. */
   private restReplay: ParticipantRestReplay | null = null;
-  /** Single retry-policy counter, independent of the cumulative public diagnostic metric. */
+  /** Post-open REST failures carried into the next loop, separate from failed-open diagnostics. */
   private recoveryFailureCount = 0;
   /** Task-loop users complete recovery only after their canonical snapshot succeeds. */
   private restTaskRecoveryUsers = 0;
@@ -805,8 +805,6 @@ export class ParticipantRuntimeClient {
         void restReplay.replay(transportHead).catch((error: unknown) => {
           this.failRestReplay(error, prepared.generation, restReplay);
         });
-      } else {
-        this.recordRecoveryProgress();
       }
     } catch (error) {
       const openError =
@@ -1255,7 +1253,7 @@ export class ParticipantRuntimeClient {
     await Effect.runPromise(this.buildReconnectWithBackoff(initialDelayMs));
   }
 
-  /** Records one failed open or post-open recovery cycle at its reconnect owner. */
+  /** Carries one post-open transient REST failure into the next reconnect loop. */
   private recordRecoveryFailure(): void {
     this.recoveryFailureCount += 1;
   }
@@ -1270,8 +1268,6 @@ export class ParticipantRuntimeClient {
     if (this.reconnectPromise) {
       return this.reconnectPromise;
     }
-    /** Close and delivery recovery start a failed cycle before any refused reopen. */
-    if (!this.restReplay && this.recoveryFailureCount === 0) this.recoveryFailureCount = 1;
     const reconnect = this.restReplay
       ? this.delivery.waitForSettlement().then(() => this.reconnectWithBackoff(initialDelayMs))
       : this.reconnectWithBackoff(initialDelayMs);
@@ -1292,12 +1288,10 @@ export class ParticipantRuntimeClient {
     initialDelayMs: number | null = null,
   ): Effect.Effect<void, never> {
     return Effect.gen(this, function* () {
-      /** A REST wire loss before any failed read still gets the normal initial delay. */
-      let delayMs =
-        initialDelayMs ??
-        (this.recoveryFailureCount === 0
-          ? boundedReconnectDelayMs(0, this.config.reconnect)
-          : reconnectDelayMs(this.recoveryFailureCount, this.config));
+      const carried = this.restReplay ? this.recoveryFailureCount : 0;
+      const offset = Math.max(0, carried - 1);
+      let attempt = 0;
+      let delayMs = initialDelayMs ?? reconnectDelayMs(attempt + offset, this.config);
       while (!this.stopped && this.pausedReason === null) {
         if (delayMs > 0) {
           yield* sleepUnrefEffect(delayMs);
@@ -1315,9 +1309,9 @@ export class ParticipantRuntimeClient {
         }
         const error = opened.left;
         this.reconnectFailureCount += 1;
-        this.recordRecoveryFailure();
         this.emitError(error instanceof Error ? error : new Error("Reconnect failed"));
-        delayMs = reconnectDelayMs(this.recoveryFailureCount, this.config);
+        attempt += 1;
+        delayMs = reconnectDelayMs(attempt + offset, this.config);
       }
     });
   }
@@ -1650,7 +1644,7 @@ export class ParticipantRuntimeClient {
       return;
     }
     this.recoveryCount += 1;
-    const delayMs = reconnectDelayMs(this.deliveryRecoveryAttempts, this.config);
+    const delayMs = reconnectDelayMs(this.deliveryRecoveryAttempts - 1, this.config);
     this.observability.debug("recoverDelivery", "participant_event_delivery.recovering", {
       attempt: this.deliveryRecoveryAttempts,
       delayMs,
