@@ -86,6 +86,7 @@ export class RestParticipantTaskError extends Error {
     readonly observed?: number;
   };
 
+  /** Retains bounded operation metadata without the response body or credentials. */
   constructor(input: {
     readonly code: RestParticipantTaskErrorCode;
     readonly operation: string;

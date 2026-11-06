@@ -47,6 +47,37 @@ function findingScope(node: ts.Node, source: ts.SourceFile): string {
   return owners.join("/");
 }
 
+/** Recognizes named functions and fields on exported interface contracts. */
+function documentationTarget(node: ts.Node): ts.Node | null {
+  if (
+    (ts.isFunctionDeclaration(node) ||
+      ts.isMethodDeclaration(node) ||
+      ts.isConstructorDeclaration(node) ||
+      ts.isGetAccessorDeclaration(node) ||
+      ts.isSetAccessorDeclaration(node)) &&
+    node.body
+  )
+    return node;
+  if (
+    ts.isVariableDeclaration(node) &&
+    node.initializer &&
+    (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))
+  )
+    return node.parent.parent;
+  if (ts.isPropertySignature(node)) {
+    let owner: ts.Node | undefined = node.parent;
+    while (owner && !ts.isSourceFile(owner)) {
+      if (ts.isInterfaceDeclaration(owner)) {
+        return owner.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)
+          ? node
+          : null;
+      }
+      owner = owner.parent;
+    }
+  }
+  return null;
+}
+
 /** Resolves exact finding identities, preserving every reference to an already-listed name. */
 function analyzeModule(path: string, text = readFileSync(path, "utf8")) {
   const options = { noLib: true, noResolve: true };
@@ -87,21 +118,14 @@ function analyzeModule(path: string, text = readFileSync(path, "utf8")) {
         }
       }
     }
-    if (
-      (ts.isFunctionDeclaration(node) ||
-        ts.isMethodDeclaration(node) ||
-        ts.isConstructorDeclaration(node) ||
-        ts.isGetAccessorDeclaration(node) ||
-        ts.isSetAccessorDeclaration(node)) &&
-      node.body &&
-      ts.getJSDocCommentsAndTags(node).length === 0
-    ) {
+    const documented = documentationTarget(node);
+    if (documented && ts.getJSDocCommentsAndTags(documented).length === 0) {
       documentation.push(
         JSON.stringify([
           file,
           "jsdoc",
           ts.SyntaxKind[node.kind],
-          node.name?.getText(source) ?? "constructor",
+          (node as ts.NamedDeclaration).name?.getText(source) ?? "constructor",
           findingScope(node, source),
         ]),
       );
@@ -113,7 +137,10 @@ function analyzeModule(path: string, text = readFileSync(path, "utf8")) {
 /** Exact legacy identities only; fixing a violation must remove its baseline entry. */
 const baseline = JSON.parse(
   readFileSync(new URL("./participant-conventions.baseline.json", import.meta.url), "utf8"),
-) as Record<string, { readonly declarations: readonly string[] }>;
+) as Record<
+  string,
+  { readonly declarations: readonly string[]; readonly documentation: readonly string[] }
+>;
 
 describe("REST replay module conventions", () => {
   for (const module of checkedModules) {
@@ -125,16 +152,13 @@ describe("REST replay module conventions", () => {
       ).toEqual(baseline[module]?.declarations ?? []);
     });
   }
-  for (const module of [
-    { path: "../src/participant-rest-replay.ts", documentationBaseline: 0 },
-    { path: "./participant-runtime-client.test.ts", documentationBaseline: 8 },
-  ]) {
-    it(`${module.path} documents named functions and methods`, () => {
-      const path = fileURLToPath(new URL(module.path, import.meta.url));
+  for (const module of checkedModules) {
+    it(`${module} documents named functions and methods`, () => {
+      const path = fileURLToPath(new URL(module, import.meta.url));
       expect(
-        analyzeModule(path).documentation.length,
-        "Add JSDoc to named declarations.",
-      ).toBeLessThanOrEqual(module.documentationBaseline);
+        analyzeModule(path).documentation,
+        "Add JSDoc to named declarations and exported contract fields. Remove fixed identities from the baseline; never admit new undocumented declarations.",
+      ).toEqual(baseline[module]?.documentation ?? []);
     });
   }
 });

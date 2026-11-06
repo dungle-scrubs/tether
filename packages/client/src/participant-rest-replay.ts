@@ -377,16 +377,19 @@ export class ParticipantRestReplay {
     this.assertActive();
     if (predicate()) return Promise.resolve();
     return new Promise((resolve, reject) => {
+      /** Releases the delivery-progress and cancellation listeners together. */
       const cleanup = () => {
         this.waiters.delete(check);
         this.controller.signal.removeEventListener("abort", aborted);
       };
+      /** Settles the waiter only after its requested progress occurs. */
       const check = () => {
         if (predicate()) {
           cleanup();
           resolve();
         }
       };
+      /** Rejects the waiter when its generation loses ownership. */
       const aborted = () => {
         cleanup();
         reject(new RestParticipantTaskError({ code: "TRANSPORT", operation: "replay" }));

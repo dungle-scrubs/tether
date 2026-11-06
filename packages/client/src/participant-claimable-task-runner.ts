@@ -36,9 +36,13 @@ export interface ParticipantClaimableTaskRunnerClient {
   readonly isPaused: () => boolean;
   /** REST recovery owns finite task state and loads candidates before dispatch. */
   readonly taskRecovery?: {
+    /** Loads the canonical active-task snapshot under this generation's read policy. */
     readonly load: () => Promise<readonly TaskRecord[]>;
+    /** Maximum retained task bytes, independently equal to the delivery byte budget. */
     readonly maxQueueBytes: number;
+    /** Maximum retained task identities, independently equal to the delivery item budget. */
     readonly maxQueueSize: number;
+    /** Reports admission failures through the runtime's terminal delivery policy. */
     readonly fail: (error: ParticipantRestReplayError) => void;
   };
   /** Registers a live/replayed event handler. */
@@ -296,6 +300,7 @@ export function buildParticipantClaimableTaskLoop(
       .finally(() => pendingWork.delete(work));
   };
 
+  /** Starts the next eligible REST claim only after the active flow settles. */
   const pumpRestTasks = (): void => {
     if (
       !restTasks ||
@@ -329,12 +334,14 @@ export function buildParticipantClaimableTaskLoop(
       });
   };
 
-  // One cancellable idle waiter belongs to the current once-mode loop, never to each queued task.
+  /** Owns one cancellable idle waiter for the current once-mode loop. */
   const waitForRestIdle = () => {
+    /** Captures the idle promise's completion callback without retaining task-specific waiters. */
     let resolve = (): void => undefined;
     const promise = new Promise<void>((done) => {
       resolve = done;
     });
+    /** Resolves only when neither an active claim nor queued work remains. */
     const wake = () => {
       if (!activeWork && !restTasks?.hasPending(client.connectionGeneration())) {
         if (restIdleWake === wake) restIdleWake = null;

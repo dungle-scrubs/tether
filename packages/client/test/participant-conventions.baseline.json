@@ -1,6 +1,7 @@
 {
   "../src/participant-rest-replay.ts": {
-    "declarations": []
+    "declarations": [],
+    "documentation": []
   },
   "../src/participant-runtime-client.ts": {
     "declarations": [
@@ -39,21 +40,82 @@
       "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"TypeAliasDeclaration\",\"ParticipantRuntimePausedReason\",\"ClassDeclaration:ParticipantRuntimeTerminalStreamError/PropertyDeclaration:reason\",\"ParticipantRuntimePausedReason\"]#1",
       "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"TypeAliasDeclaration\",\"ParticipantRuntimeShutdownPhase\",\"ClassDeclaration:ParticipantRuntimeShutdownError/Parameter:input/PropertySignature:pendingPhases\",\"ParticipantRuntimeShutdownPhase\"]#1",
       "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"TypeAliasDeclaration\",\"ParticipantRuntimeShutdownPhase\",\"ClassDeclaration:ParticipantRuntimeShutdownError/PropertyDeclaration:pendingPhases\",\"ParticipantRuntimeShutdownPhase\"]#1"
+    ],
+    "documentation": [
+      "[\"packages/client/src/participant-runtime-client.ts\",\"jsdoc\",\"Constructor\",\"constructor\",\"ClassDeclaration:ParticipantRuntimeClientConfigurationError\"]",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"jsdoc\",\"Constructor\",\"constructor\",\"ClassDeclaration:ParticipantRuntimeCommandError\"]",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"jsdoc\",\"Constructor\",\"constructor\",\"ClassDeclaration:ParticipantRuntimeCommandOutcomeUnknownError\"]",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"jsdoc\",\"Constructor\",\"constructor\",\"ClassDeclaration:ParticipantRuntimeCommandTimeoutError\"]",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"jsdoc\",\"Constructor\",\"constructor\",\"ClassDeclaration:ParticipantRuntimeEventDeliveryError\"]",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"jsdoc\",\"Constructor\",\"constructor\",\"ClassDeclaration:ParticipantRuntimeShutdownError\"]",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"jsdoc\",\"Constructor\",\"constructor\",\"ClassDeclaration:ParticipantRuntimeTerminalStreamError\"]",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"jsdoc\",\"VariableDeclaration\",\"clearOwner\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:requestReconnect/VariableDeclaration:clearOwner\"]",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"jsdoc\",\"VariableDeclaration\",\"reject\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:buildCommandRequest/VariableDeclaration:reject\"]",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"jsdoc\",\"VariableDeclaration\",\"resolve\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:buildCommandRequest/VariableDeclaration:resolve\"]",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"jsdoc\",\"VariableDeclaration\",\"resolveClose\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:prepareTransport/VariableDeclaration:resolveClose\"]"
     ]
   },
   "../src/participant-claimable-task-runner.ts": {
-    "declarations": []
+    "declarations": [],
+    "documentation": [
+      "[\"packages/client/src/participant-claimable-task-runner.ts\",\"jsdoc\",\"PropertySignature\",\"cancellation\",\"InterfaceDeclaration:ParticipantClaimableTaskRunnerClient/PropertySignature:runTaskClaimFlow/Parameter:input/PropertySignature:cancellation\"]",
+      "[\"packages/client/src/participant-claimable-task-runner.ts\",\"jsdoc\",\"PropertySignature\",\"claimRefreshMs\",\"InterfaceDeclaration:ParticipantClaimableTaskRunnerClient/PropertySignature:runTaskClaimFlow/Parameter:input/PropertySignature:claimRefreshMs\"]",
+      "[\"packages/client/src/participant-claimable-task-runner.ts\",\"jsdoc\",\"PropertySignature\",\"executor\",\"InterfaceDeclaration:ParticipantClaimableTaskRunnerClient/PropertySignature:runTaskClaimFlow/Parameter:input/PropertySignature:executor\"]",
+      "[\"packages/client/src/participant-claimable-task-runner.ts\",\"jsdoc\",\"PropertySignature\",\"task\",\"InterfaceDeclaration:ParticipantClaimableTaskRunnerClient/PropertySignature:runTaskClaimFlow/Parameter:input/PropertySignature:task\"]",
+      "[\"packages/client/src/participant-claimable-task-runner.ts\",\"jsdoc\",\"VariableDeclaration\",\"runLoop\",\"FunctionDeclaration:buildParticipantClaimableTaskLoop/VariableDeclaration:runLoop\"]",
+      "[\"packages/client/src/participant-claimable-task-runner.ts\",\"jsdoc\",\"VariableDeclaration\",\"startTask\",\"FunctionDeclaration:buildParticipantClaimableTaskLoop/VariableDeclaration:startTask\"]",
+      "[\"packages/client/src/participant-claimable-task-runner.ts\",\"jsdoc\",\"VariableDeclaration\",\"subscribe\",\"FunctionDeclaration:buildParticipantClaimableTaskLoop/VariableDeclaration:subscribe\"]"
+    ]
   },
   "../src/rest-participant-task-client.ts": {
-    "declarations": []
+    "declarations": [],
+    "documentation": [
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"MethodDeclaration\",\"#error\",\"ClassDeclaration:RestParticipantTaskClient\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"MethodDeclaration\",\"#fencedBody\",\"ClassDeclaration:RestParticipantTaskClient\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"MethodDeclaration\",\"#identity\",\"ClassDeclaration:RestParticipantTaskClient\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"after\",\"InterfaceDeclaration:ListEventsQuery/PropertySignature:after\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"authToken\",\"InterfaceDeclaration:RestParticipantTaskClientConfig/PropertySignature:authToken\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"claimId\",\"InterfaceDeclaration:FencedTaskCall/PropertySignature:claimId\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"controlEpoch\",\"InterfaceDeclaration:AppendTaskEventCall/PropertySignature:controlEpoch\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"controlEpoch\",\"InterfaceDeclaration:FencedTaskCall/PropertySignature:controlEpoch\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"decision\",\"InterfaceDeclaration:RecordTaskApprovalCall/PropertySignature:decision\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"eventId\",\"InterfaceDeclaration:AppendTaskEventCall/PropertySignature:eventId\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"fetch\",\"InterfaceDeclaration:RestParticipantTaskClientOptions/PropertySignature:fetch\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"instanceId\",\"InterfaceDeclaration:AppendTaskEventCall/PropertySignature:instanceId\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"limit\",\"InterfaceDeclaration:ListEventsQuery/PropertySignature:limit\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"maxActiveTasks\",\"InterfaceDeclaration:RestParticipantTaskClientOptions/PropertySignature:readPolicy/PropertySignature:maxActiveTasks\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"maxBytes\",\"InterfaceDeclaration:RestParticipantTaskClientOptions/PropertySignature:readPolicy/PropertySignature:maxBytes\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"observability\",\"InterfaceDeclaration:RestParticipantTaskClientOptions/PropertySignature:observability\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"participantId\",\"InterfaceDeclaration:RestParticipantTaskClientConfig/PropertySignature:participantId\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"payload\",\"InterfaceDeclaration:AppendTaskEventCall/PropertySignature:payload\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"producerId\",\"InterfaceDeclaration:AppendTaskEventCall/PropertySignature:producerId\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"reason\",\"InterfaceDeclaration:RecordTaskApprovalCall/PropertySignature:reason\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"serviceUrl\",\"InterfaceDeclaration:RestParticipantTaskClientConfig/PropertySignature:serviceUrl\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"signal\",\"InterfaceDeclaration:RestParticipantTaskClientOptions/PropertySignature:readPolicy/PropertySignature:signal\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"target\",\"InterfaceDeclaration:RecordTaskApprovalCall/PropertySignature:target\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"timeoutMs\",\"InterfaceDeclaration:RestParticipantTaskClientOptions/PropertySignature:readPolicy/PropertySignature:timeoutMs\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"type\",\"InterfaceDeclaration:AppendTaskEventCall/PropertySignature:type\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"VariableDeclaration\",\"aborted\",\"FunctionDeclaration:awaitRead/VariableDeclaration:aborted\"]",
+      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"VariableDeclaration\",\"cancel\",\"FunctionDeclaration:readJsonBody/VariableDeclaration:cancel\"]"
+    ]
   },
   "./participant-runtime-client.test.ts": {
-    "declarations": []
+    "declarations": [],
+    "documentation": []
   },
   "./rest-participant-task-client.test.ts": {
-    "declarations": []
+    "declarations": [],
+    "documentation": [
+      "[\"packages/client/test/rest-participant-task-client.test.ts\",\"jsdoc\",\"FunctionDeclaration\",\"capture\",\"FunctionDeclaration:capture\"]",
+      "[\"packages/client/test/rest-participant-task-client.test.ts\",\"jsdoc\",\"FunctionDeclaration\",\"fetchJson\",\"FunctionDeclaration:fetchJson\"]",
+      "[\"packages/client/test/rest-participant-task-client.test.ts\",\"jsdoc\",\"FunctionDeclaration\",\"posted\",\"FunctionDeclaration:posted\"]",
+      "[\"packages/client/test/rest-participant-task-client.test.ts\",\"jsdoc\",\"VariableDeclaration\",\"fetch\",\"FunctionDeclaration:fetchJson/VariableDeclaration:fetch\"]",
+      "[\"packages/client/test/rest-participant-task-client.test.ts\",\"jsdoc\",\"VariableDeclaration\",\"fetch\",\"call:RestParticipantTaskClient/call:completes with the claim id and result, and sends no body on GET/VariableDeclaration:fetch\"]",
+      "[\"packages/client/test/rest-participant-task-client.test.ts\",\"jsdoc\",\"VariableDeclaration\",\"transport\",\"call:RestParticipantTaskClient/call:maps failure classes: transport, auth, and server persistence/VariableDeclaration:transport\"]"
+    ]
   },
   "./participant-rest-replay-style.test.ts": {
-    "declarations": []
+    "declarations": [],
+    "documentation": []
   }
 }

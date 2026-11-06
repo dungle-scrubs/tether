@@ -268,6 +268,7 @@ function createRuntimeClientFixture(
     ...baseTask,
     claimExpiresAt: "2099-06-05T00:00:30.000Z",
   };
+  /** Supplies the current server claim during refresh, replaceable by each test. */
   let refreshTaskClaim = async (): Promise<TaskRecord | null> => baseTask;
   const actions: string[] = [];
   const diagnostics: string[] = [];
@@ -334,6 +335,7 @@ function createCancellationFixture(
 ): CancellationFixture {
   let cancelled = options.cancelled ?? false;
   const controller = new AbortController();
+  /** Changes the cancellation flag and aborts the matching executor signal. */
   const setCancelled = (): void => {
     cancelled = true;
     controller.abort();
@@ -410,8 +412,11 @@ interface RejectableDeferred<TValue> extends Deferred<TValue> {
   readonly reject: (error: Error) => void;
 }
 
+/** Creates a manually settled promise that can model transport failure. */
 function createRejectableDeferred<TValue>(): RejectableDeferred<TValue> {
+  /** Captures the promise reject callback during construction. */
   let reject: (error: Error) => void = () => undefined;
+  /** Captures the promise resolve callback during construction. */
   let resolve: (value: TValue | PromiseLike<TValue>) => void = () => undefined;
   const promise = new Promise<TValue>((promiseResolve, promiseReject) => {
     reject = promiseReject;
@@ -422,6 +427,7 @@ function createRejectableDeferred<TValue>(): RejectableDeferred<TValue> {
 
 /** Creates a manually controlled promise for async loop tests. */
 function createDeferred<TValue>(): Deferred<TValue> {
+  /** Captures the promise resolve callback during construction. */
   let resolve: (value: TValue | PromiseLike<TValue>) => void = () => undefined;
   const promise = new Promise<TValue>((promiseResolve) => {
     resolve = promiseResolve;
@@ -685,6 +691,7 @@ class ParticipantFakeWebSocket extends EventEmitter {
   readyState = WebSocket.CONNECTING;
   readonly sent: string[] = [];
 
+  /** Opens asynchronously so callers can attach transport listeners first. */
   constructor(readonly url: string) {
     super();
     queueMicrotask(() => {
@@ -693,6 +700,7 @@ class ParticipantFakeWebSocket extends EventEmitter {
     });
   }
 
+  /** Supports deferred closure for generation-replacement race tests. */
   close(): void {
     if (this.deferClose) {
       this.readyState = WebSocket.CLOSING;
@@ -701,24 +709,29 @@ class ParticipantFakeWebSocket extends EventEmitter {
     this.emitClose();
   }
 
+  /** Delivers the server-side close notification. */
   emitClose(): void {
     this.readyState = WebSocket.CLOSED;
     this.emit("close");
   }
 
+  /** Delivers the normal replay completion frame. */
   emitReplayComplete(): void {
     this.emit("message", JSON.stringify({ op: "replay.complete" }));
   }
 
+  /** Delivers a canonical event through the real runtime message handler. */
   emitServerEvent(event: SessionEvent): void {
     this.emit("message", JSON.stringify({ event, op: "event" }));
   }
 
+  /** Records outgoing commands and lets the synthetic server reply. */
   send(data: string): void {
     this.sent.push(data);
     this.emit("client-command", data);
   }
 
+  /** Uses the same close notification as an interrupted transport. */
   terminate(): void {
     this.close();
   }
@@ -2956,6 +2969,7 @@ describe("ParticipantRuntimeClient REST replay", () => {
     } as ParticipantRuntimeClientConfig);
     clients.push(client);
     client.onError((error) => errors.push(error));
+    /** Opens REST recovery and supplies matching wire authority before waiting for replay. */
     const open = async () => {
       await client.open();
       const socket = sockets.at(-1);
