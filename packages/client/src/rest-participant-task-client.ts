@@ -73,6 +73,11 @@ interface RestTaskReadPolicy {
 /** Recovery policy cannot be supplied through an exported options property. */
 const recoveryReadPolicy = Symbol("participant-rest-read-policy");
 
+/** Discards an unused response without reading its body or delaying its status. */
+function discardBody(response: Response): void {
+  void response.body?.cancel().catch(() => undefined);
+}
+
 /** The private symbol keeps constructor dependencies separate from recovery ownership. */
 type InternalRestTaskClientOptions = RestParticipantTaskClientOptions & {
   /** Recovery-owned cancellation, deadlines and admission policy. */
@@ -125,50 +130,76 @@ type RestTaskFailureInput = {
     }
 );
 
+/** Common bounded context retained by every failure variant. */
+type RestTaskFailureDetails = {
+  /** REST operation that failed. */
+  readonly operation: string;
+  /** Known status or null when no response was available. */
+  readonly status: number | null;
+};
+
+/** The stored failure keeps its discriminator and required metadata together. */
+type RestTaskFailure =
+  | {
+      /** Resource-policy rejection rather than a transport or server failure. */
+      readonly code: "RESOURCE_LIMIT";
+      /** Complete policy metadata alongside the common operation context. */
+      readonly details: RestTaskFailureDetails & {
+        /** Resource, configured limit and rejected observation in the same units. */
+        readonly resourceLimit: RestTaskResourceLimit;
+      };
+    }
+  | {
+      /** Non-resource failures have no resource-policy metadata. */
+      readonly code: Exclude<RestParticipantTaskErrorCode, "RESOURCE_LIMIT">;
+      /** Operation context for the classified failure. */
+      readonly details: RestTaskFailureDetails;
+    };
+
 /** Typed, operation-scoped REST task-route failure. */
 export class RestParticipantTaskError extends Error {
-  readonly code: RestParticipantTaskErrorCode;
-  readonly details: {
-    readonly operation: string;
-    readonly status: number | null;
-    readonly resourceLimit?: RestTaskResourceLimit;
-  };
+  /** Single stored owner of the failure discriminator and its correlated details. */
+  readonly failure: RestTaskFailure;
 
   /** Retains bounded operation metadata without the response body or credentials. */
   constructor(input: RestTaskFailureInput) {
     super(`REST participant task ${input.operation} failed: ${input.code}`);
-    if (input.code === "RESOURCE_LIMIT" && !input.resourceLimit)
-      throw new TypeError("RESOURCE_LIMIT requires complete resource metadata");
-    this.code = input.code;
-    this.details = {
-      operation: input.operation,
-      status: input.status ?? null,
-      ...(input.resourceLimit === undefined
-        ? {}
-        : {
-            resourceLimit: {
-              resource: input.resourceLimit.resource,
-              limit: input.resourceLimit.limit,
-              observed: input.resourceLimit.observed,
+    const context = { operation: input.operation, status: input.status ?? null };
+    this.failure =
+      input.code === "RESOURCE_LIMIT"
+        ? {
+            code: input.code,
+            details: {
+              ...context,
+              resourceLimit: {
+                resource: input.resourceLimit.resource,
+                limit: input.resourceLimit.limit,
+                observed: input.resourceLimit.observed,
+              },
             },
-          }),
-    };
+          }
+        : { code: input.code, details: context };
     this.name = "RestParticipantTaskError";
+  }
+
+  /** Preserves the public classification while reading its single stored owner. */
+  get code(): RestParticipantTaskErrorCode {
+    return this.failure.code;
+  }
+
+  /** Preserves the public details object without independently stored metadata. */
+  get details(): RestTaskFailure["details"] {
+    return this.failure.details;
   }
 }
 
-/** Narrows the resource variant guaranteed by the constructor contract. */
+/** Narrows the stored resource variant without restating its details shape. */
 export function isRestParticipantResourceLimit(
   error: unknown,
 ): error is RestParticipantTaskError & {
-  readonly code: "RESOURCE_LIMIT";
-  readonly details: {
-    readonly operation: string;
-    readonly status: number | null;
-    readonly resourceLimit: RestTaskResourceLimit;
-  };
+  readonly failure: Extract<RestTaskFailure, { readonly code: "RESOURCE_LIMIT" }>;
 } {
-  return error instanceof RestParticipantTaskError && error.code === "RESOURCE_LIMIT";
+  return error instanceof RestParticipantTaskError && error.failure.code === "RESOURCE_LIMIT";
 }
 
 /** Options shared by every fenced mutation. */
@@ -706,7 +737,7 @@ export class RestParticipantTaskClient {
               ...(signal === undefined ? {} : { signal }),
             }).then((response) => {
               if (signal?.aborted) {
-                void response.body?.cancel().catch(() => undefined);
+                discardBody(response);
                 signal.throwIfAborted();
               }
               return response;
@@ -717,7 +748,7 @@ export class RestParticipantTaskClient {
           throw readTransportError(operation, signal, this.#readPolicy?.signal);
         }
         if (!response.ok) {
-          void response.body?.cancel().catch(() => undefined);
+          discardBody(response);
           throw this.#error(mapTaskServerError(response.status), operation, response.status);
         }
         const responseBody = await readJsonBody(

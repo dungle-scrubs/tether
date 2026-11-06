@@ -21,20 +21,71 @@ import {
 import { replayMarkerByteCost, type SerialEventDelivery } from "./serial-event-delivery.js";
 import type { SessionEvent, TaskRecord } from "./types.js";
 
+/** Original overflow metadata, correlated with its terminal reason. */
+export type ParticipantOverflowDetails = {
+  /** Count admission failed before retaining the rejected item. */
+  readonly delivery_queue_overflow: {
+    /** Configured retained item limit. */
+    readonly maxQueueSize: number;
+    /** Items that admission would retain. */
+    readonly observedQueueSize: number;
+  };
+  /** Byte admission failed before retaining the rejected payload. */
+  readonly delivery_byte_overflow: {
+    /** Configured retained byte limit. */
+    readonly maxQueueBytes: number;
+    /** Bytes observed at rejection. */
+    readonly observedQueueBytes: number;
+    /** Separate HTTP response cap when the response reader rejected the body. */
+    readonly maxResponseBytes?: number;
+  };
+};
+
+/** Constructor arguments preserve the correlation between reason and bounded details. */
+type ReplayFailureArgs =
+  | [
+      reason: "delivery_queue_overflow",
+      details: ParticipantOverflowDetails["delivery_queue_overflow"],
+    ]
+  | [
+      reason: "delivery_byte_overflow",
+      details: ParticipantOverflowDetails["delivery_byte_overflow"],
+    ]
+  | [
+      reason: "invalid_server_envelope" | "non_contiguous_event",
+      details?: Readonly<Record<string, number>>,
+    ];
+
 /** Internal replay failures carry only bounded policy and sequence metadata. */
 export class ParticipantRestReplayError extends Error {
+  readonly reason: ReplayFailureArgs[0];
+  readonly safeDetails: Readonly<Record<string, number>>;
+
   /** Records bounded failure metadata without retaining a response payload. */
-  constructor(
-    readonly reason:
-      | "delivery_byte_overflow"
-      | "delivery_queue_overflow"
-      | "invalid_server_envelope"
-      | "non_contiguous_event",
-    readonly safeDetails: Readonly<Record<string, number>> = {},
-  ) {
+  constructor(...[reason, details = {}]: ReplayFailureArgs) {
     super("Participant REST replay failed");
+    this.reason = reason;
+    this.safeDetails = details;
     this.name = "ParticipantRestReplayError";
   }
+}
+
+/** Checks the shared count-first admission policy for history and task reservations. */
+export function checkRecoveryBudget(
+  limits: { readonly maxQueueSize: number; readonly maxQueueBytes: number },
+  observedQueueSize: number,
+  observedQueueBytes: number,
+): void {
+  if (observedQueueSize > limits.maxQueueSize)
+    throw new ParticipantRestReplayError("delivery_queue_overflow", {
+      maxQueueSize: limits.maxQueueSize,
+      observedQueueSize,
+    });
+  if (observedQueueBytes > limits.maxQueueBytes)
+    throw new ParticipantRestReplayError("delivery_byte_overflow", {
+      maxQueueBytes: limits.maxQueueBytes,
+      observedQueueBytes,
+    });
 }
 
 type HeldFrame =
@@ -102,26 +153,6 @@ export function isTransientRestReplayFailure(error: unknown): error is RestParti
   );
 }
 
-/** Normalizes bounded HTTP reads while preserving transport timeout provenance. */
-function replayReadFailure(error: unknown, maxQueueBytes: number): never {
-  if (isRestParticipantResourceLimit(error)) {
-    const resource = error.details.resourceLimit;
-    switch (resource.resource) {
-      case "active_tasks":
-        throw new ParticipantRestReplayError("delivery_queue_overflow", {
-          maxQueueSize: resource.limit,
-          observedQueueSize: resource.observed,
-        });
-      case "response_bytes":
-        throw new ParticipantRestReplayError("delivery_byte_overflow", {
-          maxQueueBytes,
-          observedQueueBytes: resource.observed,
-        });
-    }
-  }
-  throw error;
-}
-
 /** One generation's bounded REST history and ordered WebSocket handoff. */
 export class ParticipantRestReplay {
   private readonly controller = new AbortController();
@@ -135,6 +166,31 @@ export class ParticipantRestReplay {
   private readonly pageLimit: number;
   /** Highest request size still admissible after a failure in this generation. */
   private historyLimitCeiling: number;
+
+  /** Normalizes bounded HTTP reads while preserving transport timeout provenance. */
+  private readonly replayReadFailure = (error: unknown): never => {
+    if (isRestParticipantResourceLimit(error)) {
+      const resource = error.failure.details.resourceLimit;
+      switch (resource.resource) {
+        case "active_tasks":
+          throw new ParticipantRestReplayError("delivery_queue_overflow", {
+            maxQueueSize: resource.limit,
+            observedQueueSize: resource.observed,
+          });
+        case "response_bytes":
+          throw new ParticipantRestReplayError("delivery_byte_overflow", {
+            maxQueueBytes: this.options.maxQueueBytes,
+            observedQueueBytes: resource.observed,
+            maxResponseBytes: resource.limit,
+          });
+        default: {
+          const unsupported: never = resource.resource;
+          throw new Error(`Unsupported REST resource: ${unsupported}`);
+        }
+      }
+    }
+    throw error;
+  };
 
   /** Binds replay to one generation's delivery state and existing resource limits. */
   constructor(
@@ -282,7 +338,7 @@ export class ParticipantRestReplay {
   async loadActiveTasks(): Promise<readonly TaskRecord[]> {
     const snapshot = await this.rest
       .listActiveTasks(this.options.config.sessionId)
-      .catch((error: unknown) => replayReadFailure(error, this.options.maxQueueBytes));
+      .catch(this.replayReadFailure);
     this.assertActive();
     if (
       snapshot.invalidRowCount > 0 ||
@@ -332,7 +388,7 @@ export class ParticipantRestReplay {
           error instanceof ParticipantRestReplayError &&
           (error.reason === "delivery_byte_overflow" || error.reason === "delivery_queue_overflow");
         if ((!overflow && !isRestParticipantReadTimeout(error)) || limit === 1) throw error;
-        this.historyLimitCeiling = Math.min(this.historyLimitCeiling, limit - 1);
+        if (overflow) this.historyLimitCeiling = Math.min(this.historyLimitCeiling, limit - 1);
         limit = Math.max(1, Math.floor(limit / 2));
       }
     }
@@ -346,7 +402,7 @@ export class ParticipantRestReplay {
         after,
         limit,
       })
-      .catch((error: unknown) => replayReadFailure(error, this.options.maxQueueBytes));
+      .catch(this.replayReadFailure);
     this.assertActive();
     const { events, pagination } = page;
     if (
@@ -387,19 +443,8 @@ export class ParticipantRestReplay {
   private checkBudget(items: number, bytes: number): void {
     const delivery = this.options.delivery.debugInfo();
     const observedQueueSize = delivery.queueSize + this.held.length + items;
-    if (observedQueueSize > this.options.maxQueueSize) {
-      throw new ParticipantRestReplayError("delivery_queue_overflow", {
-        maxQueueSize: this.options.maxQueueSize,
-        observedQueueSize,
-      });
-    }
     const observedQueueBytes = delivery.queueBytes + this.heldBytes + bytes;
-    if (observedQueueBytes > this.options.maxQueueBytes) {
-      throw new ParticipantRestReplayError("delivery_byte_overflow", {
-        maxQueueBytes: this.options.maxQueueBytes,
-        observedQueueBytes,
-      });
-    }
+    checkRecoveryBudget(this.options, observedQueueSize, observedQueueBytes);
   }
 
   /** Waits for delivery progress while remaining cancellable by the generation owner. */

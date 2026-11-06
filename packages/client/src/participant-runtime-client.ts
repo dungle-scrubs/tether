@@ -18,6 +18,7 @@ import {
   isTransientRestReplayFailure,
   ParticipantRestReplay,
   ParticipantRestReplayError,
+  type ParticipantOverflowDetails,
 } from "./participant-rest-replay.js";
 import { runParticipantTaskClaimFlow } from "./participant-task-claim-flow.js";
 import {
@@ -515,7 +516,7 @@ export interface ParticipantRuntimeClientDebugInfo extends BoundaryDebugInfo {
   readonly pendingCursorSeq: number | null;
   /** Terminal reason requiring explicit reconnect, or null while active. */
   readonly pausedReason: ParticipantRuntimePausedReason | null;
-  /** Number of failed reconnect attempts since startup. */
+  /** Number of failed reconnect opens since startup, excluding post-open recovery reads. */
   readonly reconnectFailureCount: number;
   /** Number of successful reconnects since startup. */
   readonly reconnectSuccessCount: number;
@@ -648,7 +649,7 @@ function writeDefaultRuntimeError(
  * Maps consecutive failed cycles to the shared zero-based backoff policy.
  */
 function reconnectDelayMs(failures: number, config: ParticipantRuntimeClientConfig): number {
-  return boundedReconnectDelayMs(Math.max(0, failures - 1), config.reconnect);
+  return boundedReconnectDelayMs(failures - 1, config.reconnect);
 }
 
 /**
@@ -801,6 +802,8 @@ export class ParticipantRuntimeClient {
         void restReplay.replay(transportHead).catch((error: unknown) => {
           this.failRestReplay(error, prepared.generation, restReplay);
         });
+      } else {
+        this.recordRecoveryProgress();
       }
     } catch (error) {
       const openError =
@@ -1252,7 +1255,6 @@ export class ParticipantRuntimeClient {
   /** Records one failed open or post-open recovery cycle at its reconnect owner. */
   private recordRecoveryFailure(): void {
     this.recoveryFailureCount += 1;
-    this.reconnectFailureCount += 1;
   }
 
   /** Resets retry policy only after acknowledged progress or completed recovery. */
@@ -1265,10 +1267,11 @@ export class ParticipantRuntimeClient {
     if (this.reconnectPromise) {
       return this.reconnectPromise;
     }
-    const delayMs = initialDelayMs;
+    /** Close and delivery recovery start a failed cycle before any refused reopen. */
+    if (!this.restReplay && this.recoveryFailureCount === 0) this.recoveryFailureCount = 1;
     const reconnect = this.restReplay
-      ? this.delivery.waitForSettlement().then(() => this.reconnectWithBackoff(delayMs))
-      : this.reconnectWithBackoff(delayMs);
+      ? this.delivery.waitForSettlement().then(() => this.reconnectWithBackoff(initialDelayMs))
+      : this.reconnectWithBackoff(initialDelayMs);
     this.reconnectPromise = reconnect;
     const clearOwner = (): void => {
       if (this.reconnectPromise === reconnect) {
@@ -1286,7 +1289,12 @@ export class ParticipantRuntimeClient {
     initialDelayMs: number | null = null,
   ): Effect.Effect<void, never> {
     return Effect.gen(this, function* () {
-      let delayMs = initialDelayMs ?? reconnectDelayMs(this.recoveryFailureCount, this.config);
+      /** A REST wire loss before any failed read still gets the normal initial delay. */
+      let delayMs =
+        initialDelayMs ??
+        (this.recoveryFailureCount === 0
+          ? boundedReconnectDelayMs(0, this.config.reconnect)
+          : reconnectDelayMs(this.recoveryFailureCount, this.config));
       while (!this.stopped && this.pausedReason === null) {
         if (delayMs > 0) {
           yield* sleepUnrefEffect(delayMs);
@@ -1303,6 +1311,7 @@ export class ParticipantRuntimeClient {
           return;
         }
         const error = opened.left;
+        this.reconnectFailureCount += 1;
         this.recordRecoveryFailure();
         this.emitError(error instanceof Error ? error : new Error("Reconnect failed"));
         delayMs = reconnectDelayMs(this.recoveryFailureCount, this.config);
@@ -1523,7 +1532,7 @@ export class ParticipantRuntimeClient {
           {
             maxQueueBytes: outcome.maxQueueBytes,
             observedQueueBytes: outcome.observedQueueBytes,
-          },
+          } satisfies ParticipantOverflowDetails["delivery_byte_overflow"],
           generation,
         );
         return;
@@ -1534,7 +1543,7 @@ export class ParticipantRuntimeClient {
           {
             maxQueueSize: outcome.maxQueueSize,
             observedQueueSize: outcome.observedQueueSize,
-          },
+          } satisfies ParticipantOverflowDetails["delivery_queue_overflow"],
           generation,
         );
         return;
@@ -1658,10 +1667,9 @@ export class ParticipantRuntimeClient {
     this.rejectPendingCommandsAsUnknown(error);
     const delivery = this.delivery;
     const socket = this.socket;
-    const close = this.closePromise.catch(() => undefined);
+    const close = this.closePromise;
     this.socket = null;
     socket?.close();
-    if (!this.transportHasSocket) this.resolveTransportClose?.();
     /** REST requestReconnect owns settlement; WebSocket handler recovery retains its barrier. */
     return replay
       ? close

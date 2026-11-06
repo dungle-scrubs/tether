@@ -1,6 +1,7 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 
 import * as Client from "../src/index.js";
+import { ParticipantRestReplayError } from "../src/participant-rest-replay.js";
 
 /** The public options type must not expose recovery-owned transport limits. */
 const publicTaskOptions: Client.RestParticipantTaskClientOptions = {};
@@ -23,6 +24,16 @@ const transportWithResource = {
 const mismatchedResourceFailure: RestTaskFailureInput = transportWithResource;
 void incompleteResourceFailure;
 void mismatchedResourceFailure;
+
+/** Overflow reasons require their original metadata keys at every construction site. */
+type ReplayFailureArgs = ConstructorParameters<typeof ParticipantRestReplayError>;
+const renamedOverflowDetails = { limit: 1, observed: 2 };
+// @ts-expect-error Count overflow requires maxQueueSize and observedQueueSize.
+const invalidCountOverflow: ReplayFailureArgs = ["delivery_queue_overflow", renamedOverflowDetails];
+// @ts-expect-error Byte overflow requires maxQueueBytes and observedQueueBytes.
+const invalidByteOverflow: ReplayFailureArgs = ["delivery_byte_overflow", renamedOverflowDetails];
+void invalidCountOverflow;
+void invalidByteOverflow;
 
 type PromiseReturning<TArgs extends readonly unknown[], TValue> = (
   ...args: TArgs

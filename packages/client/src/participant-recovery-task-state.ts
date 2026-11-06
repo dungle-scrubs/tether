@@ -1,5 +1,5 @@
 /** Owns REST task reservations under a budget independently equal to serial delivery. */
-import { ParticipantRestReplayError } from "./participant-rest-replay.js";
+import { checkRecoveryBudget } from "./participant-rest-replay.js";
 import type { TaskRecord } from "./types.js";
 
 /** Counts a retained canonical task record for the recovery-state owner. */
@@ -79,19 +79,8 @@ export class RecoveryTaskState {
   private put(taskId: string, slot: RecoveryTaskSlot): void {
     const previous = this.slots.get(taskId);
     const observedQueueSize = this.slots.size + (previous ? 0 : 1);
-    if (observedQueueSize > this.limits.maxQueueSize) {
-      throw new ParticipantRestReplayError("delivery_queue_overflow", {
-        maxQueueSize: this.limits.maxQueueSize,
-        observedQueueSize,
-      });
-    }
     const observedQueueBytes = this.bytes - (previous?.bytes ?? 0) + slot.bytes;
-    if (observedQueueBytes > this.limits.maxQueueBytes) {
-      throw new ParticipantRestReplayError("delivery_byte_overflow", {
-        maxQueueBytes: this.limits.maxQueueBytes,
-        observedQueueBytes,
-      });
-    }
+    checkRecoveryBudget(this.limits, observedQueueSize, observedQueueBytes);
     this.slots.set(taskId, slot);
     this.bytes = observedQueueBytes;
   }

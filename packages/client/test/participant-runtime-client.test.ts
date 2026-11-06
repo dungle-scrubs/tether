@@ -3061,10 +3061,18 @@ describe("ParticipantRuntimeClient REST replay", () => {
       safeDetails: { maxQueueBytes: 64 },
     });
     expect(f.errors.at(-1)).toMatchObject({
-      safeDetails: { maxQueueBytes: 64, observedQueueBytes: observedBytes },
+      safeDetails: {
+        maxQueueBytes: 64,
+        observedQueueBytes: observedBytes,
+        maxResponseBytes: 4_160,
+      },
     });
     expect(diagnostics).toHaveLength(1);
-    expect(diagnostics[0]).toMatchObject({ maxQueueBytes: 64, observedQueueBytes: observedBytes });
+    expect(diagnostics[0]).toMatchObject({
+      maxQueueBytes: 64,
+      observedQueueBytes: observedBytes,
+      maxResponseBytes: 4_160,
+    });
     expect(diagnostics[0]).not.toHaveProperty("limit");
     expect(f.writes).toEqual([]);
   });
@@ -3229,6 +3237,46 @@ describe("ParticipantRuntimeClient REST replay", () => {
     ]);
     expect(f.sockets).toHaveLength(1);
     expect(f.writes).toEqual([1, 2, 3, 4]);
+  });
+
+  it("resumes page growth after a transient timeout halves one history request", async () => {
+    let timedOut = false;
+    const f = await fixture({
+      head: 20,
+      config: { commandTimeoutMs: 5, eventDelivery: { maxQueueSize: 9 } },
+      page: (after, limit, _call, signal, phase) => {
+        if (phase === "history" && !timedOut) {
+          timedOut = true;
+          return new Promise<never>((_resolve, reject) => {
+            signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+          });
+        }
+        return restHistoryPage(after, limit, 20);
+      },
+    });
+    const handled: number[] = [];
+    f.client.onEvent((event) => {
+      handled.push(event.seq);
+    });
+    try {
+      emitFencedReplay(await f.open());
+      await f.client.waitForReplayComplete();
+      expect(
+        f.requests
+          .filter(({ phase }) => phase === "history")
+          .map(({ after, limit }) => [after, limit]),
+      ).toEqual([
+        [0, 8],
+        [0, 4],
+        [4, 8],
+        [12, 8],
+      ]);
+      expect(handled).toEqual(Array.from({ length: 20 }, (_, index) => index + 1));
+      expect(f.sockets).toHaveLength(1);
+      expect(f.client.debugInfo().lastHandledSeq).toBe(20);
+    } finally {
+      await f.client.closeAndWait();
+    }
   });
 
   it("reconnects a single-row deadline failure after halving without advancing the failed cursor", async () => {
@@ -3556,6 +3604,53 @@ describe("ParticipantRuntimeClient REST replay", () => {
     } finally {
       await f.client.closeAndWait();
       await vi.advanceTimersByTimeAsync(800);
+      vi.useRealTimers();
+    }
+  });
+
+  it("counts refused opens but not post-open REST snapshot failures in reconnect diagnostics", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(1);
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    let attempts = 0;
+    let snapshots = 0;
+    const f = await fixture({
+      config: {
+        reconnect: { baseDelayMs: 100, maxDelayMs: 800 },
+        webSocketFactory: (url) => {
+          attempts += 1;
+          const socket = new ParticipantFakeWebSocket(
+            url,
+            attempts === 2 ? new Error("synthetic refused upgrade") : undefined,
+          );
+          socket.once("open", () => queueMicrotask(() => emitFencedReplay(socket)));
+          return socket as unknown as WebSocket;
+        },
+      },
+      tasks: () => (++snapshots === 1 ? Response.json({}, { status: 503 }) : { tasks: [] }),
+    });
+    const loop = f.client.runClaimableTasks({
+      claimRefreshMs: 1_000,
+      executor: createExecutor(),
+      once: false,
+      shouldClaimTask: () => true,
+    });
+    loop.catch(() => undefined);
+    try {
+      await f.client.open();
+      await flushMicrotasks();
+      expect(snapshots).toBe(1);
+      expect(f.client.debugInfo().reconnectFailureCount).toBe(0);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(f.client.debugInfo().reconnectFailureCount).toBe(1);
+      await vi.advanceTimersByTimeAsync(200);
+      expect(snapshots).toBe(2);
+      expect(f.client.debugInfo().reconnectFailureCount).toBe(1);
+    } finally {
+      f.client.close();
+      await vi.advanceTimersByTimeAsync(800);
+      await loop;
+      await f.client.closeAndWait();
       vi.useRealTimers();
     }
   });
@@ -3997,6 +4092,136 @@ describe("ParticipantRuntimeClient REST replay", () => {
     }
   });
 
+  it("rejects the startup replay waiter when direct REST discovery returns 503", async () => {
+    const f = await fixture({ page: () => Response.json({}, { status: 503 }) });
+    const replay = f.client.waitForReplayComplete();
+    replay.catch(() => undefined);
+    try {
+      await expect(f.client.open()).rejects.toMatchObject({
+        code: "PERSISTENCE",
+        details: { status: 503 },
+      });
+      await expect(replay).rejects.toMatchObject({ code: "PERSISTENCE", details: { status: 503 } });
+      await f.client.waitForClose();
+      expect(f.sockets).toEqual([]);
+      expect(f.writes).toEqual([]);
+    } finally {
+      await f.client.closeAndWait();
+    }
+  });
+
+  it("preserves WebSocket byte-overflow details before admitting an oversized frame", async () => {
+    const f = await fixture({
+      config: { replayMode: "websocket", eventDelivery: { maxQueueBytes: 64 } },
+    });
+    const socket = await f.open();
+    const event = restHistoryEvent(1);
+    try {
+      socket.emitServerEvent(event);
+      expect(f.errors.at(-1)).toMatchObject({
+        reason: "delivery_byte_overflow",
+        safeDetails: {
+          maxQueueBytes: 64,
+          observedQueueBytes: Buffer.byteLength(JSON.stringify({ event, op: "event" })),
+        },
+      });
+      expect(f.client.debugInfo().lastHandledSeq).toBe(0);
+      expect(f.writes).toEqual([]);
+    } finally {
+      await f.client.closeAndWait();
+    }
+  });
+
+  it("preserves the WebSocket delivery-recovery handoff delay after a refused upgrade", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(1);
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const attempts: number[] = [];
+    const sockets: ParticipantFakeWebSocket[] = [];
+    const client = await ParticipantRuntimeClient.create({
+      ...baseConfig,
+      reconnect: { baseDelayMs: 100, maxDelayMs: 800 },
+      webSocketFactory: (url) => {
+        attempts.push(Date.now());
+        const socket = new ParticipantFakeWebSocket(
+          url,
+          attempts.length === 2 ? new Error("synthetic refused upgrade") : undefined,
+        );
+        sockets.push(socket);
+        return socket as unknown as WebSocket;
+      },
+    });
+    client.onError(() => undefined);
+    client.onEvent(async () => {
+      throw new Error("synthetic delivery failure");
+    });
+    try {
+      await client.open();
+      const socket = sockets[0];
+      if (!socket) throw new Error("Missing delivery handoff socket");
+      socket.emitServerEvent(restHistoryEvent(1));
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(300);
+      expect(attempts).toEqual([0, 100, 300]);
+      expect(client.debugInfo().lastHandledSeq).toBe(0);
+    } finally {
+      client.close();
+      await vi.advanceTimersByTimeAsync(800);
+      await client.closeAndWait();
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves default WebSocket outage delays and restarts them after a successful open", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(1);
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const attempts: number[] = [];
+    const sockets: ParticipantFakeWebSocket[] = [];
+    const client = await ParticipantRuntimeClient.create({
+      ...baseConfig,
+      reconnect: { baseDelayMs: 100, maxDelayMs: 800 },
+      webSocketFactory: (url) => {
+        attempts.push(Date.now());
+        const refused = [2, 3, 5].includes(attempts.length);
+        const socket = new ParticipantFakeWebSocket(
+          url,
+          refused ? new Error("synthetic refused upgrade") : undefined,
+        );
+        sockets.push(socket);
+        if (attempts.length === 1)
+          socket.once("open", () => queueMicrotask(() => emitFencedReplay(socket)));
+        return socket as unknown as WebSocket;
+      },
+    });
+    client.onError(() => undefined);
+    const loop = client.runClaimableTasks({
+      claimRefreshMs: 1_000,
+      executor: createExecutor(),
+      once: false,
+      shouldClaimTask: () => true,
+    });
+    loop.catch(() => undefined);
+    try {
+      await client.open();
+      await flushMicrotasks();
+      sockets[0]?.emitClose();
+      await vi.advanceTimersByTimeAsync(700);
+      expect(attempts).toEqual([0, 100, 300, 700]);
+      /** No replay marker or handled event occurs on the successful replacement. */
+      sockets[3]?.emitClose();
+      await vi.advanceTimersByTimeAsync(300);
+      expect(attempts).toEqual([0, 100, 300, 700, 800, 1_000]);
+      expect(client.debugInfo().lastHandledSeq).toBe(0);
+    } finally {
+      client.close();
+      await vi.advanceTimersByTimeAsync(800);
+      await loop;
+      await client.closeAndWait();
+      vi.useRealTimers();
+    }
+  });
+
   it("prepares no WebSocket generation when explicitly closed during reconnect backoff", async () => {
     const sockets: ParticipantFakeWebSocket[] = [];
     const f = await fixture({
@@ -4125,6 +4350,18 @@ describe("ParticipantRuntimeClient REST replay", () => {
     expect(f.client.debugInfo().pausedReason).toBe(
       bound === "count" ? "delivery_queue_overflow" : "delivery_byte_overflow",
     );
+    expect(f.errors.at(-1)).toMatchObject({
+      safeDetails:
+        bound === "count"
+          ? { maxQueueSize: 2, observedQueueSize: 3 }
+          : {
+              maxQueueBytes: 800,
+              observedQueueBytes: tasks.reduce(
+                (bytes, task) => bytes + Buffer.byteLength(JSON.stringify(task)),
+                0,
+              ),
+            },
+    });
     expect(f.writes).toEqual([]);
   });
 
@@ -4221,6 +4458,18 @@ describe("ParticipantRuntimeClient REST replay", () => {
     expect(f.client.debugInfo()).toMatchObject({
       lastHandledSeq: 2,
       pausedReason: bound === "count" ? "delivery_queue_overflow" : "delivery_byte_overflow",
+    });
+    expect(f.errors.at(-1)).toMatchObject({
+      safeDetails:
+        bound === "count"
+          ? { maxQueueSize: 2, observedQueueSize: 3 }
+          : {
+              maxQueueBytes: 1_200,
+              observedQueueBytes: tasks.reduce(
+                (bytes, task) => bytes + Buffer.byteLength(JSON.stringify(task)),
+                0,
+              ),
+            },
     });
     expect(f.writes.every((seq) => seq <= 2)).toBe(true);
   });
@@ -4763,6 +5012,12 @@ describe("ParticipantRuntimeClient REST replay", () => {
     expect(f.client.debugInfo().pausedReason).toBe(
       bound === "items" ? "delivery_queue_overflow" : "delivery_byte_overflow",
     );
+    expect(f.errors.at(-1)).toMatchObject({
+      safeDetails:
+        bound === "items"
+          ? { maxQueueSize: 2, observedQueueSize: 3 }
+          : { maxQueueBytes: 64 + frameBytes * 2 - 1, observedQueueBytes: 64 + frameBytes * 2 },
+    });
     expect(handled).not.toHaveBeenCalled();
     expect(f.writes).toEqual([]);
   });

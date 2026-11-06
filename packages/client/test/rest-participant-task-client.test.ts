@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createReplayRestTaskClient,
   RestParticipantTaskClient,
+  RestParticipantTaskError,
   type RestParticipantTaskFetch,
 } from "../src/rest-participant-task-client.js";
 
@@ -82,12 +83,7 @@ function posted(requests: CapturedRequest[], path: string): Record<string, unkno
 /** Uses only an injected synthetic response with the runtime's internal read policy. */
 function boundedTaskClient(
   response: Response,
-  input: {
-    readonly maxBytes?: number;
-    readonly maxActiveTasks?: number;
-    readonly signal?: AbortSignal;
-    readonly timeoutMs?: number;
-  } = {},
+  input: Partial<Parameters<typeof createReplayRestTaskClient>[1]> = {},
 ): RestParticipantTaskClient {
   vi.stubGlobal("fetch", async () => response);
   return createReplayRestTaskClient(
@@ -130,6 +126,26 @@ describe("RestParticipantTaskClient", () => {
     expect(cancellations).toBe(1);
   });
 
+  it("stores resource failure metadata under its discriminated failure value", () => {
+    const error = new RestParticipantTaskError({
+      code: "RESOURCE_LIMIT",
+      operation: "list-active",
+      resourceLimit: { resource: "active_tasks", limit: 2, observed: 3 },
+    });
+    expect(error.failure).toEqual({
+      code: "RESOURCE_LIMIT",
+      details: {
+        operation: "list-active",
+        status: null,
+        resourceLimit: { resource: "active_tasks", limit: 2, observed: 3 },
+      },
+    });
+    expect(error.code).toBe("RESOURCE_LIMIT");
+    expect(error.details).toBe(error.failure.details);
+    if (error.failure.code === "RESOURCE_LIMIT")
+      expect(error.failure.details.resourceLimit.observed).toBe(3);
+  });
+
   it("bundles a resource limit into one bounded details object", async () => {
     const failure = boundedTaskClient(new Response(new Uint8Array(80)), {
       maxBytes: 64,
@@ -146,10 +162,7 @@ describe("RestParticipantTaskClient", () => {
     { status: 401, code: "AUTHENTICATION" },
     { status: 503, code: "PERSISTENCE" },
     { status: 501, code: "PERSISTENCE" },
-  ])("maps HTTP $status before an oversized error body under the fixed envelope cap", async ({
-    status,
-    code,
-  }) => {
+  ])("maps HTTP $status before discarding an oversized error body", async ({ status, code }) => {
     const bytes = new TextEncoder().encode("x".repeat(8_000));
     let offset = 0;
     let pulls = 0;
