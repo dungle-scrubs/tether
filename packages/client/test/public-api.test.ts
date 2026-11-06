@@ -2,6 +2,11 @@ import { describe, expect, expectTypeOf, it } from "vitest";
 
 import * as Client from "../src/index.js";
 
+/** The public options type must not expose recovery-owned transport limits. */
+const publicTaskOptions: Client.RestParticipantTaskClientOptions = {};
+// @ts-expect-error Recovery read policy is an internal construction detail.
+void publicTaskOptions.readPolicy;
+
 type PromiseReturning<TArgs extends readonly unknown[], TValue> = (
   ...args: TArgs
 ) => Promise<TValue>;

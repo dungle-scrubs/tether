@@ -16,9 +16,6 @@
       "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"readStringField\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:handleMessage/PropertyAssignment:op\",\"readStringField(envelope, \\\"command\\\")\"]#1",
       "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"readStringField\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:handleMessage/VariableDeclaration:taskId\",\"readStringField(envelope, \\\"taskId\\\")\"]#1",
       "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"readStringField\",\"FunctionDeclaration:readCommandContext/VariableDeclaration:taskId\",\"readStringField(command, \\\"taskId\\\")\"]#1",
-      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"reconnectDelayMs\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:buildReconnectWithBackoff\",\"reconnectDelayMs(attempt, this.config)\"]#1",
-      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"reconnectDelayMs\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:buildReconnectWithBackoff/VariableDeclaration:delayMs\",\"reconnectDelayMs(attempt, this.config)\"]#1",
-      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"reconnectDelayMs\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:recoverFromDeliveryFailure/VariableDeclaration:delayMs\",\"reconnectDelayMs(this.deliveryRecoveryAttempts - 1, this.config)\"]#1",
       "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"resolveCommandTimeoutMs\",\"ClassDeclaration:ParticipantRuntimeClient\",\"resolveCommandTimeoutMs(config.commandTimeoutMs)\"]#1",
       "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"resolvePositiveIntegerConfig\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:createCursorWriter/PropertyAssignment:retryAttempts/call:cursorPersist.retryAttempts\",\"resolvePositiveIntegerConfig( \\\"cursorPersist.retryAttempts\\\", this.config.cursorPersist?.retryAttempts, defaultCursorPersistRetryAttempts, )\"]#1",
       "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"resolvePositiveIntegerConfig\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:createCursorWriter/PropertyAssignment:retryBaseDelayMs/call:cursorPersist.retryBaseDelayMs\",\"resolvePositiveIntegerConfig( \\\"cursorPersist.retryBaseDelayMs\\\", this.config.cursorPersist?.retryBaseDelayMs, defaultCursorPersistRetryBaseDelayMs, )\"]#1",
@@ -83,17 +80,13 @@
       "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"fetch\",\"InterfaceDeclaration:RestParticipantTaskClientOptions/PropertySignature:fetch\"]",
       "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"instanceId\",\"InterfaceDeclaration:AppendTaskEventCall/PropertySignature:instanceId\"]",
       "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"limit\",\"InterfaceDeclaration:ListEventsQuery/PropertySignature:limit\"]",
-      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"maxActiveTasks\",\"InterfaceDeclaration:RestParticipantTaskClientOptions/PropertySignature:readPolicy/PropertySignature:maxActiveTasks\"]",
-      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"maxBytes\",\"InterfaceDeclaration:RestParticipantTaskClientOptions/PropertySignature:readPolicy/PropertySignature:maxBytes\"]",
       "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"observability\",\"InterfaceDeclaration:RestParticipantTaskClientOptions/PropertySignature:observability\"]",
       "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"participantId\",\"InterfaceDeclaration:RestParticipantTaskClientConfig/PropertySignature:participantId\"]",
       "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"payload\",\"InterfaceDeclaration:AppendTaskEventCall/PropertySignature:payload\"]",
       "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"producerId\",\"InterfaceDeclaration:AppendTaskEventCall/PropertySignature:producerId\"]",
       "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"reason\",\"InterfaceDeclaration:RecordTaskApprovalCall/PropertySignature:reason\"]",
       "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"serviceUrl\",\"InterfaceDeclaration:RestParticipantTaskClientConfig/PropertySignature:serviceUrl\"]",
-      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"signal\",\"InterfaceDeclaration:RestParticipantTaskClientOptions/PropertySignature:readPolicy/PropertySignature:signal\"]",
       "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"target\",\"InterfaceDeclaration:RecordTaskApprovalCall/PropertySignature:target\"]",
-      "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"timeoutMs\",\"InterfaceDeclaration:RestParticipantTaskClientOptions/PropertySignature:readPolicy/PropertySignature:timeoutMs\"]",
       "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"PropertySignature\",\"type\",\"InterfaceDeclaration:AppendTaskEventCall/PropertySignature:type\"]",
       "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"VariableDeclaration\",\"aborted\",\"FunctionDeclaration:awaitRead/VariableDeclaration:aborted\"]",
       "[\"packages/client/src/rest-participant-task-client.ts\",\"jsdoc\",\"VariableDeclaration\",\"cancel\",\"FunctionDeclaration:readJsonBody/VariableDeclaration:cancel\"]"
@@ -115,6 +108,14 @@
     ]
   },
   "./participant-rest-replay-style.test.ts": {
+    "declarations": [],
+    "documentation": []
+  },
+  "./public-api.test.ts": {
+    "declarations": [],
+    "documentation": []
+  },
+  "../src/participant-recovery-task-state.ts": {
     "declarations": [],
     "documentation": []
   }

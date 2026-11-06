@@ -645,6 +645,13 @@ function writeDefaultRuntimeError(
 }
 
 /**
+ * Computes bounded exponential reconnect backoff from client configuration.
+ */
+function reconnectDelayMs(attempt: number, config: ParticipantRuntimeClientConfig): number {
+  return boundedReconnectDelayMs(attempt, config.reconnect);
+}
+
+/**
  * Reusable WebSocket runtime client for external participants. It owns replay
  * buffering, command correlation, task claiming, claim refresh, cancellation,
  * and shutdown hooks so adapter workers only provide task-selection and
@@ -695,6 +702,10 @@ export class ParticipantRuntimeClient {
   private pausedReason: ParticipantRuntimePausedReason | null = null;
   private preparedTransport: PreparedParticipantTransport | null = null;
   private restReplay: ParticipantRestReplay | null = null;
+  /** Consecutive REST failures since handled progress or successful full recovery. */
+  private consecutiveRestTransientFailures = 0;
+  /** Task-loop users complete recovery only after their canonical snapshot succeeds. */
+  private restTaskRecoveryUsers = 0;
   private socket: WebSocket | null = null;
   private stopped = false;
   private shutdownPromise: Promise<void> | null = null;
@@ -797,9 +808,18 @@ export class ParticipantRuntimeClient {
       let reportedError: Error = openError;
       if (prepared.generation === this.connectionGeneration) {
         if (this.restReplay && !this.stopped) {
-          reportedError =
-            this.failRestReplay(openError, prepared.generation, this.restReplay, false) ??
-            openError;
+          if (isTransientRestReplayFailure(openError)) {
+            if (!this.restReplay.aborted && this.pausedReason === null) {
+              this.consecutiveRestTransientFailures += 1;
+              this.restReplay.abort();
+              this.delivery.stop();
+              this.settleReplayCompleteError(openError);
+              if (!this.reconnectPromise) this.emitError(openError);
+            }
+          } else {
+            reportedError =
+              this.failRestReplay(openError, prepared.generation, this.restReplay) ?? openError;
+          }
         } else {
           this.settleReplayCompleteError(openError);
         }
@@ -1054,35 +1074,41 @@ export class ParticipantRuntimeClient {
    * one-shot replay work completes or the socket closes.
    */
   async runClaimableTasks(options: ParticipantRuntimeTaskLoopOptions): Promise<void> {
-    await Effect.runPromise(
-      buildParticipantClaimableTaskLoop(
-        {
-          close: () => this.close(),
-          connectionGeneration: () => this.connectionGeneration,
-          isPaused: () => this.pausedReason !== null,
-          isStopped: () => this.stopped,
-          ...(this.restReplay
-            ? {
-                taskRecovery: {
-                  load: () => this.loadReplayTasks(),
-                  maxQueueBytes: this.maxDeliveryQueueBytes,
-                  maxQueueSize: this.maxDeliveryQueueSize,
-                  fail: (error: ParticipantRestReplayError) => {
-                    const replay = this.restReplay;
-                    if (replay) this.failRestReplay(error, this.connectionGeneration, replay);
+    const restRecovery = Boolean(this.restReplay);
+    if (restRecovery) this.restTaskRecoveryUsers += 1;
+    try {
+      await Effect.runPromise(
+        buildParticipantClaimableTaskLoop(
+          {
+            close: () => this.close(),
+            connectionGeneration: () => this.connectionGeneration,
+            isPaused: () => this.pausedReason !== null,
+            isStopped: () => this.stopped,
+            ...(this.restReplay
+              ? {
+                  taskRecovery: {
+                    load: () => this.loadReplayTasks(),
+                    maxQueueBytes: this.maxDeliveryQueueBytes,
+                    maxQueueSize: this.maxDeliveryQueueSize,
+                    fail: (error: ParticipantRestReplayError) => {
+                      const replay = this.restReplay;
+                      if (replay) this.failRestReplay(error, this.connectionGeneration, replay);
+                    },
                   },
-                },
-              }
-            : {}),
-          onEvent: (handler) => this.onEvent(handler),
-          reconnectAfterClose: () => this.requestReconnect(),
-          runTaskClaimFlow: (input) => this.runTaskClaimFlow(input),
-          waitForClose: () => this.waitForClose(),
-          waitForReplayComplete: () => this.waitForReplayComplete(),
-        },
-        options,
-      ),
-    );
+                }
+              : {}),
+            onEvent: (handler) => this.onEvent(handler),
+            reconnectAfterClose: () => this.requestReconnect(),
+            runTaskClaimFlow: (input) => this.runTaskClaimFlow(input),
+            waitForClose: () => this.waitForClose(),
+            waitForReplayComplete: () => this.waitForReplayComplete(),
+          },
+          options,
+        ),
+      );
+    } finally {
+      if (restRecovery) this.restTaskRecoveryUsers -= 1;
+    }
   }
 
   /**
@@ -1226,14 +1252,22 @@ export class ParticipantRuntimeClient {
     await Effect.runPromise(this.buildReconnectWithBackoff(initialDelayMs));
   }
 
+  /** Carries failures across successful socket opens until recovery makes real progress. */
+  private restTransientDelayMs(): number | null {
+    return this.consecutiveRestTransientFailures > 0
+      ? reconnectDelayMs(this.consecutiveRestTransientFailures - 1, this.config)
+      : null;
+  }
+
   /** Coalesces every reconnect caller behind one transport-owner promise. */
   private requestReconnect(initialDelayMs: number | null = null): Promise<void> {
     if (this.reconnectPromise) {
       return this.reconnectPromise;
     }
+    const delayMs = initialDelayMs ?? this.restTransientDelayMs();
     const reconnect = this.restReplay
-      ? this.delivery.waitForSettlement().then(() => this.reconnectWithBackoff(initialDelayMs))
-      : this.reconnectWithBackoff(initialDelayMs);
+      ? this.delivery.waitForSettlement().then(() => this.reconnectWithBackoff(delayMs))
+      : this.reconnectWithBackoff(delayMs);
     this.reconnectPromise = reconnect;
     const clearOwner = (): void => {
       if (this.reconnectPromise === reconnect) {
@@ -1257,7 +1291,7 @@ export class ParticipantRuntimeClient {
         if (delayMs > 0) {
           yield* sleepUnrefEffect(delayMs);
         }
-        if (this.restReplay && (this.stopped || this.pausedReason !== null)) return;
+        if (this.stopped || this.pausedReason !== null) return;
         const opened = yield* Effect.either(
           Effect.tryPromise({
             catch: (error) => error,
@@ -1272,7 +1306,7 @@ export class ParticipantRuntimeClient {
         this.reconnectFailureCount += 1;
         this.emitError(error instanceof Error ? error : new Error("Reconnect failed"));
         attempt += 1;
-        delayMs = reconnectDelayMs(attempt, this.config);
+        delayMs = this.restTransientDelayMs() ?? reconnectDelayMs(attempt, this.config);
       }
     });
   }
@@ -1404,7 +1438,9 @@ export class ParticipantRuntimeClient {
     const generation = this.connectionGeneration;
     if (!replay) return [];
     try {
-      return await replay.loadActiveTasks();
+      const tasks = await replay.loadActiveTasks();
+      this.consecutiveRestTransientFailures = 0;
+      return tasks;
     } catch (error) {
       throw this.failRestReplay(error, generation, replay) ?? error;
     }
@@ -1415,7 +1451,6 @@ export class ParticipantRuntimeClient {
     error: unknown,
     generation: number,
     replay: ParticipantRestReplay,
-    reconnect = true,
   ): ParticipantRuntimeTerminalStreamError | null {
     if (
       generation !== this.connectionGeneration ||
@@ -1426,35 +1461,9 @@ export class ParticipantRuntimeClient {
     )
       return null;
     if (isTransientRestReplayFailure(error)) {
-      replay.abort();
-      this.delivery.stop();
-      this.settleReplayCompleteError(error);
-      this.rejectPendingCommandsAsUnknown(error);
-      const socket = this.socket;
-      const close = this.closePromise;
-      const delivery = this.delivery;
-      this.socket = null;
-      socket?.close();
-      if (!this.transportHasSocket) this.resolveTransportClose?.();
+      this.consecutiveRestTransientFailures += 1;
       this.emitError(error);
-      if (reconnect) {
-        void Promise.all([close, delivery.waitForSettlement()]).then(async () => {
-          if (
-            this.stopped ||
-            this.pausedReason !== null ||
-            generation !== this.connectionGeneration
-          )
-            return;
-          // An open owner may still be settling. Enqueue behind it instead of losing this retry.
-          await this.reconnectPromise?.catch(() => undefined);
-          if (
-            !this.stopped &&
-            this.pausedReason === null &&
-            generation === this.connectionGeneration
-          )
-            await this.requestReconnect();
-        });
-      }
+      this.endGenerationAndReconnect(error, generation, this.restTransientDelayMs());
       return null;
     }
     let reason: ParticipantRuntimePausedReason = "rest_replay_failed";
@@ -1462,12 +1471,6 @@ export class ParticipantRuntimeClient {
     if (error instanceof ParticipantRestReplayError) {
       reason = error.reason;
       details = error.safeDetails;
-    } else if (error instanceof RestParticipantTaskError && error.code === "RESOURCE_LIMIT") {
-      reason =
-        error.details.resource === "active_tasks"
-          ? "delivery_queue_overflow"
-          : "delivery_byte_overflow";
-      details = { limit: error.details.limit ?? 0, observed: error.details.observed ?? 0 };
     }
     return this.enterPausedState(
       reason,
@@ -1519,8 +1522,8 @@ export class ParticipantRuntimeClient {
           serialDeliveryFailureReason(outcome.kind),
           undefined,
           {
-            maxQueueBytes: outcome.maxQueueBytes,
-            observedQueueBytes: outcome.observedQueueBytes,
+            limit: outcome.maxQueueBytes,
+            observed: outcome.observedQueueBytes,
           },
           generation,
         );
@@ -1530,8 +1533,8 @@ export class ParticipantRuntimeClient {
           serialDeliveryFailureReason(outcome.kind),
           undefined,
           {
-            maxQueueSize: outcome.maxQueueSize,
-            observedQueueSize: outcome.observedQueueSize,
+            limit: outcome.maxQueueSize,
+            observed: outcome.observedQueueSize,
           },
           generation,
         );
@@ -1539,6 +1542,7 @@ export class ParticipantRuntimeClient {
       case "duplicate-ignored":
         return;
       case "event-handled":
+        if (outcome.event.seq > this.lastHandledSeq) this.consecutiveRestTransientFailures = 0;
         this.recordHandledEvent(outcome.event);
         this.restReplay?.notifyProgress();
         if (this.deliveryRecoverySeq === outcome.event.seq) {
@@ -1581,6 +1585,7 @@ export class ParticipantRuntimeClient {
         );
         return;
       case "replay-complete":
+        if (this.restTaskRecoveryUsers === 0) this.consecutiveRestTransientFailures = 0;
         this.settleReplayComplete();
         return;
     }
@@ -1642,21 +1647,33 @@ export class ParticipantRuntimeClient {
       handledSeq: this.lastHandledSeq,
       seq: input.event.seq,
     });
-    this.restReplay?.abort();
+    this.endGenerationAndReconnect(error, generation, delayMs);
+  }
+
+  /** Ends failed delivery and rejoins the existing reconnect owner after socket closure. */
+  private endGenerationAndReconnect(
+    error: Error,
+    generation: number,
+    delayMs: number | null,
+  ): void {
+    const replay = this.restReplay;
+    replay?.abort();
+    this.delivery.stop();
     this.settleReplayCompleteError(error);
     this.rejectPendingCommandsAsUnknown(error);
-    // Await the delivery settlement barrier alongside socket closure so a
-    // timed-out handler that is still running can never overlap its own
-    // replayed invocation on the replacement transport.
-    const settlingDelivery = this.delivery;
+    const delivery = this.delivery;
     const socket = this.socket;
-    const closePromise = this.closePromise;
+    const close = this.closePromise.catch(() => undefined);
     this.socket = null;
     socket?.close();
-    void Promise.all([
-      closePromise.catch(() => undefined),
-      settlingDelivery.waitForSettlement(),
-    ]).then(() => this.requestReconnect(delayMs));
+    if (!this.transportHasSocket) this.resolveTransportClose?.();
+    /** REST requestReconnect owns settlement; WebSocket handler recovery retains its barrier. */
+    const ended = replay ? close : Promise.all([close, delivery.waitForSettlement()]);
+    void ended.then(async () => {
+      await this.reconnectPromise?.catch(() => undefined);
+      if (!this.stopped && this.pausedReason === null && generation === this.connectionGeneration)
+        await this.requestReconnect(delayMs);
+    });
   }
 
   /** Enters terminal Paused State without opening another socket. */
@@ -2002,13 +2019,6 @@ export function buildParticipantRuntimeStreamUrl(config: ParticipantRuntimeClien
     url.searchParams.set("access_token", authToken);
   }
   return url.toString();
-}
-
-/**
- * Computes bounded exponential reconnect backoff from client configuration.
- */
-function reconnectDelayMs(attempt: number, config: ParticipantRuntimeClientConfig): number {
-  return boundedReconnectDelayMs(attempt, config.reconnect);
 }
 
 /** Applies one overall deadline to graceful participant shutdown settlement. */

@@ -119,9 +119,12 @@ REST mode discovers a witnessed history head with single-event exponential and
 binary probes bounded by the safe-integer sequence domain, then opens the
 WebSocket at that head. After the wire replay marker supplies the control epoch,
 it delivers history through the serial event handlers. Discovery never advances
-the handled or durable cursor. A valid page that exceeds available bytes retries
-with fewer rows at the same cursor; a single event must still fit. Command
-responses remain available while a historical handler awaits a command.
+the handled or durable cursor. A history read that exceeds available bytes or
+item slots, or reaches its deadline, retries with half the rows at the same
+cursor. The accepted limit carries forward and can double toward the normal
+page limit, within the available slots. At one row, a deadline failure uses
+reconnect backoff; resource overflow pauses. Command responses remain available
+while a historical handler awaits a command.
 
 Direct clients must register an `onEvent` subscriber before opening. REST replay
 waits for actual handler success, including when a subscriber attaches late.
@@ -134,9 +137,11 @@ wire replay marker complete. The task runner also loads the active-task snapshot
 before its post-replay hook and task dispatch. This recovers pending tasks whose
 request events precede a persisted cursor. REST task execution is serial, with
 one active claim flow. Pending candidates, running work, and snapshot-touched IDs
-share a task-state budget using the existing delivery count and byte limits.
-Responses are bounded while reading, and oversized snapshots fail before dispatch.
-Claims still use the existing server claim, refresh, and cancellation fences.
+have a separate task-state budget equal to the delivery count and byte limits.
+Responses are bounded while reading, and raw snapshot row counts are checked
+before validation. Selected tasks must fit the retained-state budget before
+any dispatch. Claims still use the existing server claim, refresh, and
+cancellation fences.
 
 REST replay rejects any malformed snapshot row to avoid silently losing pending
 work. Direct `RestParticipantTaskClient.listActiveTasks` callers retain their
@@ -144,11 +149,15 @@ existing tolerant behavior and receive `invalidRowCount`.
 
 REST requests and the wait for wire control use `commandTimeoutMs`. Ending a
 connection generation aborts its REST requests, including stalled bodies.
-Transport and body-read failures, temporary service errors, and HTTP 429 or 408
-recover through the existing reconnect backoff from the handled cursor. Direct
-`open()` still rejects startup errors. Authentication failures, invalid pages,
-sequence gaps, malformed task rows, and resource overflow pause without skipping
-work.
+Transport and body-read failures, and HTTP 408, 429, 500, 502, 503, or 504, recover
+through the existing reconnect backoff from the handled cursor. Consecutive
+transient failures grow the delay up to `maxDelayMs`, including failures after a
+socket opens. Handled progress or completed recovery resets the delay. Error
+responses are classified by status and read under a fixed 4096-byte body cap.
+Direct `open()` still rejects discovery and opening errors. Other HTTP statuses,
+including 501, authentication failures, invalid pages, sequence gaps, malformed
+task rows, and resource overflow pause without skipping work.
+
 A gap beyond the WebSocket replay window still fails closed. REST mode does not
 provide exactly-once effects or increase any delivery limit.
 

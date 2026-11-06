@@ -8,9 +8,11 @@ const checkedModules = [
   "../src/participant-rest-replay.ts",
   "../src/participant-runtime-client.ts",
   "../src/participant-claimable-task-runner.ts",
+  "../src/participant-recovery-task-state.ts",
   "../src/rest-participant-task-client.ts",
   "./participant-runtime-client.test.ts",
   "./rest-participant-task-client.test.ts",
+  "./public-api.test.ts",
   "./participant-rest-replay-style.test.ts",
 ];
 

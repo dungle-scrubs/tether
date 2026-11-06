@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 
+import * as RestTaskClientModule from "../src/rest-participant-task-client.js";
+
 import {
   RestParticipantTaskClient,
   type RestParticipantTaskFetch,
@@ -97,13 +99,73 @@ function boundedTaskClient(
       timeoutMs: input.timeoutMs ?? 1_000,
     },
   };
-  return new RestParticipantTaskClient(
-    { authToken: null, participantId: "part_1", serviceUrl: "https://fixture.invalid" },
-    options,
-  );
+  const config = {
+    authToken: null,
+    participantId: "part_1",
+    serviceUrl: "https://fixture.invalid",
+  };
+  const factory: unknown = Reflect.get(RestTaskClientModule, "createReplayRestTaskClient");
+  if (typeof factory === "function") {
+    const create = factory as (
+      config: ConstructorParameters<typeof RestParticipantTaskClient>[0],
+      dependencies: NonNullable<ConstructorParameters<typeof RestParticipantTaskClient>[1]>,
+      policy: typeof options.readPolicy,
+    ) => RestParticipantTaskClient;
+    return create(config, { fetch: options.fetch }, options.readPolicy);
+  }
+  /** Historical-source proofs retain the old constructor seam, with identical response fixtures. */
+  return new RestParticipantTaskClient(config, options);
 }
 
 describe("RestParticipantTaskClient", () => {
+  it("bundles a resource limit into one bounded details object", async () => {
+    const failure = boundedTaskClient(new Response(new Uint8Array(80)), {
+      maxBytes: 64,
+    }).listActiveTasks("sess_1");
+    await expect(failure).rejects.toMatchObject({ code: "RESOURCE_LIMIT" });
+    await expect(failure).rejects.toHaveProperty("details", {
+      operation: "list-active",
+      status: null,
+      resourceLimit: { resource: "response_bytes", limit: 64, observed: 80 },
+    });
+  });
+
+  it.each([
+    { status: 401, code: "AUTHENTICATION" },
+    { status: 503, code: "PERSISTENCE" },
+    { status: 501, code: "PERSISTENCE" },
+  ])("maps HTTP $status before an oversized error body under the fixed envelope cap", async ({
+    status,
+    code,
+  }) => {
+    const bytes = new TextEncoder().encode("x".repeat(8_000));
+    let offset = 0;
+    let pulls = 0;
+    let cancellations = 0;
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        pull: (controller) => {
+          pulls += 1;
+          const chunk = bytes.subarray(offset, offset + 1_000);
+          offset += chunk.length;
+          if (chunk.length === 0) controller.close();
+          else controller.enqueue(chunk);
+        },
+        cancel: () => {
+          cancellations += 1;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const client = boundedTaskClient(new Response(stream, { status }), { maxBytes: 64 });
+    await expect(client.listActiveTasks("sess_1")).rejects.toMatchObject({
+      code,
+      details: { operation: "list-active", status },
+    });
+    expect(pulls).toBe(5);
+    expect(cancellations).toBe(1);
+  });
+
   it("cancels an over-budget body while reading chunks before buffering or parsing it", async () => {
     const bytes = new TextEncoder().encode(JSON.stringify({ tasks: [taskRecord] }));
     let offset = 0;
@@ -127,7 +189,10 @@ describe("RestParticipantTaskClient", () => {
     const client = boundedTaskClient(new Response(stream), { maxBytes: 64 });
     await expect(client.listActiveTasks("sess_1")).rejects.toMatchObject({
       code: "RESOURCE_LIMIT",
-      details: { operation: "list-active", resource: "response_bytes", limit: 64, observed: 80 },
+      details: {
+        operation: "list-active",
+        resourceLimit: { resource: "response_bytes", limit: 64, observed: 80 },
+      },
     });
     expect(cancellations).toBe(1);
     expect(pulls).toBe(2);
@@ -208,7 +273,7 @@ describe("RestParticipantTaskClient", () => {
     const bounded = boundedTaskClient(Response.json(body), { maxActiveTasks: 1 });
     await expect(bounded.listActiveTasks("sess_1")).rejects.toMatchObject({
       code: "RESOURCE_LIMIT",
-      details: { resource: "active_tasks", limit: 1, observed: 2 },
+      details: { resourceLimit: { resource: "active_tasks", limit: 1, observed: 2 } },
     });
     const legacy = fetchJson(200, body);
     await expect(legacy.client.listActiveTasks("sess_1")).resolves.toMatchObject({

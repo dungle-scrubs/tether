@@ -10,9 +10,12 @@ import type { ZodType } from "zod";
 
 import { sessionEventType } from "./protocol.js";
 import {
-  RestParticipantTaskClient,
+  createReplayRestTaskClient,
+  isRestParticipantReadTimeout,
+  type RestParticipantTaskClient,
   RestParticipantTaskError,
   type RestParticipantTaskClientConfig,
+  restResponseEnvelopeAllowance,
 } from "./rest-participant-task-client.js";
 import { replayMarkerByteCost, type SerialEventDelivery } from "./serial-event-delivery.js";
 import type { SessionEvent, TaskRecord } from "./types.js";
@@ -53,14 +56,6 @@ const taskPayloadSchemas = new Map<string, ZodType<{ readonly task: TaskRecord }
   [sessionEventType.approvalRecorded, taskApprovalRecordedPayloadSchema],
 ]);
 
-// Only HTTP envelope metadata gets this allowance; event and task admission budgets stay unchanged.
-const responseEnvelopeAllowance = 4_096;
-
-/** Counts a retained canonical task record for the recovery-state owner. */
-export function replayTaskByteCost(task: TaskRecord): number {
-  return Buffer.byteLength(JSON.stringify(task));
-}
-
 /** Counts the same event envelope retained by serial delivery. */
 function eventByteCost(event: SessionEvent): number {
   return Buffer.byteLength(JSON.stringify({ event, op: "event" }));
@@ -77,15 +72,31 @@ export function taskFromReplayStateEvent(event: SessionEvent): TaskRecord | null
   return parsed.data.task;
 }
 
+/** HTTP failures with temporary service, gateway, rate or request-timeout semantics. */
+const transientRestStatuses = new Set([408, 429, 500, 502, 503, 504]);
+
 /** Classifies only temporary read failures for the existing transport reconnect owner. */
 export function isTransientRestReplayFailure(error: unknown): error is RestParticipantTaskError {
   return (
     error instanceof RestParticipantTaskError &&
-    (error.code === "TRANSPORT" ||
-      error.code === "PERSISTENCE" ||
-      error.details.status === 429 ||
-      error.details.status === 408)
+    (error.code === "TRANSPORT" || transientRestStatuses.has(error.details.status ?? 0))
   );
+}
+
+/** Normalizes bounded HTTP reads while preserving transport timeout provenance. */
+function replayReadFailure(error: unknown): never {
+  if (error instanceof RestParticipantTaskError && error.code === "RESOURCE_LIMIT") {
+    throw new ParticipantRestReplayError(
+      error.details.resourceLimit?.resource === "active_tasks"
+        ? "delivery_queue_overflow"
+        : "delivery_byte_overflow",
+      {
+        limit: error.details.resourceLimit?.limit ?? 0,
+        observed: error.details.resourceLimit?.observed ?? 0,
+      },
+    );
+  }
+  throw error;
 }
 
 /** One generation's bounded REST history and ordered WebSocket handoff. */
@@ -115,14 +126,16 @@ export class ParticipantRestReplay {
     this.wireSeq = options.afterSeq;
     // Leave room for the wire marker at the normal page boundary.
     this.pageLimit = Math.min(500, Math.max(1, options.maxQueueSize - 1));
-    this.rest = new RestParticipantTaskClient(options.config, {
-      readPolicy: {
-        maxBytes: options.maxQueueBytes + responseEnvelopeAllowance,
+    this.rest = createReplayRestTaskClient(
+      options.config,
+      {},
+      {
+        maxBytes: options.maxQueueBytes + restResponseEnvelopeAllowance,
         maxActiveTasks: options.maxQueueSize,
         signal: this.controller.signal,
         timeoutMs: options.timeoutMs,
       },
-    });
+    );
   }
 
   /** Finds a witnessed head with probes bounded by the safe-integer sequence domain. */
@@ -165,13 +178,15 @@ export class ParticipantRestReplay {
   async replay(head: number): Promise<void> {
     await this.waitForWire();
     let after = this.options.afterSeq;
+    let historyLimit = this.pageLimit;
     while (after < head) {
       const availableSlots =
         this.options.maxQueueSize - this.held.length - this.options.delivery.debugInfo().queueSize;
       const page = await this.readHistoryPage(
         after,
-        Math.min(this.pageLimit, head - after, Math.max(1, availableSlots)),
+        Math.min(historyLimit, head - after, Math.max(1, availableSlots)),
       );
+      historyLimit = Math.min(this.pageLimit, page.pagination.limit * 2);
       const events = page.events;
       if (
         events.length === 0 ||
@@ -243,23 +258,15 @@ export class ParticipantRestReplay {
 
   /** Seeds the existing runner from canonical active rows, never from skipped malformed rows. */
   async loadActiveTasks(): Promise<readonly TaskRecord[]> {
-    const snapshot = await this.rest.listActiveTasks(this.options.config.sessionId);
+    const snapshot = await this.rest
+      .listActiveTasks(this.options.config.sessionId)
+      .catch(replayReadFailure);
     this.assertActive();
     if (
       snapshot.invalidRowCount > 0 ||
       snapshot.tasks.some((task) => task.sessionId !== this.options.config.sessionId)
     ) {
       throw new RestParticipantTaskError({ code: "INVALID_RESPONSE", operation: "list-active" });
-    }
-    let bytes = 0;
-    for (const task of snapshot.tasks) {
-      bytes += replayTaskByteCost(task);
-      if (bytes > this.options.maxQueueBytes) {
-        throw new ParticipantRestReplayError("delivery_byte_overflow", {
-          maxQueueBytes: this.options.maxQueueBytes,
-          observedQueueBytes: bytes,
-        });
-      }
     }
     return snapshot.tasks;
   }
@@ -288,7 +295,7 @@ export class ParticipantRestReplay {
     }
   }
 
-  /** Retries only byte-heavy multi-event pages, at the same unacknowledged cursor. */
+  /** Reduces byte-heavy or timed-out multi-event reads at the same unacknowledged cursor. */
   private async readHistoryPage(
     after: number,
     initialLimit: number,
@@ -298,13 +305,11 @@ export class ParticipantRestReplay {
       try {
         return await this.readPage(after, limit);
       } catch (error) {
-        const byteOverflow =
-          (error instanceof ParticipantRestReplayError &&
-            error.reason === "delivery_byte_overflow") ||
-          (error instanceof RestParticipantTaskError &&
-            error.code === "RESOURCE_LIMIT" &&
-            error.details.resource === "response_bytes");
-        if (!byteOverflow || limit === 1) throw error;
+        this.assertActive();
+        const overflow =
+          error instanceof ParticipantRestReplayError &&
+          (error.reason === "delivery_byte_overflow" || error.reason === "delivery_queue_overflow");
+        if ((!overflow && !isRestParticipantReadTimeout(error)) || limit === 1) throw error;
         limit = Math.max(1, Math.floor(limit / 2));
       }
     }
@@ -313,10 +318,12 @@ export class ParticipantRestReplay {
   /** Validates pagination, contiguous sequences and shared queue budgets at ingress. */
   private async readPage(after: number, limit = this.pageLimit): Promise<ValidatedHistoryPage> {
     this.assertActive();
-    const page = await this.rest.listEvents(this.options.config.sessionId, {
-      after,
-      limit,
-    });
+    const page = await this.rest
+      .listEvents(this.options.config.sessionId, {
+        after,
+        limit,
+      })
+      .catch(replayReadFailure);
     this.assertActive();
     const { events, pagination } = page;
     if (
@@ -359,15 +366,15 @@ export class ParticipantRestReplay {
     const observedQueueSize = delivery.queueSize + this.held.length + items;
     if (observedQueueSize > this.options.maxQueueSize) {
       throw new ParticipantRestReplayError("delivery_queue_overflow", {
-        maxQueueSize: this.options.maxQueueSize,
-        observedQueueSize,
+        limit: this.options.maxQueueSize,
+        observed: observedQueueSize,
       });
     }
     const observedQueueBytes = delivery.queueBytes + this.heldBytes + bytes;
     if (observedQueueBytes > this.options.maxQueueBytes) {
       throw new ParticipantRestReplayError("delivery_byte_overflow", {
-        maxQueueBytes: this.options.maxQueueBytes,
-        observedQueueBytes,
+        limit: this.options.maxQueueBytes,
+        observed: observedQueueBytes,
       });
     }
   }

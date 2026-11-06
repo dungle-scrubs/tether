@@ -2392,7 +2392,7 @@ describe("ParticipantRuntimeClient reconnect scheduling", () => {
     expect(errors).toHaveLength(1);
     expect(errors[0]).toMatchObject({
       reason: "delivery_queue_overflow",
-      safeDetails: { maxQueueSize: 2_000, observedQueueSize: 2_001 },
+      safeDetails: { limit: 2_000, observed: 2_001 },
     });
     expect(client.debugInfo()).toMatchObject({
       eventBacklogSize: 2_000,
@@ -3016,6 +3016,202 @@ describe("ParticipantRuntimeClient REST replay", () => {
     expect(f.writes).toEqual([]);
   });
 
+  it("halves a valid history page after streamed HTTP byte overflow", async () => {
+    const handled: number[] = [];
+    let pulls = 0;
+    let cancellations = 0;
+    const f = await fixture({
+      config: { eventDelivery: { maxQueueBytes: 1_200 } },
+      page: (after, limit, _call, _signal, phase) => {
+        const page = restHistoryPage(after, limit, 20);
+        const body = {
+          ...page,
+          events: page.events.map((event) => ({ ...event, payload: { text: "x".repeat(180) } })),
+        };
+        if (phase !== "history" || after !== 0 || limit !== 20) return body;
+        const bytes = new TextEncoder().encode(JSON.stringify(body));
+        let offset = 0;
+        return new Response(
+          new ReadableStream<Uint8Array>(
+            {
+              pull: (controller) => {
+                pulls += 1;
+                const chunk = bytes.subarray(offset, offset + 1_024);
+                offset += chunk.length;
+                if (chunk.length === 0) controller.close();
+                else controller.enqueue(chunk);
+              },
+              cancel: () => {
+                cancellations += 1;
+                expect(handled).toEqual([]);
+                expect(f.writes).toEqual([]);
+              },
+            },
+            { highWaterMark: 0 },
+          ),
+        );
+      },
+    });
+    f.client.onEvent((event) => {
+      handled.push(event.seq);
+    });
+    emitFencedReplay(await f.open());
+    await f.client.waitForReplayComplete();
+    await waitFor(() => f.client.debugInfo().lastPersistedSeq === 20);
+    expect(pulls).toBe(6);
+    expect(cancellations).toBe(1);
+    expect(handled).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    ]);
+    expect(
+      f.requests
+        .filter(({ phase, after }) => phase === "history" && after === 0)
+        .map(({ limit }) => limit),
+    ).toEqual([20, 10, 5, 2]);
+    expect(f.sockets).toHaveLength(1);
+  });
+
+  it("carries the accepted history limit forward instead of restarting the full page window", async () => {
+    const f = await fixture({
+      head: 12,
+      config: { eventDelivery: { maxQueueBytes: 600 } },
+    });
+    const handled: number[] = [];
+    f.client.onEvent((event) => {
+      handled.push(event.seq);
+    });
+    emitFencedReplay(await f.open());
+    await f.client.waitForReplayComplete();
+    expect(handled).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    expect(
+      f.requests
+        .filter(({ phase, after }) => phase === "history" && after === 0)
+        .map(({ limit }) => limit),
+    ).toEqual([12, 6, 3, 1]);
+    expect(f.requests.find(({ phase, after }) => phase === "history" && after === 1)?.limit).toBe(
+      2,
+    );
+    expect(f.sockets).toHaveLength(1);
+    expect(f.client.debugInfo().lastHandledSeq).toBe(12);
+  });
+
+  it("halves a history page when live arrivals consume its available item slots", async () => {
+    const pageReady = createDeferred<void>();
+    const releasePage = createDeferred<void>();
+    const f = await fixture({
+      config: { eventDelivery: { maxQueueSize: 3 } },
+      page: async (after, limit, _call, _signal, phase) => {
+        if (phase === "history" && after === 0 && limit === 2) {
+          pageReady.resolve();
+          await releasePage.promise;
+        }
+        return restHistoryPage(after, limit, 3);
+      },
+    });
+    const handled: number[] = [];
+    f.client.onEvent((event) => {
+      handled.push(event.seq);
+    });
+    const socket = await f.open();
+    emitFencedReplay(socket);
+    await pageReady.promise;
+    socket.emitServerEvent(restHistoryEvent(4));
+    releasePage.resolve();
+    await f.client.waitForReplayComplete();
+    await waitFor(() => f.client.debugInfo().lastPersistedSeq === 4);
+    expect(handled).toEqual([1, 2, 3, 4]);
+    expect(
+      f.requests
+        .filter(({ phase }) => phase === "history")
+        .slice(0, 2)
+        .map(({ after, limit }) => [after, limit]),
+    ).toEqual([
+      [0, 2],
+      [0, 1],
+    ]);
+    expect(f.sockets).toHaveLength(1);
+    expect(f.writes).toEqual([1, 2, 3, 4]);
+    expect(f.client.debugInfo().pausedReason).toBeNull();
+  });
+
+  it.each([
+    "headers",
+    "body",
+  ] as const)("halves a timed-out history read at the same cursor before reconnecting [%s]", async (phaseOfTimeout) => {
+    const f = await fixture({
+      head: 4,
+      config: { commandTimeoutMs: 5 },
+      page: (after, limit, _call, signal, phase) => {
+        if (phase === "history" && limit > 1) {
+          if (phaseOfTimeout === "body")
+            return new Response(new ReadableStream<Uint8Array>({ pull: () => undefined }));
+          return new Promise<never>((_resolve, reject) => {
+            signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+          });
+        }
+        return restHistoryPage(after, limit, 4);
+      },
+    });
+    const handled: number[] = [];
+    f.client.onEvent((event) => {
+      handled.push(event.seq);
+    });
+    emitFencedReplay(await f.open());
+    await f.client.waitForReplayComplete();
+    expect(handled).toEqual([1, 2, 3, 4]);
+    expect(
+      f.requests
+        .filter(({ phase }) => phase === "history")
+        .slice(0, 3)
+        .map(({ after, limit }) => [after, limit]),
+    ).toEqual([
+      [0, 4],
+      [0, 2],
+      [0, 1],
+    ]);
+    expect(f.sockets).toHaveLength(1);
+    expect(f.writes).toEqual([1, 2, 3, 4]);
+  });
+
+  it("reconnects a single-row deadline failure after halving without advancing the failed cursor", async () => {
+    const f = await fixture({
+      config: { commandTimeoutMs: 5, reconnect: { baseDelayMs: 0, maxDelayMs: 0 } },
+      page: (after, limit, _call, signal, phase) => {
+        if (phase === "history" && f.sockets.length === 1)
+          return new Promise<never>((_resolve, reject) => {
+            signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+          });
+        return restHistoryPage(after, limit, 2);
+      },
+    });
+    const handled: number[] = [];
+    f.client.onEvent((event) => {
+      handled.push(event.seq);
+    });
+    const oldReplay = f.client.waitForReplayComplete();
+    oldReplay.catch(() => undefined);
+    emitFencedReplay(await f.open());
+    await expect(oldReplay).rejects.toMatchObject({ code: "TRANSPORT" });
+    expect(handled).toEqual([]);
+    expect(f.writes).toEqual([]);
+    expect(
+      f.requests
+        .filter(({ phase }) => phase === "history")
+        .map(({ after, limit }) => [after, limit]),
+    ).toEqual([
+      [0, 2],
+      [0, 1],
+    ]);
+    await waitFor(() => f.sockets.length === 2);
+    const replacement = f.sockets[1];
+    if (!replacement) throw new Error("Missing deadline recovery socket");
+    emitFencedReplay(replacement);
+    await f.client.waitForReplayComplete();
+    expect(handled).toEqual([1, 2]);
+    expect(f.client.debugInfo()).toMatchObject({ lastHandledSeq: 2, pausedReason: null });
+    expect(f.sockets).toHaveLength(2);
+  });
+
   it("retries a byte-heavy history page at the same cursor without partially admitting it", async () => {
     const handled: number[] = [];
     let retried = false;
@@ -3130,8 +3326,150 @@ describe("ParticipantRuntimeClient REST replay", () => {
     expect(f.client.debugInfo()).toMatchObject({ lastHandledSeq: 2, pausedReason: null });
   });
 
+  it("charges only selected snapshot tasks to the retained-task byte budget", async () => {
+    const ignored = {
+      ...baseTask,
+      taskId: "task_unselected_large",
+      input: { padding: "x".repeat(1_200) },
+    };
+    const f = await fixture({
+      config: { eventDelivery: { maxQueueBytes: 800 } },
+      tasks: () => ({ tasks: [ignored, baseTask] }),
+    });
+    const selected: string[] = [];
+    const executed: string[] = [];
+    const loop = f.client.runClaimableTasks({
+      claimRefreshMs: 1_000,
+      executor: async ({ task }) => {
+        executed.push(task.taskId);
+        return { result: {} };
+      },
+      once: true,
+      shouldClaimTask: (task) => {
+        selected.push(task.taskId);
+        return task.taskId !== ignored.taskId;
+      },
+    });
+    loop.catch(() => undefined);
+    const socket = await f.open();
+    replyToTaskCommands(socket, [baseTask]);
+    emitFencedReplay(socket);
+    await loop;
+    expect(selected).toEqual(["task_unselected_large", baseTask.taskId]);
+    expect(executed).toEqual([baseTask.taskId]);
+    expect(f.client.debugInfo().pausedReason).toBeNull();
+    expect(f.writes).toEqual([]);
+  });
+
+  it("rejects REST once mode when terminal pause wins before the idle drain", async () => {
+    const f = await fixture({ tasks: () => ({ tasks: [baseTask] }) });
+    let completed = false;
+    const loop = f.client.runClaimableTasks({
+      claimRefreshMs: 1_000,
+      executor: createExecutor(),
+      once: true,
+      shouldClaimTask: () => true,
+    });
+    loop.catch(() => undefined);
+    const socket = await f.open();
+    replyToTaskCommands(socket, [baseTask]);
+    socket.on("client-command", (data: string) => {
+      if ((JSON.parse(data) as { readonly op: string }).op !== "task.complete") return;
+      completed = true;
+      socket.deferClose = true;
+      socket.emitServerEvent(restHistoryEvent(2));
+    });
+    try {
+      emitFencedReplay(socket);
+      await expect(loop).rejects.toThrow("Participant task loop entered Paused State");
+      expect(completed).toBe(true);
+      expect(f.client.debugInfo().pausedReason).toBe("non_contiguous_event");
+      expect(f.writes).toEqual([]);
+    } finally {
+      socket.emitClose();
+    }
+  });
+
+  it("emits a failed REST reconnect open error exactly once", async () => {
+    const f = await fixture({
+      config: { reconnect: { baseDelayMs: 0, maxDelayMs: 0 } },
+      page: (after, limit, call) =>
+        call === 1
+          ? Response.json({ error: "synthetic temporary service failure" }, { status: 503 })
+          : restHistoryPage(after, limit, 0),
+    });
+    await f.client.reconnect();
+    expect(f.sockets).toHaveLength(1);
+    const socket = f.sockets[0];
+    if (!socket) throw new Error("Missing recovered socket");
+    emitFencedReplay(socket);
+    await f.client.waitForReplayComplete();
+    expect(f.errors).toHaveLength(1);
+    expect(f.errors[0]).toMatchObject({
+      code: "PERSISTENCE",
+      details: { operation: "list-events", status: 503 },
+    });
+    expect(f.requests).toHaveLength(2);
+    expect(f.writes).toEqual([]);
+  });
+
+  it("grows snapshot transient backoff across successful wire opens until real recovery", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(1);
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const snapshots: number[] = [];
+    const sockets: ParticipantFakeWebSocket[] = [];
+    let unavailable = true;
+    const f = await fixture({
+      config: {
+        reconnect: { baseDelayMs: 100, maxDelayMs: 400 },
+        webSocketFactory: (url) => {
+          const socket = new ParticipantFakeWebSocket(url);
+          sockets.push(socket);
+          socket.once("open", () => queueMicrotask(() => emitFencedReplay(socket)));
+          return socket as unknown as WebSocket;
+        },
+      },
+      tasks: () => {
+        snapshots.push(Date.now());
+        return unavailable
+          ? Response.json({ error: "synthetic service unavailable" }, { status: 503 })
+          : { tasks: [] };
+      },
+    });
+    const loop = f.client.runClaimableTasks({
+      claimRefreshMs: 1_000,
+      executor: createExecutor(),
+      once: false,
+      shouldClaimTask: () => true,
+    });
+    loop.catch(() => undefined);
+    try {
+      await f.client.open();
+      await flushMicrotasks();
+      expect(snapshots).toEqual([0]);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(snapshots).toEqual([0, 100, 300, 700]);
+      unavailable = false;
+      await vi.advanceTimersByTimeAsync(100);
+      expect(snapshots).toEqual([0, 100, 300, 700, 1_100]);
+      unavailable = true;
+      sockets.at(-1)?.emitClose();
+      await vi.advanceTimersByTimeAsync(200);
+      expect(snapshots).toEqual([0, 100, 300, 700, 1_100, 1_200, 1_300]);
+      expect(f.client.debugInfo()).toMatchObject({ pausedReason: null, lastHandledSeq: 0 });
+      expect(f.writes).toEqual([]);
+    } finally {
+      await f.client.closeAndWait();
+      await vi.advanceTimersByTimeAsync(400);
+      await loop;
+      vi.useRealTimers();
+    }
+  });
+
   it.each([
     503,
+    502,
     429,
     408,
     "body",
@@ -3170,6 +3508,31 @@ describe("ParticipantRuntimeClient REST replay", () => {
     await loop;
     expect(snapshots).toBe(2);
     expect(f.client.debugInfo().pausedReason).toBeNull();
+    expect(f.writes).toEqual([]);
+  });
+
+  it("keeps unsupported snapshot HTTP 501 terminal instead of retrying it", async () => {
+    let snapshots = 0;
+    const f = await fixture({
+      config: { reconnect: { baseDelayMs: 100, maxDelayMs: 100 } },
+      tasks: () => {
+        snapshots += 1;
+        return Response.json({ error: "synthetic unsupported operation" }, { status: 501 });
+      },
+    });
+    const loop = f.client.runClaimableTasks({
+      claimRefreshMs: 1_000,
+      executor: createExecutor(),
+      once: true,
+      shouldClaimTask: () => true,
+    });
+    loop.catch(() => undefined);
+    emitFencedReplay(await f.open());
+    await flushMicrotasks();
+    expect(f.client.debugInfo().pausedReason).toBe("rest_replay_failed");
+    await expect(loop).rejects.toThrow();
+    expect(snapshots).toBe(1);
+    expect(f.sockets).toHaveLength(1);
     expect(f.writes).toEqual([]);
   });
 
@@ -3375,6 +3738,42 @@ describe("ParticipantRuntimeClient REST replay", () => {
     expect(handled).toEqual([]);
     expect(f.writes).toEqual([]);
     expect(f.sockets).toHaveLength(action === "close" ? 1 : 2);
+  });
+
+  it("prepares no WebSocket generation when explicitly closed during reconnect backoff", async () => {
+    const sockets: ParticipantFakeWebSocket[] = [];
+    const f = await fixture({
+      config: {
+        replayMode: "websocket",
+        reconnect: { baseDelayMs: 10, maxDelayMs: 10 },
+        webSocketFactory: (url) => {
+          if (sockets.length > 0) throw new Error("synthetic WebSocket refusal");
+          const socket = new ParticipantFakeWebSocket(url);
+          sockets.push(socket);
+          return socket as unknown as WebSocket;
+        },
+      },
+    });
+    await f.client.open();
+    vi.useFakeTimers();
+    try {
+      const reconnect = f.client.reconnect();
+      await waitForMicrotasks(() => f.client.debugInfo().reconnectFailureCount === 1);
+      const generation = f.client.debugInfo().connectionGeneration;
+      await f.client.closeAndWait();
+      await vi.advanceTimersByTimeAsync(10);
+      await reconnect;
+      expect(f.requests).toEqual([]);
+      expect(sockets).toHaveLength(1);
+      expect(f.client.debugInfo()).toMatchObject({
+        stopped: true,
+        pausedReason: null,
+        connectionGeneration: generation,
+        reconnectFailureCount: 1,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("stops a transient reconnect backoff when explicitly closed", async () => {
@@ -3664,19 +4063,141 @@ describe("ParticipantRuntimeClient REST replay", () => {
     await expect(loop).rejects.toThrow();
   });
 
-  it("releases replaced and terminal reservations without double-charging duplicate task IDs", async () => {
+  it("requeues a task that becomes claimable again while its current claim is running", async () => {
+    const started = createDeferred<void>();
+    const release = createDeferred<void>();
+    const tasks: TaskRecord[] = [baseTask];
+    const f = await fixture({
+      config: { eventDelivery: { maxQueueSize: 1 } },
+      tasks: () => ({ tasks: [baseTask] }),
+    });
+    const executed: string[] = [];
+    const loop = f.client.runClaimableTasks({
+      claimRefreshMs: 1_000,
+      executor: async ({ task }) => {
+        executed.push(task.objective);
+        if (executed.length === 1) {
+          started.resolve();
+          await release.promise;
+        }
+        return { result: {} };
+      },
+      once: true,
+      shouldClaimTask: () => true,
+    });
+    loop.catch(() => undefined);
+    const socket = await f.open();
+    replyToTaskCommands(socket, tasks);
+    emitFencedReplay(socket);
+    try {
+      await started.promise;
+      await waitFor(() => f.client.debugInfo().eventBacklogSize === 0);
+      const updated = { ...baseTask, objective: "Run again" };
+      tasks[0] = updated;
+      socket.emitServerEvent(createTaskReleasedEvent(updated, 1));
+      await waitFor(() => f.client.debugInfo().lastHandledSeq === 1);
+      release.resolve();
+      await loop;
+      expect(executed).toEqual(["Summarize the session", "Run again"]);
+      expect(
+        socket.sent
+          .map((packet) => JSON.parse(packet) as { readonly op: string })
+          .filter(({ op }) => op === "task.claim"),
+      ).toHaveLength(2);
+      expect(f.client.debugInfo().pausedReason).toBeNull();
+    } finally {
+      release.resolve();
+    }
+  });
+
+  it("releases snapshot tombstones before admitting later work at the full task-count budget", async () => {
+    const snapshotStarted = createDeferred<void>();
+    const releaseSnapshot = createDeferred<void>();
+    const snapshotEnded = createDeferred<void>();
+    const releaseBarrier = createDeferred<void>();
+    const f = await fixture({
+      config: { eventDelivery: { maxQueueSize: 1 } },
+      tasks: async () => {
+        snapshotStarted.resolve();
+        await releaseSnapshot.promise;
+        return { tasks: [baseTask] };
+      },
+    });
+    const executed: string[] = [];
+    const loop = f.client.runClaimableTasks({
+      claimRefreshMs: 1_000,
+      executor: async ({ task }) => {
+        executed.push(task.taskId);
+        return { result: {} };
+      },
+      once: true,
+      replayBarrier: async () => {
+        snapshotEnded.resolve();
+        await releaseBarrier.promise;
+      },
+      shouldClaimTask: () => true,
+    });
+    loop.catch(() => undefined);
+    const socket = await f.open();
+    replyToTaskCommands(socket, [otherTask]);
+    emitFencedReplay(socket);
+    try {
+      await snapshotStarted.promise;
+      await waitFor(() => f.client.debugInfo().eventBacklogSize === 0);
+      socket.emitServerEvent({
+        ...createTaskReleasedEvent({ ...baseTask, completedAt: "2026-06-05T00:01:00Z" }, 1),
+        type: "task.completed",
+      });
+      await waitFor(
+        () =>
+          f.client.debugInfo().lastHandledSeq === 1 && f.client.debugInfo().eventBacklogSize === 0,
+      );
+      releaseSnapshot.resolve();
+      await snapshotEnded.promise;
+      socket.emitServerEvent(createTaskCreatedEvent(otherTask, 2));
+      await waitFor(
+        () =>
+          f.client.debugInfo().lastHandledSeq === 2 || f.client.debugInfo().pausedReason !== null,
+      );
+      releaseBarrier.resolve();
+      await loop;
+      expect(executed).toEqual([otherTask.taskId]);
+      expect(f.client.debugInfo().pausedReason).toBeNull();
+      expect(f.client.debugInfo().lastHandledSeq).toBe(2);
+    } finally {
+      releaseSnapshot.resolve();
+      releaseBarrier.resolve();
+    }
+  });
+
+  it.each([
+    "duplicate",
+    "terminal",
+  ] as const)("releases replaced and terminal reservations without double-charging duplicate task IDs [%s]", async (kind) => {
     const first = { ...baseTask, objective: "x".repeat(500) };
     const replaced = { ...baseTask, objective: "short" };
     const second = { ...otherTask, objective: "y".repeat(500) };
+    const third = { ...baseTask, taskId: "task_after_terminal", objective: "z".repeat(500) };
+    const source =
+      kind === "duplicate"
+        ? [
+            createTaskCreatedEvent(first, 1),
+            createTaskCreatedEvent(second, 2),
+            createTaskReleasedEvent(replaced, 3),
+          ]
+        : [
+            createTaskCreatedEvent(first, 1),
+            {
+              ...createTaskReleasedEvent({ ...first, completedAt: "2026-06-05T00:01:00Z" }, 2),
+              type: "task.completed",
+            },
+            createTaskCreatedEvent(second, 3),
+            createTaskCreatedEvent(third, 4),
+          ];
     const f = await fixture({
       config: { eventDelivery: { maxQueueSize: 2, maxQueueBytes: 2_000 } },
       page: (after, limit) => {
-        const source = [
-          createTaskCreatedEvent(first, 1),
-          createTaskReleasedEvent(replaced, 2),
-          createTaskCreatedEvent(second, 3),
-        ];
-        const page = restHistoryPage(after, limit, 3);
+        const page = restHistoryPage(after, limit, source.length);
         return { ...page, events: source.filter((event) => event.seq > after).slice(0, limit) };
       },
     });
@@ -3692,10 +4213,11 @@ describe("ParticipantRuntimeClient REST replay", () => {
     });
     loop.catch(() => undefined);
     const socket = await f.open();
-    replyToTaskCommands(socket, [replaced, second]);
+    replyToTaskCommands(socket, kind === "duplicate" ? [replaced, second] : [second, third]);
     emitFencedReplay(socket);
     await loop;
-    expect(executed).toEqual(["short", "y".repeat(500)]);
+    if (kind === "duplicate") expect(executed).toEqual(["short", "y".repeat(500)]);
+    else expect(executed).toEqual(["y".repeat(500), "z".repeat(500)]);
     expect(f.client.debugInfo().pausedReason).toBeNull();
   });
 
