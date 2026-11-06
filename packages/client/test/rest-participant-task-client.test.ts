@@ -1,8 +1,7 @@
-import { describe, expect, it } from "vitest";
-
-import * as RestTaskClientModule from "../src/rest-participant-task-client.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  createReplayRestTaskClient,
   RestParticipantTaskClient,
   type RestParticipantTaskFetch,
 } from "../src/rest-participant-task-client.js";
@@ -90,34 +89,47 @@ function boundedTaskClient(
     readonly timeoutMs?: number;
   } = {},
 ): RestParticipantTaskClient {
-  const options = {
-    fetch: async () => response,
-    readPolicy: {
+  vi.stubGlobal("fetch", async () => response);
+  return createReplayRestTaskClient(
+    { authToken: null, participantId: "part_1", serviceUrl: "https://fixture.invalid" },
+    {
       maxBytes: input.maxBytes ?? 10_000,
       maxActiveTasks: input.maxActiveTasks ?? 10,
       signal: input.signal ?? new AbortController().signal,
       timeoutMs: input.timeoutMs ?? 1_000,
     },
-  };
-  const config = {
-    authToken: null,
-    participantId: "part_1",
-    serviceUrl: "https://fixture.invalid",
-  };
-  const factory: unknown = Reflect.get(RestTaskClientModule, "createReplayRestTaskClient");
-  if (typeof factory === "function") {
-    const create = factory as (
-      config: ConstructorParameters<typeof RestParticipantTaskClient>[0],
-      dependencies: NonNullable<ConstructorParameters<typeof RestParticipantTaskClient>[1]>,
-      policy: typeof options.readPolicy,
-    ) => RestParticipantTaskClient;
-    return create(config, { fetch: options.fetch }, options.readPolicy);
-  }
-  /** Historical-source proofs retain the old constructor seam, with identical response fixtures. */
-  return new RestParticipantTaskClient(config, options);
+  );
 }
 
 describe("RestParticipantTaskClient", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it("cancels an error response without reading or parsing its body", async () => {
+    let pulls = 0;
+    let cancellations = 0;
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        pull: (controller) => {
+          pulls += 1;
+          controller.enqueue(new Uint8Array(1_000));
+        },
+        cancel: () => {
+          cancellations += 1;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const client = new RestParticipantTaskClient(
+      { authToken: null, participantId: "part_1", serviceUrl: "https://fixture.invalid" },
+      { fetch: async () => new Response(stream, { status: 503 }) },
+    );
+    await expect(client.listActiveTasks("sess_1")).rejects.toMatchObject({
+      code: "PERSISTENCE",
+      details: { status: 503 },
+    });
+    expect(pulls).toBe(0);
+    expect(cancellations).toBe(1);
+  });
+
   it("bundles a resource limit into one bounded details object", async () => {
     const failure = boundedTaskClient(new Response(new Uint8Array(80)), {
       maxBytes: 64,
@@ -162,7 +174,7 @@ describe("RestParticipantTaskClient", () => {
       code,
       details: { operation: "list-active", status },
     });
-    expect(pulls).toBe(5);
+    expect(pulls).toBe(0);
     expect(cancellations).toBe(1);
   });
 

@@ -7,6 +7,23 @@ const publicTaskOptions: Client.RestParticipantTaskClientOptions = {};
 // @ts-expect-error Recovery read policy is an internal construction detail.
 void publicTaskOptions.readPolicy;
 
+/** Resource failures require complete metadata, while other variants do not accept it. */
+type RestTaskFailureInput = ConstructorParameters<typeof Client.RestParticipantTaskError>[0];
+// @ts-expect-error RESOURCE_LIMIT cannot omit its resource metadata.
+const incompleteResourceFailure: RestTaskFailureInput = {
+  code: "RESOURCE_LIMIT",
+  operation: "read",
+};
+const transportWithResource = {
+  code: "TRANSPORT",
+  operation: "read",
+  resourceLimit: { resource: "response_bytes", limit: 1, observed: 2 },
+} as const;
+// @ts-expect-error Transport failures cannot masquerade as resource-policy failures.
+const mismatchedResourceFailure: RestTaskFailureInput = transportWithResource;
+void incompleteResourceFailure;
+void mismatchedResourceFailure;
+
 type PromiseReturning<TArgs extends readonly unknown[], TValue> = (
   ...args: TArgs
 ) => Promise<TValue>;

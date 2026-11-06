@@ -121,8 +121,8 @@ WebSocket at that head. After the wire replay marker supplies the control epoch,
 it delivers history through the serial event handlers. Discovery never advances
 the handled or durable cursor. A history read that exceeds available bytes or
 item slots, or reaches its deadline, retries with half the rows at the same
-cursor. The accepted limit carries forward and can double toward the normal
-page limit, within the available slots. At one row, a deadline failure uses
+cursor. The accepted limit carries forward and can double within the available
+slots, but stays below every size that failed in that generation. At one row, a deadline failure uses
 reconnect backoff; resource overflow pauses. Command responses remain available
 while a historical handler awaits a command.
 
@@ -151,9 +151,9 @@ REST requests and the wait for wire control use `commandTimeoutMs`. Ending a
 connection generation aborts its REST requests, including stalled bodies.
 Transport and body-read failures, and HTTP 408, 429, 500, 502, 503, or 504, recover
 through the existing reconnect backoff from the handled cursor. Consecutive
-transient failures grow the delay up to `maxDelayMs`, including failures after a
-socket opens. Handled progress or completed recovery resets the delay. Error
-responses are classified by status and read under a fixed 4096-byte body cap.
+recovery failures grow the delay up to `maxDelayMs`, including refused upgrades
+and failures after a socket opens. Handled progress or completed recovery resets the delay. Error
+responses are classified by status; their bodies are canceled without reading.
 Direct `open()` still rejects discovery and opening errors. Other HTTP statuses,
 including 501, authentication failures, invalid pages, sequence gaps, malformed
 task rows, and resource overflow pause without skipping work.

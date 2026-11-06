@@ -101,6 +101,18 @@ export type RestParticipantTaskErrorCode =
   | "RESOURCE_LIMIT"
   | "TRANSPORT";
 
+/** Resource metadata is mandatory only for its matching failure variant. */
+type RestTaskFailureInput = {
+  readonly operation: string;
+  readonly status?: number | null;
+} & (
+  | { readonly code: "RESOURCE_LIMIT"; readonly resourceLimit: RestTaskResourceLimit }
+  | {
+      readonly code: Exclude<RestParticipantTaskErrorCode, "RESOURCE_LIMIT">;
+      readonly resourceLimit?: never;
+    }
+);
+
 /** Typed, operation-scoped REST task-route failure. */
 export class RestParticipantTaskError extends Error {
   readonly code: RestParticipantTaskErrorCode;
@@ -111,13 +123,10 @@ export class RestParticipantTaskError extends Error {
   };
 
   /** Retains bounded operation metadata without the response body or credentials. */
-  constructor(input: {
-    readonly code: RestParticipantTaskErrorCode;
-    readonly operation: string;
-    readonly status?: number | null;
-    readonly resourceLimit?: RestTaskResourceLimit;
-  }) {
+  constructor(input: RestTaskFailureInput) {
     super(`REST participant task ${input.operation} failed: ${input.code}`);
+    if (input.code === "RESOURCE_LIMIT" && !input.resourceLimit)
+      throw new TypeError("RESOURCE_LIMIT requires complete resource metadata");
     this.code = input.code;
     this.details = {
       operation: input.operation,
@@ -134,6 +143,20 @@ export class RestParticipantTaskError extends Error {
     };
     this.name = "RestParticipantTaskError";
   }
+}
+
+/** Narrows the resource variant guaranteed by the constructor contract. */
+export function isRestParticipantResourceLimit(
+  error: unknown,
+): error is RestParticipantTaskError & {
+  readonly code: "RESOURCE_LIMIT";
+  readonly details: {
+    readonly operation: string;
+    readonly status: number | null;
+    readonly resourceLimit: RestTaskResourceLimit;
+  };
+} {
+  return error instanceof RestParticipantTaskError && error.code === "RESOURCE_LIMIT";
 }
 
 /** Options shared by every fenced mutation. */
@@ -288,7 +311,10 @@ async function readJsonBody(
 /** Parses one task-or-null response body with the shared protocol schema. */
 function parseTask(
   body: unknown,
-  error: (code: RestParticipantTaskErrorCode, operation: TaskOperation) => Error,
+  error: (
+    code: Exclude<RestParticipantTaskErrorCode, "RESOURCE_LIMIT">,
+    operation: TaskOperation,
+  ) => Error,
   operation: TaskOperation,
 ): TaskRecord | null {
   if (body === null) {
@@ -302,7 +328,9 @@ function parseTask(
 }
 
 /** Maps public HTTP status to a bounded client failure. */
-function mapTaskServerError(status: number): RestParticipantTaskErrorCode {
+function mapTaskServerError(
+  status: number,
+): Exclude<RestParticipantTaskErrorCode, "RESOURCE_LIMIT"> {
   if (status === 401 || status === 403) {
     return "AUTHENTICATION";
   }
@@ -606,7 +634,11 @@ export class RestParticipantTaskClient {
     return parsed.data;
   }
 
-  #error(code: RestParticipantTaskErrorCode, operation: TaskOperation, status?: number | null) {
+  #error(
+    code: Exclude<RestParticipantTaskErrorCode, "RESOURCE_LIMIT">,
+    operation: TaskOperation,
+    status?: number | null,
+  ) {
     return new RestParticipantTaskError({
       code,
       operation,
@@ -673,12 +705,7 @@ export class RestParticipantTaskClient {
           throw readTransportError(operation, signal, this.#readPolicy?.signal);
         }
         if (!response.ok) {
-          await readJsonBody(
-            response,
-            operation,
-            { maxBytes: restResponseEnvelopeAllowance },
-            signal,
-          ).catch(() => undefined);
+          void response.body?.cancel().catch(() => undefined);
           throw this.#error(mapTaskServerError(response.status), operation, response.status);
         }
         const responseBody = await readJsonBody(
@@ -704,9 +731,8 @@ export class RestParticipantTaskClient {
 /** Constructs recovery-owned reads without exposing policy through either package entry. */
 export function createReplayRestTaskClient(
   config: RestParticipantTaskClientConfig,
-  dependencies: RestParticipantTaskClientOptions,
   policy: RestTaskReadPolicy,
 ): RestParticipantTaskClient {
-  const options: InternalRestTaskClientOptions = { ...dependencies, [recoveryReadPolicy]: policy };
+  const options: InternalRestTaskClientOptions = { [recoveryReadPolicy]: policy };
   return new RestParticipantTaskClient(config, options);
 }

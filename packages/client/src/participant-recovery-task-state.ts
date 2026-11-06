@@ -61,15 +61,15 @@ export class RecoveryTaskState {
     const observedQueueSize = this.slots.size + (previous ? 0 : 1);
     if (observedQueueSize > this.limits.maxQueueSize) {
       throw new ParticipantRestReplayError("delivery_queue_overflow", {
-        limit: this.limits.maxQueueSize,
-        observed: observedQueueSize,
+        maxQueueSize: this.limits.maxQueueSize,
+        observedQueueSize,
       });
     }
     const observedQueueBytes = this.bytes - (previous?.bytes ?? 0) + slot.bytes;
     if (observedQueueBytes > this.limits.maxQueueBytes) {
       throw new ParticipantRestReplayError("delivery_byte_overflow", {
-        limit: this.limits.maxQueueBytes,
-        observed: observedQueueBytes,
+        maxQueueBytes: this.limits.maxQueueBytes,
+        observedQueueBytes,
       });
     }
     this.slots.set(taskId, slot);

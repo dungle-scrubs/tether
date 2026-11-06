@@ -14,6 +14,9 @@ import type {
 } from "./participant-runtime-client.js";
 import type { SessionEvent, TaskRecord } from "./types.js";
 
+/** Shared terminal task-loop message in both transport modes. */
+const pausedTaskLoopMessage = "Participant task loop entered Paused State";
+
 /** Cancellation state passed from the claimable-task runner into one task flow. */
 export interface TaskCancellationContext {
   /** Aborts the active executor signal for this task. */
@@ -230,7 +233,7 @@ export function buildParticipantClaimableTaskLoop(
 
   const runLoop = async (): Promise<void> => {
     while (!client.isStopped()) {
-      if (client.isPaused()) throw new Error("Participant task loop entered Paused State");
+      if (client.isPaused()) throw new Error(pausedTaskLoopMessage);
       const currentEpoch = ++replayEpoch;
       const generation = client.connectionGeneration();
       replayReadyGeneration = null;
@@ -320,8 +323,7 @@ export function buildParticipantClaimableTaskLoop(
                 closeReady,
               ]);
               if (settled.kind === "idle") {
-                if (client.isPaused())
-                  throw new Error("Participant task loop entered Paused State");
+                if (client.isPaused()) throw new Error(pausedTaskLoopMessage);
                 client.close();
                 return;
               }
@@ -330,6 +332,7 @@ export function buildParticipantClaimableTaskLoop(
             }
           } else {
             await Promise.allSettled([...pendingWork]);
+            if (client.isPaused()) throw new Error(pausedTaskLoopMessage);
             client.close();
             return;
           }
@@ -344,7 +347,7 @@ export function buildParticipantClaimableTaskLoop(
         discardReplayTasks(generation);
       }
       if (!client.isStopped()) {
-        if (client.isPaused()) throw new Error("Participant task loop entered Paused State");
+        if (client.isPaused()) throw new Error(pausedTaskLoopMessage);
         await client.reconnectAfterClose();
       }
     }

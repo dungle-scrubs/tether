@@ -645,10 +645,10 @@ function writeDefaultRuntimeError(
 }
 
 /**
- * Computes bounded exponential reconnect backoff from client configuration.
+ * Maps consecutive failed cycles to the shared zero-based backoff policy.
  */
-function reconnectDelayMs(attempt: number, config: ParticipantRuntimeClientConfig): number {
-  return boundedReconnectDelayMs(attempt, config.reconnect);
+function reconnectDelayMs(failures: number, config: ParticipantRuntimeClientConfig): number {
+  return boundedReconnectDelayMs(Math.max(0, failures - 1), config.reconnect);
 }
 
 /**
@@ -702,8 +702,8 @@ export class ParticipantRuntimeClient {
   private pausedReason: ParticipantRuntimePausedReason | null = null;
   private preparedTransport: PreparedParticipantTransport | null = null;
   private restReplay: ParticipantRestReplay | null = null;
-  /** Consecutive REST failures since handled progress or successful full recovery. */
-  private consecutiveRestTransientFailures = 0;
+  /** Single retry-policy counter, independent of the cumulative public diagnostic metric. */
+  private recoveryFailureCount = 0;
   /** Task-loop users complete recovery only after their canonical snapshot succeeds. */
   private restTaskRecoveryUsers = 0;
   private socket: WebSocket | null = null;
@@ -810,10 +810,7 @@ export class ParticipantRuntimeClient {
         if (this.restReplay && !this.stopped) {
           if (isTransientRestReplayFailure(openError)) {
             if (!this.restReplay.aborted && this.pausedReason === null) {
-              this.consecutiveRestTransientFailures += 1;
-              this.restReplay.abort();
-              this.delivery.stop();
-              this.settleReplayCompleteError(openError);
+              void this.endGeneration(openError);
               if (!this.reconnectPromise) this.emitError(openError);
             }
           } else {
@@ -1252,11 +1249,15 @@ export class ParticipantRuntimeClient {
     await Effect.runPromise(this.buildReconnectWithBackoff(initialDelayMs));
   }
 
-  /** Carries failures across successful socket opens until recovery makes real progress. */
-  private restTransientDelayMs(): number | null {
-    return this.consecutiveRestTransientFailures > 0
-      ? reconnectDelayMs(this.consecutiveRestTransientFailures - 1, this.config)
-      : null;
+  /** Records one failed open or post-open recovery cycle at its reconnect owner. */
+  private recordRecoveryFailure(): void {
+    this.recoveryFailureCount += 1;
+    this.reconnectFailureCount += 1;
+  }
+
+  /** Resets retry policy only after acknowledged progress or completed recovery. */
+  private recordRecoveryProgress(): void {
+    this.recoveryFailureCount = 0;
   }
 
   /** Coalesces every reconnect caller behind one transport-owner promise. */
@@ -1264,7 +1265,7 @@ export class ParticipantRuntimeClient {
     if (this.reconnectPromise) {
       return this.reconnectPromise;
     }
-    const delayMs = initialDelayMs ?? this.restTransientDelayMs();
+    const delayMs = initialDelayMs;
     const reconnect = this.restReplay
       ? this.delivery.waitForSettlement().then(() => this.reconnectWithBackoff(delayMs))
       : this.reconnectWithBackoff(delayMs);
@@ -1285,8 +1286,7 @@ export class ParticipantRuntimeClient {
     initialDelayMs: number | null = null,
   ): Effect.Effect<void, never> {
     return Effect.gen(this, function* () {
-      let attempt = 0;
-      let delayMs = initialDelayMs ?? reconnectDelayMs(attempt, this.config);
+      let delayMs = initialDelayMs ?? reconnectDelayMs(this.recoveryFailureCount, this.config);
       while (!this.stopped && this.pausedReason === null) {
         if (delayMs > 0) {
           yield* sleepUnrefEffect(delayMs);
@@ -1303,10 +1303,9 @@ export class ParticipantRuntimeClient {
           return;
         }
         const error = opened.left;
-        this.reconnectFailureCount += 1;
+        this.recordRecoveryFailure();
         this.emitError(error instanceof Error ? error : new Error("Reconnect failed"));
-        attempt += 1;
-        delayMs = this.restTransientDelayMs() ?? reconnectDelayMs(attempt, this.config);
+        delayMs = reconnectDelayMs(this.recoveryFailureCount, this.config);
       }
     });
   }
@@ -1439,7 +1438,7 @@ export class ParticipantRuntimeClient {
     if (!replay) return [];
     try {
       const tasks = await replay.loadActiveTasks();
-      this.consecutiveRestTransientFailures = 0;
+      this.recordRecoveryProgress();
       return tasks;
     } catch (error) {
       throw this.failRestReplay(error, generation, replay) ?? error;
@@ -1461,9 +1460,9 @@ export class ParticipantRuntimeClient {
     )
       return null;
     if (isTransientRestReplayFailure(error)) {
-      this.consecutiveRestTransientFailures += 1;
+      this.recordRecoveryFailure();
       this.emitError(error);
-      this.endGenerationAndReconnect(error, generation, this.restTransientDelayMs());
+      this.endGenerationAndReconnect(error, generation, null);
       return null;
     }
     let reason: ParticipantRuntimePausedReason = "rest_replay_failed";
@@ -1522,8 +1521,8 @@ export class ParticipantRuntimeClient {
           serialDeliveryFailureReason(outcome.kind),
           undefined,
           {
-            limit: outcome.maxQueueBytes,
-            observed: outcome.observedQueueBytes,
+            maxQueueBytes: outcome.maxQueueBytes,
+            observedQueueBytes: outcome.observedQueueBytes,
           },
           generation,
         );
@@ -1533,8 +1532,8 @@ export class ParticipantRuntimeClient {
           serialDeliveryFailureReason(outcome.kind),
           undefined,
           {
-            limit: outcome.maxQueueSize,
-            observed: outcome.observedQueueSize,
+            maxQueueSize: outcome.maxQueueSize,
+            observedQueueSize: outcome.observedQueueSize,
           },
           generation,
         );
@@ -1542,7 +1541,7 @@ export class ParticipantRuntimeClient {
       case "duplicate-ignored":
         return;
       case "event-handled":
-        if (outcome.event.seq > this.lastHandledSeq) this.consecutiveRestTransientFailures = 0;
+        if (outcome.event.seq > this.lastHandledSeq) this.recordRecoveryProgress();
         this.recordHandledEvent(outcome.event);
         this.restReplay?.notifyProgress();
         if (this.deliveryRecoverySeq === outcome.event.seq) {
@@ -1585,7 +1584,7 @@ export class ParticipantRuntimeClient {
         );
         return;
       case "replay-complete":
-        if (this.restTaskRecoveryUsers === 0) this.consecutiveRestTransientFailures = 0;
+        if (this.restTaskRecoveryUsers === 0) this.recordRecoveryProgress();
         this.settleReplayComplete();
         return;
     }
@@ -1639,7 +1638,7 @@ export class ParticipantRuntimeClient {
       return;
     }
     this.recoveryCount += 1;
-    const delayMs = reconnectDelayMs(this.deliveryRecoveryAttempts - 1, this.config);
+    const delayMs = reconnectDelayMs(this.deliveryRecoveryAttempts, this.config);
     this.observability.debug("recoverDelivery", "participant_event_delivery.recovering", {
       attempt: this.deliveryRecoveryAttempts,
       delayMs,
@@ -1650,12 +1649,8 @@ export class ParticipantRuntimeClient {
     this.endGenerationAndReconnect(error, generation, delayMs);
   }
 
-  /** Ends failed delivery and rejoins the existing reconnect owner after socket closure. */
-  private endGenerationAndReconnect(
-    error: Error,
-    generation: number,
-    delayMs: number | null,
-  ): void {
+  /** Tears down one failed generation, including reads, queued delivery and command outcomes. */
+  private endGeneration(error: Error): Promise<void> {
     const replay = this.restReplay;
     replay?.abort();
     this.delivery.stop();
@@ -1668,7 +1663,18 @@ export class ParticipantRuntimeClient {
     socket?.close();
     if (!this.transportHasSocket) this.resolveTransportClose?.();
     /** REST requestReconnect owns settlement; WebSocket handler recovery retains its barrier. */
-    const ended = replay ? close : Promise.all([close, delivery.waitForSettlement()]);
+    return replay
+      ? close
+      : Promise.all([close, delivery.waitForSettlement()]).then(() => undefined);
+  }
+
+  /** Ends failed delivery and rejoins the existing reconnect owner after socket closure. */
+  private endGenerationAndReconnect(
+    error: Error,
+    generation: number,
+    delayMs: number | null,
+  ): void {
+    const ended = this.endGeneration(error);
     void ended.then(async () => {
       await this.reconnectPromise?.catch(() => undefined);
       if (!this.stopped && this.pausedReason === null && generation === this.connectionGeneration)

@@ -692,9 +692,18 @@ class ParticipantFakeWebSocket extends EventEmitter {
   readonly sent: string[] = [];
 
   /** Opens asynchronously so callers can attach transport listeners first. */
-  constructor(readonly url: string) {
+  constructor(
+    readonly url: string,
+    openingError?: Error,
+  ) {
     super();
     queueMicrotask(() => {
+      if (openingError) {
+        this.readyState = WebSocket.CLOSED;
+        this.emit("error", openingError);
+        this.emit("close");
+        return;
+      }
       this.readyState = WebSocket.OPEN;
       this.emit("open");
     });
@@ -2069,6 +2078,7 @@ describe("ParticipantRuntimeClient reconnect scheduling", () => {
         }
       },
       pausedReason: null,
+      recoveryFailureCount: 0,
       reconnectFailureCount: 0,
       reconnectSuccessCount: 0,
       stopped: false,
@@ -2392,7 +2402,7 @@ describe("ParticipantRuntimeClient reconnect scheduling", () => {
     expect(errors).toHaveLength(1);
     expect(errors[0]).toMatchObject({
       reason: "delivery_queue_overflow",
-      safeDetails: { limit: 2_000, observed: 2_001 },
+      safeDetails: { maxQueueSize: 2_000, observedQueueSize: 2_001 },
     });
     expect(client.debugInfo()).toMatchObject({
       eventBacklogSize: 2_000,
@@ -2906,6 +2916,7 @@ describe("ParticipantRuntimeClient REST replay", () => {
       await client.closeAndWait();
     }
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
     vi.restoreAllMocks();
   });
 
@@ -3016,6 +3027,48 @@ describe("ParticipantRuntimeClient REST replay", () => {
     expect(f.writes).toEqual([]);
   });
 
+  it("reports the admission byte budget for a REST response overflow in errors and diagnostics", async () => {
+    const diagnostics: Record<string, unknown>[] = [];
+    vi.stubEnv("DEBUG", "true");
+    vi.spyOn(console, "log").mockImplementation((encoded: unknown) => {
+      if (typeof encoded !== "string") return;
+      const entry = JSON.parse(encoded) as {
+        readonly message: string;
+        readonly data: Record<string, unknown>;
+      };
+      if (entry.message === "participant_event_delivery.paused") diagnostics.push(entry.data);
+    });
+    let observedBytes = 0;
+    const f = await fixture({
+      config: {
+        eventDelivery: { maxQueueBytes: 64 },
+      },
+      page: (after, limit) => {
+        const page = restHistoryPage(after, limit, 1);
+        const body = {
+          ...page,
+          events: page.events.map((event) => ({
+            ...event,
+            payload: { padding: "x".repeat(5_000) },
+          })),
+        };
+        observedBytes = new TextEncoder().encode(JSON.stringify(body)).byteLength;
+        return body;
+      },
+    });
+    await expect(f.open()).rejects.toMatchObject({
+      reason: "delivery_byte_overflow",
+      safeDetails: { maxQueueBytes: 64 },
+    });
+    expect(f.errors.at(-1)).toMatchObject({
+      safeDetails: { maxQueueBytes: 64, observedQueueBytes: observedBytes },
+    });
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]).toMatchObject({ maxQueueBytes: 64, observedQueueBytes: observedBytes });
+    expect(diagnostics[0]).not.toHaveProperty("limit");
+    expect(f.writes).toEqual([]);
+  });
+
   it("halves a valid history page after streamed HTTP byte overflow", async () => {
     const handled: number[] = [];
     let pulls = 0;
@@ -3091,6 +3144,11 @@ describe("ParticipantRuntimeClient REST replay", () => {
     expect(f.requests.find(({ phase, after }) => phase === "history" && after === 1)?.limit).toBe(
       2,
     );
+    expect(
+      f.requests
+        .filter(({ phase, after }) => phase === "history" && after > 0)
+        .map(({ limit }) => limit),
+    ).toEqual([2, 2, 2, 2, 2, 1]);
     expect(f.sockets).toHaveLength(1);
     expect(f.client.debugInfo().lastHandledSeq).toBe(12);
   });
@@ -3361,6 +3419,36 @@ describe("ParticipantRuntimeClient REST replay", () => {
     expect(f.writes).toEqual([]);
   });
 
+  it("rejects WebSocket once mode when terminal pause wins before the task drain", async () => {
+    const f = await fixture({ config: { replayMode: "websocket" } });
+    let completed = false;
+    const loop = f.client.runClaimableTasks({
+      claimRefreshMs: 1_000,
+      executor: createExecutor(),
+      once: true,
+      shouldClaimTask: () => true,
+    });
+    loop.catch(() => undefined);
+    const socket = await f.open();
+    replyToTaskCommands(socket, [baseTask]);
+    socket.on("client-command", (data: string) => {
+      if ((JSON.parse(data) as { readonly op: string }).op !== "task.complete") return;
+      completed = true;
+      socket.deferClose = true;
+      socket.emitServerEvent(restHistoryEvent(3));
+    });
+    try {
+      socket.emitServerEvent(createTaskCreatedEvent(baseTask, 1));
+      emitFencedReplay(socket);
+      await expect(loop).rejects.toThrow("Participant task loop entered Paused State");
+      expect(completed).toBe(true);
+      expect(f.client.debugInfo().pausedReason).toBe("non_contiguous_event");
+      expect(f.writes).toEqual([1]);
+    } finally {
+      socket.emitClose();
+    }
+  });
+
   it("rejects REST once mode when terminal pause wins before the idle drain", async () => {
     const f = await fixture({ tasks: () => ({ tasks: [baseTask] }) });
     let completed = false;
@@ -3411,6 +3499,108 @@ describe("ParticipantRuntimeClient REST replay", () => {
     });
     expect(f.requests).toHaveLength(2);
     expect(f.writes).toEqual([]);
+  });
+
+  it("resets recovery delay after a handled cursor advance before another history failure", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(1);
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    let refusedDiscovery = 0;
+    let refusedHistory = false;
+    const handled: number[] = [];
+    const f = await fixture({
+      config: { reconnect: { baseDelayMs: 100, maxDelayMs: 800 } },
+      page: (after, limit, _call, _signal, phase) => {
+        if (phase === "discovery" && refusedDiscovery < 2) {
+          refusedDiscovery += 1;
+          return Response.json({ error: "synthetic temporary discovery refusal" }, { status: 503 });
+        }
+        if (phase === "history" && after === 0) return restHistoryPage(after, 1, 2);
+        if (phase === "history" && after === 1 && !refusedHistory) {
+          refusedHistory = true;
+          return Response.json({ error: "synthetic temporary history refusal" }, { status: 503 });
+        }
+        return restHistoryPage(after, limit, 2);
+      },
+    });
+    f.client.onEvent((event) => {
+      handled.push(event.seq);
+    });
+    try {
+      const connecting = f.client.reconnect();
+      await vi.advanceTimersByTimeAsync(300);
+      await connecting;
+      expect(f.sockets).toHaveLength(1);
+      const socket = f.sockets[0];
+      if (!socket) throw new Error("Missing progress recovery socket");
+      const replay = f.client.waitForReplayComplete();
+      replay.catch(() => undefined);
+      emitFencedReplay(socket);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(handled).toEqual([1]);
+      expect(f.client.debugInfo().lastHandledSeq).toBe(1);
+      await expect(replay).rejects.toMatchObject({
+        code: "PERSISTENCE",
+        details: { status: 503, operation: "list-events" },
+      });
+      await vi.advanceTimersByTimeAsync(99);
+      expect(f.sockets).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(f.sockets).toHaveLength(2);
+      const replacement = f.sockets[1];
+      if (!replacement) throw new Error("Missing cursor-progress replacement socket");
+      emitFencedReplay(replacement);
+      await f.client.waitForReplayComplete();
+      expect(handled).toEqual([1, 2]);
+      expect(f.client.debugInfo().lastHandledSeq).toBe(2);
+    } finally {
+      await f.client.closeAndWait();
+      await vi.advanceTimersByTimeAsync(800);
+      vi.useRealTimers();
+    }
+  });
+
+  it("grows one recovery backoff across a snapshot failure followed by refused WebSocket upgrades", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(1);
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const attempts: number[] = [];
+    const f = await fixture({
+      config: {
+        reconnect: { baseDelayMs: 100, maxDelayMs: 800 },
+        webSocketFactory: (url) => {
+          attempts.push(Date.now());
+          const socket = new ParticipantFakeWebSocket(
+            url,
+            attempts.length > 1 ? new Error("synthetic refused upgrade") : undefined,
+          );
+          if (attempts.length === 1)
+            socket.once("open", () => queueMicrotask(() => emitFencedReplay(socket)));
+          return socket as unknown as WebSocket;
+        },
+      },
+      tasks: () => Response.json({ error: "synthetic service unavailable" }, { status: 503 }),
+    });
+    const loop = f.client.runClaimableTasks({
+      claimRefreshMs: 1_000,
+      executor: createExecutor(),
+      once: false,
+      shouldClaimTask: () => true,
+    });
+    loop.catch(() => undefined);
+    try {
+      await f.client.open();
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(700);
+      expect(attempts).toEqual([0, 100, 300, 700]);
+      expect(f.client.debugInfo().pausedReason).toBeNull();
+      expect(f.writes).toEqual([]);
+    } finally {
+      await f.client.closeAndWait();
+      await vi.advanceTimersByTimeAsync(800);
+      await loop;
+      vi.useRealTimers();
+    }
   });
 
   it("grows snapshot transient backoff across successful wire opens until real recovery", async () => {
@@ -3470,6 +3660,8 @@ describe("ParticipantRuntimeClient REST replay", () => {
   it.each([
     503,
     502,
+    500,
+    504,
     429,
     408,
     "body",
@@ -3738,6 +3930,71 @@ describe("ParticipantRuntimeClient REST replay", () => {
     expect(handled).toEqual([]);
     expect(f.writes).toEqual([]);
     expect(f.sockets).toHaveLength(action === "close" ? 1 : 2);
+  });
+
+  it("discards queued WebSocket delivery during handler recovery before socket closure", async () => {
+    const failed = createRejectableDeferred<void>();
+    const entered = createDeferred<void>();
+    const handled: number[] = [];
+    const f = await fixture({
+      config: { replayMode: "websocket", reconnect: { baseDelayMs: 0, maxDelayMs: 0 } },
+    });
+    f.client.onEvent(async (event) => {
+      handled.push(event.seq);
+      entered.resolve();
+      await failed.promise;
+    });
+    const socket = await f.open();
+    socket.deferClose = true;
+    try {
+      socket.emitServerEvent(restHistoryEvent(1));
+      await entered.promise;
+      socket.emitServerEvent(restHistoryEvent(2));
+      socket.emitServerEvent(restHistoryEvent(3));
+      expect(f.client.debugInfo().eventBacklogSize).toBe(3);
+      failed.reject(new Error("synthetic handler failure"));
+      await waitFor(() => f.client.debugInfo().eventDeliveryFailureCount === 1);
+      expect(f.client.debugInfo().eventBacklogSize).toBe(0);
+      expect(f.sockets).toHaveLength(1);
+      expect(handled).toEqual([1]);
+      expect(f.writes).toEqual([]);
+    } finally {
+      f.client.close();
+      socket.emitClose();
+      await f.client.closeAndWait();
+    }
+  });
+
+  it("does not reconnect a superseded WebSocket recovery after its timed-out handler settles", async () => {
+    const release = createDeferred<void>();
+    const entered = createDeferred<void>();
+    const f = await fixture({
+      config: {
+        replayMode: "websocket",
+        eventDelivery: { handlerTimeoutMs: 5 },
+        reconnect: { baseDelayMs: 0, maxDelayMs: 0 },
+      },
+    });
+    f.client.onEvent(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    const socket = await f.open();
+    try {
+      socket.emitServerEvent(restHistoryEvent(1));
+      await entered.promise;
+      await waitFor(() => f.client.debugInfo().eventDeliveryFailureCount === 1);
+      await f.client.reconnect();
+      const generation = f.client.debugInfo().connectionGeneration;
+      expect(f.sockets).toHaveLength(2);
+      release.resolve();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(f.sockets).toHaveLength(2);
+      expect(f.client.debugInfo().connectionGeneration).toBe(generation);
+    } finally {
+      release.resolve();
+      await f.client.closeAndWait();
+    }
   });
 
   it("prepares no WebSocket generation when explicitly closed during reconnect backoff", async () => {

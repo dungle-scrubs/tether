@@ -12,6 +12,7 @@ import { sessionEventType } from "./protocol.js";
 import {
   createReplayRestTaskClient,
   isRestParticipantReadTimeout,
+  isRestParticipantResourceLimit,
   type RestParticipantTaskClient,
   RestParticipantTaskError,
   type RestParticipantTaskClientConfig,
@@ -84,17 +85,21 @@ export function isTransientRestReplayFailure(error: unknown): error is RestParti
 }
 
 /** Normalizes bounded HTTP reads while preserving transport timeout provenance. */
-function replayReadFailure(error: unknown): never {
-  if (error instanceof RestParticipantTaskError && error.code === "RESOURCE_LIMIT") {
-    throw new ParticipantRestReplayError(
-      error.details.resourceLimit?.resource === "active_tasks"
-        ? "delivery_queue_overflow"
-        : "delivery_byte_overflow",
-      {
-        limit: error.details.resourceLimit?.limit ?? 0,
-        observed: error.details.resourceLimit?.observed ?? 0,
-      },
-    );
+function replayReadFailure(error: unknown, maxQueueBytes: number): never {
+  if (isRestParticipantResourceLimit(error)) {
+    const resource = error.details.resourceLimit;
+    switch (resource.resource) {
+      case "active_tasks":
+        throw new ParticipantRestReplayError("delivery_queue_overflow", {
+          maxQueueSize: resource.limit,
+          observedQueueSize: resource.observed,
+        });
+      case "response_bytes":
+        throw new ParticipantRestReplayError("delivery_byte_overflow", {
+          maxQueueBytes,
+          observedQueueBytes: resource.observed,
+        });
+    }
   }
   throw error;
 }
@@ -110,6 +115,8 @@ export class ParticipantRestReplay {
   private bootstrapping = true;
   private readonly waiters = new Set<() => void>();
   private readonly pageLimit: number;
+  /** Highest request size still admissible after a failure in this generation. */
+  private historyLimitCeiling: number;
 
   /** Binds replay to one generation's delivery state and existing resource limits. */
   constructor(
@@ -126,16 +133,13 @@ export class ParticipantRestReplay {
     this.wireSeq = options.afterSeq;
     // Leave room for the wire marker at the normal page boundary.
     this.pageLimit = Math.min(500, Math.max(1, options.maxQueueSize - 1));
-    this.rest = createReplayRestTaskClient(
-      options.config,
-      {},
-      {
-        maxBytes: options.maxQueueBytes + restResponseEnvelopeAllowance,
-        maxActiveTasks: options.maxQueueSize,
-        signal: this.controller.signal,
-        timeoutMs: options.timeoutMs,
-      },
-    );
+    this.historyLimitCeiling = this.pageLimit;
+    this.rest = createReplayRestTaskClient(options.config, {
+      maxBytes: options.maxQueueBytes + restResponseEnvelopeAllowance,
+      maxActiveTasks: options.maxQueueSize,
+      signal: this.controller.signal,
+      timeoutMs: options.timeoutMs,
+    });
   }
 
   /** Finds a witnessed head with probes bounded by the safe-integer sequence domain. */
@@ -186,7 +190,7 @@ export class ParticipantRestReplay {
         after,
         Math.min(historyLimit, head - after, Math.max(1, availableSlots)),
       );
-      historyLimit = Math.min(this.pageLimit, page.pagination.limit * 2);
+      historyLimit = Math.min(this.historyLimitCeiling, page.pagination.limit * 2);
       const events = page.events;
       if (
         events.length === 0 ||
@@ -260,7 +264,7 @@ export class ParticipantRestReplay {
   async loadActiveTasks(): Promise<readonly TaskRecord[]> {
     const snapshot = await this.rest
       .listActiveTasks(this.options.config.sessionId)
-      .catch(replayReadFailure);
+      .catch((error: unknown) => replayReadFailure(error, this.options.maxQueueBytes));
     this.assertActive();
     if (
       snapshot.invalidRowCount > 0 ||
@@ -310,6 +314,7 @@ export class ParticipantRestReplay {
           error instanceof ParticipantRestReplayError &&
           (error.reason === "delivery_byte_overflow" || error.reason === "delivery_queue_overflow");
         if ((!overflow && !isRestParticipantReadTimeout(error)) || limit === 1) throw error;
+        this.historyLimitCeiling = Math.min(this.historyLimitCeiling, limit - 1);
         limit = Math.max(1, Math.floor(limit / 2));
       }
     }
@@ -323,7 +328,7 @@ export class ParticipantRestReplay {
         after,
         limit,
       })
-      .catch(replayReadFailure);
+      .catch((error: unknown) => replayReadFailure(error, this.options.maxQueueBytes));
     this.assertActive();
     const { events, pagination } = page;
     if (
@@ -366,15 +371,15 @@ export class ParticipantRestReplay {
     const observedQueueSize = delivery.queueSize + this.held.length + items;
     if (observedQueueSize > this.options.maxQueueSize) {
       throw new ParticipantRestReplayError("delivery_queue_overflow", {
-        limit: this.options.maxQueueSize,
-        observed: observedQueueSize,
+        maxQueueSize: this.options.maxQueueSize,
+        observedQueueSize,
       });
     }
     const observedQueueBytes = delivery.queueBytes + this.heldBytes + bytes;
     if (observedQueueBytes > this.options.maxQueueBytes) {
       throw new ParticipantRestReplayError("delivery_byte_overflow", {
-        limit: this.options.maxQueueBytes,
-        observed: observedQueueBytes,
+        maxQueueBytes: this.options.maxQueueBytes,
+        observedQueueBytes,
       });
     }
   }
