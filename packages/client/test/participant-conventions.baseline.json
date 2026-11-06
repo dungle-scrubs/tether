@@ -1,0 +1,59 @@
+{
+  "../src/participant-rest-replay.ts": {
+    "declarations": []
+  },
+  "../src/participant-runtime-client.ts": {
+    "declarations": [
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"ClassDeclaration\",\"ParticipantRuntimeClient\",\"FunctionDeclaration:installRunParticipantRuntimeErrorHandler/Parameter:client\",\"ParticipantRuntimeClient\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"ClassDeclaration\",\"ParticipantRuntimeClient\",\"FunctionDeclaration:runParticipantRuntime/VariableDeclaration:client/PropertyAccessExpression:create\",\"ParticipantRuntimeClient.create\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"ClassDeclaration\",\"ParticipantRuntimeClient\",\"FunctionDeclaration:writeDefaultRuntimeError/Parameter:client\",\"ParticipantRuntimeClient\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"ClassDeclaration\",\"ParticipantRuntimeClient\",\"InterfaceDeclaration:RunParticipantRuntimeHooks/PropertySignature:onClientReady/Parameter:client\",\"ParticipantRuntimeClient\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"ClassDeclaration\",\"ParticipantRuntimeClient\",\"InterfaceDeclaration:RunParticipantRuntimeHooks/PropertySignature:onReplayComplete/Parameter:client\",\"ParticipantRuntimeClient\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"buildParticipantRuntimeStreamUrl\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:attachPreparedTransport/VariableDeclaration:socket\",\"buildParticipantRuntimeStreamUrl({ ...this.config, afterSeq, })\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"installRunParticipantRuntimeErrorHandler\",\"FunctionDeclaration:runParticipantRuntime/VariableDeclaration:unsubscribeError\",\"installRunParticipantRuntimeErrorHandler(client, input)\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"readCommandContext\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:buildCommandRequest/VariableDeclaration:commandContext\",\"readCommandContext(command, requestId)\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"readStringField\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:handleMessage/PropertyAssignment:op\",\"readStringField(envelope, \\\"command\\\")\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"readStringField\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:handleMessage/VariableDeclaration:taskId\",\"readStringField(envelope, \\\"taskId\\\")\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"readStringField\",\"FunctionDeclaration:readCommandContext/VariableDeclaration:taskId\",\"readStringField(command, \\\"taskId\\\")\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"reconnectDelayMs\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:buildReconnectWithBackoff\",\"reconnectDelayMs(attempt, this.config)\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"reconnectDelayMs\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:buildReconnectWithBackoff/VariableDeclaration:delayMs\",\"reconnectDelayMs(attempt, this.config)\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"reconnectDelayMs\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:recoverFromDeliveryFailure/VariableDeclaration:delayMs\",\"reconnectDelayMs(this.deliveryRecoveryAttempts - 1, this.config)\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"resolveCommandTimeoutMs\",\"ClassDeclaration:ParticipantRuntimeClient\",\"resolveCommandTimeoutMs(config.commandTimeoutMs)\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"resolvePositiveIntegerConfig\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:createCursorWriter/PropertyAssignment:retryAttempts/call:cursorPersist.retryAttempts\",\"resolvePositiveIntegerConfig( \\\"cursorPersist.retryAttempts\\\", this.config.cursorPersist?.retryAttempts, defaultCursorPersistRetryAttempts, )\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"resolvePositiveIntegerConfig\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:createCursorWriter/PropertyAssignment:retryBaseDelayMs/call:cursorPersist.retryBaseDelayMs\",\"resolvePositiveIntegerConfig( \\\"cursorPersist.retryBaseDelayMs\\\", this.config.cursorPersist?.retryBaseDelayMs, defaultCursorPersistRetryBaseDelayMs, )\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"resolvePositiveIntegerConfig\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:createCursorWriter/PropertyAssignment:retryMaxDelayMs/call:cursorPersist.retryMaxDelayMs\",\"resolvePositiveIntegerConfig( \\\"cursorPersist.retryMaxDelayMs\\\", this.config.cursorPersist?.retryMaxDelayMs, defaultCursorPersistRetryMaxDelayMs, )\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"resolvePositiveIntegerConfig\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:createCursorWriter/PropertyAssignment:writeTimeoutMs/call:cursorPersist.writeTimeoutMs\",\"resolvePositiveIntegerConfig( \\\"cursorPersist.writeTimeoutMs\\\", this.config.cursorPersist?.writeTimeoutMs, defaultCursorPersistWriteTimeoutMs, )\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"resolvePositiveIntegerConfig\",\"ClassDeclaration:ParticipantRuntimeClient/call:eventDelivery.handlerTimeoutMs\",\"resolvePositiveIntegerConfig( \\\"eventDelivery.handlerTimeoutMs\\\", config.eventDelivery?.handlerTimeoutMs, defaultParticipantHandlerTimeoutMs, )\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"resolvePositiveIntegerConfig\",\"ClassDeclaration:ParticipantRuntimeClient/call:eventDelivery.maxQueueBytes\",\"resolvePositiveIntegerConfig( \\\"eventDelivery.maxQueueBytes\\\", config.eventDelivery?.maxQueueBytes, defaultParticipantMaxQueueBytes, )\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"resolvePositiveIntegerConfig\",\"ClassDeclaration:ParticipantRuntimeClient/call:eventDelivery.maxQueueSize\",\"resolvePositiveIntegerConfig( \\\"eventDelivery.maxQueueSize\\\", config.eventDelivery?.maxQueueSize, defaultParticipantMaxQueueSize, )\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"resolvePositiveIntegerConfig\",\"ClassDeclaration:ParticipantRuntimeClient/call:eventDelivery.maxRecoveryAttempts\",\"resolvePositiveIntegerConfig( \\\"eventDelivery.maxRecoveryAttempts\\\", config.eventDelivery?.maxRecoveryAttempts, defaultParticipantMaxRecoveryAttempts, )\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"resolvePositiveIntegerConfig\",\"ClassDeclaration:ParticipantRuntimeClient/call:shutdownTimeoutMs\",\"resolvePositiveIntegerConfig( \\\"shutdownTimeoutMs\\\", config.shutdownTimeoutMs, defaultParticipantShutdownTimeoutMs, )\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"resolveResumeSeq\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:resolveInitialResumeSeq\",\"resolveResumeSeq(this.config.afterSeq, stored)\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"shouldClaimParticipantTask\",\"FunctionDeclaration:runParticipantRuntime/VariableDeclaration:claimableTasks/PropertyAssignment:shouldClaimTask\",\"shouldClaimParticipantTask(task, input.workKinds, input.participantId)\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"withShutdownTimeout\",\"ClassDeclaration:ParticipantRuntimeClient/MethodDeclaration:closeAndWait/VariableDeclaration:shutdown\",\"withShutdownTimeout(settlement, { pendingPhases, timeoutMs: this.shutdownTimeoutMs, })\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"FunctionDeclaration\",\"writeDefaultRuntimeError\",\"FunctionDeclaration:installRunParticipantRuntimeErrorHandler/VariableDeclaration:handler\",\"writeDefaultRuntimeError(error, client, input)\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"MethodDeclaration\",\"create\",\"FunctionDeclaration:runParticipantRuntime/VariableDeclaration:client/PropertyAccessExpression:create\",\"ParticipantRuntimeClient.create\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"MethodDeclaration\",\"debugInfo\",\"FunctionDeclaration:writeDefaultRuntimeError/VariableDeclaration:debug/PropertyAccessExpression:debugInfo\",\"client.debugInfo\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"MethodDeclaration\",\"onError\",\"FunctionDeclaration:installRunParticipantRuntimeErrorHandler/PropertyAccessExpression:onError\",\"client.onError\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"TypeAliasDeclaration\",\"ParticipantRuntimePausedReason\",\"ClassDeclaration:ParticipantRuntimeTerminalStreamError/Parameter:input/PropertySignature:reason\",\"ParticipantRuntimePausedReason\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"TypeAliasDeclaration\",\"ParticipantRuntimePausedReason\",\"ClassDeclaration:ParticipantRuntimeTerminalStreamError/PropertyDeclaration:reason\",\"ParticipantRuntimePausedReason\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"TypeAliasDeclaration\",\"ParticipantRuntimeShutdownPhase\",\"ClassDeclaration:ParticipantRuntimeShutdownError/Parameter:input/PropertySignature:pendingPhases\",\"ParticipantRuntimeShutdownPhase\"]#1",
+      "[\"packages/client/src/participant-runtime-client.ts\",\"declaration-order\",\"TypeAliasDeclaration\",\"ParticipantRuntimeShutdownPhase\",\"ClassDeclaration:ParticipantRuntimeShutdownError/PropertyDeclaration:pendingPhases\",\"ParticipantRuntimeShutdownPhase\"]#1"
+    ]
+  },
+  "../src/participant-claimable-task-runner.ts": {
+    "declarations": []
+  },
+  "../src/rest-participant-task-client.ts": {
+    "declarations": []
+  },
+  "./participant-runtime-client.test.ts": {
+    "declarations": []
+  },
+  "./rest-participant-task-client.test.ts": {
+    "declarations": []
+  },
+  "./participant-rest-replay-style.test.ts": {
+    "declarations": []
+  }
+}

@@ -3,14 +3,15 @@ import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
+/** Files whose convention identities are ratcheted by the client test command. */
 const checkedModules = [
-  { path: "../src/participant-rest-replay.ts", declarationBaseline: 0, documentationBaseline: 0 },
-  // Incremental baseline measured at pre-feature commit 085c182, not a waiver for new helpers.
-  {
-    path: "./participant-runtime-client.test.ts",
-    declarationBaseline: 27,
-    documentationBaseline: 8,
-  },
+  "../src/participant-rest-replay.ts",
+  "../src/participant-runtime-client.ts",
+  "../src/participant-claimable-task-runner.ts",
+  "../src/rest-participant-task-client.ts",
+  "./participant-runtime-client.test.ts",
+  "./rest-participant-task-client.test.ts",
+  "./participant-rest-replay-style.test.ts",
 ];
 
 /** Finds the module-level declaration containing a node. */
@@ -26,7 +27,27 @@ function visit(node: ts.Node, check: (node: ts.Node) => void): void {
   ts.forEachChild(node, (child) => visit(child, check));
 }
 
-/** Resolves symbols in one source file, including archived source supplied by correction proofs. */
+/** Identifies enclosing declarations and literal test titles without unstable line numbers. */
+function findingScope(node: ts.Node, source: ts.SourceFile): string {
+  const owners: string[] = [];
+  let current: ts.Node | undefined = node;
+  while (current && current !== source) {
+    if ("name" in current && current.name && ts.isIdentifier(current.name as ts.Node)) {
+      owners.unshift(`${ts.SyntaxKind[current.kind]}:${(current.name as ts.Identifier).text}`);
+    } else if (
+      ts.isCallExpression(current) &&
+      current.arguments[0] &&
+      (ts.isStringLiteral(current.arguments[0]) ||
+        ts.isNoSubstitutionTemplateLiteral(current.arguments[0]))
+    ) {
+      owners.unshift(`call:${current.arguments[0].text}`);
+    }
+    current = current.parent;
+  }
+  return owners.join("/");
+}
+
+/** Resolves exact finding identities, preserving every reference to an already-listed name. */
 function analyzeModule(path: string, text = readFileSync(path, "utf8")) {
   const options = { noLib: true, noResolve: true };
   const host = ts.createCompilerHost(options);
@@ -39,8 +60,10 @@ function analyzeModule(path: string, text = readFileSync(path, "utf8")) {
   const positions = new Map<ts.Node, number>(
     source.statements.map((statement, index) => [statement, index]),
   );
-  const declarations = new Set<string>();
+  const file = path.slice(path.lastIndexOf("packages/client/"));
+  const declarations: string[] = [];
   const documentation: string[] = [];
+  const occurrences = new Map<string, number>();
   visit(source, (node) => {
     if (ts.isIdentifier(node)) {
       const declaration = checker
@@ -50,7 +73,17 @@ function analyzeModule(path: string, text = readFileSync(path, "utf8")) {
         const declaredAt = positions.get(moduleStatement(declaration, source));
         const usedAt = positions.get(moduleStatement(node, source));
         if (declaredAt !== undefined && usedAt !== undefined && declaredAt > usedAt) {
-          declarations.add(`Declare ${node.text} before the module declaration that uses it`);
+          const site = JSON.stringify([
+            file,
+            "declaration-order",
+            ts.SyntaxKind[declaration.kind],
+            node.text,
+            findingScope(node.parent, source),
+            node.parent.getText(source).replace(/\s+/gu, " "),
+          ]);
+          const occurrence = (occurrences.get(site) ?? 0) + 1;
+          occurrences.set(site, occurrence);
+          declarations.push(`${site}#${occurrence}`);
         }
       }
     }
@@ -63,27 +96,44 @@ function analyzeModule(path: string, text = readFileSync(path, "utf8")) {
       node.body &&
       ts.getJSDocCommentsAndTags(node).length === 0
     ) {
-      documentation.push(`Add JSDoc to ${node.name?.getText(source) ?? "constructor"}`);
+      documentation.push(
+        JSON.stringify([
+          file,
+          "jsdoc",
+          ts.SyntaxKind[node.kind],
+          node.name?.getText(source) ?? "constructor",
+          findingScope(node, source),
+        ]),
+      );
     }
   });
-  return { declarations: [...declarations], documentation };
+  return { declarations: declarations.sort(), documentation: documentation.sort() };
 }
+
+/** Exact legacy identities only; fixing a violation must remove its baseline entry. */
+const baseline = JSON.parse(
+  readFileSync(new URL("./participant-conventions.baseline.json", import.meta.url), "utf8"),
+) as Record<string, { readonly declarations: readonly string[] }>;
 
 describe("REST replay module conventions", () => {
   for (const module of checkedModules) {
-    const path = fileURLToPath(new URL(module.path, import.meta.url));
-    it(`${module.path} declares module dependencies before use`, () => {
-      const findings = analyzeModule(path).declarations;
+    const path = fileURLToPath(new URL(module, import.meta.url));
+    it(`${module} declares module dependencies before use`, () => {
       expect(
-        findings.length,
-        `${findings.join("\n")}\nMove dependencies above first use; do not increase the pre-feature baseline.`,
-      ).toBeLessThanOrEqual(module.declarationBaseline);
+        analyzeModule(path).declarations,
+        "Move each dependency above every referencing declaration. Remove fixed identities from the baseline; never replace them with new violations.",
+      ).toEqual(baseline[module]?.declarations ?? []);
     });
+  }
+  for (const module of [
+    { path: "../src/participant-rest-replay.ts", documentationBaseline: 0 },
+    { path: "./participant-runtime-client.test.ts", documentationBaseline: 8 },
+  ]) {
     it(`${module.path} documents named functions and methods`, () => {
-      const findings = analyzeModule(path).documentation;
+      const path = fileURLToPath(new URL(module.path, import.meta.url));
       expect(
-        findings.length,
-        `${findings.join("\n")}\nAdd JSDoc to new named declarations; do not increase the pre-feature baseline.`,
+        analyzeModule(path).documentation.length,
+        "Add JSDoc to named declarations.",
       ).toBeLessThanOrEqual(module.documentationBaseline);
     });
   }

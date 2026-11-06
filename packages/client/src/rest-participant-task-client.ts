@@ -230,6 +230,36 @@ async function readJsonBody(
   }
 }
 
+/** Parses one task-or-null response body with the shared protocol schema. */
+function parseTask(
+  body: unknown,
+  error: (code: RestParticipantTaskErrorCode, operation: TaskOperation) => Error,
+  operation: TaskOperation,
+): TaskRecord | null {
+  if (body === null) {
+    return null;
+  }
+  const parsed = taskRecordSchema.safeParse(body);
+  if (!parsed.success) {
+    throw error("INVALID_RESPONSE", operation);
+  }
+  return parsed.data;
+}
+
+/** Maps public HTTP status to a bounded client failure. */
+function mapTaskServerError(status: number): RestParticipantTaskErrorCode {
+  if (status === 401 || status === 403) {
+    return "AUTHENTICATION";
+  }
+  if (status === 404) {
+    return "NOT_FOUND";
+  }
+  if (status === 409) {
+    return "CLAIM_CONFLICT";
+  }
+  return status >= 500 ? "PERSISTENCE" : "INVALID_RESPONSE";
+}
+
 /** Reusable REST task-route client for one participant identity. */
 export class RestParticipantTaskClient {
   readonly #authToken: string | null;
@@ -597,34 +627,4 @@ export class RestParticipantTaskClient {
       () => ({ outcome: "done" }),
     );
   }
-}
-
-/** Parses one task-or-null response body with the shared protocol schema. */
-function parseTask(
-  body: unknown,
-  error: (code: RestParticipantTaskErrorCode, operation: TaskOperation) => Error,
-  operation: TaskOperation,
-): TaskRecord | null {
-  if (body === null) {
-    return null;
-  }
-  const parsed = taskRecordSchema.safeParse(body);
-  if (!parsed.success) {
-    throw error("INVALID_RESPONSE", operation);
-  }
-  return parsed.data;
-}
-
-/** Maps public HTTP status to a bounded client failure. */
-function mapTaskServerError(status: number): RestParticipantTaskErrorCode {
-  if (status === 401 || status === 403) {
-    return "AUTHENTICATION";
-  }
-  if (status === 404) {
-    return "NOT_FOUND";
-  }
-  if (status === 409) {
-    return "CLAIM_CONFLICT";
-  }
-  return status >= 500 ? "PERSISTENCE" : "INVALID_RESPONSE";
 }

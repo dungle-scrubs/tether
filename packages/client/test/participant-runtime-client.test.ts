@@ -137,6 +137,14 @@ const baseConfig: ParticipantRuntimeClientConfig = {
   sessionId: "sess_runtime_client",
 };
 
+/** Creates a task executor that can trigger an optional side effect before completing. */
+function createExecutor(beforeReturn: () => void = () => undefined): ParticipantTaskExecutor {
+  return async () => {
+    beforeReturn();
+    return { result: { ok: true } };
+  };
+}
+
 /** Runs the high-level participant helper against the current connect mock. */
 async function runParticipantRuntimeForTest(
   options: RunParticipantRuntimeForTestOptions,
@@ -241,6 +249,508 @@ const otherTask: TaskRecord = {
   objective: "Handle a second task",
   taskId: "task_runtime_client_other",
 };
+
+/** Builds a private ParticipantRuntimeClient test double for task-flow tests. */
+function createRuntimeClientFixture(
+  options: {
+    readonly afterAppend?: (appendCount: number) => void;
+    readonly afterClaim?: () => void;
+    readonly appendEvent?: () => Promise<void>;
+    readonly claimTask?: () => Promise<TaskRecord | null>;
+    readonly completeTask?: () => Promise<void>;
+    readonly controlEpoch?: number;
+    readonly lastHandledSeq?: number;
+    readonly recentEvents?: readonly SessionEvent[];
+  } = {},
+): RuntimeClientFixture {
+  let appendCount = 0;
+  let claimedTask: TaskRecord | null = {
+    ...baseTask,
+    claimExpiresAt: "2099-06-05T00:00:30.000Z",
+  };
+  let refreshTaskClaim = async (): Promise<TaskRecord | null> => baseTask;
+  const actions: string[] = [];
+  const diagnostics: string[] = [];
+  const failures: Record<string, unknown>[] = [];
+  const client = Object.assign(Object.create(ParticipantRuntimeClient.prototype), {
+    appendEvent: async () => {
+      appendCount += 1;
+      actions.push("append");
+      options.afterAppend?.(appendCount);
+      await options.appendEvent?.();
+    },
+    claimTask: async () => {
+      actions.push("claim");
+      options.afterClaim?.();
+      if (options.claimTask) {
+        return options.claimTask();
+      }
+      return claimedTask;
+    },
+    completeTask: async () => {
+      actions.push("complete");
+      await options.completeTask?.();
+    },
+    config: baseConfig,
+    currentControlEpoch: options.controlEpoch ?? null,
+    failTask: async (_taskId: string, failure: Record<string, unknown>) => {
+      actions.push("fail");
+      failures.push(failure);
+    },
+    observability: {
+      debug: (_boundary: string, message: string) => {
+        diagnostics.push(message);
+      },
+      traceBoundary: async <TValue>(
+        _operation: string,
+        _input: Record<string, unknown>,
+        action: () => Promise<TValue>,
+      ) => action(),
+    },
+    lastHandledSeq: options.lastHandledSeq ?? Number.MAX_SAFE_INTEGER,
+    recentEvents: [...(options.recentEvents ?? [])],
+    refreshTaskClaim: async () => {
+      return refreshTaskClaim();
+    },
+  }) as unknown as ParticipantRuntimeClient;
+
+  return {
+    actions,
+    client,
+    diagnostics,
+    failures,
+    setClaimedTask: (task) => {
+      claimedTask = task;
+    },
+    setRefreshTaskClaim: (nextRefreshTaskClaim) => {
+      refreshTaskClaim = nextRefreshTaskClaim;
+    },
+  };
+}
+
+/** Creates a mutable cancellation context matching the runtime flow contract. */
+function createCancellationFixture(
+  options: { readonly cancelled?: boolean } = {},
+): CancellationFixture {
+  let cancelled = options.cancelled ?? false;
+  const controller = new AbortController();
+  const setCancelled = (): void => {
+    cancelled = true;
+    controller.abort();
+  };
+  return {
+    abortActive: setCancelled,
+    cancellation: {
+      abortActive: setCancelled,
+      isCancelled: () => cancelled,
+      signal: controller.signal,
+    },
+    setCancelled,
+    signal: controller.signal,
+  };
+}
+
+/** Keeps task execution active until the task cancellation signal is aborted. */
+async function waitForAbortExecutor(context: { readonly signal: AbortSignal }): Promise<{
+  readonly result: Record<string, unknown>;
+}> {
+  if (!context.signal.aborted) {
+    await new Promise<void>((resolve) => {
+      context.signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+  }
+  return { result: { ok: false } };
+}
+
+/** Builds a claimable task-created session event fixture. */
+function createTaskCreatedEvent(task: TaskRecord, seq: number): SessionEvent {
+  return {
+    createdAt: "2026-06-05T00:00:00.000Z",
+    eventId: `evt_task_created_${seq}`,
+    payload: { task },
+    producerId: "tether",
+    seq,
+    sessionId: task.sessionId,
+    type: "task.created",
+  };
+}
+
+/** Builds an approval event used to guard awaited private projection commits. */
+function createApprovalRecordedEvent(seq: number): SessionEvent {
+  return {
+    createdAt: "2026-06-05T00:00:00.000Z",
+    eventId: `evt_approval_recorded_${seq}`,
+    payload: { approvalId: `approval_${seq}` },
+    producerId: "tether",
+    seq,
+    sessionId: baseTask.sessionId,
+    type: "approval.recorded",
+  };
+}
+
+/** Builds a claimable task-released session event fixture. */
+function createTaskReleasedEvent(task: TaskRecord, seq: number): SessionEvent {
+  return {
+    createdAt: "2026-06-05T00:00:00.000Z",
+    eventId: `evt_task_released_${seq}`,
+    payload: { participantId: "part_runtime_client", task },
+    producerId: "tether",
+    seq,
+    sessionId: task.sessionId,
+    type: "task.released",
+  };
+}
+
+interface Deferred<TValue> {
+  readonly promise: Promise<TValue>;
+  readonly resolve: (value?: TValue | PromiseLike<TValue>) => void;
+}
+
+interface RejectableDeferred<TValue> extends Deferred<TValue> {
+  readonly reject: (error: Error) => void;
+}
+
+function createRejectableDeferred<TValue>(): RejectableDeferred<TValue> {
+  let reject: (error: Error) => void = () => undefined;
+  let resolve: (value: TValue | PromiseLike<TValue>) => void = () => undefined;
+  const promise = new Promise<TValue>((promiseResolve, promiseReject) => {
+    reject = promiseReject;
+    resolve = promiseResolve;
+  });
+  return { promise, reject, resolve };
+}
+
+/** Creates a manually controlled promise for async loop tests. */
+function createDeferred<TValue>(): Deferred<TValue> {
+  let resolve: (value: TValue | PromiseLike<TValue>) => void = () => undefined;
+  const promise = new Promise<TValue>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
+}
+
+/** Builds a task-loop client fixture with controllable replay and close promises. */
+function createTaskLoopFixture(
+  options: { readonly runTaskClaimFlow?: (input: RunTaskClaimFlowInput) => Promise<void> } = {},
+): TaskLoopFixture {
+  const actions: string[] = [];
+  const handlers = new Set<(event: SessionEvent) => void>();
+  let replay = createRejectableDeferred<void>();
+  replay.promise.catch(() => undefined);
+  let close = createDeferred<void>();
+  let supersededClose: ReturnType<typeof createDeferred<void>> | null = null;
+  let replacementInProgress = false;
+  let reconnectAttempts = 0;
+  const client = Object.assign(Object.create(ParticipantRuntimeClient.prototype), {
+    close: () => {
+      client.stopped = true;
+      actions.push("close");
+    },
+    connectionGeneration: 1,
+    onEvent: (handler: (event: SessionEvent) => void) => {
+      handlers.add(handler);
+      return () => {
+        handlers.delete(handler);
+        actions.push("unsubscribe");
+      };
+    },
+    pausedReason: null,
+    reconnectWithBackoff: async () => {
+      reconnectAttempts += 1;
+      actions.push("reconnect");
+      if (replacementInProgress) {
+        replacementInProgress = false;
+        return;
+      }
+      client.connectionGeneration += 1;
+      replay = createRejectableDeferred<void>();
+      replay.promise.catch(() => undefined);
+      close = createDeferred<void>();
+    },
+    runTaskClaimFlow: async (input: RunTaskClaimFlowInput) => {
+      if (options.runTaskClaimFlow) {
+        await options.runTaskClaimFlow(input);
+        return;
+      }
+      actions.push(`task:${input.task.taskId}`);
+    },
+    waitForClose: async () => close.promise,
+    waitForReplayComplete: async () => replay.promise,
+    stopped: false,
+  }) as unknown as ParticipantRuntimeClient & {
+    connectionGeneration: number;
+    stopped: boolean;
+  };
+
+  return {
+    actions,
+    beginReplacementBeforeClose: () => {
+      supersededClose = close;
+      replacementInProgress = true;
+      client.connectionGeneration += 1;
+      replay = createRejectableDeferred<void>();
+      replay.promise.catch(() => undefined);
+      close = createDeferred<void>();
+    },
+    client,
+    closeSupersededTransport: () => supersededClose?.resolve(),
+    closeTransport: () => close.resolve(),
+    completeReplay: () => replay.resolve(),
+    emit: (event) => {
+      for (const handler of handlers) {
+        handler(event);
+      }
+    },
+    failReplay: (error) => replay.reject(error),
+    reconnectAttempts: () => reconnectAttempts,
+  };
+}
+
+/** Builds a durable-cursor fixture around private client persistence methods. */
+function createCursorFixture(
+  options: {
+    readonly afterSeq?: number;
+    readonly cursorStore?: ParticipantRuntimeCursorStore;
+    readonly eventCount?: number;
+    readonly intervalMs?: number;
+    readonly stored?: number | null;
+    readonly withHandler?: boolean;
+    readonly withStore?: boolean;
+  } = {},
+): CursorFixture {
+  const writes: number[] = [];
+  const errors: Error[] = [];
+  const afterSeq = options.afterSeq ?? 0;
+  const withStore = options.withStore ?? true;
+  const withHandler = options.withHandler ?? true;
+  const replay = createRejectableDeferred<void>();
+  replay.promise.catch(() => undefined);
+  const cursorStore =
+    options.cursorStore ??
+    (withStore
+      ? ({
+          read: () => options.stored ?? null,
+          write: (seq: number) => {
+            writes.push(seq);
+          },
+        } satisfies ParticipantRuntimeCursorStore)
+      : undefined);
+  const eventHandlers = new Set<(event: SessionEvent) => void>();
+  if (withHandler) {
+    eventHandlers.add(() => undefined);
+  }
+  const cursorWriter = new ParticipantCursorWriter({
+    acknowledgedSeq: afterSeq,
+    onError: (error) => errors.push(error),
+    retryAttempts: 1,
+    retryBaseDelayMs: 100,
+    retryMaxDelayMs: 2_000,
+    ...(cursorStore === undefined ? {} : { store: cursorStore }),
+    writeTimeoutMs: 5_000,
+  });
+  const client = Object.assign(Object.create(ParticipantRuntimeClient.prototype), {
+    config: { ...baseConfig, afterSeq, cursorStore },
+    connectionGeneration: 0,
+    currentControlEpoch: null,
+    cursorPersistEventCount: options.eventCount ?? 50,
+    cursorPersistIntervalMs: options.intervalMs ?? 1_000,
+    cursorPersistTimer: null,
+    cursorWriter,
+    deliveryUnsubscribers: new Map(),
+    deliveryFailureCount: 0,
+    deliveryRecoveryAttempts: 0,
+    deliveryRecoverySeq: null,
+    errorBacklog: [],
+    errorHandlers: new Set<(error: Error) => void>([(error) => errors.push(error)]),
+    eventBacklog: [],
+    eventHandlers,
+    eventsSinceCursorPersist: 0,
+    lastHandledSeq: afterSeq,
+    lastPersistedSeq: afterSeq,
+    handlerTimeoutMs: 30_000,
+    maxDeliveryQueueBytes: 16 * 1024 * 1024,
+    maxDeliveryQueueSize: 2_000,
+    maxRecoveryAttempts: 5,
+    observability: {
+      debug: () => undefined,
+      debugInfo: () => ({}),
+    },
+    pendingCommands: new Map(),
+    pausedReason: null,
+    reconnectFailureCount: 0,
+    reconnectPromise: null,
+    reconnectSuccessCount: 0,
+    recoveryCount: 0,
+    rejectReplayComplete: replay.reject,
+    replayComplete: replay.promise,
+    replayCompleteSettled: false,
+    recentEvents: [],
+    resolveReplayComplete: replay.resolve,
+    socket: null,
+    stopped: true,
+  }) as PrivateCursorRuntimeClient;
+  client.replaceDelivery(afterSeq);
+  return { client, errors, writes };
+}
+
+/** Feeds one observed event envelope through the private message handler. */
+function emitCursorEvent(client: PrivateCursorRuntimeClient, seq: number): void {
+  client.handleMessage(
+    JSON.stringify({ event: createTaskCreatedEvent(baseTask, seq), op: "event" }),
+  );
+}
+
+/** Builds a command-correlation fixture around private client methods. */
+function createCommandFixture(
+  options: { readonly commandTimeoutMs?: number; readonly send?: (encoded: string) => void } = {},
+): CommandFixture {
+  const sentMessages: Record<string, unknown>[] = [];
+  const client = Object.assign(Object.create(ParticipantRuntimeClient.prototype), {
+    commandTimeoutMs: options.commandTimeoutMs ?? 15_000,
+    config: { ...baseConfig, commandTimeoutMs: options.commandTimeoutMs ?? 15_000 },
+    cursorWriter: {
+      debugInfo: () => ({
+        acknowledgedSeq: 0,
+        failureCount: 0,
+        inFlightSeq: null,
+        pendingSeq: null,
+      }),
+    },
+    delivery: {
+      debugInfo: () => ({
+        activeDeliverySeq: null,
+        draining: false,
+        halted: false,
+        handlerCount: 0,
+        lastHandledSeq: 0,
+        lastReceivedSeq: 0,
+        queueSize: 0,
+      }),
+    },
+    eventBacklog: [],
+    eventHandlers: new Set<(event: SessionEvent) => void>(),
+    lastObservedSeq: 0,
+    observability: {
+      debugInfo: () => ({}),
+    },
+    pendingCommands: new Map(),
+    reconnectFailureCount: 0,
+    reconnectSuccessCount: 0,
+    requireOpenSocket: () => ({
+      send: (encoded: string) => {
+        if (options.send) {
+          options.send(encoded);
+          return;
+        }
+        sentMessages.push(JSON.parse(encoded) as Record<string, unknown>);
+      },
+    }),
+    resolveReplayComplete: () => undefined,
+    socket: null,
+    stopped: false,
+  }) as PrivateCommandRuntimeClient;
+  return { client, sentMessages };
+}
+
+/** Lets queued Promise continuations settle without depending on timer state. */
+async function flushMicrotasks(iterations = 50): Promise<void> {
+  for (let index = 0; index < iterations; index += 1) {
+    await Promise.resolve();
+  }
+}
+
+/** Waits for async state changes without relying on real or fake timer mode. */
+async function waitForMicrotasks(predicate: () => boolean, iterations = 100): Promise<void> {
+  for (let index = 0; index < iterations; index += 1) {
+    if (predicate()) {
+      return;
+    }
+    await Promise.resolve();
+  }
+  throw new Error("Timed out waiting for microtask condition");
+}
+
+/** Reads a generated WebSocket request id from a sent command fixture. */
+function readRequestId(message: Record<string, unknown> | undefined): string {
+  const requestId = message?.requestId;
+  if (typeof requestId !== "string") {
+    throw new Error("Expected command request id");
+  }
+  return requestId;
+}
+
+/** In-memory participant WebSocket with controllable server frames and closure. */
+class ParticipantFakeWebSocket extends EventEmitter {
+  deferClose = false;
+  readyState = WebSocket.CONNECTING;
+  readonly sent: string[] = [];
+
+  constructor(readonly url: string) {
+    super();
+    queueMicrotask(() => {
+      this.readyState = WebSocket.OPEN;
+      this.emit("open");
+    });
+  }
+
+  close(): void {
+    if (this.deferClose) {
+      this.readyState = WebSocket.CLOSING;
+      return;
+    }
+    this.emitClose();
+  }
+
+  emitClose(): void {
+    this.readyState = WebSocket.CLOSED;
+    this.emit("close");
+  }
+
+  emitReplayComplete(): void {
+    this.emit("message", JSON.stringify({ op: "replay.complete" }));
+  }
+
+  emitServerEvent(event: SessionEvent): void {
+    this.emit("message", JSON.stringify({ event, op: "event" }));
+  }
+
+  send(data: string): void {
+    this.sent.push(data);
+    this.emit("client-command", data);
+  }
+
+  terminate(): void {
+    this.close();
+  }
+}
+
+/** Creates participant fake sockets while preserving the public factory type. */
+function createParticipantWebSocketFactory(
+  sockets: ParticipantFakeWebSocket[],
+): ParticipantRuntimeWebSocketFactory {
+  return (url) => {
+    const socket = new ParticipantFakeWebSocket(url);
+    sockets.push(socket);
+    return socket as unknown as WebSocket;
+  };
+}
+
+/** Allows already-queued promise continuations to run. */
+async function flushPromises(): Promise<void> {
+  await Promise.resolve();
+}
+
+/** Waits for one synchronous condition. */
+async function waitFor(predicate: () => boolean): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < 1_000) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  throw new Error("Timed out waiting for condition");
+}
 
 describe("ParticipantRuntimeClient auth token", () => {
   it("opens participant transport through an injected WebSocket factory", async () => {
@@ -4431,513 +4941,3 @@ describe("ParticipantRuntimeClient durable cursor", () => {
     await expect(fixture.client.resolveInitialResumeSeq()).resolves.toBe(9_550);
   });
 });
-
-/** Builds a private ParticipantRuntimeClient test double for task-flow tests. */
-function createRuntimeClientFixture(
-  options: {
-    readonly afterAppend?: (appendCount: number) => void;
-    readonly afterClaim?: () => void;
-    readonly appendEvent?: () => Promise<void>;
-    readonly claimTask?: () => Promise<TaskRecord | null>;
-    readonly completeTask?: () => Promise<void>;
-    readonly controlEpoch?: number;
-    readonly lastHandledSeq?: number;
-    readonly recentEvents?: readonly SessionEvent[];
-  } = {},
-): RuntimeClientFixture {
-  let appendCount = 0;
-  let claimedTask: TaskRecord | null = {
-    ...baseTask,
-    claimExpiresAt: "2099-06-05T00:00:30.000Z",
-  };
-  let refreshTaskClaim = async (): Promise<TaskRecord | null> => baseTask;
-  const actions: string[] = [];
-  const diagnostics: string[] = [];
-  const failures: Record<string, unknown>[] = [];
-  const client = Object.assign(Object.create(ParticipantRuntimeClient.prototype), {
-    appendEvent: async () => {
-      appendCount += 1;
-      actions.push("append");
-      options.afterAppend?.(appendCount);
-      await options.appendEvent?.();
-    },
-    claimTask: async () => {
-      actions.push("claim");
-      options.afterClaim?.();
-      if (options.claimTask) {
-        return options.claimTask();
-      }
-      return claimedTask;
-    },
-    completeTask: async () => {
-      actions.push("complete");
-      await options.completeTask?.();
-    },
-    config: baseConfig,
-    currentControlEpoch: options.controlEpoch ?? null,
-    failTask: async (_taskId: string, failure: Record<string, unknown>) => {
-      actions.push("fail");
-      failures.push(failure);
-    },
-    observability: {
-      debug: (_boundary: string, message: string) => {
-        diagnostics.push(message);
-      },
-      traceBoundary: async <TValue>(
-        _operation: string,
-        _input: Record<string, unknown>,
-        action: () => Promise<TValue>,
-      ) => action(),
-    },
-    lastHandledSeq: options.lastHandledSeq ?? Number.MAX_SAFE_INTEGER,
-    recentEvents: [...(options.recentEvents ?? [])],
-    refreshTaskClaim: async () => {
-      return refreshTaskClaim();
-    },
-  }) as unknown as ParticipantRuntimeClient;
-
-  return {
-    actions,
-    client,
-    diagnostics,
-    failures,
-    setClaimedTask: (task) => {
-      claimedTask = task;
-    },
-    setRefreshTaskClaim: (nextRefreshTaskClaim) => {
-      refreshTaskClaim = nextRefreshTaskClaim;
-    },
-  };
-}
-
-/** Creates a mutable cancellation context matching the runtime flow contract. */
-function createCancellationFixture(
-  options: { readonly cancelled?: boolean } = {},
-): CancellationFixture {
-  let cancelled = options.cancelled ?? false;
-  const controller = new AbortController();
-  const setCancelled = (): void => {
-    cancelled = true;
-    controller.abort();
-  };
-  return {
-    abortActive: setCancelled,
-    cancellation: {
-      abortActive: setCancelled,
-      isCancelled: () => cancelled,
-      signal: controller.signal,
-    },
-    setCancelled,
-    signal: controller.signal,
-  };
-}
-
-/** Creates a task executor that can trigger an optional side effect before completing. */
-function createExecutor(beforeReturn: () => void = () => undefined): ParticipantTaskExecutor {
-  return async () => {
-    beforeReturn();
-    return { result: { ok: true } };
-  };
-}
-
-/** Keeps task execution active until the task cancellation signal is aborted. */
-async function waitForAbortExecutor(context: { readonly signal: AbortSignal }): Promise<{
-  readonly result: Record<string, unknown>;
-}> {
-  if (!context.signal.aborted) {
-    await new Promise<void>((resolve) => {
-      context.signal.addEventListener("abort", () => resolve(), { once: true });
-    });
-  }
-  return { result: { ok: false } };
-}
-
-/** Builds a claimable task-created session event fixture. */
-function createTaskCreatedEvent(task: TaskRecord, seq: number): SessionEvent {
-  return {
-    createdAt: "2026-06-05T00:00:00.000Z",
-    eventId: `evt_task_created_${seq}`,
-    payload: { task },
-    producerId: "tether",
-    seq,
-    sessionId: task.sessionId,
-    type: "task.created",
-  };
-}
-
-/** Builds an approval event used to guard awaited private projection commits. */
-function createApprovalRecordedEvent(seq: number): SessionEvent {
-  return {
-    createdAt: "2026-06-05T00:00:00.000Z",
-    eventId: `evt_approval_recorded_${seq}`,
-    payload: { approvalId: `approval_${seq}` },
-    producerId: "tether",
-    seq,
-    sessionId: baseTask.sessionId,
-    type: "approval.recorded",
-  };
-}
-
-/** Builds a claimable task-released session event fixture. */
-function createTaskReleasedEvent(task: TaskRecord, seq: number): SessionEvent {
-  return {
-    createdAt: "2026-06-05T00:00:00.000Z",
-    eventId: `evt_task_released_${seq}`,
-    payload: { participantId: "part_runtime_client", task },
-    producerId: "tether",
-    seq,
-    sessionId: task.sessionId,
-    type: "task.released",
-  };
-}
-
-/** Builds a task-loop client fixture with controllable replay and close promises. */
-function createTaskLoopFixture(
-  options: { readonly runTaskClaimFlow?: (input: RunTaskClaimFlowInput) => Promise<void> } = {},
-): TaskLoopFixture {
-  const actions: string[] = [];
-  const handlers = new Set<(event: SessionEvent) => void>();
-  let replay = createRejectableDeferred<void>();
-  replay.promise.catch(() => undefined);
-  let close = createDeferred<void>();
-  let supersededClose: ReturnType<typeof createDeferred<void>> | null = null;
-  let replacementInProgress = false;
-  let reconnectAttempts = 0;
-  const client = Object.assign(Object.create(ParticipantRuntimeClient.prototype), {
-    close: () => {
-      client.stopped = true;
-      actions.push("close");
-    },
-    connectionGeneration: 1,
-    onEvent: (handler: (event: SessionEvent) => void) => {
-      handlers.add(handler);
-      return () => {
-        handlers.delete(handler);
-        actions.push("unsubscribe");
-      };
-    },
-    pausedReason: null,
-    reconnectWithBackoff: async () => {
-      reconnectAttempts += 1;
-      actions.push("reconnect");
-      if (replacementInProgress) {
-        replacementInProgress = false;
-        return;
-      }
-      client.connectionGeneration += 1;
-      replay = createRejectableDeferred<void>();
-      replay.promise.catch(() => undefined);
-      close = createDeferred<void>();
-    },
-    runTaskClaimFlow: async (input: RunTaskClaimFlowInput) => {
-      if (options.runTaskClaimFlow) {
-        await options.runTaskClaimFlow(input);
-        return;
-      }
-      actions.push(`task:${input.task.taskId}`);
-    },
-    waitForClose: async () => close.promise,
-    waitForReplayComplete: async () => replay.promise,
-    stopped: false,
-  }) as unknown as ParticipantRuntimeClient & {
-    connectionGeneration: number;
-    stopped: boolean;
-  };
-
-  return {
-    actions,
-    beginReplacementBeforeClose: () => {
-      supersededClose = close;
-      replacementInProgress = true;
-      client.connectionGeneration += 1;
-      replay = createRejectableDeferred<void>();
-      replay.promise.catch(() => undefined);
-      close = createDeferred<void>();
-    },
-    client,
-    closeSupersededTransport: () => supersededClose?.resolve(),
-    closeTransport: () => close.resolve(),
-    completeReplay: () => replay.resolve(),
-    emit: (event) => {
-      for (const handler of handlers) {
-        handler(event);
-      }
-    },
-    failReplay: (error) => replay.reject(error),
-    reconnectAttempts: () => reconnectAttempts,
-  };
-}
-
-/** Builds a durable-cursor fixture around private client persistence methods. */
-function createCursorFixture(
-  options: {
-    readonly afterSeq?: number;
-    readonly cursorStore?: ParticipantRuntimeCursorStore;
-    readonly eventCount?: number;
-    readonly intervalMs?: number;
-    readonly stored?: number | null;
-    readonly withHandler?: boolean;
-    readonly withStore?: boolean;
-  } = {},
-): CursorFixture {
-  const writes: number[] = [];
-  const errors: Error[] = [];
-  const afterSeq = options.afterSeq ?? 0;
-  const withStore = options.withStore ?? true;
-  const withHandler = options.withHandler ?? true;
-  const replay = createRejectableDeferred<void>();
-  replay.promise.catch(() => undefined);
-  const cursorStore =
-    options.cursorStore ??
-    (withStore
-      ? ({
-          read: () => options.stored ?? null,
-          write: (seq: number) => {
-            writes.push(seq);
-          },
-        } satisfies ParticipantRuntimeCursorStore)
-      : undefined);
-  const eventHandlers = new Set<(event: SessionEvent) => void>();
-  if (withHandler) {
-    eventHandlers.add(() => undefined);
-  }
-  const cursorWriter = new ParticipantCursorWriter({
-    acknowledgedSeq: afterSeq,
-    onError: (error) => errors.push(error),
-    retryAttempts: 1,
-    retryBaseDelayMs: 100,
-    retryMaxDelayMs: 2_000,
-    ...(cursorStore === undefined ? {} : { store: cursorStore }),
-    writeTimeoutMs: 5_000,
-  });
-  const client = Object.assign(Object.create(ParticipantRuntimeClient.prototype), {
-    config: { ...baseConfig, afterSeq, cursorStore },
-    connectionGeneration: 0,
-    currentControlEpoch: null,
-    cursorPersistEventCount: options.eventCount ?? 50,
-    cursorPersistIntervalMs: options.intervalMs ?? 1_000,
-    cursorPersistTimer: null,
-    cursorWriter,
-    deliveryUnsubscribers: new Map(),
-    deliveryFailureCount: 0,
-    deliveryRecoveryAttempts: 0,
-    deliveryRecoverySeq: null,
-    errorBacklog: [],
-    errorHandlers: new Set<(error: Error) => void>([(error) => errors.push(error)]),
-    eventBacklog: [],
-    eventHandlers,
-    eventsSinceCursorPersist: 0,
-    lastHandledSeq: afterSeq,
-    lastPersistedSeq: afterSeq,
-    handlerTimeoutMs: 30_000,
-    maxDeliveryQueueBytes: 16 * 1024 * 1024,
-    maxDeliveryQueueSize: 2_000,
-    maxRecoveryAttempts: 5,
-    observability: {
-      debug: () => undefined,
-      debugInfo: () => ({}),
-    },
-    pendingCommands: new Map(),
-    pausedReason: null,
-    reconnectFailureCount: 0,
-    reconnectPromise: null,
-    reconnectSuccessCount: 0,
-    recoveryCount: 0,
-    rejectReplayComplete: replay.reject,
-    replayComplete: replay.promise,
-    replayCompleteSettled: false,
-    recentEvents: [],
-    resolveReplayComplete: replay.resolve,
-    socket: null,
-    stopped: true,
-  }) as PrivateCursorRuntimeClient;
-  client.replaceDelivery(afterSeq);
-  return { client, errors, writes };
-}
-
-/** Feeds one observed event envelope through the private message handler. */
-function emitCursorEvent(client: PrivateCursorRuntimeClient, seq: number): void {
-  client.handleMessage(
-    JSON.stringify({ event: createTaskCreatedEvent(baseTask, seq), op: "event" }),
-  );
-}
-
-/** Builds a command-correlation fixture around private client methods. */
-function createCommandFixture(
-  options: { readonly commandTimeoutMs?: number; readonly send?: (encoded: string) => void } = {},
-): CommandFixture {
-  const sentMessages: Record<string, unknown>[] = [];
-  const client = Object.assign(Object.create(ParticipantRuntimeClient.prototype), {
-    commandTimeoutMs: options.commandTimeoutMs ?? 15_000,
-    config: { ...baseConfig, commandTimeoutMs: options.commandTimeoutMs ?? 15_000 },
-    cursorWriter: {
-      debugInfo: () => ({
-        acknowledgedSeq: 0,
-        failureCount: 0,
-        inFlightSeq: null,
-        pendingSeq: null,
-      }),
-    },
-    delivery: {
-      debugInfo: () => ({
-        activeDeliverySeq: null,
-        draining: false,
-        halted: false,
-        handlerCount: 0,
-        lastHandledSeq: 0,
-        lastReceivedSeq: 0,
-        queueSize: 0,
-      }),
-    },
-    eventBacklog: [],
-    eventHandlers: new Set<(event: SessionEvent) => void>(),
-    lastObservedSeq: 0,
-    observability: {
-      debugInfo: () => ({}),
-    },
-    pendingCommands: new Map(),
-    reconnectFailureCount: 0,
-    reconnectSuccessCount: 0,
-    requireOpenSocket: () => ({
-      send: (encoded: string) => {
-        if (options.send) {
-          options.send(encoded);
-          return;
-        }
-        sentMessages.push(JSON.parse(encoded) as Record<string, unknown>);
-      },
-    }),
-    resolveReplayComplete: () => undefined,
-    socket: null,
-    stopped: false,
-  }) as PrivateCommandRuntimeClient;
-  return { client, sentMessages };
-}
-
-/** Lets queued Promise continuations settle without depending on timer state. */
-async function flushMicrotasks(iterations = 50): Promise<void> {
-  for (let index = 0; index < iterations; index += 1) {
-    await Promise.resolve();
-  }
-}
-
-/** Waits for async state changes without relying on real or fake timer mode. */
-async function waitForMicrotasks(predicate: () => boolean, iterations = 100): Promise<void> {
-  for (let index = 0; index < iterations; index += 1) {
-    if (predicate()) {
-      return;
-    }
-    await Promise.resolve();
-  }
-  throw new Error("Timed out waiting for microtask condition");
-}
-
-/** Reads a generated WebSocket request id from a sent command fixture. */
-function readRequestId(message: Record<string, unknown> | undefined): string {
-  const requestId = message?.requestId;
-  if (typeof requestId !== "string") {
-    throw new Error("Expected command request id");
-  }
-  return requestId;
-}
-
-/** Creates a manually controlled promise for async loop tests. */
-function createDeferred<TValue>(): Deferred<TValue> {
-  let resolve: (value: TValue | PromiseLike<TValue>) => void = () => undefined;
-  const promise = new Promise<TValue>((promiseResolve) => {
-    resolve = promiseResolve;
-  });
-  return { promise, resolve };
-}
-
-function createRejectableDeferred<TValue>(): RejectableDeferred<TValue> {
-  let reject: (error: Error) => void = () => undefined;
-  let resolve: (value: TValue | PromiseLike<TValue>) => void = () => undefined;
-  const promise = new Promise<TValue>((promiseResolve, promiseReject) => {
-    reject = promiseReject;
-    resolve = promiseResolve;
-  });
-  return { promise, reject, resolve };
-}
-
-interface Deferred<TValue> {
-  readonly promise: Promise<TValue>;
-  readonly resolve: (value?: TValue | PromiseLike<TValue>) => void;
-}
-
-interface RejectableDeferred<TValue> extends Deferred<TValue> {
-  readonly reject: (error: Error) => void;
-}
-
-/** In-memory participant WebSocket with controllable server frames and closure. */
-class ParticipantFakeWebSocket extends EventEmitter {
-  deferClose = false;
-  readyState = WebSocket.CONNECTING;
-  readonly sent: string[] = [];
-
-  constructor(readonly url: string) {
-    super();
-    queueMicrotask(() => {
-      this.readyState = WebSocket.OPEN;
-      this.emit("open");
-    });
-  }
-
-  close(): void {
-    if (this.deferClose) {
-      this.readyState = WebSocket.CLOSING;
-      return;
-    }
-    this.emitClose();
-  }
-
-  emitClose(): void {
-    this.readyState = WebSocket.CLOSED;
-    this.emit("close");
-  }
-
-  emitReplayComplete(): void {
-    this.emit("message", JSON.stringify({ op: "replay.complete" }));
-  }
-
-  emitServerEvent(event: SessionEvent): void {
-    this.emit("message", JSON.stringify({ event, op: "event" }));
-  }
-
-  send(data: string): void {
-    this.sent.push(data);
-    this.emit("client-command", data);
-  }
-
-  terminate(): void {
-    this.close();
-  }
-}
-
-/** Creates participant fake sockets while preserving the public factory type. */
-function createParticipantWebSocketFactory(
-  sockets: ParticipantFakeWebSocket[],
-): ParticipantRuntimeWebSocketFactory {
-  return (url) => {
-    const socket = new ParticipantFakeWebSocket(url);
-    sockets.push(socket);
-    return socket as unknown as WebSocket;
-  };
-}
-
-/** Allows already-queued promise continuations to run. */
-async function flushPromises(): Promise<void> {
-  await Promise.resolve();
-}
-
-/** Waits for one synchronous condition. */
-async function waitFor(predicate: () => boolean): Promise<void> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < 1_000) {
-    if (predicate()) {
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 1));
-  }
-  throw new Error("Timed out waiting for condition");
-}
