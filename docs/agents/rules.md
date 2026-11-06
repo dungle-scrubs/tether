@@ -1,6 +1,6 @@
 # Checked code conventions
 
-These checks cover `packages/client/src/participant-rest-replay.ts`. The declaration-order check also covers `packages/client/test/participant-runtime-client.test.ts` with an incremental baseline of 27 findings measured at pre-feature commit `085c18223934c4e5754f6ea6328cec3dab1ffe5c`; new helpers must be declared above first use. The replay module permits zero findings. Do not increase the baseline to admit new violations.
+These checks cover `packages/client/src/participant-rest-replay.ts` with zero permitted findings. They also cover `packages/client/test/participant-runtime-client.test.ts` using incremental baselines measured at pre-feature commit `085c18223934c4e5754f6ea6328cec3dab1ffe5c`: 27 declaration-order findings and 8 undocumented named declarations. New helpers must be declared above first use and have JSDoc. Do not increase these baselines to admit new violations.
 
 | Convention | Enforcement |
 | --- | --- |

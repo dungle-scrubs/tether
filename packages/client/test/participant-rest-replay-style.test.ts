@@ -4,9 +4,13 @@ import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
 const checkedModules = [
-  { path: "../src/participant-rest-replay.ts", declarationBaseline: 0 },
+  { path: "../src/participant-rest-replay.ts", declarationBaseline: 0, documentationBaseline: 0 },
   // Incremental baseline measured at pre-feature commit 085c182, not a waiver for new helpers.
-  { path: "./participant-runtime-client.test.ts", declarationBaseline: 27 },
+  {
+    path: "./participant-runtime-client.test.ts",
+    declarationBaseline: 27,
+    documentationBaseline: 8,
+  },
 ];
 
 /** Finds the module-level declaration containing a node. */
@@ -75,10 +79,12 @@ describe("REST replay module conventions", () => {
         `${findings.join("\n")}\nMove dependencies above first use; do not increase the pre-feature baseline.`,
       ).toBeLessThanOrEqual(module.declarationBaseline);
     });
+    it(`${module.path} documents named functions and methods`, () => {
+      const findings = analyzeModule(path).documentation;
+      expect(
+        findings.length,
+        `${findings.join("\n")}\nAdd JSDoc to new named declarations; do not increase the pre-feature baseline.`,
+      ).toBeLessThanOrEqual(module.documentationBaseline);
+    });
   }
-
-  it("documents named functions and methods", () => {
-    const path = fileURLToPath(new URL(checkedModules[0]?.path ?? "", import.meta.url));
-    expect(analyzeModule(path).documentation).toEqual([]);
-  });
 });

@@ -2301,6 +2301,7 @@ describe("ParticipantRuntimeClient command correlation", () => {
   });
 });
 
+/** Builds one synthetic history event without task lifecycle semantics. */
 function restHistoryEvent(seq: number): SessionEvent {
   return {
     createdAt: "2026-06-05T00:00:00.000Z",
@@ -2329,6 +2330,7 @@ function restHistoryPage(after: number, limit: number, head: number) {
   };
 }
 
+/** Supplies the participant's matching wire replay marker and control epoch. */
 function emitFencedReplay(socket: ParticipantFakeWebSocket): void {
   socket.emit(
     "message",
@@ -2352,6 +2354,7 @@ describe("ParticipantRuntimeClient REST replay", () => {
     vi.restoreAllMocks();
   });
 
+  /** Creates a public runtime client against synthetic HTTP and WebSocket boundaries. */
   async function fixture(
     input: {
       readonly afterSeq?: number;
