@@ -28,6 +28,7 @@ function fakeTaskGrantStores(): AuthPersistenceStores & {
       findManyByJti: async () => [],
       findByJti: async () => null,
       list: async () => [],
+      listForSessionInventory: async () => [],
     },
     revokeGrantWithAudit: vi.fn(async () => ({ grant: null, status: "not_found" }) as const),
     revokeTaskGrantWithAudit: vi.fn(async ({ audit, jti, revokedAt }) => {

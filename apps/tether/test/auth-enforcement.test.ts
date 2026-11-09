@@ -20,6 +20,7 @@ describe("auth enforcement runtime", () => {
     const store: AuthGrantStore = {
       findByJti: vi.fn(async () => grant),
       list: async () => [],
+      listForSessionInventory: async () => [],
     };
     const runtime = createAuthRuntime({
       activeKid: "current",
@@ -79,6 +80,7 @@ describe("auth enforcement runtime", () => {
         }),
       ),
       list: async () => [],
+      listForSessionInventory: async () => [],
     };
     const runtime = createAuthRuntime({
       activeKid: "current",
@@ -155,7 +157,11 @@ describe("auth enforcement runtime", () => {
       browserSessionStore: {
         findBrowserSession,
       },
-      grantStore: { findByJti: vi.fn(async () => grant), list: async () => [] },
+      grantStore: {
+        findByJti: vi.fn(async () => grant),
+        list: async () => [],
+        listForSessionInventory: async () => [],
+      },
       issuer: grant.issuer,
       mode: "required",
       now: () => new Date("2026-07-17T01:00:00.000Z"),
@@ -558,6 +564,7 @@ async function createCommandFixture() {
       return grant.value;
     }),
     list: async () => [],
+    listForSessionInventory: async () => [],
   };
   const warnings: AuthWarning[] = [];
   const runtime = createAuthRuntime({
