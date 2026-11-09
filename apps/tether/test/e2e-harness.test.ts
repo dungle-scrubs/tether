@@ -7,8 +7,11 @@ import {
   E2E_CREATED_AT_LABEL,
   E2E_LABEL,
   E2E_RUN_ID_LABEL,
+  E2E_TEST_FILES,
+  type E2ETestFile,
   exitStatusFromResult,
   parseDockerLabelLines,
+  parseE2ETestFileArguments,
   parsePublishedPort,
   planExpiredCleanup,
   type RunE2EDeps,
@@ -170,15 +173,21 @@ interface SpawnCall {
   child: FakeChild;
 }
 
-function harness(program: (call: SpawnCall) => void) {
+function harness(
+  program: (call: SpawnCall) => void,
+  options: {
+    readonly env?: Record<string, string>;
+    readonly testFiles?: readonly E2ETestFile[];
+  } = {},
+) {
   const calls: SpawnCall[] = [];
   const logs: string[] = [];
   let signalHandler: ((signal: TerminationSignal) => void) | null = null;
   const overrides: Array<Record<string, string>> = [];
 
-  const spawn: Spawn = (command, args, options) => {
+  const spawn: Spawn = (command, args, spawnOptions) => {
     const child = new FakeChild();
-    const call: SpawnCall = { command, args: [...args], options, child };
+    const call: SpawnCall = { command, args: [...args], options: spawnOptions, child };
     calls.push(call);
     program(call);
     return child;
@@ -186,7 +195,8 @@ function harness(program: (call: SpawnCall) => void) {
 
   const deps: RunE2EDeps = {
     spawn,
-    env: { PATH: "/usr/bin" },
+    env: { PATH: "/usr/bin", ...(options.env ?? {}) },
+    testFiles: options.testFiles ?? E2E_TEST_FILES,
     registerSignalHandler: (handler) => {
       signalHandler = handler;
     },
@@ -351,6 +361,127 @@ describe("runE2E lifecycle", () => {
       expect(down[0]?.child.killed).toEqual([]);
     });
   }
+});
+
+// --- Runner CLI test-file selection and loopback pinning ---
+
+describe("parseE2ETestFileArguments", () => {
+  it("allows exactly the two known E2E test files and nothing else", () => {
+    expect([...E2E_TEST_FILES]).toEqual([
+      "test/e2e.test.ts",
+      "test/e2e-rest-control-two-instance.test.ts",
+    ]);
+  });
+
+  it("selects both files when no arguments are supplied", () => {
+    expect(parseE2ETestFileArguments([])).toEqual({
+      ok: true,
+      testFiles: ["test/e2e.test.ts", "test/e2e-rest-control-two-instance.test.ts"],
+    });
+  });
+
+  it("selects exactly the requested allowlisted file in focused mode", () => {
+    expect(
+      parseE2ETestFileArguments(["--test-file", "test/e2e-rest-control-two-instance.test.ts"]),
+    ).toEqual({ ok: true, testFiles: ["test/e2e-rest-control-two-instance.test.ts"] });
+    expect(parseE2ETestFileArguments(["--test-file", "test/e2e.test.ts"])).toEqual({
+      ok: true,
+      testFiles: ["test/e2e.test.ts"],
+    });
+  });
+
+  it("rejects a missing --test-file value", () => {
+    const result = parseE2ETestFileArguments(["--test-file"]);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("--test-file requires a value");
+    }
+  });
+
+  it("rejects unknown options", () => {
+    for (const args of [["--reporter"], ["-t", "name"], ["--test-file=x", "extra"]]) {
+      const result = parseE2ETestFileArguments(args);
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.reason).toContain("Unknown argument");
+      }
+    }
+  });
+
+  it("rejects extra arguments after a valid --test-file value", () => {
+    const result = parseE2ETestFileArguments([
+      "--test-file",
+      "test/e2e-rest-control-two-instance.test.ts",
+      "extra",
+    ]);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("Exactly one --test-file value");
+    }
+  });
+
+  it("rejects arbitrary or unknown paths instead of forwarding them to Vitest", () => {
+    for (const path of [
+      "test/http.test.ts",
+      "test/e2e.test.tsx",
+      "./test/e2e.test.ts",
+      "src/server.ts",
+      "test/../test/e2e.test.ts",
+    ]) {
+      const result = parseE2ETestFileArguments(["--test-file", path]);
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.reason).toContain("Unknown test file");
+      }
+    }
+  });
+});
+
+describe("runE2E test-file selection and Postgres bind pinning", () => {
+  const respondSuccess = (call: SpawnCall): void => {
+    const stdout = isCommand(call, "port") ? "127.0.0.1:54321" : "";
+    call.child.resolve({ status: 0, signal: null, stdout });
+  };
+
+  it("passes only the focused file to Vitest, never the old suite alongside", async () => {
+    const { deps, calls } = harness(respondSuccess, {
+      testFiles: ["test/e2e-rest-control-two-instance.test.ts"],
+    });
+    const code = await runE2E(deps);
+    expect(code).toBe(0);
+    const vitestCall = calls.find((call) => call.command === "vitest");
+    expect(vitestCall?.args).toEqual(["run", "test/e2e-rest-control-two-instance.test.ts"]);
+    expect(vitestCall?.args).not.toContain("test/e2e.test.ts");
+  });
+
+  it("runs both allowlisted files by default", async () => {
+    const { deps, calls } = harness(respondSuccess);
+    const code = await runE2E(deps);
+    expect(code).toBe(0);
+    const vitestCall = calls.find((call) => call.command === "vitest");
+    expect(vitestCall?.args).toEqual([
+      "run",
+      "test/e2e.test.ts",
+      "test/e2e-rest-control-two-instance.test.ts",
+    ]);
+  });
+
+  it("pins POSTGRES_HOST_BIND to loopback even when the parent env widens it", async () => {
+    const { deps, calls } = harness(respondSuccess, {
+      env: { POSTGRES_HOST_BIND: "0.0.0.0" },
+    });
+    const code = await runE2E(deps);
+    expect(code).toBe(0);
+    // Every compose-scoped docker invocation (up, port, and cleanup down) runs
+    // with the loopback pin, regardless of the inherited parent value.
+    const dockerCalls = calls.filter((call) => call.command === "docker");
+    expect(dockerCalls.length).toBeGreaterThan(0);
+    for (const call of dockerCalls) {
+      expect(call.options.env.POSTGRES_HOST_BIND).toBe("127.0.0.1");
+    }
+    const up = dockerCalls.find((call) => call.args.includes("up"));
+    expect(up?.options.env.POSTGRES_HOST_BIND).toBe("127.0.0.1");
+  });
 });
 
 // --- Expired-resource cleanup command ---

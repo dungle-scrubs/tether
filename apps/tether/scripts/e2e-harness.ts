@@ -17,6 +17,62 @@ export const E2E_LABEL = "com.tether.e2e";
 export const E2E_RUN_ID_LABEL = "com.tether.e2e.run-id";
 export const E2E_CREATED_AT_LABEL = "com.tether.e2e.created-at";
 
+/** The exact Vitest test files the E2E runner may execute, in default order. */
+export const E2E_TEST_FILES = [
+  "test/e2e.test.ts",
+  "test/e2e-rest-control-two-instance.test.ts",
+] as const;
+
+/** One allowlisted Vitest test file for an E2E run. */
+export type E2ETestFile = (typeof E2E_TEST_FILES)[number];
+
+/** Checks membership in the exact E2E test-file allowlist. */
+export function isE2ETestFile(value: string): value is E2ETestFile {
+  return (E2E_TEST_FILES as readonly string[]).includes(value);
+}
+
+/** Selection of test files derived from the runner CLI arguments. */
+export type E2ETestFileSelection =
+  | { readonly ok: true; readonly testFiles: readonly E2ETestFile[] }
+  | { readonly ok: false; readonly reason: string };
+
+/** Usage line shared by every rejection reason. */
+export const E2E_TEST_FILE_USAGE = `Usage: pnpm --filter tether test:e2e [--test-file <${E2E_TEST_FILES.join(" | ")}>]`;
+
+/**
+ * Pure selection of the Vitest test files for one E2E run. Accepts either no
+ * arguments (both allowlisted files) or exactly `--test-file <file>` with one
+ * allowlisted filename. Unknown options, extra arguments, arbitrary paths, and
+ * a missing value are rejected so callers can exit before any temporary
+ * directory, Docker command, or database work runs.
+ */
+export function parseE2ETestFileArguments(args: readonly string[]): E2ETestFileSelection {
+  if (args.length === 0) {
+    return { ok: true, testFiles: E2E_TEST_FILES };
+  }
+  const first = args[0];
+  if (first !== "--test-file") {
+    return {
+      ok: false,
+      reason: `Unknown argument. ${E2E_TEST_FILE_USAGE}`,
+    };
+  }
+  if (args.length === 1) {
+    return { ok: false, reason: `--test-file requires a value. ${E2E_TEST_FILE_USAGE}` };
+  }
+  if (args.length > 2) {
+    return {
+      ok: false,
+      reason: `Exactly one --test-file value is accepted. ${E2E_TEST_FILE_USAGE}`,
+    };
+  }
+  const value = args[1];
+  if (value === undefined || !isE2ETestFile(value)) {
+    return { ok: false, reason: `Unknown test file. ${E2E_TEST_FILE_USAGE}` };
+  }
+  return { ok: true, testFiles: [value] };
+}
+
 /** Label map applied to E2E containers and volumes. */
 export interface ResourceLabels {
   [E2E_LABEL]: "true";
@@ -154,6 +210,8 @@ export interface RunE2EDeps {
   spawn: Spawn;
   /** Parent process environment. */
   env: Record<string, string>;
+  /** Exact allowlisted Vitest test files this run executes. */
+  testFiles: readonly E2ETestFile[];
   /** Registers a handler invoked once per received termination signal. */
   registerSignalHandler: (handler: (signal: TerminationSignal) => void) => void;
   /** Writes the label override compose file and returns its path. */
@@ -184,6 +242,9 @@ export async function runE2E(deps: RunE2EDeps): Promise<number> {
   const composeEnv: Record<string, string> = {
     ...deps.env,
     DATABASE_URL: composeDatabaseUrl,
+    // Pinned after the inherited environment so a parent POSTGRES_HOST_BIND can
+    // never widen the published Postgres port beyond loopback.
+    POSTGRES_HOST_BIND: "127.0.0.1",
     POSTGRES_HOST_PORT: "0",
     POSTGRES_PASSWORD: deps.databasePassword,
   };
@@ -270,7 +331,7 @@ export async function runE2E(deps: RunE2EDeps): Promise<number> {
           E2E: "true",
           E2E_ADMIN_DATABASE_URL: `postgres://tether:${deps.databasePassword}@127.0.0.1:${publishedPort}/postgres`,
         };
-        const test = await runForwarded("vitest", ["run", "test/e2e.test.ts"], {
+        const test = await runForwarded("vitest", ["run", ...deps.testFiles], {
           env: testEnv,
         });
         testStatus = exitStatusFromResult(test);
