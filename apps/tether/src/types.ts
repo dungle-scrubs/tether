@@ -42,6 +42,8 @@ export type {
 
 /** Optional bounded read settings for durable session event-list queries. */
 export interface SessionEventListOptions {
+  /** Event types left out of the page, filtered in SQL before the limit applies. */
+  readonly excludeTypes?: readonly string[] | undefined;
   /** Maximum number of events to materialize after the sequence cursor. */
   readonly limit?: number | undefined;
 }

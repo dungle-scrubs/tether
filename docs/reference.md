@@ -12,6 +12,7 @@ POST /sessions                                         create or return a sessio
 GET  /sessions/{id}/context                             context view
 POST /sessions/{id}/delete                              permanent delete, single replica only
 GET  /sessions/{id}/events?after={seq}&limit={count}      event page
+GET  /sessions/{id}/events?since={instant}&exclude={types}  event page from an instant, without listed types
 POST /sessions/{id}/events                              publish an event
 GET  /sessions/{id}/stream                              WebSocket upgrade
 GET  /sessions/{id}/participants                        participant inventory
@@ -38,6 +39,8 @@ POST /auth/grants/{id}/revoke                          revoke a grant
 ```
 
 Event pages contain `events` and `pagination`. Pagination fields are `afterSeq`, `hasMore`, `limit`, `nextAfterSeq`, and `returned`. The request parameter is `after`, not `afterSeq`.
+
+An event page can also carry `since`, an ISO 8601 date-time with an explicit offset or `Z`, and `exclude`, a comma-separated list of event types. `since` starts the page at the first event created at or after that instant, and `exclude` leaves the listed types out of the page. `exclude` takes at most 16 types of at most 128 characters each, and excluded events do not count against `limit`. The page starts at the later of `after` and `since`, so a caller can page forward and keep sending `since`. A `since` value the service cannot parse, or an `exclude` list with an empty or oversized entry, returns `400`.
 
 Participant-owned mutations require the current `controlEpoch`. Registration is the acquisition operation. The [REST control guide](../apps/tether/docs/rest-control-migration.md) describes acquisition IDs, renewal, release, migration compatibility, and uncertain outcomes.
 

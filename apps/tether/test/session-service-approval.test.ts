@@ -344,6 +344,9 @@ function createApprovalStores(
       listContextSuffix: async () => {
         throw new Error("approval service should not list context events");
       },
+      resolveSinceCursor: async () => {
+        throw new Error("approval service should not resolve a since cursor");
+      },
     },
     participants: {
       heartbeat: async () => null,

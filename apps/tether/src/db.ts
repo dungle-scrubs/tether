@@ -2610,6 +2610,9 @@ export async function readSessionDebugSummary(
 
 /**
  * Lists session events after the provided sequence cursor.
+ *
+ * Excluded types are filtered in SQL so the excluded rows never reach the
+ * caller and never consume the row limit or the byte budget of a page.
  */
 export async function listEvents(
   database: DatabasePool,
@@ -2617,11 +2620,18 @@ export async function listEvents(
   afterSeq: number,
   options: SessionEventListOptions = {},
 ): Promise<SessionEvent[]> {
-  const limitClause = options.limit === undefined || options.limit <= 0 ? "" : "LIMIT $3";
-  const values =
-    options.limit === undefined || options.limit <= 0
-      ? [sessionId, afterSeq]
-      : [sessionId, afterSeq, options.limit];
+  const values: unknown[] = [sessionId, afterSeq];
+  const excludeTypes = options.excludeTypes ?? [];
+  let excludeClause = "";
+  if (excludeTypes.length > 0) {
+    values.push(excludeTypes);
+    excludeClause = `AND type <> ALL($${values.length}::text[])`;
+  }
+  let limitClause = "";
+  if (options.limit !== undefined && options.limit > 0) {
+    values.push(options.limit);
+    limitClause = `LIMIT $${values.length}`;
+  }
   const rows = await database.pool.query<PgSessionEventRow>(
     `
       SELECT
@@ -2635,12 +2645,60 @@ export async function listEvents(
       FROM session_events
       WHERE session_id = $1
         AND seq > $2
+        ${excludeClause}
       ORDER BY seq
       ${limitClause}
     `,
     values,
   );
   return rows.rows.map(toSessionEvent);
+}
+
+/**
+ * Resolves the exclusive sequence cursor of the first event created at or
+ * after an instant.
+ *
+ * The lookup uses the `session_events (session_id, created_at)` index so a
+ * reader jumps straight to the events it asked for instead of paging through
+ * the whole session. It takes the lowest matching sequence, not the earliest
+ * matching `created_at`: concurrent appends can commit a later sequence with an
+ * earlier timestamp, and starting from the earliest timestamp would skip a
+ * matching event with a lower sequence. The cursor is that sequence minus one,
+ * so the matching event itself is the first row of the page. When no event is
+ * at or after the instant, the cursor is the session's highest sequence,
+ * which yields an empty page, and a session without events resolves to zero.
+ */
+export async function resolveEventSinceCursor(
+  database: DatabasePool,
+  sessionId: string,
+  since: Date,
+): Promise<number> {
+  const rows = await database.pool.query<{
+    readonly firstSeq: unknown;
+    readonly maxSeq: unknown;
+  }>(
+    `
+      SELECT
+        (
+          SELECT MIN(seq)
+          FROM session_events
+          WHERE session_id = $1
+            AND created_at >= $2
+        ) AS "firstSeq",
+        (
+          SELECT MAX(seq)
+          FROM session_events
+          WHERE session_id = $1
+        ) AS "maxSeq"
+    `,
+    [sessionId, since],
+  );
+  const row = rows.rows[0];
+  const firstSeq = parseOptionalEventSequence(row?.firstSeq, sessionId);
+  if (firstSeq !== null) {
+    return Math.max(0, firstSeq - 1);
+  }
+  return parseOptionalEventSequence(row?.maxSeq, sessionId) ?? 0;
 }
 
 /** Reads only the newest bounded context candidates and aggregate suffix size. */
@@ -5604,4 +5662,12 @@ function parseEventSequence(value: unknown, sessionId: string): number {
     throw new SessionEventSequenceRangeError({ attemptedSeq, sessionId });
   }
   return parsed;
+}
+
+/** Parses an optional int8 sequence returned by pg into a safe integer. */
+function parseOptionalEventSequence(value: unknown, sessionId: string): number | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  return parseEventSequence(value, sessionId);
 }

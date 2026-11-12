@@ -555,6 +555,54 @@ describe("RestParticipantTaskClient", () => {
     expect(requests[0]?.path).toBe("/sessions/sess_1/events?after=0&limit=50");
   });
 
+  it("sends the event-list since and exclude filters as query parameters", async () => {
+    const { client, requests } = fetchJson(200, {
+      events: [],
+      pagination: {
+        afterSeq: 0,
+        hasMore: false,
+        limit: 50,
+        nextAfterSeq: 0,
+        returned: 0,
+      },
+    });
+
+    await client.listEvents("sess_1", {
+      exclude: ["participant.heartbeat", "task.progress"],
+      since: "2026-10-01T00:00:00.000Z",
+    });
+
+    expect(requests[0]?.path).toBe(
+      "/sessions/sess_1/events?exclude=participant.heartbeat%2Ctask.progress&since=2026-10-01T00%3A00%3A00.000Z",
+    );
+  });
+
+  it("lists the session's participants with their presence", async () => {
+    const participant = {
+      capabilities: {},
+      displayName: "Media",
+      joinedAt: "2026-10-01T00:00:00.000Z",
+      lastSeenAt: "2026-10-01T00:05:00.000Z",
+      participantId: "media",
+      runtimeKind: "generic_agent",
+      sessionId: "sess_1",
+    };
+    const { client, requests } = fetchJson(200, { participants: [participant] });
+
+    const list = await client.listParticipants("sess_1");
+
+    expect(list.participants).toEqual([participant]);
+    expect(requests[0]?.path).toBe("/sessions/sess_1/participants");
+  });
+
+  it("rejects a participant list that does not match the record shape", async () => {
+    const { client } = fetchJson(200, { participants: [{ participantId: "media" }] });
+
+    await expect(client.listParticipants("sess_1")).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+    });
+  });
+
   it("records an approval decision", async () => {
     const { client, requests } = fetchJson(204, null);
 

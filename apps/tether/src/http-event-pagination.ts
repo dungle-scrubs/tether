@@ -22,6 +22,7 @@ export interface EventListPage {
  */
 export function listEventPageWithinByteBudget(input: {
   readonly afterSeq: number;
+  readonly excludeTypes?: readonly string[] | undefined;
   readonly limit: number;
   readonly maxBytes: number;
   readonly maxEventBytes: number;
@@ -39,7 +40,10 @@ export function listEventPageWithinByteBudget(input: {
       // Fetch one row beyond the requested page size so a full page still
       // detects that more events remain, matching the prior limit + 1 lookahead.
       const pageLimit = Math.min(fetchPageSize, input.limit + 1 - events.length);
-      const page = yield* input.service.listEvents(input.sessionId, cursor, { limit: pageLimit });
+      const page = yield* input.service.listEvents(input.sessionId, cursor, {
+        excludeTypes: input.excludeTypes ?? [],
+        limit: pageLimit,
+      });
       for (const event of page) {
         if (events.length >= input.limit) {
           // Lookahead row: more events exist past the requested page size.

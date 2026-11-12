@@ -408,6 +408,303 @@ describe("REST events-list byte budget", () => {
   });
 });
 
+/** Builds one event with an explicit creation instant for event-list query tests. */
+function createEventListEvent(
+  seq: number,
+  sessionId: string,
+  createdAt: string,
+  type = "user.message",
+): SessionEvent {
+  return {
+    createdAt,
+    eventId: `evt_query_${seq}`,
+    payload: {},
+    producerId: "test",
+    seq,
+    sessionId,
+    type,
+  };
+}
+
+/**
+ * Resolves the exclusive cursor of the first event created at or after an
+ * instant, the way the durable store does.
+ */
+function resolveEventSinceCursor(events: readonly SessionEvent[], since: Date): number {
+  const first = events.find((event) => Date.parse(event.createdAt) >= since.getTime());
+  if (first) {
+    return first.seq - 1;
+  }
+  return events.at(-1)?.seq ?? 0;
+}
+
+/**
+ * Serves an in-memory event log that honours `since` cursors and excluded
+ * event types the way the durable store does.
+ */
+function createFilteredEventListSessionService(
+  events: readonly SessionEvent[],
+): SessionServiceEffect {
+  return {
+    debugInfo: createSessionServiceDebugInfo,
+    expireTaskClaims: () => Effect.succeed({ events: [], expiredCount: 0 }),
+    listEvents: (
+      _sessionId: string,
+      afterSeq: number,
+      options?: { readonly excludeTypes?: readonly string[]; readonly limit?: number },
+    ) =>
+      Effect.succeed(
+        events
+          .filter((event) => event.seq > afterSeq)
+          .filter((event) => !(options?.excludeTypes ?? []).includes(event.type))
+          .slice(0, options?.limit ?? events.length),
+      ),
+    resolveEventSinceCursor: (input: { readonly sessionId: string; readonly since: Date }) =>
+      Effect.succeed(resolveEventSinceCursor(events, input.since)),
+  } as unknown as SessionServiceEffect;
+}
+
+interface EventListPageBody {
+  readonly events: SessionEvent[];
+  readonly pagination: {
+    readonly afterSeq: number;
+    readonly hasMore: boolean;
+    readonly limit: number;
+    readonly nextAfterSeq: number;
+    readonly returned: number;
+  };
+}
+
+describe("REST events-list since and exclude filters", () => {
+  const openApps: AppServer[] = [];
+
+  afterEach(async () => {
+    const apps = openApps.splice(0);
+    await Promise.all(apps.map((app) => app.close()));
+  });
+
+  /** Starts an app server backed by the given in-memory event log. */
+  async function startEventListApp(
+    events: readonly SessionEvent[],
+  ): Promise<{ readonly port: number; readonly sessionId: string }> {
+    const sessionId = "sess_events_query";
+    const app = createAppServerWithSessionService(
+      createUnusedDatabasePool(),
+      createFilteredEventListSessionService(events),
+      {
+        auth: { activeKid: "disabled", mode: "disabled", secrets: {} },
+        eventFanout: { catchUpPollIntervalMs: 0, listenEnabled: false },
+        readiness: healthyTestReadiness,
+        taskClaimSweeper: { intervalMs: 0 },
+      },
+    );
+    openApps.push(app);
+    const port = await app.listen(0);
+    return { port, sessionId };
+  }
+
+  /** Reads one event page from the running app. */
+  async function readEventPage(
+    port: number,
+    sessionId: string,
+    query: string,
+  ): Promise<{ readonly body: EventListPageBody; readonly status: number }> {
+    const response = await fetch(`http://127.0.0.1:${port}/sessions/${sessionId}/events${query}`);
+    return {
+      body: (await response.json()) as EventListPageBody,
+      status: response.status,
+    };
+  }
+
+  it("starts the page at the first event created at or after the requested instant", async () => {
+    const sessionId = "sess_events_query";
+    const { port } = await startEventListApp([
+      createEventListEvent(1, sessionId, "2026-05-21T00:00:00.000Z"),
+      createEventListEvent(2, sessionId, "2026-05-21T01:00:00.000Z"),
+      createEventListEvent(3, sessionId, "2026-05-21T02:00:00.000Z"),
+    ]);
+
+    const { body, status } = await readEventPage(
+      port,
+      sessionId,
+      "?since=2026-05-21T01:00:00.000Z",
+    );
+
+    expect(status).toBe(200);
+    expect(body.events.map((event) => event.seq)).toEqual([2, 3]);
+    expect(body.pagination.afterSeq).toBe(1);
+    expect(body.pagination.nextAfterSeq).toBe(3);
+    expect(body.pagination.returned).toBe(2);
+  });
+
+  it("keeps the later cursor when an explicit after cursor is ahead of since", async () => {
+    const sessionId = "sess_events_query";
+    const { port } = await startEventListApp([
+      createEventListEvent(1, sessionId, "2026-05-21T00:00:00.000Z"),
+      createEventListEvent(2, sessionId, "2026-05-21T01:00:00.000Z"),
+      createEventListEvent(3, sessionId, "2026-05-21T02:00:00.000Z"),
+    ]);
+
+    const { body, status } = await readEventPage(
+      port,
+      sessionId,
+      "?since=2026-05-21T00:00:00.000Z&after=2",
+    );
+
+    expect(status).toBe(200);
+    expect(body.events.map((event) => event.seq)).toEqual([3]);
+    expect(body.pagination.afterSeq).toBe(2);
+    expect(body.pagination.nextAfterSeq).toBe(3);
+  });
+
+  it("returns an empty page when the instant is after the newest event", async () => {
+    const sessionId = "sess_events_query";
+    const { port } = await startEventListApp([
+      createEventListEvent(1, sessionId, "2026-05-21T00:00:00.000Z"),
+      createEventListEvent(2, sessionId, "2026-05-21T01:00:00.000Z"),
+    ]);
+
+    const { body, status } = await readEventPage(
+      port,
+      sessionId,
+      "?since=2026-06-01T00:00:00.000Z",
+    );
+
+    expect(status).toBe(200);
+    expect(body.events).toEqual([]);
+    expect(body.pagination.afterSeq).toBe(2);
+    expect(body.pagination.hasMore).toBe(false);
+    expect(body.pagination.nextAfterSeq).toBe(2);
+  });
+
+  it("leaves one excluded event type out of the page", async () => {
+    const sessionId = "sess_events_query";
+    const { port } = await startEventListApp([
+      createEventListEvent(1, sessionId, "2026-05-21T00:00:00.000Z", "user.message"),
+      createEventListEvent(2, sessionId, "2026-05-21T00:00:01.000Z", "participant.heartbeat"),
+      createEventListEvent(3, sessionId, "2026-05-21T00:00:02.000Z", "user.message"),
+    ]);
+
+    const { body, status } = await readEventPage(port, sessionId, "?exclude=participant.heartbeat");
+
+    expect(status).toBe(200);
+    expect(body.events.map((event) => event.seq)).toEqual([1, 3]);
+    expect(body.pagination.returned).toBe(2);
+  });
+
+  it("leaves two excluded event types out of the page", async () => {
+    const sessionId = "sess_events_query";
+    const { port } = await startEventListApp([
+      createEventListEvent(1, sessionId, "2026-05-21T00:00:00.000Z", "user.message"),
+      createEventListEvent(2, sessionId, "2026-05-21T00:00:01.000Z", "participant.heartbeat"),
+      createEventListEvent(3, sessionId, "2026-05-21T00:00:02.000Z", "task.created"),
+      createEventListEvent(4, sessionId, "2026-05-21T00:00:03.000Z", "user.message"),
+    ]);
+
+    const { body, status } = await readEventPage(
+      port,
+      sessionId,
+      "?exclude=participant.heartbeat,task.created",
+    );
+
+    expect(status).toBe(200);
+    expect(body.events.map((event) => event.seq)).toEqual([1, 4]);
+  });
+
+  it("does not count excluded events against the page limit", async () => {
+    const sessionId = "sess_events_query";
+    const { port } = await startEventListApp([
+      createEventListEvent(1, sessionId, "2026-05-21T00:00:00.000Z", "user.message"),
+      createEventListEvent(2, sessionId, "2026-05-21T00:00:01.000Z", "participant.heartbeat"),
+      createEventListEvent(3, sessionId, "2026-05-21T00:00:02.000Z", "participant.heartbeat"),
+      createEventListEvent(4, sessionId, "2026-05-21T00:00:03.000Z", "user.message"),
+    ]);
+
+    const { body, status } = await readEventPage(
+      port,
+      sessionId,
+      "?exclude=participant.heartbeat&limit=2",
+    );
+
+    expect(status).toBe(200);
+    expect(body.events.map((event) => event.seq)).toEqual([1, 4]);
+    expect(body.pagination.limit).toBe(2);
+    expect(body.pagination.returned).toBe(2);
+  });
+
+  it("applies since and exclude together", async () => {
+    const sessionId = "sess_events_query";
+    const { port } = await startEventListApp([
+      createEventListEvent(1, sessionId, "2026-05-21T00:00:00.000Z", "user.message"),
+      createEventListEvent(2, sessionId, "2026-05-21T01:00:00.000Z", "participant.heartbeat"),
+      createEventListEvent(3, sessionId, "2026-05-21T02:00:00.000Z", "user.message"),
+      createEventListEvent(4, sessionId, "2026-05-21T03:00:00.000Z", "user.message"),
+    ]);
+
+    const { body, status } = await readEventPage(
+      port,
+      sessionId,
+      "?since=2026-05-21T01:00:00.000Z&exclude=participant.heartbeat",
+    );
+
+    expect(status).toBe(200);
+    expect(body.events.map((event) => event.seq)).toEqual([3, 4]);
+    expect(body.pagination.afterSeq).toBe(1);
+  });
+
+  it("refuses a since value that is not an ISO 8601 instant with an offset", async () => {
+    const sessionId = "sess_events_query";
+    const { port } = await startEventListApp([
+      createEventListEvent(1, sessionId, "2026-05-21T00:00:00.000Z"),
+    ]);
+
+    for (const since of [
+      "not-a-date",
+      "2026-05-21",
+      "2026-05-21T00:00:00",
+      "2026-05-21T00:00:00+99:99",
+    ]) {
+      const response = await fetch(
+        `http://127.0.0.1:${port}/sessions/${sessionId}/events?since=${encodeURIComponent(since)}`,
+      );
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: "Invalid since parameter" });
+    }
+  });
+
+  it("refuses an exclude list with an empty, oversized, or overlong entry", async () => {
+    const sessionId = "sess_events_query";
+    const { port } = await startEventListApp([
+      createEventListEvent(1, sessionId, "2026-05-21T00:00:00.000Z"),
+    ]);
+    const tooManyTypes = Array.from({ length: 17 }, (_, index) => `type.${index}`).join(",");
+    const overlongType = "x".repeat(129);
+
+    for (const exclude of ["", "user.message,,task.created", tooManyTypes, overlongType]) {
+      const response = await fetch(
+        `http://127.0.0.1:${port}/sessions/${sessionId}/events?exclude=${encodeURIComponent(exclude)}`,
+      );
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: "Invalid exclude parameter" });
+    }
+  });
+
+  it("serves the same page as before when neither parameter is present", async () => {
+    const sessionId = "sess_events_query";
+    const { port } = await startEventListApp([
+      createEventListEvent(1, sessionId, "2026-05-21T00:00:00.000Z"),
+      createEventListEvent(2, sessionId, "2026-05-21T00:00:01.000Z"),
+    ]);
+
+    const { body, status } = await readEventPage(port, sessionId, "");
+
+    expect(status).toBe(200);
+    expect(body.events.map((event) => event.seq)).toEqual([1, 2]);
+    expect(body.pagination.afterSeq).toBe(0);
+    expect(body.pagination.nextAfterSeq).toBe(2);
+  });
+});
+
 /** Serves an in-memory event log paged by afterSeq for events-list tests. */
 function createEventListSessionService(events: readonly SessionEvent[]): SessionServiceEffect {
   return {

@@ -39,6 +39,7 @@ import {
 } from "./protocol.js";
 import { parseEventListLimit, type ResourceLimits } from "./resource-limits.js";
 import { listEventPageWithinByteBudget } from "./http-event-pagination.js";
+import { parseEventListExclude, parseEventListSince } from "./http-event-list-query.js";
 import { authorizeClientPublishedEvent } from "./session-event-publish-policy.js";
 import { projectParticipantContractDiagnostics } from "./participant-contract-diagnostics.js";
 import type { SessionServiceEffect } from "./session-service.js";
@@ -249,8 +250,30 @@ export function handleSessionHttpRoute(
       }
       const afterSeq = parseAfterSeq(url.searchParams.get("after"));
       const limit = parseEventListLimit(url.searchParams.get("limit"), input.resourceLimits);
+      const since = parseEventListSince(url.searchParams.get("since"));
+      if (since.status === "invalid") {
+        sendJson(response, 400, { error: "Invalid since parameter" });
+        return true;
+      }
+      const exclude = parseEventListExclude(url.searchParams.get("exclude"));
+      if (exclude.status === "invalid") {
+        sendJson(response, 400, { error: "Invalid exclude parameter" });
+        return true;
+      }
+      // The `since` cursor skips the events created before the requested
+      // instant, while an `after` cursor keeps its own position. The later of
+      // the two wins, so a caller can page forward and keep sending `since`.
+      const sinceCursor =
+        since.status === "present"
+          ? yield* service.resolveEventSinceCursor({
+              sessionId: route.sessionId,
+              since: since.since,
+            })
+          : 0;
+      const effectiveAfterSeq = Math.max(afterSeq, sinceCursor);
       const page = yield* listEventPageWithinByteBudget({
-        afterSeq,
+        afterSeq: effectiveAfterSeq,
+        excludeTypes: exclude.status === "present" ? exclude.types : [],
         limit,
         maxBytes: input.resourceLimits.restEventListMaxBytes,
         maxEventBytes: input.resourceLimits.httpMaxBodyBytes,
@@ -258,11 +281,11 @@ export function handleSessionHttpRoute(
         sessionId: route.sessionId,
       });
       const { events } = page;
-      const nextAfterSeq = events.at(-1)?.seq ?? afterSeq;
+      const nextAfterSeq = events.at(-1)?.seq ?? effectiveAfterSeq;
       sendJson(response, 200, {
         events,
         pagination: {
-          afterSeq,
+          afterSeq: effectiveAfterSeq,
           hasMore: page.hasMore,
           limit,
           nextAfterSeq,

@@ -230,6 +230,14 @@ export interface SessionServiceEffect {
     afterSeq: number,
     options?: SessionEventListOptions,
   ) => Effect.Effect<SessionEvent[], SessionServiceFailure>;
+  /**
+   * Resolves the exclusive sequence cursor of the first event created at or
+   * after an instant, so a reader can skip the events before it.
+   */
+  readonly resolveEventSinceCursor: (input: {
+    readonly sessionId: string;
+    readonly since: Date;
+  }) => Effect.Effect<number, SessionServiceFailure>;
   /** Lists visible participants for a session. */
   readonly listParticipants: (
     sessionId: string,

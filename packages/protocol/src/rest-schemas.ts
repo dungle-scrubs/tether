@@ -6,7 +6,11 @@ import {
   taskResultSchema,
 } from "./approval-targets.js";
 import { sessionEventSchema } from "./event-builders.js";
-import { controlChannelSchema, participantRuntimeKindSchema } from "./records.js";
+import {
+  controlChannelSchema,
+  participantRecordSchema,
+  participantRuntimeKindSchema,
+} from "./records.js";
 import {
   recurringWorkScopeKeySchema,
   rejectedTaskContractSchema,
@@ -84,6 +88,14 @@ export type EventListPagination = z.infer<typeof eventListPaginationSchema>;
 
 /** HTTP response body for bounded session event-list responses. */
 export type EventListResponse = z.infer<typeof eventListResponseSchema>;
+
+/** HTTP response schema for a session's visible participant list. */
+export const participantListResponseSchema = z.object({
+  participants: z.array(participantRecordSchema),
+});
+
+/** HTTP response body for a session's visible participant list. */
+export type ParticipantListResponse = z.infer<typeof participantListResponseSchema>;
 
 /** HTTP body schema for appending a generic session event. */
 export const appendEventSchema = z.object({

@@ -41,6 +41,7 @@ import {
   releaseRestControlLease,
   releaseTaskWithEvent,
   renewControlLease,
+  resolveEventSinceCursor,
   supersedeScheduledRunsWithEvent,
   upsertClientSessionBinding,
   upsertParticipant,
@@ -59,6 +60,7 @@ import type { AppendSessionEventInput, ApprovalTarget } from "./protocol.js";
 import type {
   ParticipantListOptions,
   ParticipantRuntimeKind,
+  SessionEventListOptions,
   TaskListOptions,
   TaskListStatus,
 } from "./types.js";
@@ -184,12 +186,16 @@ class DbSessionEventStore implements SessionEventStore {
     return appendEventIdempotent(this.database, input, options);
   }
 
-  list(sessionId: string, afterSeq: number, options?: { readonly limit?: number | undefined }) {
+  list(sessionId: string, afterSeq: number, options?: SessionEventListOptions) {
     return listEvents(this.database, sessionId, afterSeq, options);
   }
 
   listContextSuffix(sessionId: string, afterSeq: number, limit: number) {
     return listContextEventSuffix(this.database, sessionId, afterSeq, limit);
+  }
+
+  resolveSinceCursor(input: { readonly sessionId: string; readonly since: Date }) {
+    return resolveEventSinceCursor(this.database, input.sessionId, input.since);
   }
 }
 

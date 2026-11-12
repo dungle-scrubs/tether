@@ -306,6 +306,7 @@ function makeSessionServiceEffect(
     readSessionDebugSummaryEffect,
     readSessionScalabilityDebugEffect,
     readScalabilityHealthWarningsEffect,
+    resolveEventSinceCursorEffect,
   } = createSessionReadEffects({ scalabilityDiagnostics, sessionSummaryStore, stores });
   const withRestTaskMutationControl = <TInput extends RestControlledInput & TaskParticipantInput>(
     operation: RestTaskOperation,
@@ -403,6 +404,13 @@ function makeSessionServiceEffect(
         { afterSeq, limit: options?.limit ?? null, sessionId },
         listEventsEffect(sessionId, afterSeq, options),
         (events) => ({ eventCount: events.length }),
+      ),
+    resolveEventSinceCursor: (cursorInput) =>
+      traceEffect(
+        "resolveEventSinceCursor",
+        { sessionId: cursorInput.sessionId, since: cursorInput.since.toISOString() },
+        resolveEventSinceCursorEffect(cursorInput),
+        (cursor) => ({ cursor }),
       ),
     listParticipants: (sessionId, options) =>
       traceEffect(
