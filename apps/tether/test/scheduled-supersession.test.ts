@@ -590,6 +590,7 @@ function createStores(
         events: [],
         truncated: false,
       }),
+      resolveSinceCursor: async () => 0,
     },
     participants: {
       heartbeat: async () => null,

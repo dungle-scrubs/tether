@@ -87,6 +87,10 @@ export interface SessionReadEffects {
     afterSeq: number,
     options?: SessionEventListOptions,
   ) => Effect.Effect<SessionEvent[], SessionServiceFailure>;
+  readonly resolveEventSinceCursorEffect: (input: {
+    readonly sessionId: string;
+    readonly since: Date;
+  }) => Effect.Effect<number, SessionServiceFailure>;
   readonly listParticipantRuntimeSnapshotsEffect: (
     sessionId: string,
   ) => Effect.Effect<ParticipantRuntimeSnapshot[], SessionServiceFailure>;
@@ -229,6 +233,13 @@ export function createSessionReadEffects(input: SessionReadEffectsInput): Sessio
       trySessionPromise(() => input.scalabilityDiagnostics.read(sessionId)),
     readScalabilityHealthWarningsEffect: () =>
       trySessionPromise(() => input.scalabilityDiagnostics.readHealthWarnings()),
+    resolveEventSinceCursorEffect: (cursorInput) =>
+      trySessionPromise(() =>
+        input.stores.events.resolveSinceCursor({
+          sessionId: cursorInput.sessionId,
+          since: cursorInput.since,
+        }),
+      ),
   };
 }
 

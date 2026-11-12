@@ -183,6 +183,14 @@ export interface SessionEventStore {
     readonly events: readonly SessionEvent[];
     readonly truncated: boolean;
   }>;
+  /**
+   * Resolves the exclusive sequence cursor of the first event created at or
+   * after an instant, so a reader can skip the events before it.
+   */
+  readonly resolveSinceCursor: (input: {
+    readonly sessionId: string;
+    readonly since: Date;
+  }) => Promise<number>;
 }
 
 /** Persistence for participant presence and runtime diagnostics. */

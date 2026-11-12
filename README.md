@@ -125,6 +125,7 @@ The main HTTP operations are:
 ```text
 POST /sessions                         create or return a conversation
 GET  /sessions/{id}/events?after={seq}   read event history
+GET  /sessions/{id}/events?since={instant}&exclude={types}   read a recent window without listed event types
 POST /sessions/{id}/participants        acquire participant control
 POST /sessions/{id}/events              publish with the current control epoch
 GET  /sessions/{id}/stream              WebSocket replay and live events

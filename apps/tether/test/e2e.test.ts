@@ -4170,6 +4170,135 @@ e2e("tether e2e", () => {
     }
   });
 
+  it("filters event pages by instant and excluded types against real Postgres", async () => {
+    const sessionId = `sess_event_filters_${randomUUID()}`;
+    await createDbSession(currentPool(), sessionId);
+    await currentPool().pool.query(
+      `
+        INSERT INTO session_events (
+          created_at,
+          event_id,
+          payload,
+          producer_id,
+          seq,
+          session_id,
+          type
+        )
+        VALUES
+          ('2026-05-21T00:00:00.000Z', $2 || '_1', '{}'::jsonb, 'event-filter-e2e', 1, $1, 'user.message'),
+          ('2026-05-21T01:00:00.000Z', $2 || '_2', '{}'::jsonb, 'event-filter-e2e', 2, $1, 'participant.heartbeat'),
+          ('2026-05-21T02:00:00.000Z', $2 || '_3', '{}'::jsonb, 'event-filter-e2e', 3, $1, 'user.message'),
+          ('2026-05-21T03:00:00.000Z', $2 || '_4', '{}'::jsonb, 'event-filter-e2e', 4, $1, 'task.progress')
+      `,
+      [sessionId, `evt_event_filter_${sessionId}`],
+    );
+    await currentPool().pool.query(
+      `UPDATE session_event_sequences SET next_seq = 5 WHERE session_id = $1`,
+      [sessionId],
+    );
+
+    const wholePage = await request<EventsResponse>(`/sessions/${sessionId}/events?after=0`);
+    expect(wholePage.events.map((event) => event.seq)).toEqual([1, 2, 3, 4]);
+
+    const sincePage = await request<EventsResponse>(
+      `/sessions/${sessionId}/events?since=2026-05-21T01:00:00.000Z`,
+    );
+    expect(sincePage.events.map((event) => event.seq)).toEqual([2, 3, 4]);
+    expect(sincePage.pagination).toMatchObject({ afterSeq: 1, nextAfterSeq: 4, returned: 3 });
+
+    const sinceWithLaterAfter = await request<EventsResponse>(
+      `/sessions/${sessionId}/events?since=2026-05-21T00:00:00.000Z&after=3`,
+    );
+    expect(sinceWithLaterAfter.events.map((event) => event.seq)).toEqual([4]);
+    expect(sinceWithLaterAfter.pagination).toMatchObject({ afterSeq: 3 });
+
+    const sinceAfterNewest = await request<EventsResponse>(
+      `/sessions/${sessionId}/events?since=2026-06-01T00:00:00.000Z`,
+    );
+    expect(sinceAfterNewest.events).toEqual([]);
+    expect(sinceAfterNewest.pagination).toMatchObject({
+      afterSeq: 4,
+      hasMore: false,
+      nextAfterSeq: 4,
+      returned: 0,
+    });
+
+    const excludedPage = await request<EventsResponse>(
+      `/sessions/${sessionId}/events?exclude=participant.heartbeat,task.progress`,
+    );
+    expect(excludedPage.events.map((event) => event.seq)).toEqual([1, 3]);
+
+    const excludedWithLimit = await request<EventsResponse>(
+      `/sessions/${sessionId}/events?exclude=participant.heartbeat&limit=2`,
+    );
+    expect(excludedWithLimit.events.map((event) => event.seq)).toEqual([1, 3]);
+    expect(excludedWithLimit.pagination).toMatchObject({ limit: 2, returned: 2 });
+
+    const combinedPage = await request<EventsResponse>(
+      `/sessions/${sessionId}/events?since=2026-05-21T01:00:00.000Z&exclude=participant.heartbeat`,
+    );
+    expect(combinedPage.events.map((event) => event.seq)).toEqual([3, 4]);
+    expect(combinedPage.pagination).toMatchObject({ afterSeq: 1 });
+
+    const invalidSince = await requestStatus(`/sessions/${sessionId}/events?since=not-a-date`);
+    expect(invalidSince.status).toBe(400);
+    expect(invalidSince.body).toMatchObject({ error: "Invalid since parameter" });
+
+    const invalidExclude = await requestStatus(`/sessions/${sessionId}/events?exclude=`);
+    expect(invalidExclude.status).toBe(400);
+    expect(invalidExclude.body).toMatchObject({ error: "Invalid exclude parameter" });
+  });
+
+  it("starts a since page at the lowest matching seq when created_at runs out of seq order", async () => {
+    const sessionId = `sess_event_since_order_${randomUUID()}`;
+    await createDbSession(currentPool(), sessionId);
+    // Concurrent appends can commit a later seq with an earlier created_at:
+    // seq 2 is newer than seq 3 here, and both are at or after `since`.
+    await currentPool().pool.query(
+      `
+        INSERT INTO session_events (
+          created_at, event_id, payload, producer_id, seq, session_id, type
+        )
+        VALUES
+          ('2026-05-21T00:30:00.000Z', $2 || '_1', '{}'::jsonb, 'event-order-e2e', 1, $1, 'user.message'),
+          ('2026-05-21T01:05:00.000Z', $2 || '_2', '{}'::jsonb, 'event-order-e2e', 2, $1, 'user.message'),
+          ('2026-05-21T01:02:00.000Z', $2 || '_3', '{}'::jsonb, 'event-order-e2e', 3, $1, 'user.message'),
+          ('2026-05-21T01:10:00.000Z', $2 || '_4', '{}'::jsonb, 'event-order-e2e', 4, $1, 'participant.heartbeat')
+      `,
+      [sessionId, `evt_event_order_${sessionId}`],
+    );
+    await currentPool().pool.query(
+      `UPDATE session_event_sequences SET next_seq = 5 WHERE session_id = $1`,
+      [sessionId],
+    );
+
+    const sincePage = await request<EventsResponse>(
+      `/sessions/${sessionId}/events?since=2026-05-21T01:00:00.000Z`,
+    );
+    expect(sincePage.events.map((event) => event.seq)).toEqual([2, 3, 4]);
+    expect(sincePage.pagination).toMatchObject({ afterSeq: 1 });
+
+    // A tail of only excluded rows ends the page: nothing more to read.
+    const tailExcluded = await request<EventsResponse>(
+      `/sessions/${sessionId}/events?after=3&exclude=participant.heartbeat`,
+    );
+    expect(tailExcluded.events).toEqual([]);
+    expect(tailExcluded.pagination).toMatchObject({
+      afterSeq: 3,
+      hasMore: false,
+      nextAfterSeq: 3,
+      returned: 0,
+    });
+
+    const emptySessionId = `sess_event_since_empty_${randomUUID()}`;
+    await createDbSession(currentPool(), emptySessionId);
+    const emptyPage = await request<EventsResponse>(
+      `/sessions/${emptySessionId}/events?since=2026-05-21T00:00:00.000Z`,
+    );
+    expect(emptyPage.events).toEqual([]);
+    expect(emptyPage.pagination).toMatchObject({ afterSeq: 0, hasMore: false, nextAfterSeq: 0 });
+  });
+
   it("returns Host-presence inventory fields without duplicating public ensure events", async () => {
     const sessionId = `sess_host_presence_inventory_${randomUUID()}`;
     const firstEnsure = await request<SessionResponse>("/sessions", {

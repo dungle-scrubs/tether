@@ -14,8 +14,10 @@
 
 import {
   eventListResponseSchema,
+  participantListResponseSchema,
   taskRecordSchema,
   type EventListResponse,
+  type ParticipantListResponse,
   type TaskRecord,
 } from "@dungle-scrubs/tether-protocol";
 import { z } from "zod";
@@ -205,8 +207,14 @@ export interface AppendTaskEventCall {
 
 /** Bounded event-list query. */
 export interface ListEventsQuery {
+  /** Exclusive sequence cursor of the first returned event. */
   readonly after?: number;
+  /** Event types left out of the page, sent as one comma-separated list. */
+  readonly exclude?: readonly string[];
+  /** Maximum number of events in the page. */
   readonly limit?: number;
+  /** ISO 8601 instant with an explicit offset or `Z` the page starts at. */
+  readonly since?: string;
 }
 
 type TaskOperation =
@@ -217,6 +225,7 @@ type TaskOperation =
   | "fail"
   | "list-active"
   | "list-events"
+  | "list-participants"
   | "read"
   | "record-approval"
   | "refresh-claim"
@@ -639,8 +648,14 @@ export class RestParticipantTaskClient {
     if (query.after !== undefined) {
       params.set("after", String(query.after));
     }
+    if (query.exclude !== undefined && query.exclude.length > 0) {
+      params.set("exclude", query.exclude.join(","));
+    }
     if (query.limit !== undefined) {
       params.set("limit", String(query.limit));
+    }
+    if (query.since !== undefined) {
+      params.set("since", query.since);
     }
     const suffix = params.size > 0 ? `?${params.toString()}` : "";
     const { body } = await this.#request(
@@ -651,6 +666,20 @@ export class RestParticipantTaskClient {
     const parsed = eventListResponseSchema.safeParse(body);
     if (!parsed.success) {
       throw this.#error("INVALID_RESPONSE", "list-events");
+    }
+    return parsed.data;
+  }
+
+  /** Lists the session's visible participants with their presence timestamps. */
+  async listParticipants(sessionId: string): Promise<ParticipantListResponse> {
+    const { body } = await this.#request(
+      "list-participants",
+      "GET",
+      `/sessions/${encodeURIComponent(sessionId)}/participants`,
+    );
+    const parsed = participantListResponseSchema.safeParse(body);
+    if (!parsed.success) {
+      throw this.#error("INVALID_RESPONSE", "list-participants");
     }
     return parsed.data;
   }
