@@ -1,5 +1,54 @@
 # @dungle-scrubs/tether-client
 
+## 1.2.0
+
+### Minor Changes
+
+- 3e9c483: Add `since` and `exclude` to the session event-list query. `listEvents` accepts an
+  optional `since` ISO 8601 instant with an explicit offset or `Z` and an optional
+  `exclude` list of event types, and sends them as the `since` and `exclude` query
+  parameters of `GET /sessions/{id}/events`. The service starts the page at the
+  first event created at or after `since` and leaves the listed event types out of
+  the page, so a read-only panel can load a recent window without paging through
+  every heartbeat.
+- 3e9c483: Add `listParticipants` to the REST client and `participantListResponseSchema` to
+  the protocol. `listParticipants(sessionId)` reads `GET /sessions/{id}/participants`
+  and validates each participant record, so a read-only panel can show presence
+  without hand-writing the request.
+- 06bf32e: Add optional REST history replay for participant runtimes that exceed the WebSocket replay window. Discover a finite witnessed head, adapt history pages to byte limits, and keep cursors behind successful handlers. Bound streamed reads and retained task state, execute recovered tasks serially through the existing claim flow, and retry transient failures through the existing reconnect backoff.
+
+  `RestParticipantTaskError.code` includes `RESOURCE_LIMIT`; that failure variant requires `details.resourceLimit` containing `{ resource, limit, observed }`. Errors retain enumerable own `code` and `details` fields for JSON serialization and object spread. Recovery read policy remains internal rather than an exported client option.
+
+  In default WebSocket mode, `runClaimableTasks({ once: true })` now rejects if terminal pause wins before task settlement completes. REST once mode rejects under the same condition.
+
+- 1163dae: Expose bounded, payload-free rejected task contract diagnostics and truncation counts in participant read records and REST control responses, and retain them in the REST control client context. Preserve absent diagnostics from older servers and keep derived diagnostics out of durable participant events.
+- ff9906f: Add fine-grained task authorization: separate task.create and task.claim actions with kind allowlists and optional explicit assignee, parent linkage as lineage only, typed claim denials distinct from race rejection. Default off with no policy rows; strict when rows exist.
+
+### Patch Changes
+
+- 8e090b8: Deduplicate the browser operator session wire shape and share transport helpers.
+
+  - `browserOperatorSessionSchema` no longer carries a top-level `sessionIds`
+    copy of `scope.sessionIds`; the `/operator/browser-session` response emits
+    the list once, under `scope`.
+  - `BrowserOperatorClient` throws the new `BrowserOperatorConfigurationError`
+    for local precondition failures (missing CSRF token, invalid service URL)
+    instead of a fake `BrowserOperatorHttpError` with status 0.
+  - Browser session stream pause reasons stay in the protocol-owned recovery
+    taxonomy, falling back to `server_stream_error` for unknown server reasons.
+  - New shared protocol exports: `buildSessionStreamUrl`,
+    `serialDeliveryFailureReason`, `utf8ByteLength`, `exactHttpOriginSchema`,
+    `participantRecordSchema`, `defaultReconnectDelayPolicy`,
+    `boundedReconnectDelayMs`; client and browser packages delegate to them.
+  - `taskResultSchema` output is now a loose object with a typed optional
+    `targetManifest` instead of `Record<string, unknown>`.
+
+- Updated dependencies [8e090b8]
+- Updated dependencies [3e9c483]
+- Updated dependencies [1163dae]
+- Updated dependencies [ff9906f]
+  - @dungle-scrubs/tether-protocol@0.4.0
+
 ## 1.0.1
 
 ### Patch Changes
