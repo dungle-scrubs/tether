@@ -67,6 +67,7 @@ interface ScheduledTaskCreateSchedule {
 }
 
 interface ScheduledTaskCreateInput {
+  /** Authenticated caller used to attest the creator; omitted when auth is disabled. */
   readonly actorParticipantId?: string | undefined;
   readonly body: {
     readonly input?: Record<string, unknown> | null | undefined;

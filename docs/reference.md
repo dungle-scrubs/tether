@@ -50,9 +50,13 @@ Common HTTP errors include `400` for invalid bodies, `401` for failed authentica
 
 Task APIs and lifecycle events return the shared `TaskRecord` shape defined in [records.ts](../packages/protocol/src/records.ts).
 
-`createdByParticipantId` is the service-attested participant ID of the authenticated caller that created the task. Claimants may authorize on this field. REST creates, scheduled creates, and operator commands record the authenticated principal. Request body fields and task input cannot set or override it. Replayed creates preserve the original creator.
+`createdByParticipantId` is the service-attested participant ID of the authenticated caller that created the task. REST and scheduled creates record the authenticated principal. Request body fields and task input cannot set or override it. Only the top-level `createdByParticipantId` is attested; keys inside task input are caller data.
 
-The field is `null` when authentication is disabled or the row predates creator attestation. Older servers may omit it, so the protocol schema accepts an absent field. An absent or null value attests no creator.
+Operator commands record the operator grant's subject under reserved `operator.*` task kinds. An authorizer must check the task kind as well as the creator.
+
+An idempotent replay of an existing `taskId` by a different caller returns the original task with its original creator.
+
+The field is `null` when authentication is disabled, the row predates this column, or the server itself created the task, such as a session-summary task. Older servers may omit it, so the protocol schema accepts an absent field. An absent or null value attests no creator.
 
 ## Configuration
 

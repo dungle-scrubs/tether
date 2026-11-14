@@ -302,28 +302,7 @@ interface ArchivedClientSessionBindingResponse extends JsonResponse {
 interface TaskResponse extends JsonResponse {
   readonly contract?: TaskContractsResponse["taskContracts"][number] | null;
   readonly status?: "created" | "replayed";
-  readonly task: {
-    readonly cancelledAt: string | null;
-    readonly claimExpiredAt: string | null;
-    readonly claimExpiredBy: string | null;
-    readonly claimExpiresAt: string | null;
-    readonly claimId: string | null;
-    readonly claimedAt: string | null;
-    readonly claimedBy: string | null;
-    readonly completedAt: string | null;
-    readonly createdAt: string;
-    readonly createdByParticipantId?: string | null | undefined;
-    readonly failedAt: string | null;
-    readonly failure: Record<string, unknown> | null;
-    readonly input: Record<string, unknown> | null;
-    readonly kind: string;
-    readonly objective: string;
-    readonly releasedAt: string | null;
-    readonly releasedBy: string | null;
-    readonly result: Record<string, unknown> | null;
-    readonly sessionId: string;
-    readonly taskId: string;
-  };
+  readonly task: TaskRecord;
 }
 
 interface PublishedEventResponse extends JsonResponse {
@@ -460,14 +439,7 @@ interface ParticipantRuntimeSnapshotsResponse extends JsonResponse {
 }
 
 interface TasksResponse extends JsonResponse {
-  readonly tasks: readonly {
-    readonly cancelledAt: string | null;
-    readonly claimExpiresAt: string | null;
-    readonly claimedBy: string | null;
-    readonly completedAt: string | null;
-    readonly result: Record<string, unknown> | null;
-    readonly taskId: string;
-  }[];
+  readonly tasks: readonly TaskRecord[];
 }
 
 interface TaskSnapshotsResponse extends JsonResponse {
@@ -8013,6 +7985,36 @@ e2e("tether e2e", () => {
     ).toBe(false);
   });
 
+  it("records a null creator on server-created session-summary tasks", async () => {
+    const session = await createSession();
+    await appendEvent(
+      currentPool(),
+      {
+        eventId: `evt_summary_creator_${randomUUID()}`,
+        payload: { text: "Source material for a summary" },
+        producerId: "summary-creator-e2e",
+        sessionId: session.sessionId,
+        type: "user.message",
+      },
+      { sourceId: "src_summary_creator_e2e" },
+    );
+    const generation = createSessionSummaryGenerationService({
+      store: createSessionSummaryStore(currentPool().pool),
+    });
+    const reservation = await generation.requestGeneration(
+      createSummaryRangeFixture(session.sessionId),
+    );
+    expect(reservation.status).toBe("created");
+    if (reservation.status !== "created") {
+      throw new Error(`Expected created summary job, got ${reservation.status}`);
+    }
+    const response = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${reservation.job.taskId}`,
+    );
+    expect(response.task.kind).toBe("session_summary_generation");
+    expect(response.task.createdByParticipantId).toBeNull();
+  });
+
   it("attests the REST creator from a participant token through create, read, list, claim, and events", async () => {
     const session = await createSession();
     const participantId = "part_attested_creator";
@@ -8059,6 +8061,7 @@ e2e("tether e2e", () => {
     const taskId = `task_creator_spoof_${randomUUID()}`;
     const body = {
       actorParticipantId: "part_forged_actor",
+      assigneeParticipantId: "part_distinct_assignee",
       createdBy: "part_forged_creator",
       createdByParticipantId: "part_forged_creator",
       input: {
@@ -8085,6 +8088,7 @@ e2e("tether e2e", () => {
       });
       expect(response.status).toBe(status);
       expect(response.task.createdByParticipantId).toBe("part_original_creator");
+      expect(response.task.assigneeParticipantId).toBe("part_distinct_assignee");
     }
     await expect(
       getTask(currentPool(), { sessionId: session.sessionId, taskId }),
@@ -11311,6 +11315,13 @@ e2e("tether e2e", () => {
           .map((item) => `${item.sessionId}:${item.taskId}`),
       );
 
+      for (const event of singleBatchEvents) {
+        expect(event.type).toBe("task.claim_expired");
+        expect(event.payload.task).toMatchObject({
+          createdByParticipantId: "part_expiration_creator",
+        });
+      }
+
       const concurrentBatch = [
         {
           sessionId: `sess_expiration_concurrent_a_${randomUUID()}`,
@@ -11354,6 +11365,7 @@ e2e("tether e2e", () => {
         expect(task).toMatchObject({
           claimExpiredAt: expect.any(String),
           claimExpiredBy: `part_expiration_${item.taskId}`,
+          createdByParticipantId: "part_expiration_creator",
           claimExpiresAt: null,
           claimedAt: null,
           claimedBy: null,
@@ -12421,6 +12433,7 @@ e2e("tether e2e", () => {
   ): Promise<void> {
     await createDbSession(targetPool, sessionId);
     await createTaskWithEvent(targetPool, {
+      actorParticipantId: "part_expiration_creator",
       eventSourceId: "src_expiration_setup_e2e",
       kind: "software_dev",
       objective: "Expire this claim",

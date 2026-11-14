@@ -62,6 +62,7 @@ function pgTaskRow(overrides: PgRow = {}): PgRow {
     claimedBy: null,
     completedAt: null,
     createdAt: new Date("2026-09-15T00:00:00.000Z"),
+    createdByParticipantId: null,
     failedAt: null,
     failure: null,
     input: null,
