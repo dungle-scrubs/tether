@@ -44,7 +44,7 @@ export interface TaskRecord {
   /** Creation timestamp returned by Tether. */
   readonly createdAt: string;
   /**
-   * Service-attested authenticated creator. Null when auth is disabled, the row
+   * Service-attested authenticated creator; claimants may authorize on it. Null when auth is disabled, the row
    * predates this column, or the server itself created the task. Older servers
    * may omit it. Only this top-level field is attested; keys inside task input
    * are caller data. Operator commands carry the operator grant's subject, so
@@ -539,7 +539,7 @@ export const taskRecordSchema = z.object({
   completedAt: z.string().nullable(),
   createdAt: z.string(),
   /**
-   * Service-attested authenticated creator. Null when auth is disabled, the row
+   * Service-attested authenticated creator; claimants may authorize on it. Null when auth is disabled, the row
    * predates this column, or the server itself created the task. Older servers
    * may omit it. Only this top-level field is attested; keys inside task input
    * are caller data. Operator commands carry the operator grant's subject, so

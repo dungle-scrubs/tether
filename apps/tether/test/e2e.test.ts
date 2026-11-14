@@ -129,6 +129,22 @@ const summaryWorkerOllamaIdentity = {
   thinkingMode: "disabled",
 } as const satisfies SessionSummaryOllamaIdentity;
 
+/** Builds the exact range-selection policy used by integrated worker jobs. */
+function createSummaryRangeFixture(sessionId: string) {
+  return {
+    budgetClass: "8k",
+    deadlineAt: new Date(Date.now() + 60_000),
+    inputLimitBytes: 64_000,
+    maxEventCount: 100,
+    ollama: summaryWorkerOllamaIdentity,
+    outputLimitBytes: 64_000,
+    outputSchemaVersion: "session-summary.v1",
+    producer: { id: "session-summary-worker", version: "e2e" },
+    promptVersion: "session-summary.v1",
+    sessionId,
+  } as const;
+}
+
 /** Exact final Plan 32 current-lease fence used by protected mutations. */
 const currentControlLeaseFenceQuery = `
       SELECT
@@ -8020,9 +8036,14 @@ e2e("tether e2e", () => {
     const participantId = "part_attested_creator";
     const created = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
       authToken: mintE2eToken({ participantId, role: "participant", sessionId: session.sessionId }),
-      body: { kind: "software_dev", objective: "Record the authenticated creator" },
+      body: {
+        assigneeParticipantId: "part_distinct_assignee",
+        kind: "software_dev",
+        objective: "Record the authenticated creator",
+      },
       method: "POST",
     });
+    expect(created.task.assigneeParticipantId).toBe("part_distinct_assignee");
     expect(created.task.createdByParticipantId).toBe(participantId);
     const path = `/sessions/${session.sessionId}/tasks/${created.task.taskId}`;
     const read = await request<TaskResponse>(path);
@@ -13013,22 +13034,6 @@ function enabledSummaryWorkerSelection() {
 /** Creates one fake Ollama transport that returns protocol-valid structured content. */
 function createFakeOllamaFetch(content: SessionSummaryContent): typeof globalThis.fetch {
   return async () => Response.json({ message: { content: JSON.stringify(content) } });
-}
-
-/** Builds the exact range-selection policy used by integrated worker jobs. */
-function createSummaryRangeFixture(sessionId: string) {
-  return {
-    budgetClass: "8k",
-    deadlineAt: new Date(Date.now() + 60_000),
-    inputLimitBytes: 64_000,
-    maxEventCount: 100,
-    ollama: summaryWorkerOllamaIdentity,
-    outputLimitBytes: 64_000,
-    outputSchemaVersion: "session-summary.v1",
-    producer: { id: "session-summary-worker", version: "e2e" },
-    promptVersion: "session-summary.v1",
-    sessionId,
-  } as const;
 }
 
 /** Seeds a long raw-event session whose final events change inventory eligibility. */

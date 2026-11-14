@@ -336,6 +336,7 @@ interface ExpiredTaskClaimRow {
   readonly claimedBy: string | null;
   readonly completedAt: Date | null;
   readonly createdAt: Date;
+  /** Service-attested authenticated creator; null when auth is disabled, the row predates the column, or the server created the task. */
   readonly createdByParticipantId: string | null;
   readonly failedAt: Date | null;
   readonly failure: Record<string, unknown> | null;
@@ -368,6 +369,7 @@ interface PgTaskRow {
   readonly claimedBy: string | null;
   readonly completedAt: Date | null;
   readonly createdAt: Date;
+  /** Service-attested authenticated creator; null when auth is disabled, the row predates the column, or the server created the task. */
   readonly createdByParticipantId: string | null;
   readonly failedAt: Date | null;
   readonly failure: Record<string, unknown> | null;

@@ -50,7 +50,7 @@ Common HTTP errors include `400` for invalid bodies, `401` for failed authentica
 
 Task APIs and lifecycle events return the shared `TaskRecord` shape defined in [records.ts](../packages/protocol/src/records.ts).
 
-`createdByParticipantId` is the service-attested participant ID of the authenticated caller that created the task. REST and scheduled creates record the authenticated principal. Request body fields and task input cannot set or override it. Only the top-level `createdByParticipantId` is attested; keys inside task input are caller data.
+`createdByParticipantId` is the service-attested participant ID of the authenticated caller that created the task; claimants may authorize on it. REST and scheduled creates record the authenticated principal. Request body fields and task input cannot set or override it. Only the top-level `createdByParticipantId` is attested; keys inside task input are caller data.
 
 Operator commands record the operator grant's subject under reserved `operator.*` task kinds. An authorizer must check the task kind as well as the creator.
 
