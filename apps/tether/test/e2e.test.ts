@@ -312,6 +312,7 @@ interface TaskResponse extends JsonResponse {
     readonly claimedBy: string | null;
     readonly completedAt: string | null;
     readonly createdAt: string;
+    readonly createdByParticipantId?: string | null | undefined;
     readonly failedAt: string | null;
     readonly failure: Record<string, unknown> | null;
     readonly input: Record<string, unknown> | null;
@@ -1238,6 +1239,10 @@ e2e("tether e2e", () => {
         },
       );
       expect(command.status).toBe(201);
+      expect(command.body.task.createdByParticipantId).toBe("operator@example.test");
+      await expect(
+        getTask(currentPool(), { sessionId, taskId: command.body.task.taskId }),
+      ).resolves.toMatchObject({ createdByParticipantId: "operator@example.test" });
       const persistedCommand = await currentPool().pool.query<{
         readonly operatorCommandKey: string | null;
         readonly operatorGrantJti: string | null;
@@ -8006,6 +8011,176 @@ e2e("tether e2e", () => {
         (event) => event.type === "task.created" && taskIdFromEventPayload(event) === taskId,
       ),
     ).toBe(false);
+  });
+
+  it("attests the REST creator from a participant token through create, read, list, claim, and events", async () => {
+    const session = await createSession();
+    const participantId = "part_attested_creator";
+    const created = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
+      authToken: mintE2eToken({ participantId, role: "participant", sessionId: session.sessionId }),
+      body: { kind: "software_dev", objective: "Record the authenticated creator" },
+      method: "POST",
+    });
+    expect(created.task.createdByParticipantId).toBe(participantId);
+    const path = `/sessions/${session.sessionId}/tasks/${created.task.taskId}`;
+    const read = await request<TaskResponse>(path);
+    expect(read.task.createdByParticipantId).toBe(participantId);
+    const listed = await request<TasksResponse>(`/sessions/${session.sessionId}/tasks`);
+    expect(listed.tasks).toContainEqual(
+      expect.objectContaining({
+        createdByParticipantId: participantId,
+        taskId: created.task.taskId,
+      }),
+    );
+    const claimed = await request<TaskResponse>(`${path}/claim`, {
+      body: { instanceId: "inst_creator_claim", participantId: "part_creator_claimant" },
+      method: "POST",
+    });
+    expect(claimed.task.createdByParticipantId).toBe(participantId);
+    expect(claimed.task.claimedBy).toBe("part_creator_claimant");
+    const events = await request<EventsResponse>(`/sessions/${session.sessionId}/events?after=0`);
+    for (const type of ["task.created", "task.claimed"]) {
+      expect(events.events).toContainEqual(
+        expect.objectContaining({
+          payload: expect.objectContaining({
+            task: expect.objectContaining({
+              createdByParticipantId: participantId,
+              taskId: created.task.taskId,
+            }),
+          }),
+          type,
+        }),
+      );
+    }
+  });
+
+  it("ignores forged creator fields in REST bodies and task input, and preserves the creator on replay", async () => {
+    const session = await createSession();
+    const taskId = `task_creator_spoof_${randomUUID()}`;
+    const body = {
+      actorParticipantId: "part_forged_actor",
+      createdBy: "part_forged_creator",
+      createdByParticipantId: "part_forged_creator",
+      input: {
+        actorParticipantId: "part_forged_actor",
+        createdBy: "part_forged_creator",
+        createdByParticipantId: "part_forged_creator",
+      },
+      kind: "software_dev",
+      objective: "Ignore caller-provided creator claims",
+      taskId,
+    };
+    for (const [participantId, status] of [
+      ["part_original_creator", "created"],
+      ["part_replay_caller", "replayed"],
+    ] as const) {
+      const response = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
+        authToken: mintE2eToken({
+          participantId,
+          role: "participant",
+          sessionId: session.sessionId,
+        }),
+        body,
+        method: "POST",
+      });
+      expect(response.status).toBe(status);
+      expect(response.task.createdByParticipantId).toBe("part_original_creator");
+    }
+    await expect(
+      getTask(currentPool(), { sessionId: session.sessionId, taskId }),
+    ).resolves.toMatchObject({
+      createdByParticipantId: "part_original_creator",
+    });
+  });
+
+  it("attests the creator on REST and service scheduled creates", async () => {
+    const session = await createSession();
+    const participantId = "part_schedule_creator";
+    const schedule = {
+      scheduleAlgorithmVersion: 1,
+      scheduleIntervalMs: 3_600_000,
+      scheduleWindowStart: 1_700_000_000_000,
+      scopeKey: "creator-attestation",
+    };
+    const response = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
+      authToken: mintE2eToken({ participantId, role: "participant", sessionId: session.sessionId }),
+      body: {
+        createdByParticipantId: "part_forged_creator",
+        input: { createdByParticipantId: "part_forged_creator" },
+        kind: "scheduled_creator_test",
+        objective: "Attest scheduled REST caller",
+        schedule,
+      },
+      method: "POST",
+    });
+    expect(response.task.createdByParticipantId).toBe(participantId);
+    const service = createSessionServiceEffect(currentPool());
+    const result = await Effect.runPromise(
+      service.createTask({
+        actorParticipantId: participantId,
+        input: null,
+        taskId: undefined,
+        kind: "scheduled_service_creator_test",
+        objective: "Attest scheduled service caller",
+        schedule: {
+          scheduleAlgorithmVersion: schedule.scheduleAlgorithmVersion,
+          scheduleIdentityVersion: 2,
+          scheduleIntervalMs: schedule.scheduleIntervalMs,
+          scheduleScopeKey: schedule.scopeKey,
+          scheduleWindowStart: schedule.scheduleWindowStart,
+        },
+        sessionId: session.sessionId,
+      }),
+    );
+    expect(result.task?.createdByParticipantId).toBe(participantId);
+    for (const taskId of [response.task.taskId, result.task?.taskId]) {
+      if (taskId === undefined) throw new Error("Expected a created scheduled task");
+      await expect(
+        getTask(currentPool(), { sessionId: session.sessionId, taskId }),
+      ).resolves.toMatchObject({ createdByParticipantId: participantId });
+    }
+  });
+
+  it("records null creators when authentication is disabled, including scheduled creates", async () => {
+    const session = await createSession();
+    const disabledApp = createAppServer(currentPool(), {
+      auth: { activeKid: testAuthSigningKid, mode: "disabled", secrets: {} },
+    });
+    const port = await disabledApp.listen(0);
+    try {
+      for (const schedule of [
+        undefined,
+        {
+          scheduleAlgorithmVersion: 1,
+          scheduleIntervalMs: 3_600_000,
+          scheduleWindowStart: 1_700_000_000_000,
+          scopeKey: "disabled-creator",
+        },
+      ]) {
+        const created = await requestFrom<TaskResponse>(
+          `http://127.0.0.1:${port}`,
+          `/sessions/${session.sessionId}/tasks`,
+          {
+            authToken: null,
+            body: {
+              actorParticipantId: "part_forged_actor",
+              createdByParticipantId: "part_forged_creator",
+              input: { createdByParticipantId: "part_forged_creator" },
+              kind: "disabled_creator_test",
+              objective: "Record no authenticated creator",
+              ...(schedule === undefined ? {} : { schedule }),
+            },
+            method: "POST",
+          },
+        );
+        expect(created.task.createdByParticipantId).toBeNull();
+        await expect(
+          getTask(currentPool(), { sessionId: session.sessionId, taskId: created.task.taskId }),
+        ).resolves.toMatchObject({ createdByParticipantId: null });
+      }
+    } finally {
+      await disabledApp.close();
+    }
   });
 
   it("keeps task completion retryable when composed event insert fails", async () => {

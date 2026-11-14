@@ -521,6 +521,7 @@ function ensureScheduledRunStoreEffect(
   return trySessionPromise(
     () =>
       input.stores.tasks.ensureScheduledRun({
+        actorParticipantId: request.actorParticipantId,
         eventSourceId: input.eventSourceId,
         ...(request.expectedTaskId !== undefined ? { expectedTaskId: request.expectedTaskId } : {}),
         input: request.input ?? null,
@@ -579,6 +580,7 @@ function createScheduledTaskEffect(
       );
     }
     const ensuredOrConflict = yield* ensureScheduledRunStoreEffect(input, {
+      actorParticipantId: taskInput.actorParticipantId,
       ...(taskInput.taskId !== undefined ? { expectedTaskId: taskInput.taskId } : {}),
       identity,
       input: taskInput.input ?? null,

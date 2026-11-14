@@ -43,6 +43,12 @@ export interface TaskRecord {
   readonly completedAt: string | null;
   /** Creation timestamp returned by Tether. */
   readonly createdAt: string;
+  /**
+   * Service-attested authenticated creator; claimants may authorize on it.
+   * Null when auth is disabled or the row predates attestation. Optional for
+   * compatibility with records returned by older servers.
+   */
+  readonly createdByParticipantId?: string | null | undefined;
   /** Failure timestamp, when the task has reached a terminal failure. */
   readonly failedAt: string | null;
   /** Structured failure payload, when the task failed with details. */
@@ -529,6 +535,8 @@ export const taskRecordSchema = z.object({
   claimedBy: z.string().nullable(),
   completedAt: z.string().nullable(),
   createdAt: z.string(),
+  /** Service-attested authenticated creator; claimants may authorize on it. Null when auth is disabled or the row predates attestation; absent on older servers. */
+  createdByParticipantId: z.string().nullable().optional(),
   failedAt: z.string().nullable(),
   failure: z.record(z.string(), z.unknown()).nullable(),
   input: z.record(z.string(), z.unknown()).nullable(),

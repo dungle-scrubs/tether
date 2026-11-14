@@ -36,6 +36,21 @@ describe("taskRecordSchema", () => {
     expect(parsed).not.toHaveProperty("schedule");
   });
 
+  it("accepts older records without creator attestation", () => {
+    const parsed = taskRecordSchema.parse(createTaskFixture());
+
+    expect(parsed).not.toHaveProperty("createdByParticipantId");
+  });
+
+  it.each(["participant_creator", null])("preserves creator attestation %s", (creator) => {
+    const parsed = taskRecordSchema.parse({
+      ...createTaskFixture(),
+      createdByParticipantId: creator,
+    });
+
+    expect(parsed.createdByParticipantId).toBe(creator);
+  });
+
   it("round-trips a claimed record with an offset deadline and a claim id", () => {
     const task: TaskRecord = {
       ...createTaskFixture(),
@@ -43,6 +58,7 @@ describe("taskRecordSchema", () => {
       claimId: "claim_a1b2c3",
       claimedAt: "2026-01-01T00:00:00.000Z",
       claimedBy: "participant_1",
+      createdByParticipantId: "participant_creator",
     };
 
     expect(taskRecordSchema.parse(task)).toEqual(task);

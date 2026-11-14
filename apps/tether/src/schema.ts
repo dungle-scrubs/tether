@@ -656,6 +656,8 @@ export const tasks = pgTable(
     claimedBy: text("claimed_by"),
     completedAt: timestamp("completed_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    /** Participant id of the authenticated caller that created the task; null when auth is disabled or for rows created before this column existed. */
+    createdByParticipantId: text("created_by_participant_id"),
     failedAt: timestamp("failed_at", { withTimezone: true }),
     failure: jsonb("failure").$type<Record<string, unknown>>(),
     input: jsonb("input").$type<Record<string, unknown>>(),

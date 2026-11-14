@@ -1,0 +1,1 @@
+ALTER TABLE "tasks" ADD COLUMN "created_by_participant_id" text;

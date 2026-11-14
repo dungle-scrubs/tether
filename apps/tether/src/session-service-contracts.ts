@@ -842,6 +842,8 @@ export interface ScheduledSupersessionResult {
  * the derived identity so a caller cannot smuggle in a mismatched scheduled id.
  */
 export interface EnsureScheduledRunRequest {
+  /** Authenticated creator, independent of the supersession event actor. */
+  readonly actorParticipantId?: string | undefined;
   /** Optional caller-supplied task id verified against the derived identity. */
   readonly expectedTaskId?: string | undefined;
   readonly identity: ScheduledMaintenanceIdentity;
