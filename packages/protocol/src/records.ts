@@ -43,6 +43,15 @@ export interface TaskRecord {
   readonly completedAt: string | null;
   /** Creation timestamp returned by Tether. */
   readonly createdAt: string;
+  /**
+   * Service-attested authenticated creator; claimants may authorize on it. Null when auth is disabled, the row
+   * predates this column, or the server itself created the task. Older servers
+   * may omit it. Only this top-level field is attested; keys inside task input
+   * are caller data. Operator commands carry the operator grant's subject, so
+   * authorizers must also check the task kind. An idempotent replay of an existing
+   * taskId by a different caller returns the original task and creator.
+   */
+  readonly createdByParticipantId?: string | null | undefined;
   /** Failure timestamp, when the task has reached a terminal failure. */
   readonly failedAt: string | null;
   /** Structured failure payload, when the task failed with details. */
@@ -529,6 +538,15 @@ export const taskRecordSchema = z.object({
   claimedBy: z.string().nullable(),
   completedAt: z.string().nullable(),
   createdAt: z.string(),
+  /**
+   * Service-attested authenticated creator; claimants may authorize on it. Null when auth is disabled, the row
+   * predates this column, or the server itself created the task. Older servers
+   * may omit it. Only this top-level field is attested; keys inside task input
+   * are caller data. Operator commands carry the operator grant's subject, so
+   * authorizers must also check the task kind. An idempotent replay of an existing
+   * taskId by a different caller returns the original task and creator.
+   */
+  createdByParticipantId: z.string().nullable().optional(),
   failedAt: z.string().nullable(),
   failure: z.record(z.string(), z.unknown()).nullable(),
   input: z.record(z.string(), z.unknown()).nullable(),

@@ -46,6 +46,18 @@ Participant-owned mutations require the current `controlEpoch`. Registration is 
 
 Common HTTP errors include `400` for invalid bodies, `401` for failed authentication, `403` for denied authority, and `409` for control or state conflicts. Resource limits can return `413` or `429`. Grant creation returns `503` while issuance is gated. Inspect the response's bounded `reason` or `error` before deciding whether to retry.
 
+## Task records
+
+Task APIs and lifecycle events return the shared `TaskRecord` shape defined in [records.ts](../packages/protocol/src/records.ts).
+
+`createdByParticipantId` is the service-attested participant ID of the authenticated caller that created the task; claimants may authorize on it. REST and scheduled creates record the authenticated principal. Request body fields and task input cannot set or override it. Only the top-level `createdByParticipantId` is attested; keys inside task input are caller data.
+
+Operator commands record the operator grant's subject under reserved `operator.*` task kinds. An authorizer must check the task kind as well as the creator.
+
+An idempotent replay of an existing `taskId` by a different caller returns the original task with its original creator.
+
+The field is `null` when authentication is disabled, the row predates this column, or the server itself created the task, such as a session-summary task. Older servers may omit it, so the protocol schema accepts an absent field. An absent or null value attests no creator.
+
 ## Configuration
 
 The native server reads process environment variables. It does not load the repository's `.env` file itself. Compose uses `.env` for interpolation, then forwards only the variables declared under each service's `environment` block.

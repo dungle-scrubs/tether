@@ -62,6 +62,7 @@ function pgTaskRow(overrides: PgRow = {}): PgRow {
     claimedBy: null,
     completedAt: null,
     createdAt: new Date("2026-09-15T00:00:00.000Z"),
+    createdByParticipantId: null,
     failedAt: null,
     failure: null,
     input: null,
@@ -180,6 +181,7 @@ function route(world: GrantWorld, text: string, values: readonly unknown[]): { r
   if (normalized.includes("INSERT INTO tasks")) {
     const row = pgTaskRow({
       assigneeParticipantId: (values[0] as string | null) ?? null,
+      createdByParticipantId: (values[15] as string | null) ?? null,
       input:
         values[1] === null || values[1] === undefined
           ? null
@@ -418,6 +420,7 @@ describe("service boundary: auth-enabled positives", () => {
       taskIdSource: "caller",
     });
     expect(result.status).toBe("created");
+    expect(result.task?.createdByParticipantId).toBe("worker_one");
     expect(result.task?.claimedBy).toBeNull();
     expect(result.task?.claimId).toBeNull();
     expect(result.events).toHaveLength(1);
@@ -428,13 +431,14 @@ describe("service boundary: auth-enabled positives", () => {
 
   it("claims a task carrying a parent link when the grant covers the claim", async () => {
     const world = makeWorld({ grants: [grant({ jti: "tgrant_claim" })] });
-    seedTask(world, { parentTaskId: "task_parent" });
+    seedTask(world, { createdByParticipantId: "creator_one", parentTaskId: "task_parent" });
     const result = await claimTaskWithEvent(poolFor(world), {
       ...claimInput,
       taskGrantAuthMode: "required",
     });
     expect(result?.task.claimedBy).toBe("worker_one");
     expect(result?.task.parentTaskId).toBe("task_parent");
+    expect(result?.task.createdByParticipantId).toBe("creator_one");
     expect(result?.events).toHaveLength(1);
   });
 
@@ -1229,6 +1233,24 @@ describe("service boundary: system-owned paths never consult grants", () => {
     const result = await ensureScheduledRunWithEvents(poolFor(world), scheduleInput);
     expect(result.current.status).toBe("created");
     expect(grantStatements(world)).toEqual([]);
+  });
+
+  it.each([
+    "creator_one",
+    undefined,
+  ])("records only the authenticated scheduled creator %s, independent of the supersession actor and input", async (actorParticipantId) => {
+    const world = makeWorld();
+    const result = await ensureScheduledRunWithEvents(poolFor(world), {
+      ...scheduleInput,
+      actorParticipantId,
+      input: { createdByParticipantId: "forged_creator" },
+    });
+
+    expect(result.current.task.createdByParticipantId).toBe(actorParticipantId ?? null);
+    if (result.current.status !== "created") throw new Error("Expected a created scheduled task");
+    expect(result.current.event.payload).toMatchObject({
+      task: { createdByParticipantId: actorParticipantId ?? null },
+    });
   });
 
   it("expires claims via the sweeper with policy rows present and no grant read", async () => {

@@ -129,6 +129,22 @@ const summaryWorkerOllamaIdentity = {
   thinkingMode: "disabled",
 } as const satisfies SessionSummaryOllamaIdentity;
 
+/** Builds the exact range-selection policy used by integrated worker jobs. */
+function createSummaryRangeFixture(sessionId: string) {
+  return {
+    budgetClass: "8k",
+    deadlineAt: new Date(Date.now() + 60_000),
+    inputLimitBytes: 64_000,
+    maxEventCount: 100,
+    ollama: summaryWorkerOllamaIdentity,
+    outputLimitBytes: 64_000,
+    outputSchemaVersion: "session-summary.v1",
+    producer: { id: "session-summary-worker", version: "e2e" },
+    promptVersion: "session-summary.v1",
+    sessionId,
+  } as const;
+}
+
 /** Exact final Plan 32 current-lease fence used by protected mutations. */
 const currentControlLeaseFenceQuery = `
       SELECT
@@ -302,27 +318,7 @@ interface ArchivedClientSessionBindingResponse extends JsonResponse {
 interface TaskResponse extends JsonResponse {
   readonly contract?: TaskContractsResponse["taskContracts"][number] | null;
   readonly status?: "created" | "replayed";
-  readonly task: {
-    readonly cancelledAt: string | null;
-    readonly claimExpiredAt: string | null;
-    readonly claimExpiredBy: string | null;
-    readonly claimExpiresAt: string | null;
-    readonly claimId: string | null;
-    readonly claimedAt: string | null;
-    readonly claimedBy: string | null;
-    readonly completedAt: string | null;
-    readonly createdAt: string;
-    readonly failedAt: string | null;
-    readonly failure: Record<string, unknown> | null;
-    readonly input: Record<string, unknown> | null;
-    readonly kind: string;
-    readonly objective: string;
-    readonly releasedAt: string | null;
-    readonly releasedBy: string | null;
-    readonly result: Record<string, unknown> | null;
-    readonly sessionId: string;
-    readonly taskId: string;
-  };
+  readonly task: TaskRecord;
 }
 
 interface PublishedEventResponse extends JsonResponse {
@@ -459,14 +455,7 @@ interface ParticipantRuntimeSnapshotsResponse extends JsonResponse {
 }
 
 interface TasksResponse extends JsonResponse {
-  readonly tasks: readonly {
-    readonly cancelledAt: string | null;
-    readonly claimExpiresAt: string | null;
-    readonly claimedBy: string | null;
-    readonly completedAt: string | null;
-    readonly result: Record<string, unknown> | null;
-    readonly taskId: string;
-  }[];
+  readonly tasks: readonly TaskRecord[];
 }
 
 interface TaskSnapshotsResponse extends JsonResponse {
@@ -1238,6 +1227,10 @@ e2e("tether e2e", () => {
         },
       );
       expect(command.status).toBe(201);
+      expect(command.body.task.createdByParticipantId).toBe("operator@example.test");
+      await expect(
+        getTask(currentPool(), { sessionId, taskId: command.body.task.taskId }),
+      ).resolves.toMatchObject({ createdByParticipantId: "operator@example.test" });
       const persistedCommand = await currentPool().pool.query<{
         readonly operatorCommandKey: string | null;
         readonly operatorGrantJti: string | null;
@@ -8008,6 +8001,213 @@ e2e("tether e2e", () => {
     ).toBe(false);
   });
 
+  it("records a null creator on server-created session-summary tasks", async () => {
+    const session = await createSession();
+    await appendEvent(
+      currentPool(),
+      {
+        eventId: `evt_summary_creator_${randomUUID()}`,
+        payload: { text: "Source material for a summary" },
+        producerId: "summary-creator-e2e",
+        sessionId: session.sessionId,
+        type: "user.message",
+      },
+      { sourceId: "src_summary_creator_e2e" },
+    );
+    const generation = createSessionSummaryGenerationService({
+      store: createSessionSummaryStore(currentPool().pool),
+    });
+    const reservation = await generation.requestGeneration(
+      createSummaryRangeFixture(session.sessionId),
+    );
+    expect(reservation.status).toBe("created");
+    if (reservation.status !== "created") {
+      throw new Error(`Expected created summary job, got ${reservation.status}`);
+    }
+    const response = await request<TaskResponse>(
+      `/sessions/${session.sessionId}/tasks/${reservation.job.taskId}`,
+    );
+    expect(response.task.kind).toBe("session_summary_generation");
+    expect(response.task.createdByParticipantId).toBeNull();
+  });
+
+  it("attests the REST creator from a participant token through create, read, list, claim, and events", async () => {
+    const session = await createSession();
+    const participantId = "part_attested_creator";
+    const created = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
+      authToken: mintE2eToken({ participantId, role: "participant", sessionId: session.sessionId }),
+      body: {
+        assigneeParticipantId: "part_distinct_assignee",
+        kind: "software_dev",
+        objective: "Record the authenticated creator",
+      },
+      method: "POST",
+    });
+    expect(created.task.assigneeParticipantId).toBe("part_distinct_assignee");
+    expect(created.task.createdByParticipantId).toBe(participantId);
+    const path = `/sessions/${session.sessionId}/tasks/${created.task.taskId}`;
+    const read = await request<TaskResponse>(path);
+    expect(read.task.createdByParticipantId).toBe(participantId);
+    const listed = await request<TasksResponse>(`/sessions/${session.sessionId}/tasks`);
+    expect(listed.tasks).toContainEqual(
+      expect.objectContaining({
+        createdByParticipantId: participantId,
+        taskId: created.task.taskId,
+      }),
+    );
+    const claimed = await request<TaskResponse>(`${path}/claim`, {
+      body: { instanceId: "inst_creator_claim", participantId: "part_creator_claimant" },
+      method: "POST",
+    });
+    expect(claimed.task.createdByParticipantId).toBe(participantId);
+    expect(claimed.task.claimedBy).toBe("part_creator_claimant");
+    const events = await request<EventsResponse>(`/sessions/${session.sessionId}/events?after=0`);
+    for (const type of ["task.created", "task.claimed"]) {
+      expect(events.events).toContainEqual(
+        expect.objectContaining({
+          payload: expect.objectContaining({
+            task: expect.objectContaining({
+              createdByParticipantId: participantId,
+              taskId: created.task.taskId,
+            }),
+          }),
+          type,
+        }),
+      );
+    }
+  });
+
+  it("ignores forged creator fields in REST bodies and task input, and preserves the creator on replay", async () => {
+    const session = await createSession();
+    const taskId = `task_creator_spoof_${randomUUID()}`;
+    const body = {
+      actorParticipantId: "part_forged_actor",
+      assigneeParticipantId: "part_distinct_assignee",
+      createdBy: "part_forged_creator",
+      createdByParticipantId: "part_forged_creator",
+      input: {
+        actorParticipantId: "part_forged_actor",
+        createdBy: "part_forged_creator",
+        createdByParticipantId: "part_forged_creator",
+      },
+      kind: "software_dev",
+      objective: "Ignore caller-provided creator claims",
+      taskId,
+    };
+    for (const [participantId, status] of [
+      ["part_original_creator", "created"],
+      ["part_replay_caller", "replayed"],
+    ] as const) {
+      const response = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
+        authToken: mintE2eToken({
+          participantId,
+          role: "participant",
+          sessionId: session.sessionId,
+        }),
+        body,
+        method: "POST",
+      });
+      expect(response.status).toBe(status);
+      expect(response.task.createdByParticipantId).toBe("part_original_creator");
+      expect(response.task.assigneeParticipantId).toBe("part_distinct_assignee");
+    }
+    await expect(
+      getTask(currentPool(), { sessionId: session.sessionId, taskId }),
+    ).resolves.toMatchObject({
+      createdByParticipantId: "part_original_creator",
+    });
+  });
+
+  it("attests the creator on REST and service scheduled creates", async () => {
+    const session = await createSession();
+    const participantId = "part_schedule_creator";
+    const schedule = {
+      scheduleAlgorithmVersion: 1,
+      scheduleIntervalMs: 3_600_000,
+      scheduleWindowStart: 1_700_000_000_000,
+      scopeKey: "creator-attestation",
+    };
+    const response = await request<TaskResponse>(`/sessions/${session.sessionId}/tasks`, {
+      authToken: mintE2eToken({ participantId, role: "participant", sessionId: session.sessionId }),
+      body: {
+        createdByParticipantId: "part_forged_creator",
+        input: { createdByParticipantId: "part_forged_creator" },
+        kind: "scheduled_creator_test",
+        objective: "Attest scheduled REST caller",
+        schedule,
+      },
+      method: "POST",
+    });
+    expect(response.task.createdByParticipantId).toBe(participantId);
+    const service = createSessionServiceEffect(currentPool());
+    const result = await Effect.runPromise(
+      service.createTask({
+        actorParticipantId: participantId,
+        input: null,
+        taskId: undefined,
+        kind: "scheduled_service_creator_test",
+        objective: "Attest scheduled service caller",
+        schedule: {
+          scheduleAlgorithmVersion: schedule.scheduleAlgorithmVersion,
+          scheduleIdentityVersion: 2,
+          scheduleIntervalMs: schedule.scheduleIntervalMs,
+          scheduleScopeKey: schedule.scopeKey,
+          scheduleWindowStart: schedule.scheduleWindowStart,
+        },
+        sessionId: session.sessionId,
+      }),
+    );
+    expect(result.task?.createdByParticipantId).toBe(participantId);
+    for (const taskId of [response.task.taskId, result.task?.taskId]) {
+      if (taskId === undefined) throw new Error("Expected a created scheduled task");
+      await expect(
+        getTask(currentPool(), { sessionId: session.sessionId, taskId }),
+      ).resolves.toMatchObject({ createdByParticipantId: participantId });
+    }
+  });
+
+  it("records null creators when authentication is disabled, including scheduled creates", async () => {
+    const session = await createSession();
+    const disabledApp = createAppServer(currentPool(), {
+      auth: { activeKid: testAuthSigningKid, mode: "disabled", secrets: {} },
+    });
+    const port = await disabledApp.listen(0);
+    try {
+      for (const schedule of [
+        undefined,
+        {
+          scheduleAlgorithmVersion: 1,
+          scheduleIntervalMs: 3_600_000,
+          scheduleWindowStart: 1_700_000_000_000,
+          scopeKey: "disabled-creator",
+        },
+      ]) {
+        const created = await requestFrom<TaskResponse>(
+          `http://127.0.0.1:${port}`,
+          `/sessions/${session.sessionId}/tasks`,
+          {
+            authToken: null,
+            body: {
+              actorParticipantId: "part_forged_actor",
+              createdByParticipantId: "part_forged_creator",
+              input: { createdByParticipantId: "part_forged_creator" },
+              kind: "disabled_creator_test",
+              objective: "Record no authenticated creator",
+              ...(schedule === undefined ? {} : { schedule }),
+            },
+            method: "POST",
+          },
+        );
+        expect(created.task.createdByParticipantId).toBeNull();
+        await expect(
+          getTask(currentPool(), { sessionId: session.sessionId, taskId: created.task.taskId }),
+        ).resolves.toMatchObject({ createdByParticipantId: null });
+      }
+    } finally {
+      await disabledApp.close();
+    }
+  });
+
   it("keeps task completion retryable when composed event insert fails", async () => {
     const session = await createSession();
     const taskId = `task_atomic_complete_${randomUUID()}`;
@@ -11136,6 +11336,13 @@ e2e("tether e2e", () => {
           .map((item) => `${item.sessionId}:${item.taskId}`),
       );
 
+      for (const event of singleBatchEvents) {
+        expect(event.type).toBe("task.claim_expired");
+        expect(event.payload.task).toMatchObject({
+          createdByParticipantId: "part_expiration_creator",
+        });
+      }
+
       const concurrentBatch = [
         {
           sessionId: `sess_expiration_concurrent_a_${randomUUID()}`,
@@ -11179,6 +11386,7 @@ e2e("tether e2e", () => {
         expect(task).toMatchObject({
           claimExpiredAt: expect.any(String),
           claimExpiredBy: `part_expiration_${item.taskId}`,
+          createdByParticipantId: "part_expiration_creator",
           claimExpiresAt: null,
           claimedAt: null,
           claimedBy: null,
@@ -12246,6 +12454,7 @@ e2e("tether e2e", () => {
   ): Promise<void> {
     await createDbSession(targetPool, sessionId);
     await createTaskWithEvent(targetPool, {
+      actorParticipantId: "part_expiration_creator",
       eventSourceId: "src_expiration_setup_e2e",
       kind: "software_dev",
       objective: "Expire this claim",
@@ -12825,22 +13034,6 @@ function enabledSummaryWorkerSelection() {
 /** Creates one fake Ollama transport that returns protocol-valid structured content. */
 function createFakeOllamaFetch(content: SessionSummaryContent): typeof globalThis.fetch {
   return async () => Response.json({ message: { content: JSON.stringify(content) } });
-}
-
-/** Builds the exact range-selection policy used by integrated worker jobs. */
-function createSummaryRangeFixture(sessionId: string) {
-  return {
-    budgetClass: "8k",
-    deadlineAt: new Date(Date.now() + 60_000),
-    inputLimitBytes: 64_000,
-    maxEventCount: 100,
-    ollama: summaryWorkerOllamaIdentity,
-    outputLimitBytes: 64_000,
-    outputSchemaVersion: "session-summary.v1",
-    producer: { id: "session-summary-worker", version: "e2e" },
-    promptVersion: "session-summary.v1",
-    sessionId,
-  } as const;
 }
 
 /** Seeds a long raw-event session whose final events change inventory eligibility. */

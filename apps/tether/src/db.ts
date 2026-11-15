@@ -336,6 +336,8 @@ interface ExpiredTaskClaimRow {
   readonly claimedBy: string | null;
   readonly completedAt: Date | null;
   readonly createdAt: Date;
+  /** Service-attested authenticated creator; null when auth is disabled, the row predates the column, or the server created the task. */
+  readonly createdByParticipantId: string | null;
   readonly failedAt: Date | null;
   readonly failure: Record<string, unknown> | null;
   readonly input: Record<string, unknown> | null;
@@ -367,6 +369,8 @@ interface PgTaskRow {
   readonly claimedBy: string | null;
   readonly completedAt: Date | null;
   readonly createdAt: Date;
+  /** Service-attested authenticated creator; null when auth is disabled, the row predates the column, or the server created the task. */
+  readonly createdByParticipantId: string | null;
   readonly failedAt: Date | null;
   readonly failure: Record<string, unknown> | null;
   readonly input: Record<string, unknown> | null;
@@ -821,6 +825,7 @@ const taskReturningColumns = `
   claimed_by AS "claimedBy",
   completed_at AS "completedAt",
   created_at AS "createdAt",
+  created_by_participant_id AS "createdByParticipantId",
   failed_at AS "failedAt",
   failure,
   input,
@@ -2130,6 +2135,7 @@ export async function expireTaskClaims(
           tasks.claimed_by AS "claimedBy",
           tasks.completed_at AS "completedAt",
           tasks.created_at AS "createdAt",
+          tasks.created_by_participant_id AS "createdByParticipantId",
           tasks.failed_at AS "failedAt",
           tasks.failure,
           tasks.input,
@@ -2777,7 +2783,18 @@ export async function createTaskWithEvent(
     sourceId: input.eventSourceId,
     mutate: async (client) => {
       await assertTaskCreateGrantedWithClient(client, input, new Date());
-      return insertTaskWithClient(client, input);
+      return insertTaskWithClient(client, {
+        assigneeParticipantId: input.assigneeParticipantId,
+        createdByParticipantId: input.actorParticipantId ?? null,
+        input: input.input ?? null,
+        kind: input.kind,
+        objective: input.objective,
+        parentTaskId: input.parentTaskId,
+        schedule: input.schedule,
+        scopeLabel: input.scopeLabel,
+        sessionId: input.sessionId,
+        taskId: input.taskId,
+      });
     },
     buildEvent: (task) => buildTaskCreatedEventInput({ sessionId: input.sessionId, task }),
   });
@@ -2929,6 +2946,7 @@ export async function createOperatorCommandTaskWithEvent(
       throw new OperatorCommandAdmissionError("operator_command_queue_full");
     }
     const task = await insertTaskWithClient(client, {
+      createdByParticipantId: operatorSubject,
       input: {
         command: input.authority.request.command,
         operatorGrantJti: input.authority.grantJti,
@@ -2977,7 +2995,17 @@ export async function createTaskWithEventOnClient(
     readonly taskId: string;
   } & TaskDelegationInput,
 ): Promise<PersistedTaskEventResult> {
-  const task = await insertTaskWithClient(client, input);
+  const task = await insertTaskWithClient(client, {
+    assigneeParticipantId: input.assigneeParticipantId,
+    createdByParticipantId: null,
+    input: input.input ?? null,
+    kind: input.kind,
+    objective: input.objective,
+    parentTaskId: input.parentTaskId,
+    scopeLabel: input.scopeLabel,
+    sessionId: input.sessionId,
+    taskId: input.taskId,
+  });
   const event = await appendEventWithClient(
     client,
     buildTaskCreatedEventInput({ sessionId: input.sessionId, task }),
@@ -3036,7 +3064,18 @@ export async function createTaskWithEventIdempotent(
     // Idempotent replay and conflict outcomes above never consult grants, so a
     // replayed create keeps current behavior. Only the actual insert is gated.
     await assertTaskCreateGrantedWithClient(client, input, new Date());
-    const task = await insertTaskWithClient(client, input);
+    const task = await insertTaskWithClient(client, {
+      assigneeParticipantId: input.assigneeParticipantId,
+      createdByParticipantId: input.actorParticipantId ?? null,
+      input: input.input ?? null,
+      kind: input.kind,
+      objective: input.objective,
+      parentTaskId: input.parentTaskId,
+      schedule: input.schedule,
+      scopeLabel: input.scopeLabel,
+      sessionId: input.sessionId,
+      taskId: input.taskId,
+    });
     const event = await appendEventWithClient(
       client,
       buildTaskCreatedEventInput({ sessionId: input.sessionId, task }),
@@ -4033,6 +4072,8 @@ export class ScheduledRunIdentityConflictError extends Error {
 
 /** Caller-owned inputs for one atomic ensure-scheduled-run operation. */
 export interface EnsureScheduledRunInput {
+  /** Authenticated creator used for attestation; omitted when auth is disabled, independent of the supersession event actor. */
+  readonly actorParticipantId?: string | undefined;
   readonly eventSourceId: string;
   /** Optional caller-supplied task id; it MUST equal the derived deterministic id. */
   readonly expectedTaskId?: string | undefined;
@@ -4289,6 +4330,7 @@ export async function ensureScheduledRunWithEvents(
         current = { status: "superseded_by_newer", task: newer };
       } else {
         const task = await insertTaskWithClient(client, {
+          createdByParticipantId: input.actorParticipantId ?? null,
           input: input.input ?? null,
           kind: input.kind,
           objective: input.objective,
@@ -4610,6 +4652,8 @@ export interface TaskDelegationInput {
 async function insertTaskWithClient(
   client: TransactionClient,
   input: {
+    /** Authenticated creator; null for auth-disabled or server-created tasks. */
+    readonly createdByParticipantId: string | null;
     readonly input?: Record<string, unknown> | null;
     readonly kind: string;
     readonly objective: string;
@@ -4639,9 +4683,10 @@ async function insertTaskWithClient(
         schedule_window_start,
         scope_label,
         session_id,
-        task_id
+        task_id,
+        created_by_participant_id
       )
-      VALUES ($1, $2::jsonb, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+      VALUES ($1, $2::jsonb, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
       RETURNING ${taskReturningColumns}
     `,
     [
@@ -4660,6 +4705,7 @@ async function insertTaskWithClient(
       input.scopeLabel ?? null,
       input.sessionId,
       input.taskId,
+      input.createdByParticipantId,
     ],
   );
   return toTaskRecord(rows.rows[0]);
@@ -5225,6 +5271,7 @@ function toTaskRecord(row: DbTaskRow | ExpiredTaskClaimRow | PgTaskRow | undefin
     claimedBy: row.claimedBy,
     completedAt: row.completedAt?.toISOString() ?? null,
     createdAt: row.createdAt.toISOString(),
+    createdByParticipantId: row.createdByParticipantId,
     failedAt: row.failedAt?.toISOString() ?? null,
     failure: row.failure ?? null,
     input: row.input ?? null,

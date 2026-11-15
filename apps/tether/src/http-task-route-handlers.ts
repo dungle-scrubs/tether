@@ -67,6 +67,8 @@ interface ScheduledTaskCreateSchedule {
 }
 
 interface ScheduledTaskCreateInput {
+  /** Authenticated caller used to attest the creator; omitted when auth is disabled. */
+  readonly actorParticipantId?: string | undefined;
   readonly body: {
     readonly input?: Record<string, unknown> | null | undefined;
     readonly kind: string;
@@ -257,6 +259,7 @@ export function handleTaskHttpRoute(
       }
       if (body.schedule !== undefined) {
         return yield* handleScheduledTaskCreate({
+          actorParticipantId: input.authContext?.participantId,
           body: { ...body, schedule: body.schedule },
           hub,
           response,
@@ -566,6 +569,7 @@ function handleScheduledTaskCreate(
   const { body, hub, response, service, sessionId } = input;
   return service
     .ensureScheduledRun({
+      actorParticipantId: input.actorParticipantId,
       ...(body.taskId !== undefined ? { expectedTaskId: body.taskId } : {}),
       identity: {
         identityVersion: currentScheduledTaskIdentityVersion,
