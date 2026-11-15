@@ -1,5 +1,12 @@
 # @dungle-scrubs/tether-browser
 
+## 0.3.1
+
+### Patch Changes
+
+- Updated dependencies [2c8576d]
+  - @dungle-scrubs/tether-protocol@0.5.0
+
 ## 0.3.0
 
 ### Minor Changes
