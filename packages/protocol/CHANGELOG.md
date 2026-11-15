@@ -1,5 +1,11 @@
 # @dungle-scrubs/tether-protocol
 
+## 0.5.0
+
+### Minor Changes
+
+- 2c8576d: Expose the optional nullable `createdByParticipantId` field on task records. Tether attests the authenticated creator so claimants can authorize on it. Records from older servers remain valid without the field.
+
 ## 0.4.0
 
 ### Minor Changes
