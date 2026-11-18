@@ -44,7 +44,6 @@ import {
 import {
   type AppendSessionEventInput,
   type ApprovalDecision,
-  buildParticipantHeartbeatEventInput,
   buildParticipantRegistrationEventInput,
   buildTaskApprovalRecordedEventInput,
   buildTaskCancelledEventInput,
@@ -2438,60 +2437,27 @@ async function upsertParticipantWithClient(
 }
 
 /**
- * Refreshes participant liveness and optionally updates capabilities.
+ * Refreshes participant presence inside one transaction, optionally fenced by a
+ * Control Epoch guard. A heartbeat appends no session event: presence lives on
+ * the participant row's `last_seen_at`, and a durable event per heartbeat filled
+ * the session log with rows no reader wanted.
+ *
+ * When a guard is supplied, the current control lease row is locked and the epoch
+ * is validated FIRST, so a superseded (stale-epoch) heartbeat rolls back before it
+ * can refresh `last_seen_at` or capabilities. Without a guard (legacy
+ * enforcement-off path) the refresh runs without an epoch check.
+ *
+ * Returns the refreshed participant, or null when it is not registered.
  */
 export async function heartbeatParticipant(
   database: DatabasePool,
   input: {
-    readonly capabilities?: Record<string, unknown>;
+    readonly capabilities?: Record<string, unknown> | undefined;
+    readonly controlGuard?: ControlEpochGuard | undefined;
     readonly participantId: string;
     readonly sessionId: string;
   },
 ): Promise<ParticipantRecord | null> {
-  const rows = await database.db
-    .update(participants)
-    .set({
-      ...(input.capabilities ? { capabilities: input.capabilities } : {}),
-      lastSeenAt: sql`now()`,
-    })
-    .where(
-      and(
-        eq(participants.sessionId, input.sessionId),
-        eq(participants.participantId, input.participantId),
-      ),
-    )
-    .returning();
-  return rows[0] ? toParticipantRecord(rows[0]) : null;
-}
-
-/** Outcome of an atomic epoch-fenced participant heartbeat. */
-export type HeartbeatParticipantWithEventResult =
-  | { readonly participant: null }
-  | { readonly event: SessionEvent; readonly participant: ParticipantRecord };
-
-/**
- * Refreshes participant presence and appends the durable heartbeat event inside
- * one transaction, optionally fenced by a Control Epoch guard.
- *
- * When a guard is supplied, the current control lease row is locked and the epoch
- * is validated FIRST, so a superseded (stale-epoch) heartbeat rolls back before it
- * can refresh `last_seen_at` or capabilities. This keeps presence and the
- * heartbeat event on the same atomic fence the RFC requires at every mutation
- * boundary; without it, a stale heartbeat could still refresh presence outside the
- * fenced event append. When no guard is supplied (legacy enforcement-off path),
- * the presence refresh and event append still commit together but without an epoch
- * check, preserving existing behavior.
- */
-export async function heartbeatParticipantWithEvent(
-  database: DatabasePool,
-  input: {
-    readonly capabilities?: Record<string, unknown> | undefined;
-    readonly controlGuard?: ControlEpochGuard | undefined;
-    readonly eventSourceId: string;
-    readonly participantId: string;
-    readonly sessionId: string;
-  },
-): Promise<HeartbeatParticipantWithEventResult> {
   const client = await database.pool.connect();
   try {
     await client.query("BEGIN");
@@ -2512,32 +2478,15 @@ export async function heartbeatParticipantWithEvent(
         ? [input.sessionId, input.participantId, JSON.stringify(input.capabilities)]
         : [input.sessionId, input.participantId],
     );
-    const participantRow = rows.rows[0];
-    if (!participantRow) {
-      await client.query("COMMIT");
-      return { participant: null };
-    }
-    const participant = toParticipantRecord(participantRow);
-    const event = await appendEventWithClient(
-      client,
-      buildParticipantHeartbeatEventInput({
-        participant,
-        sessionId: input.sessionId,
-      }),
-      input.eventSourceId,
-      { ensureSession: false },
-    );
     await client.query("COMMIT");
-    return { event, participant };
+    const participantRow = rows.rows[0];
+    return participantRow ? toParticipantRecord(participantRow) : null;
   } catch (error) {
     await client.query("ROLLBACK");
     if (error instanceof ControlEpochStaleError) {
       throw error;
     }
-    throw new ParticipantRegistrationTransactionRollbackError(
-      "heartbeatParticipantWithEvent",
-      error,
-    );
+    throw new ParticipantRegistrationTransactionRollbackError("heartbeatParticipant", error);
   } finally {
     client.release();
   }

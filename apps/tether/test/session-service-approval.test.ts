@@ -350,7 +350,6 @@ function createApprovalStores(
     },
     participants: {
       heartbeat: async () => null,
-      heartbeatWithEvent: async () => ({ participant: null }),
       list: async () => [],
       listRuntimeSnapshots: async () => [],
       upsert: async () => {

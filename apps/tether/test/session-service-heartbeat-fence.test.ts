@@ -2,12 +2,7 @@ import { Effect } from "effect";
 import { describe, expect, it } from "vitest";
 
 import { ControlEpochStaleError } from "../src/control-epoch.js";
-import type {
-  ControlLease,
-  ControlLeaseClaim,
-  ControlLeaseRenewal,
-  HeartbeatParticipantWithEventResult,
-} from "../src/db.js";
+import type { ControlLease, ControlLeaseClaim, ControlLeaseRenewal } from "../src/db.js";
 import type {
   ControlLeaseStore,
   ParticipantStore,
@@ -16,7 +11,7 @@ import type {
 import { ModuleObservability } from "../src/observability.js";
 import type { HeartbeatParticipantInput } from "../src/session-service-contracts.js";
 import { createSessionControlEffects } from "../src/session-service-control-effects.js";
-import type { ParticipantRecord, SessionEvent } from "../src/types.js";
+import type { ParticipantRecord } from "../src/types.js";
 
 /**
  * Control-lease double whose renewal always succeeds for the configured epoch, so
@@ -52,7 +47,7 @@ class RenewableControlLeaseStore implements ControlLeaseStore {
 }
 
 /**
- * Participant double whose `heartbeatWithEvent` models the atomic epoch fence: a
+ * Participant double whose `heartbeat` models the atomic epoch fence: a
  * guard epoch that does not equal the authoritative current epoch throws
  * `ControlEpochStaleError` before recording any mutation, exactly as the durable
  * transaction rolls back before the presence UPDATE. It records whether the
@@ -63,7 +58,7 @@ class FencedParticipantStore implements Partial<ParticipantStore> {
 
   constructor(private readonly authoritativeEpoch: number) {}
 
-  async heartbeatWithEvent(input: {
+  async heartbeat(input: {
     readonly capabilities?: Record<string, unknown> | undefined;
     readonly controlGuard?:
       | {
@@ -73,10 +68,9 @@ class FencedParticipantStore implements Partial<ParticipantStore> {
           readonly sessionId: string;
         }
       | undefined;
-    readonly eventSourceId: string;
     readonly participantId: string;
     readonly sessionId: string;
-  }): Promise<HeartbeatParticipantWithEventResult> {
+  }): Promise<ParticipantRecord | null> {
     if (input.controlGuard && input.controlGuard.controlEpoch !== this.authoritativeEpoch) {
       throw new ControlEpochStaleError({
         controlChannel: "rest",
@@ -96,16 +90,7 @@ class FencedParticipantStore implements Partial<ParticipantStore> {
       runtimeKind: "worker",
       sessionId: input.sessionId,
     };
-    const event: SessionEvent = {
-      createdAt: "2026-07-12T00:00:01.000Z",
-      eventId: "evt_heartbeat_1",
-      payload: { participant },
-      producerId: "system",
-      seq: 1,
-      sessionId: input.sessionId,
-      type: "participant.heartbeat",
-    };
-    return { event, participant };
+    return participant;
   }
 }
 
@@ -158,7 +143,7 @@ describe("epoch-fenced REST heartbeat", () => {
     expect(participants.mutated).toBe(false);
   });
 
-  it("refreshes presence and appends the heartbeat event when the epoch is current", async () => {
+  it("refreshes presence without appending a session event when the epoch is current", async () => {
     const participants = new FencedParticipantStore(5);
     const effects = createHeartbeatEffects({
       controlLeases: new RenewableControlLeaseStore(5),
@@ -176,7 +161,7 @@ describe("epoch-fenced REST heartbeat", () => {
     if (result.status !== "ok") {
       throw new Error(`unexpected status ${result.status}`);
     }
-    expect(result.events).toHaveLength(1);
+    expect(result.events).toEqual([]);
     expect(result.participant?.participantId).toBe("part_1");
   });
 });

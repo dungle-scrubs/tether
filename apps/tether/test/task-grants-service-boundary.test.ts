@@ -788,7 +788,6 @@ describe("service boundary: authenticated identity binding", () => {
       },
       participants: {
         heartbeat: async () => null,
-        heartbeatWithEvent: async () => ({ participant: null }),
         list: async () => [],
         listRuntimeSnapshots: async () => [],
         upsert: async () => {

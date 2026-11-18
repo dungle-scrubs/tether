@@ -5,7 +5,6 @@ import type {
   CreateSessionResult,
   EnsureScheduledRunInput,
   EnsureScheduledRunResult,
-  HeartbeatParticipantWithEventResult,
   OperatorCommandTaskAuthority,
   ParticipantRegistration,
   PermanentSessionDeleteResult,
@@ -195,23 +194,22 @@ export interface SessionEventStore {
 
 /** Persistence for participant presence and runtime diagnostics. */
 export interface ParticipantStore {
+  /**
+   * Refreshes presence in one transaction, fenced by the Control Epoch guard
+   * when one is supplied so a stale-epoch heartbeat cannot refresh presence or
+   * capabilities. Appends no session event. Null when the participant is not
+   * registered.
+   */
   readonly heartbeat: (input: {
-    readonly capabilities?: Record<string, unknown>;
+    /** Replacement capabilities, when the heartbeat carries them. */
+    readonly capabilities?: Record<string, unknown> | undefined;
+    /** Control Epoch fence checked before presence is refreshed. */
+    readonly controlGuard?: ControlEpochGuard | undefined;
+    /** Participant whose presence is refreshed. */
     readonly participantId: string;
+    /** Session the participant belongs to. */
     readonly sessionId: string;
   }) => Promise<ParticipantRecord | null>;
-  /**
-   * Refreshes presence and appends the durable heartbeat event in one atomic
-   * transaction, fenced by the Control Epoch guard when one is supplied so a
-   * stale-epoch heartbeat cannot refresh presence or capabilities.
-   */
-  readonly heartbeatWithEvent: (input: {
-    readonly capabilities?: Record<string, unknown> | undefined;
-    readonly controlGuard?: ControlEpochGuard | undefined;
-    readonly eventSourceId: string;
-    readonly participantId: string;
-    readonly sessionId: string;
-  }) => Promise<HeartbeatParticipantWithEventResult>;
   readonly list: (
     sessionId: string,
     options?: ParticipantListOptions,
