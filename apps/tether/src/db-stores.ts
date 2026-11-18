@@ -23,7 +23,6 @@ import {
   findClientSessionBinding,
   getTask,
   heartbeatParticipant,
-  heartbeatParticipantWithEvent,
   listClientSessionBindings,
   listContextEventSuffix,
   listControlLeaseSnapshots,
@@ -203,21 +202,12 @@ class DbParticipantStore implements ParticipantStore {
   constructor(private readonly database: DatabasePool) {}
 
   heartbeat(input: {
-    readonly capabilities?: Record<string, unknown>;
+    readonly capabilities?: Record<string, unknown> | undefined;
+    readonly controlGuard?: ControlEpochGuard | undefined;
     readonly participantId: string;
     readonly sessionId: string;
   }) {
     return heartbeatParticipant(this.database, input);
-  }
-
-  heartbeatWithEvent(input: {
-    readonly capabilities?: Record<string, unknown> | undefined;
-    readonly controlGuard?: ControlEpochGuard | undefined;
-    readonly eventSourceId: string;
-    readonly participantId: string;
-    readonly sessionId: string;
-  }) {
-    return heartbeatParticipantWithEvent(this.database, input);
   }
 
   list(sessionId: string, options?: ParticipantListOptions) {

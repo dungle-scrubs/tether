@@ -17,7 +17,6 @@ export type {
 export {
   appendEventSchema,
   approvalDecisionSchema,
-  buildParticipantHeartbeatEventInput,
   buildParticipantRegistrationEventInput,
   buildPublishedEventInput,
   buildSessionCreatedEventInput,

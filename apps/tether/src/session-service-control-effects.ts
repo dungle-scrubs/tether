@@ -140,12 +140,11 @@ export function createSessionControlEffects(
         if (control.status !== "ok") {
           return control;
         }
-        // Fence the presence refresh and the durable heartbeat event append to
-        // the supplied epoch inside one transaction. Validating the epoch atomically
-        // before the participant row mutation ensures a superseded socket can
-        // neither refresh presence/capabilities nor write a heartbeat event. When
-        // no epoch is supplied (enforcement off), the guard is absent and legacy
-        // behavior is preserved.
+        // Fence the presence refresh to the supplied epoch inside one
+        // transaction. Validating the epoch before the participant row mutation
+        // ensures a superseded socket cannot refresh presence or capabilities.
+        // When no epoch is supplied (enforcement off), the guard is absent and
+        // legacy behavior is preserved. A heartbeat appends no session event.
         const controlGuard =
           heartbeatInput.controlEpoch !== undefined
             ? {
@@ -157,49 +156,28 @@ export function createSessionControlEffects(
               }
             : undefined;
         const heartbeatOrStale = yield* catchAtomicEpochStale(
-          trySessionPromise(() =>
-            input.stores.participants.heartbeatWithEvent({
+          trySessionPromise(async () => ({
+            participant: await input.stores.participants.heartbeat({
               ...(heartbeatInput.capabilities !== undefined
                 ? { capabilities: heartbeatInput.capabilities }
                 : {}),
               ...(controlGuard !== undefined ? { controlGuard } : {}),
-              eventSourceId: input.eventSourceId,
               participantId: heartbeatInput.participantId,
               sessionId: heartbeatInput.sessionId,
             }),
-          ),
+          })),
         );
         if ("status" in heartbeatOrStale) {
           return heartbeatOrStale;
         }
-        if (heartbeatOrStale.participant === null) {
-          return {
-            controlEpoch: heartbeatInput.controlEpoch ?? null,
-            events: [],
-            leaseExpiresAt: control.leaseExpiresAt ?? null,
-            participant: null,
-            renewAfterMs: Math.floor(restControlLeaseTtlMs / 2),
-            status: "ok" as const,
-          };
-        }
-        const result = {
+        return {
           controlEpoch: heartbeatInput.controlEpoch ?? null,
-          events: [heartbeatOrStale.event],
+          events: [],
           leaseExpiresAt: control.leaseExpiresAt ?? null,
           participant: heartbeatOrStale.participant,
           renewAfterMs: Math.floor(restControlLeaseTtlMs / 2),
           status: "ok" as const,
         };
-        yield* Effect.sync(() =>
-          input.assertBroadcastEvents(
-            input.observability,
-            "heartbeatRestParticipant",
-            heartbeatInput.sessionId,
-            result.events,
-            1,
-          ),
-        );
-        return result;
       }),
     refreshWebSocketControlLeaseEffect: (leaseInput) =>
       Effect.gen(function* () {

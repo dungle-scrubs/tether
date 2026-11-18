@@ -15,7 +15,7 @@ import {
   createSession,
   createTaskWithEvent,
   type DatabasePool,
-  heartbeatParticipantWithEvent,
+  heartbeatParticipant,
   recordTaskApproval,
   supersedeScheduledRunsWithEvent,
   upsertParticipantWithEvent,
@@ -161,7 +161,7 @@ describe("Session Projection persistence", () => {
     expect(client.queries.at(-1)).toBe("COMMIT");
   });
 
-  it("commits participant registration and heartbeat projections atomically", async () => {
+  it("commits participant registration projections atomically", async () => {
     const registrationClient = new ParticipantEventTransactionClient();
     const registration = await upsertParticipantWithEvent(registrationClient.database, {
       capabilities: { role: "worker" },
@@ -171,23 +171,29 @@ describe("Session Projection persistence", () => {
       runtimeKind: "worker",
       sessionId: "sess_projection_persistence",
     });
+
+    expect(registration.events).toHaveLength(1);
+    expect(commitsEventAndProjection(registrationClient.queries)).toBe(true);
+  });
+
+  it("refreshes heartbeat presence without appending a session event", async () => {
     const heartbeatClient = new ParticipantEventTransactionClient();
-    const heartbeat = await heartbeatParticipantWithEvent(heartbeatClient.database, {
-      eventSourceId: "src_projection_persistence_test",
+    const participant = await heartbeatParticipant(heartbeatClient.database, {
       participantId: "part_projection",
       sessionId: "sess_projection_persistence",
     });
 
-    expect(registration.events).toHaveLength(1);
-    expect(heartbeat.participant).not.toBeNull();
-    expect(commitsEventAndProjection(registrationClient.queries)).toBe(true);
-    expect(commitsEventAndProjection(heartbeatClient.queries)).toBe(true);
+    expect(participant).not.toBeNull();
+    expect(heartbeatClient.queries.some((query) => query.includes("UPDATE participants"))).toBe(
+      true,
+    );
+    expect(heartbeatClient.queries.some((query) => query.includes("session_events"))).toBe(false);
+    expect(heartbeatClient.queries.at(-1)).toBe("COMMIT");
   });
 
   it.each([
     "joined",
     "updated",
-    "heartbeat",
   ] as const)("keeps derived diagnostics out of durable participant %s events", async (operation) => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
@@ -206,11 +212,8 @@ describe("Session Projection persistence", () => {
         runtimeKind: "worker",
         sessionId: "sess_projection_persistence",
       };
-      const result =
-        operation === "heartbeat"
-          ? await heartbeatParticipantWithEvent(client.database, input)
-          : await upsertParticipantWithEvent(client.database, input);
-      const events = "events" in result ? result.events : "event" in result ? [result.event] : [];
+      const result = await upsertParticipantWithEvent(client.database, input);
+      const events = result.events;
       expect(events).toHaveLength(1);
       expect(events[0]?.type).toBe(`participant.${operation}`);
       const event = events[0];
@@ -225,8 +228,7 @@ describe("Session Projection persistence", () => {
       expect(warn).not.toHaveBeenCalled();
       const log = vi.fn();
       const project = createParticipantContractDiagnostics({ log });
-      const participant =
-        "registration" in result ? result.registration.participant : result.participant;
+      const participant = result.registration.participant;
       if (!participant) throw new Error("Expected a persisted participant");
       expect(project(participant).rejectedContracts).toEqual([
         {
