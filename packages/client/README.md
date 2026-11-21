@@ -109,6 +109,48 @@ schedule })` sends `schedule` only when given. It is the protocol's
 `scheduleWindowStart`, `scopeKey`): the server derives the task id from it and
 returns the existing run for a window it has already created.
 
+### Conflicts
+
+Every HTTP 409 from a task call rejects with a `RestParticipantTaskError` whose
+`code` is `CLAIM_CONFLICT`. Its `conflictReason` names the server's reason when
+the body carries a known one, and is `null` otherwise:
+
+| `conflictReason` | Meaning |
+| --- | --- |
+| `CONTROL_CONFLICT` | Another channel holds this participant's control lease. |
+| `CONTROL_EPOCH_STALE` | The call's control epoch is missing, invalid or stale. |
+| `task_id_conflict` | `createTask`: the task id belongs to a task with different fields. |
+| `scheduled_run_identity_conflict` | `createTask`: a scheduled run's derived id is taken by a task with a different identity. |
+| `scheduled_task_identity_mismatch` | `createTask`: a supplied task id differs from the id derived from `schedule`. |
+| `null` | No known code: a lost claim race, a missing, expired or terminal claim, a task that is already terminal, or a body that is absent, unreadable, oversized, slower than two seconds or aborted. |
+
+`isControlConflict(error)` is true exactly for `CONTROL_CONFLICT` and
+`CONTROL_EPOCH_STALE`: take control again, then retry. A false result on a
+`CLAIM_CONFLICT` does not prove the task's own state refused the call. The
+client stops reading a conflict body that is unreadable, larger than 4096
+bytes, still open after two seconds, or cut off by the caller's abort signal,
+and each of those also gives a `null` reason. A caller that needs certainty
+must treat `null` as "unknown", for example by reading the task. The error carries
+only the code, never the response body, a token or a header. A server that
+enforces control epochs answers a fenced call sent without one with HTTP 428,
+which surfaces as `INVALID_RESPONSE`, not as a conflict.
+
+### Cancelling a task
+
+`RestParticipantTaskClient.cancelTask(sessionId, taskId, { controlEpoch,
+reason })` posts to the task's cancel route with the client's participant and
+instance ids. Both fields are optional and typed from the protocol's
+`cancelTaskSchema`; `reason` is recorded on the cancel event and defaults to
+`{}` on the server.
+
+- Cancelled: resolves with the task record, `cancelledAt` set. A task that is
+  claimed but not terminal is cancelled too: the route does not check who
+  holds the claim.
+- Already terminal, or no such task in the session: rejects with
+  `CLAIM_CONFLICT` and a `null` `conflictReason`.
+- Control lease refused: `CLAIM_CONFLICT` with `isControlConflict(error)` true.
+- A missing session is `NOT_FOUND`, an auth failure `AUTHENTICATION`.
+
 ## Replay-Safe Startup
 
 Replay-consuming subscriptions must exist before the participant socket opens.

@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   createReplayRestTaskClient,
+  isControlConflict,
   isRestParticipantResourceLimit,
   RestParticipantTaskClient,
   RestParticipantTaskError,
@@ -692,6 +693,374 @@ describe("RestParticipantTaskClient", () => {
     const persist = fetchJson(503, { code: "STORE_BUSY" });
     await expect(persist.client.listActiveTasks("sess_1")).rejects.toMatchObject({
       code: "PERSISTENCE",
+    });
+  });
+});
+
+/** Answers every request with one raw status and body text, recording each request. */
+function fetchRaw(
+  status: number,
+  body: string | null,
+): {
+  client: RestParticipantTaskClient;
+  requests: CapturedRequest[];
+} {
+  const requests: CapturedRequest[] = [];
+  /** Records the request and answers with the fixed raw response. */
+  const fetch: RestParticipantTaskFetch = async (url, init) => {
+    requests.push(capture(url, init));
+    return new Response(body, { status });
+  };
+  const client = new RestParticipantTaskClient(
+    {
+      authToken: "tok",
+      instanceId: "inst_1",
+      participantId: "part_1",
+      serviceUrl: "http://127.0.0.1:3025",
+    },
+    { fetch },
+  );
+  return { client, requests };
+}
+
+/** Resolves the rejection of one pending call as a task error. */
+async function rejection(pending: Promise<unknown>): Promise<RestParticipantTaskError> {
+  const error = await pending.then(
+    () => {
+      throw new Error("expected the call to reject");
+    },
+    (caught: unknown) => caught,
+  );
+  ok(error instanceof RestParticipantTaskError);
+  return error;
+}
+
+describe("RestParticipantTaskClient conflict reasons", () => {
+  it.each([
+    [
+      "CONTROL_CONFLICT",
+      { code: "CONTROL_CONFLICT", error: "Participant already has an active control channel" },
+    ],
+    ["CONTROL_EPOCH_STALE", { code: "CONTROL_EPOCH_STALE", currentEpoch: 4, error: "stale" }],
+  ] as const)("maps the server's %s code on a fenced call to itself", async (reason, body) => {
+    const { client } = fetchJson(409, body);
+    const error = await rejection(
+      client.completeTask("sess_1", "task_1", { claimId: "claim_1", result: {} }),
+    );
+    expect(error.code).toBe("CLAIM_CONFLICT");
+    expect(error.conflictReason).toBe(reason);
+    expect(error.details).toEqual({ operation: "complete", status: 409 });
+  });
+
+  it.each([
+    "task_id_conflict",
+    "scheduled_run_identity_conflict",
+    "scheduled_task_identity_mismatch",
+  ] as const)("maps the server's %s create reason to itself", async (reason) => {
+    const { client } = fetchJson(409, { error: "conflict", reason, taskId: "task_1" });
+    const error = await rejection(
+      client.createTask("sess_1", { kind: "media_status", objective: "Report status" }),
+    );
+    expect(error.code).toBe("CLAIM_CONFLICT");
+    expect(error.conflictReason).toBe(reason);
+  });
+
+  it.each([
+    [
+      "a claim race, which carries no code",
+      JSON.stringify({ error: "Task is already claimed or terminal" }),
+    ],
+    ["an unknown code", JSON.stringify({ code: "TASK_CLAIM_CONFLICT" })],
+    ["an unknown reason", JSON.stringify({ reason: "something_new" })],
+    ["a non-string code", JSON.stringify({ code: 7 })],
+    ["an empty body", ""],
+    ["an absent body", null],
+    ["a non-JSON body", "<html>conflict</html>"],
+    ["a JSON array", '["CONTROL_CONFLICT"]'],
+    ["an oversized body", JSON.stringify({ code: "CONTROL_CONFLICT", padding: "x".repeat(8_192) })],
+  ])("gives a null reason, never a throw, for %s", async (_label, body) => {
+    const { client } = fetchRaw(409, body);
+    const error = await rejection(client.claimTask("sess_1", "task_1"));
+    expect(error.code).toBe("CLAIM_CONFLICT");
+    expect(error.conflictReason).toBeNull();
+  });
+
+  it("puts only the one code on the error, never the body, a token or a header", async () => {
+    const { client } = fetchJson(409, {
+      activeControlChannel: "ws",
+      code: "CONTROL_CONFLICT",
+      error: "Participant already has an active control channel",
+      instanceId: "inst_other",
+      participantId: "part_1",
+    });
+    const error = await rejection(client.claimTask("sess_1", "task_1"));
+    const expected = {
+      code: "CLAIM_CONFLICT",
+      conflictReason: "CONTROL_CONFLICT",
+      details: { operation: "claim", status: 409 },
+      name: "RestParticipantTaskError",
+    };
+    expect(JSON.parse(JSON.stringify(error))).toEqual(expected);
+    expect({ ...error }).toEqual(expected);
+    expect(JSON.stringify(error)).not.toContain("tok");
+    expect(JSON.stringify(error)).not.toContain("inst_other");
+  });
+
+  it("adds no conflict reason to errors that are not conflicts", async () => {
+    const { client } = fetchJson(503, { code: "CONTROL_CONFLICT" });
+    const error = await rejection(client.claimTask("sess_1", "task_1"));
+    expect(error.code).toBe("PERSISTENCE");
+    expect(Object.hasOwn(error, "conflictReason")).toBe(false);
+  });
+
+  it("tells a control-lease conflict from a claim race", async () => {
+    const control = await rejection(
+      fetchJson(409, { code: "CONTROL_CONFLICT" }).client.claimTask("s", "t"),
+    );
+    const stale = await rejection(
+      fetchJson(409, { code: "CONTROL_EPOCH_STALE" }).client.claimTask("s", "t"),
+    );
+    const race = await rejection(
+      fetchJson(409, { error: "Task is already claimed or terminal" }).client.claimTask("s", "t"),
+    );
+    const taskId = await rejection(
+      fetchJson(409, { reason: "task_id_conflict" }).client.createTask("s", {
+        kind: "k",
+        objective: "o",
+      }),
+    );
+    const required = await rejection(
+      fetchJson(428, { code: "CONTROL_EPOCH_REQUIRED" }).client.claimTask("s", "t"),
+    );
+    expect(isControlConflict(control)).toBe(true);
+    expect(isControlConflict(stale)).toBe(true);
+    expect(isControlConflict(race)).toBe(false);
+    expect(isControlConflict(taskId)).toBe(false);
+    expect(isControlConflict(required)).toBe(false);
+    expect(isControlConflict(new Error("CONTROL_CONFLICT"))).toBe(false);
+    expect(isControlConflict({ code: "CLAIM_CONFLICT", conflictReason: "CONTROL_CONFLICT" })).toBe(
+      false,
+    );
+    expect(isControlConflict(null)).toBe(false);
+  });
+});
+
+/** A 409 whose body stays open until the test closes it, recording whether it was cancelled. */
+function openConflictBody(): {
+  readonly close: (text: string) => void;
+  readonly response: Response;
+  readonly state: { cancelled: boolean };
+} {
+  const state = { cancelled: false };
+  let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const stream = new ReadableStream<Uint8Array>(
+    {
+      start: (c) => {
+        controller = c;
+      },
+      cancel: () => {
+        state.cancelled = true;
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  return {
+    close: (text) => {
+      controller?.enqueue(new TextEncoder().encode(text));
+      controller?.close();
+    },
+    response: new Response(stream, { status: 409 }),
+    state,
+  };
+}
+
+/** Marks when a pending call settles, without leaving its rejection unobserved. */
+function track(pending: Promise<unknown>): { readonly settled: () => boolean } {
+  let settled = false;
+  pending.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  return { settled: () => settled };
+}
+
+describe("RestParticipantTaskClient conflict body deadline", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it("settles a 409 whose body never closes as a conflict without a reason", async () => {
+    vi.useFakeTimers();
+    const body = openConflictBody();
+    const client = new RestParticipantTaskClient(
+      { authToken: null, participantId: "part_1", serviceUrl: "https://fixture.invalid" },
+      { fetch: async () => body.response },
+    );
+    const pending = client.claimTask("sess_1", "task_1");
+    const progress = track(pending);
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(progress.settled()).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(progress.settled()).toBe(true);
+    const error = await rejection(pending);
+    expect(error.code).toBe("CLAIM_CONFLICT");
+    expect(error.conflictReason).toBeNull();
+    expect(error.details).toEqual({ operation: "claim", status: 409 });
+    expect(body.state.cancelled).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("keeps the reason of a body that closes just before the deadline and leaves no timer", async () => {
+    vi.useFakeTimers();
+    const body = openConflictBody();
+    const client = new RestParticipantTaskClient(
+      { authToken: null, participantId: "part_1", serviceUrl: "https://fixture.invalid" },
+      { fetch: async () => body.response },
+    );
+    const pending = client.completeTask("sess_1", "task_1", { claimId: "claim_1", result: {} });
+    const progress = track(pending);
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(progress.settled()).toBe(false);
+    body.close(JSON.stringify({ code: "CONTROL_CONFLICT" }));
+    const error = await rejection(pending);
+    expect(error.code).toBe("CLAIM_CONFLICT");
+    expect(error.conflictReason).toBe("CONTROL_CONFLICT");
+    expect(body.state.cancelled).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("gives a conflict without a reason when the caller aborts before the deadline", async () => {
+    vi.useFakeTimers();
+    const body = openConflictBody();
+    const owner = new AbortController();
+    const client = boundedTaskClient(body.response, {
+      signal: owner.signal,
+      timeoutMs: 60_000,
+    });
+    const pending = client.releaseTask("sess_1", "task_1", { claimId: "claim_1" });
+    const progress = track(pending);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(progress.settled()).toBe(false);
+    owner.abort();
+    const error = await rejection(pending);
+    expect(error.code).toBe("CLAIM_CONFLICT");
+    expect(error.conflictReason).toBeNull();
+    expect(body.state.cancelled).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe("RestParticipantTaskClient.cancelTask", () => {
+  const cancelledRecord = { ...taskRecord, cancelledAt: "2026-10-01T00:05:00.000Z" };
+
+  it("posts the fenced identity, epoch and reason to the cancel route", async () => {
+    const { client, requests } = fetchJson(200, { task: cancelledRecord });
+
+    const task = await client.cancelTask("sess 1", "task/1", {
+      controlEpoch: 3,
+      reason: { why: "superseded" },
+    });
+
+    expect(task).toEqual(cancelledRecord);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.method).toBe("POST");
+    expect(requests[0]?.path).toBe("/sessions/sess%201/tasks/task%2F1/cancel");
+    expect(requests[0]?.headers).toEqual({
+      authorization: "Bearer tok",
+      "content-type": "application/json",
+    });
+    expect(requests[0]?.body).toEqual({
+      controlEpoch: 3,
+      instanceId: "inst_1",
+      participantId: "part_1",
+      reason: { why: "superseded" },
+    });
+  });
+
+  it("sends no epoch or reason when the caller gives none, and no auth header without a token", async () => {
+    const requests: CapturedRequest[] = [];
+    const client = new RestParticipantTaskClient(
+      { authToken: null, participantId: "part_1", serviceUrl: "http://127.0.0.1:3025/" },
+      {
+        fetch: async (url, init) => {
+          requests.push(capture(url, init));
+          return new Response(JSON.stringify({ task: cancelledRecord }), { status: 200 });
+        },
+      },
+    );
+
+    await client.cancelTask("sess_1", "task_1");
+
+    expect(requests[0]?.headers).toEqual({ "content-type": "application/json" });
+    expect(requests[0]?.body).toEqual({ participantId: "part_1" });
+  });
+
+  it.each([
+    ["a null task", { task: null }],
+    ["a malformed task", { task: { taskId: "task_1" } }],
+    ["a missing envelope", { status: "cancelled" }],
+    ["a null body", null],
+  ])("maps a 200 with %s to INVALID_RESPONSE", async (_label, body) => {
+    const { client } = fetchJson(200, body);
+    await expect(client.cancelTask("sess_1", "task_1")).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+      details: { operation: "cancel", status: null },
+    });
+  });
+
+  it("reports an already-terminal or absent task as a conflict without a reason", async () => {
+    const { client } = fetchJson(409, { error: "Task is already terminal" });
+    const error = await rejection(client.cancelTask("sess_1", "task_1"));
+    expect(error.code).toBe("CLAIM_CONFLICT");
+    expect(error.conflictReason).toBeNull();
+    expect(isControlConflict(error)).toBe(false);
+    expect(error.details).toEqual({ operation: "cancel", status: 409 });
+  });
+
+  it.each([
+    "CONTROL_CONFLICT",
+    "CONTROL_EPOCH_STALE",
+  ] as const)("reports a %s rejection as a control conflict", async (code) => {
+    const { client } = fetchJson(409, { code, error: "control" });
+    const error = await rejection(client.cancelTask("sess_1", "task_1", { controlEpoch: 2 }));
+    expect(error.conflictReason).toBe(code);
+    expect(isControlConflict(error)).toBe(true);
+  });
+
+  it.each([
+    [400, "INVALID_RESPONSE", { error: "Invalid request", issues: [] }],
+    [401, "AUTHENTICATION", { code: "AUTH_REQUIRED" }],
+    [403, "AUTHENTICATION", { code: "PARTICIPANT_MISMATCH" }],
+    [404, "NOT_FOUND", { error: "Session not found", reason: "session_not_found" }],
+    [410, "INVALID_RESPONSE", { error: "deleted", reason: "session_deleted" }],
+    [413, "INVALID_RESPONSE", { error: "Payload Too Large" }],
+    [428, "INVALID_RESPONSE", { code: "CONTROL_EPOCH_REQUIRED" }],
+    [500, "PERSISTENCE", { error: "Internal server error" }],
+  ] as const)("maps HTTP %i on cancel to %s", async (status, code, body) => {
+    const { client } = fetchJson(status, body);
+    const error = await rejection(client.cancelTask("sess_1", "task_1"));
+    expect(error.code).toBe(code);
+    expect(error.details).toEqual({ operation: "cancel", status });
+    expect(Object.hasOwn(error, "conflictReason")).toBe(false);
+  });
+
+  it("maps a transport failure on cancel to TRANSPORT", async () => {
+    const client = new RestParticipantTaskClient(
+      { participantId: "part_1", serviceUrl: "http://127.0.0.1:3025" },
+      {
+        fetch: async () => {
+          throw new Error("connection reset");
+        },
+      },
+    );
+    await expect(client.cancelTask("sess_1", "task_1")).rejects.toMatchObject({
+      code: "TRANSPORT",
+      details: { operation: "cancel", status: null },
     });
   });
 });
