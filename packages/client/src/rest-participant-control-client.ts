@@ -238,6 +238,10 @@ export class RestParticipantControlClient {
         const state = this.#state(sessionId);
         if (state.context && Date.parse(state.context.leaseExpiresAt) <= this.#now()) {
           this.#loseStateContext(state, state.context, "LEASE_EXPIRED");
+          // The loss callback may have called stop(); acquire nothing after shutdown began.
+          if (this.#stopped) {
+            throw this.#error("STOPPED", "acquire");
+          }
         }
         if (state.context) {
           return state.context;

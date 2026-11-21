@@ -572,6 +572,43 @@ describe("RestParticipantControlClient", () => {
     expect(client.debugInfo()).toMatchObject({ acquiringSessionCount: 0, activeContextCount: 0 });
   });
 
+  it("retries a timed-out acquisition with the same Acquisition ID and ignores its late response", async () => {
+    const timers = new FakeTimerScheduler();
+    const requests: CapturedRequest[] = [];
+    let answerFirst: ((response: Response) => void) | null = null;
+    const client = createTimedClient(
+      async (url, init) => {
+        requests.push(capture(url, init));
+        if (requests.length === 1) {
+          return new Promise<Response>((resolve) => {
+            answerFirst = resolve;
+          });
+        }
+        return acquisitionResponse("acq_1", 2);
+      },
+      timers,
+      { acquisitionTransportRetries: 1, requestTimeoutMs: 2_000 },
+    );
+    const acquiring = client.context("sess_1");
+
+    await vi.waitFor(() => expect(answerFirst).not.toBeNull());
+    timers.fireDelay(2_000);
+    const installed = await acquiring;
+    expect(installed).toMatchObject({ acquisitionId: "acq_1", controlEpoch: 2 });
+    expect(requests.map((request) => request.body.acquisitionId)).toEqual(["acq_1", "acq_1"]);
+
+    answerFirst?.(acquisitionResponse("acq_1", 1));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    await expect(client.context("sess_1")).resolves.toBe(installed);
+    expect(requests).toHaveLength(2);
+    expect(client.debugInfo()).toMatchObject({
+      activeContextCount: 1,
+      acquiringSessionCount: 0,
+      renewalTimerCount: 1,
+    });
+  });
+
   it("rejects an acquisition whose response body never ends at the deadline", async () => {
     const timers = new FakeTimerScheduler();
     let fetched = 0;
@@ -804,6 +841,38 @@ describe("RestParticipantControlClient", () => {
       { code: "LEASE_EXPIRED", sessionId: "sess_1" },
       { code: "INVALIDATED", sessionId: "sess_1" },
     ]);
+  });
+
+  it("acquires nothing after an expiry callback stops the client", async () => {
+    const requests: CapturedRequest[] = [];
+    let now = Date.parse("2026-07-16T12:00:00.000Z");
+    let nextId = 0;
+    let stopping: Promise<void> | null = null;
+    const client: RestParticipantControlClient = createTimedClient(
+      createControlFetch(requests),
+      new FakeTimerScheduler(),
+      {
+        acquisitionIdFactory: () => `acq_${++nextId}`,
+        now: () => now,
+        onControlLost: () => {
+          stopping = client.stop();
+        },
+      },
+    );
+    await client.context("sess_1");
+    now = Date.parse("2026-07-16T12:01:00.000Z");
+
+    await expect(client.context("sess_1")).rejects.toMatchObject({ code: "STOPPED" });
+    expect(stopping).not.toBeNull();
+    await stopping;
+
+    expect(requests.map((request) => request.path)).toEqual(["/sessions/sess_1/participants"]);
+    expect(client.debugInfo()).toMatchObject({
+      activeContextCount: 0,
+      acquiringSessionCount: 0,
+      renewalTimerCount: 0,
+      stopped: true,
+    });
   });
 
   it("does not report lost control for release or stop", async () => {
