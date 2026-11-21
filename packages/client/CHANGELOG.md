@@ -1,5 +1,39 @@
 # @dungle-scrubs/tether-client
 
+## 1.3.0
+
+### Minor Changes
+
+- 31e98bf: Close four gaps in the REST participant clients:
+
+  - `RestParticipantControlClient.invalidate` now clears the current context when
+    the snapshot names the same generation (acquisition id and control epoch),
+    including a snapshot taken before a renewal. Previously it returned `true`
+    and left the renewed context in place.
+  - New `requestTimeoutMs` option (default 10,000 ms, clamped to 100..60,000 ms)
+    bounds each acquire, renew and release request, including the response body.
+    A timeout fails as `TRANSPORT`, so acquisitions retry, renewals recover and
+    releases count as uncertain, as for any other transport failure.
+  - New `onRenewalFailure` and `onControlLost` callbacks report each failed
+    background renewal and each context the client clears other than by
+    `release()` or `stop()`. A throwing callback is traced and ignored.
+  - `RestParticipantTaskClient.createTask` sends an optional `schedule` identity.
+
+- a651add: A task conflict carries its reason, and tasks can be cancelled:
+
+  - A `CLAIM_CONFLICT` from `RestParticipantTaskClient` now carries
+    `conflictReason`: `CONTROL_CONFLICT` or `CONTROL_EPOCH_STALE` when the server
+    refused the caller's control lease, a task-identity reason when it refused a
+    create, and `null` when the 409 body names no known code or cannot be read
+    within 4096 bytes and two seconds. The `code` is unchanged, and a 409 still
+    settles promptly.
+  - New `isControlConflict(error)` is true exactly for the control-lease reasons,
+    so a caller knows to take control again. A false result does not prove the
+    task's state refused the call: treat a `null` reason as unknown.
+  - New `RestParticipantTaskClient.cancelTask(sessionId, taskId, { controlEpoch,
+reason })` cancels a task that is not yet terminal and resolves with the
+    cancelled record.
+
 ## 1.2.1
 
 ### Patch Changes
