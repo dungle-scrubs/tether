@@ -1,7 +1,7 @@
 import { createServer } from "node:net";
 
 import { Effect } from "effect";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 
 import {
@@ -19,6 +19,7 @@ import type {
 import type { SessionEvent } from "../src/types.js";
 
 const gatewaySessionId = "sess_gateway";
+const heartbeatIntervalMs = 30_000;
 
 describe("participant WebSocket gateway", () => {
   const openApps: AppServer[] = [];
@@ -26,6 +27,8 @@ describe("participant WebSocket gateway", () => {
   afterEach(async () => {
     const apps = openApps.splice(0);
     await Promise.all(apps.map((app) => app.close()));
+    vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
   it("releases the control lease when the peer disconnects during registration", async () => {
@@ -154,19 +157,166 @@ describe("participant WebSocket gateway", () => {
     socket.close();
     await waitForSocketClose(socket);
   });
+
+  it("refreshes a participant's last-seen time on pongs, at most once per heartbeat interval", async () => {
+    useFakeHeartbeatClock();
+    const service = createGatewaySessionService({ replayEvents: [] });
+    const { port } = await startGatewayApp(service.service, openApps);
+    const connectedAt = Date.now();
+
+    const messages: unknown[] = [];
+    const socket = new WebSocket(
+      participantStreamUrl(port, { instanceId: "inst_presence", participantId: "part_presence" }),
+    );
+    socket.on("message", (data) => {
+      messages.push(JSON.parse(String(data)) as unknown);
+    });
+    const hostSocket = new WebSocket(hostStreamUrl(port, { role: "participant" }));
+    await waitForSocketOpen(hostSocket);
+    await waitFor(() => hasReplayComplete(messages));
+
+    // Registration just wrote last_seen_at; a pong inside the same interval
+    // does nothing.
+    socket.pong();
+    await settleSocketTraffic();
+    expect(service.presenceRefreshes()).toEqual([]);
+
+    await advanceHeartbeat();
+    await waitFor(() => service.presenceRefreshes().length === 1);
+    socket.pong();
+    await settleSocketTraffic();
+    await advanceHeartbeat();
+    await waitFor(() => service.presenceRefreshes().length === 2);
+
+    // Only the registered participant is refreshed, never the host stream,
+    // and the refreshes are one heartbeat interval apart.
+    expect(service.presenceRefreshes()).toEqual([
+      {
+        at: connectedAt + heartbeatIntervalMs,
+        participantId: "part_presence",
+        sessionId: gatewaySessionId,
+      },
+      {
+        at: connectedAt + 2 * heartbeatIntervalMs,
+        participantId: "part_presence",
+        sessionId: gatewaySessionId,
+      },
+    ]);
+    // A refresh appends no session event.
+    expect(readEventSeqs(messages)).toEqual([]);
+    expect(socket.readyState).toBe(WebSocket.OPEN);
+
+    socket.close();
+    hostSocket.close();
+    await Promise.all([waitForSocketClose(socket), waitForSocketClose(hostSocket)]);
+  });
+
+  it("stops refreshing the last-seen time once a silent socket is terminated", async () => {
+    useFakeHeartbeatClock();
+    const service = createGatewaySessionService({ replayEvents: [] });
+    const { port } = await startGatewayApp(service.service, openApps);
+
+    const messages: unknown[] = [];
+    let answeringPings = true;
+    const socket = new WebSocket(
+      participantStreamUrl(port, { instanceId: "inst_silent", participantId: "part_silent" }),
+      { autoPong: false },
+    );
+    socket.on("ping", () => {
+      if (answeringPings) {
+        socket.pong();
+      }
+    });
+    socket.on("message", (data) => {
+      messages.push(JSON.parse(String(data)) as unknown);
+    });
+    await waitFor(() => hasReplayComplete(messages));
+
+    await advanceHeartbeat();
+    await waitFor(() => service.presenceRefreshes().length === 1);
+
+    answeringPings = false;
+    const closed = waitForSocketClose(socket);
+    await advanceHeartbeat();
+    await settleSocketTraffic();
+    await advanceHeartbeat();
+    await closed;
+
+    await advanceHeartbeat();
+    await advanceHeartbeat();
+    await settleSocketTraffic();
+    expect(service.presenceRefreshes()).toHaveLength(1);
+  });
+
+  it("logs a failed last-seen refresh and keeps the socket and later refreshes", async () => {
+    useFakeHeartbeatClock();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const refreshFailure = new Error("participants table unavailable");
+    const service = createGatewaySessionService({
+      presenceRefreshFailures: [refreshFailure],
+      replayEvents: [],
+    });
+    const { port } = await startGatewayApp(service.service, openApps);
+    const connectedAt = Date.now();
+
+    const messages: unknown[] = [];
+    const socket = new WebSocket(
+      participantStreamUrl(port, { instanceId: "inst_flaky", participantId: "part_flaky" }),
+    );
+    socket.on("message", (data) => {
+      messages.push(JSON.parse(String(data)) as unknown);
+    });
+    await waitFor(() => hasReplayComplete(messages));
+
+    await advanceHeartbeat();
+    await waitFor(() => service.presenceRefreshAttempts() === 1);
+    // The failure is logged with its cause rather than surfacing as an
+    // unhandled rejection or a socket close.
+    await waitFor(() =>
+      consoleError.mock.calls.some((call) =>
+        call.some((argument) => String(argument).includes(refreshFailure.message)),
+      ),
+    );
+    expect(socket.readyState).toBe(WebSocket.OPEN);
+
+    await advanceHeartbeat();
+    await waitFor(() => service.presenceRefreshes().length === 1);
+    expect(service.presenceRefreshes()[0]?.at).toBe(connectedAt + 2 * heartbeatIntervalMs);
+    expect(socket.readyState).toBe(WebSocket.OPEN);
+    expect(messages.some(isErrorEnvelope)).toBe(false);
+
+    socket.close();
+    await waitForSocketClose(socket);
+  });
 });
+
+/** One successful last-seen refresh the fake service recorded. */
+interface PresenceRefresh {
+  /** Fake-clock time the refresh ran at. */
+  readonly at: number;
+  /** Participant whose last-seen time was refreshed. */
+  readonly participantId: string;
+  /** Session the participant belongs to. */
+  readonly sessionId: string;
+}
 
 interface GatewaySessionService {
   readonly maxListedEventCount: () => number;
+  readonly presenceRefreshAttempts: () => number;
+  readonly presenceRefreshes: () => readonly PresenceRefresh[];
   readonly releaseCount: () => number;
   readonly service: SessionServiceEffect;
 }
 
 function createGatewaySessionService(options: {
+  readonly presenceRefreshFailures?: readonly Error[];
   readonly registerGate?: () => Promise<void>;
   readonly replayEvents: readonly SessionEvent[];
 }): GatewaySessionService {
   let maxListedEventCount = 0;
+  let presenceRefreshAttempts = 0;
+  const presenceRefreshes: PresenceRefresh[] = [];
+  const pendingPresenceRefreshFailures = [...(options.presenceRefreshFailures ?? [])];
   let releaseCount = 0;
   const service = {
     debugInfo: createGatewayDebugInfo,
@@ -180,6 +330,23 @@ function createGatewaySessionService(options: {
         return page;
       }),
     refreshWebSocketControlLease: () => Effect.succeed({ status: "ok" as const }),
+    refreshWebSocketParticipantPresence: (input: {
+      readonly participantId: string;
+      readonly sessionId: string;
+    }) =>
+      Effect.suspend(() => {
+        presenceRefreshAttempts += 1;
+        const failure = pendingPresenceRefreshFailures.shift();
+        if (failure) {
+          return Effect.fail(failure);
+        }
+        presenceRefreshes.push({
+          at: Date.now(),
+          participantId: input.participantId,
+          sessionId: input.sessionId,
+        });
+        return Effect.succeed(true);
+      }),
     registerWebSocketParticipant: (input: {
       readonly instanceId: string;
       readonly participantId: string;
@@ -204,6 +371,8 @@ function createGatewaySessionService(options: {
   } as unknown as SessionServiceEffect;
   return {
     maxListedEventCount: () => maxListedEventCount,
+    presenceRefreshAttempts: () => presenceRefreshAttempts,
+    presenceRefreshes: () => presenceRefreshes,
     releaseCount: () => releaseCount,
     service,
   };
@@ -418,10 +587,32 @@ async function waitForCloseCode(socket: WebSocket): Promise<number> {
   });
 }
 
+/**
+ * Fakes only the heartbeat's interval timer and the wall clock, so a test can
+ * step the server-wide ping loop while sockets, replay, and polling keep real
+ * timers and real I/O. Call before the app starts so its heartbeat interval is
+ * registered on the fake clock.
+ */
+function useFakeHeartbeatClock(): void {
+  vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+}
+
+/** Fires the next server-wide heartbeat tick and lets its pings reach the peers. */
+async function advanceHeartbeat(): Promise<void> {
+  vi.advanceTimersByTime(heartbeatIntervalMs);
+  await settleSocketTraffic();
+}
+
+/** Waits real time for in-flight loopback frames and their handlers to run. */
+async function settleSocketTraffic(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 50));
+}
+
 async function waitFor(assertion: () => boolean): Promise<void> {
-  const startedAt = Date.now();
+  // performance.now keeps advancing while a test fakes Date.
+  const startedAt = performance.now();
   while (!assertion()) {
-    if (Date.now() - startedAt > 2_000) {
+    if (performance.now() - startedAt > 2_000) {
       throw new Error("Timed out waiting for condition");
     }
     await new Promise((resolve) => setTimeout(resolve, 10));

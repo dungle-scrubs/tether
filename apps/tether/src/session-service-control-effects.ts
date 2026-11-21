@@ -53,6 +53,13 @@ export interface SessionControlEffects {
     readonly participantId: string;
     readonly sessionId: string;
   }) => Effect.Effect<ControlProtectedResult<{ readonly refreshed: true }>, SessionServiceFailure>;
+  /** Advances a WebSocket participant's last-seen time; false when it is not registered. */
+  readonly refreshWebSocketParticipantPresenceEffect: (input: {
+    /** Participant whose last-seen time is advanced. */
+    readonly participantId: string;
+    /** Session the participant belongs to. */
+    readonly sessionId: string;
+  }) => Effect.Effect<boolean, SessionServiceFailure>;
   readonly registerRestParticipantEffect: (
     input: RegisterParticipantInput,
   ) => Effect.Effect<RestParticipantRegistrationResult, SessionServiceFailure>;
@@ -347,6 +354,10 @@ export function createSessionControlEffects(
           ),
         );
       }),
+    // Presence only: the participant row's last_seen_at advances, and no
+    // session event, capability, lease, or Control Epoch write follows.
+    refreshWebSocketParticipantPresenceEffect: (presenceInput) =>
+      trySessionPromise(() => input.stores.participants.touchLastSeen(presenceInput)),
     releaseControlLeaseEffect: (leaseInput) =>
       trySessionPromise(
         async () => (await input.stores.controlLeases.release(leaseInput)) === true,

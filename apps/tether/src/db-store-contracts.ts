@@ -215,6 +215,17 @@ export interface ParticipantStore {
     options?: ParticipantListOptions,
   ) => Promise<ParticipantRecord[]>;
   readonly listRuntimeSnapshots: (sessionId: string) => Promise<ParticipantRuntimeSnapshot[]>;
+  /**
+   * Advances a registered participant's `last_seen_at` and nothing else: no
+   * capabilities, control lease, Control Epoch, or session event. False when
+   * the participant is not registered.
+   */
+  readonly touchLastSeen: (input: {
+    /** Participant whose last-seen time is advanced. */
+    readonly participantId: string;
+    /** Session the participant belongs to. */
+    readonly sessionId: string;
+  }) => Promise<boolean>;
   readonly upsert: (input: {
     readonly capabilities: Record<string, unknown>;
     readonly displayName: string;

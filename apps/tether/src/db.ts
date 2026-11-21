@@ -2493,6 +2493,32 @@ export async function heartbeatParticipant(
 }
 
 /**
+ * Advances a registered participant's `last_seen_at` and touches nothing else:
+ * no capabilities, control lease, Control Epoch, or session event. The
+ * WebSocket gateway calls it while a participant's socket answers pings, since
+ * a WebSocket runtime sends no REST heartbeat. Returns false, having changed
+ * nothing, when the participant is not registered.
+ */
+export async function touchParticipantLastSeen(
+  database: DatabasePool,
+  input: {
+    readonly participantId: string;
+    readonly sessionId: string;
+  },
+): Promise<boolean> {
+  const result = await database.pool.query(
+    `
+      UPDATE participants
+      SET last_seen_at = clock_timestamp()
+      WHERE session_id = $1
+        AND participant_id = $2
+    `,
+    [input.sessionId, input.participantId],
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
+/**
  * Lists participants in most-recently-seen order for one session.
  */
 export async function listParticipants(

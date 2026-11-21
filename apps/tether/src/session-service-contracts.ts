@@ -406,6 +406,18 @@ export interface SessionServiceEffect {
     readonly participantId: string;
     readonly sessionId: string;
   }) => Effect.Effect<ControlProtectedResult<{ readonly refreshed: true }>, SessionServiceFailure>;
+  /**
+   * Advances a WebSocket participant's last-seen time while its socket answers
+   * pings. Touches only the participant row's `last_seen_at`: no session
+   * event, capability, control lease, or Control Epoch change. False when the
+   * participant is not registered.
+   */
+  readonly refreshWebSocketParticipantPresence: (input: {
+    /** Participant whose last-seen time is advanced. */
+    readonly participantId: string;
+    /** Session the participant belongs to. */
+    readonly sessionId: string;
+  }) => Effect.Effect<boolean, SessionServiceFailure>;
   /** Refreshes a REST participant heartbeat and emits a visible event when found. */
   readonly heartbeatRestParticipant: (
     input: HeartbeatParticipantInput,

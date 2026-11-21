@@ -685,6 +685,9 @@ function effectStores(overrides: TaskStoreOverrides): SessionPersistenceStores {
       heartbeat: async () => null,
       list: async () => [],
       listRuntimeSnapshots: async () => [],
+      touchLastSeen: async () => {
+        throw new Error("unexpected participant last-seen touch");
+      },
       upsert: async () => {
         throw new Error("unexpected participant upsert");
       },
