@@ -13,6 +13,9 @@ export type {
   RestParticipantControlContext,
   RestParticipantControlErrorCode,
   RestParticipantControlFetch,
+  RestParticipantControlLoss,
+  RestParticipantControlLossCode,
+  RestParticipantControlRenewalFailure,
   RestParticipantControlTimerHandle,
   RestParticipantControlTimerScheduler,
 } from "./rest-participant-control-client.js";
@@ -27,6 +30,7 @@ export type {
   RecordTaskApprovalCall,
   RestParticipantTaskClientConfig,
   RestParticipantTaskClientOptions,
+  RestParticipantTaskCreateRequest,
   RestParticipantTaskErrorCode,
   RestParticipantTaskFetch,
 } from "./rest-participant-task-client.js";

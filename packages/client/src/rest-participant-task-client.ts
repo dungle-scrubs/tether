@@ -15,6 +15,7 @@
 import {
   eventListResponseSchema,
   participantListResponseSchema,
+  type scheduledTaskIdentitySchema,
   taskRecordSchema,
   type EventListResponse,
   type ParticipantListResponse,
@@ -186,6 +187,22 @@ export function isRestParticipantResourceLimit(
 export interface FencedTaskCall {
   readonly claimId: string;
   readonly controlEpoch?: number;
+}
+
+/** One task to create in a session. */
+export interface RestParticipantTaskCreateRequest {
+  /** Task input, sent only when defined. */
+  readonly input?: Record<string, unknown>;
+  /** Task kind the claiming participant handles. */
+  readonly kind: string;
+  /** Human-readable statement of what the task must do. */
+  readonly objective: string;
+  /**
+   * Schedule identity for a recurring run, sent as the protocol's
+   * `scheduledTaskIdentitySchema` defines it. The server derives the task id
+   * from it and replays an existing run for the same window.
+   */
+  readonly schedule?: z.input<typeof scheduledTaskIdentitySchema>;
 }
 
 /** Options for one approval decision on a task. */
@@ -452,11 +469,7 @@ export class RestParticipantTaskClient {
    */
   async createTask(
     sessionId: string,
-    request: {
-      readonly kind: string;
-      readonly objective: string;
-      readonly input?: Record<string, unknown>;
-    },
+    request: RestParticipantTaskCreateRequest,
   ): Promise<TaskRecord> {
     const { body } = await this.#request(
       "create",
@@ -466,6 +479,7 @@ export class RestParticipantTaskClient {
         kind: request.kind,
         objective: request.objective,
         ...(request.input === undefined ? {} : { input: request.input }),
+        ...(request.schedule === undefined ? {} : { schedule: request.schedule }),
       },
     );
     const wrapped = wrappedTaskResponseSchema.safeParse(body);
