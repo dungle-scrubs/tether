@@ -28,13 +28,16 @@ export type {
   FencedTaskCall,
   ListEventsQuery,
   RecordTaskApprovalCall,
+  RestParticipantTaskCancelCall,
   RestParticipantTaskClientConfig,
   RestParticipantTaskClientOptions,
+  RestParticipantTaskConflictReason,
   RestParticipantTaskCreateRequest,
   RestParticipantTaskErrorCode,
   RestParticipantTaskFetch,
 } from "./rest-participant-task-client.js";
 export {
+  isControlConflict,
   RestParticipantTaskClient,
   RestParticipantTaskError,
 } from "./rest-participant-task-client.js";

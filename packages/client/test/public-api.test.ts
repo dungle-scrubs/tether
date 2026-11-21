@@ -1,6 +1,7 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 
 import * as Client from "../src/index.js";
+import * as Rest from "../src/rest.js";
 import type { ParticipantRestReplayError } from "../src/participant-rest-replay.js";
 
 /** The public options type must not expose recovery-owned transport limits. */
@@ -196,6 +197,19 @@ describe("@dungle-scrubs/tether-client public API", () => {
     expect(recoveryErrors).toHaveLength(5);
     expectTypeOf<ParticipantDiagnostics["lastObservedSeq"]>().toEqualTypeOf<number>();
     expectTypeOf<ParticipantDiagnostics["lastHandledSeq"]>().toEqualTypeOf<number>();
+  });
+
+  it("exports the task conflict guard from the package and REST entries", () => {
+    expect(typeof Client.isControlConflict).toBe("function");
+    expect(Rest.isControlConflict).toBe(Client.isControlConflict);
+    expectTypeOf<Client.RestParticipantTaskConflictReason>().toEqualTypeOf<
+      | "CONTROL_CONFLICT"
+      | "CONTROL_EPOCH_STALE"
+      | "scheduled_run_identity_conflict"
+      | "scheduled_task_identity_mismatch"
+      | "task_id_conflict"
+    >();
+    expectTypeOf<Rest.RestParticipantTaskCancelCall>().toEqualTypeOf<Client.RestParticipantTaskCancelCall>();
   });
 
   it("does not export Effect as a top-level adapter API", () => {

@@ -13,6 +13,7 @@
  */
 
 import {
+  type cancelTaskSchema,
   eventListResponseSchema,
   participantListResponseSchema,
   type scheduledTaskIdentitySchema,
@@ -100,6 +101,41 @@ interface RestTaskResourceLimit {
   readonly observed: number;
 }
 
+/**
+ * Control-lease codes the server puts in a 409 body's `code` field when a
+ * fenced call is refused: another channel holds the participant's control
+ * lease, or the call's control epoch is missing, invalid or stale.
+ */
+const controlConflictCodeSchema = z.enum(["CONTROL_CONFLICT", "CONTROL_EPOCH_STALE"]);
+
+/**
+ * Task-identity codes the server puts in a 409 body's `reason` field when a
+ * create is refused: the task id belongs to a different task, or a scheduled
+ * create's derived id is occupied or does not match the supplied id.
+ */
+const createConflictReasonSchema = z.enum([
+  "scheduled_run_identity_conflict",
+  "scheduled_task_identity_mismatch",
+  "task_id_conflict",
+]);
+
+/** The one field of a 409 body that names its kind; every other field is ignored. */
+const conflictBodySchema = z.union([
+  z.object({ code: controlConflictCodeSchema }),
+  z.object({ reason: createConflictReasonSchema }),
+]);
+
+/** Conflict bodies are small; a larger one is not read past this many bytes. */
+const conflictBodyMaxBytes = 4_096;
+
+/**
+ * Why the server refused a task call with HTTP 409, when its body says so. A
+ * claim race or a terminal task carries no code, so its reason is `null`.
+ */
+export type RestParticipantTaskConflictReason =
+  | z.infer<typeof controlConflictCodeSchema>
+  | z.infer<typeof createConflictReasonSchema>;
+
 /** Stable failure classifications surfaced to callers. */
 export type RestParticipantTaskErrorCode =
   | "AUTHENTICATION"
@@ -110,7 +146,13 @@ export type RestParticipantTaskErrorCode =
   | "RESOURCE_LIMIT"
   | "TRANSPORT";
 
-/** Resource metadata is mandatory only for its matching failure variant. */
+/** Classifications that carry neither resource metadata nor a conflict reason. */
+type PlainTaskErrorCode = Exclude<
+  RestParticipantTaskErrorCode,
+  "CLAIM_CONFLICT" | "RESOURCE_LIMIT"
+>;
+
+/** Resource metadata and conflict reasons belong only to their matching failure variants. */
 type RestTaskFailureInput = {
   /** REST operation whose request failed. */
   readonly operation: string;
@@ -123,11 +165,22 @@ type RestTaskFailureInput = {
       readonly code: "RESOURCE_LIMIT";
       /** Required resource, configured limit and rejected observation. */
       readonly resourceLimit: RestTaskResourceLimit;
+      /** Conflict reasons are unavailable for this non-conflict variant. */
+      readonly conflictReason?: never;
+    }
+  | {
+      /** HTTP 409: the server refused the call in the task's or lease's current state. */
+      readonly code: "CLAIM_CONFLICT";
+      /** The server's reason when its body names a known one; null or absent otherwise. */
+      readonly conflictReason?: RestParticipantTaskConflictReason | null;
+      /** Resource metadata is unavailable for this non-resource variant. */
+      readonly resourceLimit?: never;
     }
   | {
       /** Transport or server classification without resource-policy metadata. */
-      readonly code: Exclude<RestParticipantTaskErrorCode, "RESOURCE_LIMIT">;
-
+      readonly code: PlainTaskErrorCode;
+      /** Conflict reasons are unavailable for this non-conflict variant. */
+      readonly conflictReason?: never;
       /** Resource metadata is unavailable for this non-resource variant. */
       readonly resourceLimit?: never;
     }
@@ -140,7 +193,7 @@ type RestTaskFailure<Failure extends RestTaskFailureInput = RestTaskFailureInput
         /** Classification correlated with this input variant's metadata. */
         readonly code: Failure["code"];
         /** Bounded operation context with a normalized status and variant-specific resource data. */
-        readonly details: Omit<Failure, "code" | "status"> & {
+        readonly details: Omit<Failure, "code" | "conflictReason" | "status"> & {
           /** Known status or null when no HTTP response was available. */
           readonly status: number | null;
         };
@@ -151,6 +204,12 @@ type RestTaskFailure<Failure extends RestTaskFailureInput = RestTaskFailureInput
 export class RestParticipantTaskError extends Error {
   /** Enumerable public classification retained for spread and JSON compatibility. */
   readonly code: RestTaskFailure["code"];
+  /**
+   * Own and enumerable only on a `CLAIM_CONFLICT`: the server's conflict code,
+   * or null when the 409 body is absent, unparseable or names no known code.
+   * Absent on every other classification.
+   */
+  declare readonly conflictReason?: RestParticipantTaskConflictReason | null;
   /** Enumerable bounded operation and resource metadata, assigned once from the input. */
   readonly details: RestTaskFailure["details"];
 
@@ -158,6 +217,9 @@ export class RestParticipantTaskError extends Error {
   constructor(input: RestTaskFailureInput) {
     super(`REST participant task ${input.operation} failed: ${input.code}`);
     this.code = input.code;
+    if (input.code === "CLAIM_CONFLICT") {
+      this.conflictReason = input.conflictReason ?? null;
+    }
     this.details = {
       operation: input.operation,
       status: input.status ?? null,
@@ -183,6 +245,23 @@ export function isRestParticipantResourceLimit(
   return error instanceof RestParticipantTaskError && error.code === "RESOURCE_LIMIT";
 }
 
+/**
+ * True exactly when a task call was refused because of the caller's control
+ * lease (another channel holds it, or the control epoch is stale): acquire
+ * control again before retrying. False for a claim race, a terminal task, a
+ * task-identity conflict, a conflict without a reason, and anything else.
+ */
+export function isControlConflict(error: unknown): error is RestParticipantTaskError & {
+  readonly code: "CLAIM_CONFLICT";
+  readonly conflictReason: z.infer<typeof controlConflictCodeSchema>;
+} {
+  return (
+    error instanceof RestParticipantTaskError &&
+    error.code === "CLAIM_CONFLICT" &&
+    controlConflictCodeSchema.safeParse(error.conflictReason).success
+  );
+}
+
 /** Options shared by every fenced mutation. */
 export interface FencedTaskCall {
   readonly claimId: string;
@@ -204,6 +283,15 @@ export interface RestParticipantTaskCreateRequest {
    */
   readonly schedule?: z.input<typeof scheduledTaskIdentitySchema>;
 }
+
+/**
+ * Caller fields of one cancel, typed from the protocol's `cancelTaskSchema`.
+ * The participant and instance ids come from the client's configuration.
+ */
+export type RestParticipantTaskCancelCall = Pick<
+  z.input<typeof cancelTaskSchema>,
+  "controlEpoch" | "reason"
+>;
 
 /** Options for one approval decision on a task. */
 export interface RecordTaskApprovalCall {
@@ -236,6 +324,7 @@ export interface ListEventsQuery {
 
 type TaskOperation =
   | "append-event"
+  | "cancel"
   | "claim"
   | "complete"
   | "create"
@@ -355,13 +444,29 @@ async function readJsonBody(
   }
 }
 
+/** Reads the one known code from a bounded 409 body; never throws. */
+async function readConflictReason(
+  response: Response,
+  operation: TaskOperation,
+  signal: AbortSignal | undefined,
+): Promise<RestParticipantTaskConflictReason | null> {
+  const body = await readJsonBody(
+    response,
+    operation,
+    { maxBytes: conflictBodyMaxBytes },
+    signal,
+  ).catch(() => null);
+  const parsed = conflictBodySchema.safeParse(body);
+  if (!parsed.success) {
+    return null;
+  }
+  return "code" in parsed.data ? parsed.data.code : parsed.data.reason;
+}
+
 /** Parses one task-or-null response body with the shared protocol schema. */
 function parseTask(
   body: unknown,
-  error: (
-    code: Exclude<RestParticipantTaskErrorCode, "RESOURCE_LIMIT">,
-    operation: TaskOperation,
-  ) => Error,
+  error: (code: PlainTaskErrorCode, operation: TaskOperation) => Error,
   operation: TaskOperation,
 ): TaskRecord | null {
   if (body === null) {
@@ -374,18 +479,13 @@ function parseTask(
   return parsed.data;
 }
 
-/** Maps public HTTP status to a bounded client failure. */
-function mapTaskServerError(
-  status: number,
-): Exclude<RestParticipantTaskErrorCode, "RESOURCE_LIMIT"> {
+/** Maps a public HTTP status other than 409, which carries its reason, to a bounded failure. */
+function mapTaskServerError(status: number): PlainTaskErrorCode {
   if (status === 401 || status === 403) {
     return "AUTHENTICATION";
   }
   if (status === 404) {
     return "NOT_FOUND";
-  }
-  if (status === 409) {
-    return "CLAIM_CONFLICT";
   }
   return status >= 500 ? "PERSISTENCE" : "INVALID_RESPONSE";
 }
@@ -520,7 +620,9 @@ export class RestParticipantTaskClient {
 
   /**
    * Claims a task. Returns the claimed record, or null when the server
-   * reports no claim available. A 409 surfaces as CLAIM_CONFLICT.
+   * reports no claim available. A 409 surfaces as CLAIM_CONFLICT: a claim
+   * race or terminal task has a null `conflictReason`, a refused control
+   * lease satisfies `isControlConflict`.
    */
   async claimTask(
     sessionId: string,
@@ -616,6 +718,47 @@ export class RestParticipantTaskClient {
     );
   }
 
+  /**
+   * Cancels one task that is not yet terminal, claimed or not: the server's
+   * cancel route does not check who holds the claim, so a claim taken first
+   * does not block the cancel. Any participant the token may act for can
+   * cancel.
+   *
+   * - Cancelled: resolves with the task record, `cancelledAt` set.
+   * - Already terminal (completed, failed or cancelled), or no such task in
+   *   the session: rejects with `CLAIM_CONFLICT` and a null `conflictReason`.
+   *   Read the task to tell them apart.
+   * - Control lease refused: `CLAIM_CONFLICT` with `conflictReason`
+   *   `CONTROL_CONFLICT` or `CONTROL_EPOCH_STALE`; `isControlConflict` is
+   *   true. Acquire control again before retrying.
+   * - A server that enforces control epochs answers a call without
+   *   `controlEpoch` with HTTP 428, surfaced as `INVALID_RESPONSE`.
+   * - A missing session is `NOT_FOUND`; auth failures are `AUTHENTICATION`.
+   *
+   * `reason` is recorded on the task's cancel event; the server stores `{}`
+   * when it is omitted.
+   */
+  async cancelTask(
+    sessionId: string,
+    taskId: string,
+    call: RestParticipantTaskCancelCall = {},
+  ): Promise<TaskRecord> {
+    const { body } = await this.#request(
+      "cancel",
+      "POST",
+      `/sessions/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(taskId)}/cancel`,
+      {
+        ...(call.reason === undefined ? {} : { reason: call.reason }),
+        ...this.#identity(call),
+      },
+    );
+    const parsed = readTaskResponseSchema.safeParse(body);
+    if (!parsed.success || parsed.data.task === null) {
+      throw this.#error("INVALID_RESPONSE", "cancel");
+    }
+    return parsed.data.task;
+  }
+
   /** Records one approval decision on a task. */
   async recordApproval(
     sessionId: string,
@@ -698,11 +841,7 @@ export class RestParticipantTaskClient {
     return parsed.data;
   }
 
-  #error(
-    code: Exclude<RestParticipantTaskErrorCode, "RESOURCE_LIMIT">,
-    operation: TaskOperation,
-    status?: number | null,
-  ) {
+  #error(code: PlainTaskErrorCode, operation: TaskOperation, status?: number | null) {
     return new RestParticipantTaskError({
       code,
       operation,
@@ -720,7 +859,7 @@ export class RestParticipantTaskClient {
     };
   }
 
-  #identity(call: { readonly controlEpoch?: number }): Record<string, unknown> {
+  #identity(call: { readonly controlEpoch?: number | undefined }): Record<string, unknown> {
     return {
       ...(call.controlEpoch === undefined ? {} : { controlEpoch: call.controlEpoch }),
       ...(this.#instanceId === undefined ? {} : { instanceId: this.#instanceId }),
@@ -767,6 +906,14 @@ export class RestParticipantTaskClient {
           );
         } catch {
           throw readTransportError(operation, signal, this.#readPolicy?.signal);
+        }
+        if (response.status === 409) {
+          throw new RestParticipantTaskError({
+            code: "CLAIM_CONFLICT",
+            conflictReason: await readConflictReason(response, operation, signal),
+            operation,
+            status: response.status,
+          });
         }
         if (!response.ok) {
           discardBody(response);
