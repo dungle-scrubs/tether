@@ -81,6 +81,18 @@ interface WebSocketControlLeaseRefreshInput {
   readonly socket: WebSocket;
 }
 
+/** One registered participant socket whose pongs advance its last-seen time. */
+interface WebSocketPresenceRefreshInput {
+  /** Participant the socket registered as. */
+  readonly participantContext: ParticipantControlContext;
+  /** Service that persists the last-seen time. */
+  readonly service: SessionServiceEffect;
+  /** Session the participant belongs to. */
+  readonly sessionId: string;
+  /** The participant's socket; its pongs drive the refresh. */
+  readonly socket: WebSocket;
+}
+
 interface WebSocketTaskMutationCommandInput<
   TBody extends {
     readonly requestId?: string | undefined;
@@ -301,6 +313,51 @@ export function redactWebSocketCredentials(request: IncomingMessage, url: URL): 
   return new URLSearchParams(redactedUrl.searchParams);
 }
 
+/**
+ * Minimum spacing between two last-seen refreshes of one participant socket.
+ * The server-wide heartbeat pings every `defaultWebSocketHeartbeatIntervalMs`,
+ * so a socket that keeps answering refreshes about once per ping and a pong
+ * arriving sooner (an unsolicited one, or one bunched by jitter) does nothing.
+ */
+const webSocketPresenceRefreshMinIntervalMs = 30_000;
+
+/**
+ * Advances a registered participant's `last_seen_at` each time its socket
+ * answers a heartbeat ping, at most once per
+ * `webSocketPresenceRefreshMinIntervalMs`. A WebSocket runtime sends no REST
+ * heartbeat, so without this its last-seen time would stay at its connect
+ * time. Only the participant row is touched; no session event is appended. A
+ * failed refresh is logged and the next pong tries again, so a database blip
+ * never closes the socket. Once the socket stops answering, the heartbeat
+ * terminates it, the pongs stop, and so do the refreshes. Returns a function
+ * that detaches the pong listener.
+ */
+function startWebSocketPresenceRefresh(input: WebSocketPresenceRefreshInput): () => void {
+  // Registration has just written last_seen_at, so the first refresh waits a
+  // full interval.
+  let lastRefreshAt = Date.now();
+  /** Refreshes on a pong unless the previous refresh is under one interval old. */
+  const refreshOnPong = (): void => {
+    const now = Date.now();
+    if (now - lastRefreshAt < webSocketPresenceRefreshMinIntervalMs) {
+      return;
+    }
+    lastRefreshAt = now;
+    void Effect.runPromise(
+      input.service.refreshWebSocketParticipantPresence({
+        participantId: input.participantContext.participantId,
+        sessionId: input.sessionId,
+      }),
+    ).catch((error: unknown) => {
+      console.error(error);
+    });
+  };
+  input.socket.on("pong", refreshOnPong);
+  return () => {
+    input.socket.off("pong", refreshOnPong);
+  };
+}
+
 /** Registers an upgraded WebSocket, replays historical events, and attaches live command handling. */
 function handleWebSocket(
   service: SessionServiceEffect,
@@ -440,9 +497,16 @@ function handleWebSocket(
         sessionId,
         socket,
       });
+      const stopPresenceRefresh = startWebSocketPresenceRefresh({
+        participantContext,
+        service,
+        sessionId,
+        socket,
+      });
       socket.on("close", () => {
         unregisterNativeSocket();
         stopControlLeaseRefresh();
+        stopPresenceRefresh();
         releaseParticipantRegistration();
       });
     }

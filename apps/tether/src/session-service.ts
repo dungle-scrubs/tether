@@ -208,6 +208,7 @@ function makeSessionServiceEffect(
     claimRestControlEffect,
     heartbeatRestParticipantEffect,
     refreshWebSocketControlLeaseEffect,
+    refreshWebSocketParticipantPresenceEffect,
     registerRestParticipantEffect,
     registerWebSocketParticipantEffect,
     releaseControlLeaseEffect,
@@ -795,6 +796,16 @@ function makeSessionServiceEffect(
         },
         refreshWebSocketControlLeaseEffect(input),
         (result) => ({ status: result.status }),
+      ),
+    refreshWebSocketParticipantPresence: (input) =>
+      traceEffect(
+        "refreshWebSocketParticipantPresence",
+        {
+          participantId: input.participantId,
+          sessionId: input.sessionId,
+        },
+        refreshWebSocketParticipantPresenceEffect(input),
+        (touched) => ({ touched }),
       ),
     heartbeatRestParticipant: (input) =>
       traceEffect(

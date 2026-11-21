@@ -42,6 +42,7 @@ import {
   renewControlLease,
   resolveEventSinceCursor,
   supersedeScheduledRunsWithEvent,
+  touchParticipantLastSeen,
   upsertClientSessionBinding,
   upsertParticipant,
   upsertParticipantWithEvent,
@@ -216,6 +217,11 @@ class DbParticipantStore implements ParticipantStore {
 
   listRuntimeSnapshots(sessionId: string) {
     return listParticipantRuntimeSnapshots(this.database, sessionId);
+  }
+
+  /** Advances a registered participant's last-seen time and nothing else. */
+  touchLastSeen(input: { readonly participantId: string; readonly sessionId: string }) {
+    return touchParticipantLastSeen(this.database, input);
   }
 
   upsert(input: {
