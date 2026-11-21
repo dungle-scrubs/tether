@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 
+import type { StructuredLogEntry } from "../src/observability.js";
 import {
   RestParticipantControlClient,
+  type RestParticipantControlClientOptions,
   RestParticipantControlError,
   type RestParticipantControlFetch,
   type RestParticipantControlTimerHandle,
@@ -358,7 +360,8 @@ describe("RestParticipantControlClient", () => {
     timers.fireNext();
     await vi.waitFor(() => {
       expect(requests).toHaveLength(2);
-      expect(timers.unrefCount).toBe(2);
+      // Acquisition deadline, renewal timer, renewal deadline, next renewal timer.
+      expect(timers.unrefCount).toBe(4);
     });
 
     expect(requests[1]).toEqual({
@@ -469,6 +472,529 @@ describe("RestParticipantControlClient", () => {
     });
   });
 
+  it("invalidates the current context with a snapshot taken before a renewal", async () => {
+    const requests: CapturedRequest[] = [];
+    const timers = new FakeTimerScheduler();
+    const client = createTimedClient(createControlFetch(requests), timers);
+    const beforeRenewal = await client.context("sess_1");
+
+    timers.fireNext();
+    await vi.waitFor(async () => {
+      expect((await client.context("sess_1")).leaseExpiresAt).toBe("2026-07-16T12:02:00.000Z");
+    });
+    expect(await client.context("sess_1")).not.toBe(beforeRenewal);
+
+    expect(client.invalidate(beforeRenewal)).toBe(true);
+    expect(client.debugInfo()).toMatchObject({ activeContextCount: 0, renewalTimerCount: 0 });
+    const replacement = await client.context("sess_1");
+
+    expect(replacement.controlEpoch).toBeGreaterThan(beforeRenewal.controlEpoch);
+    expect(requests.map((request) => request.path)).toEqual([
+      "/sessions/sess_1/participants",
+      "/sessions/sess_1/participants/part_1/heartbeat",
+      "/sessions/sess_1/participants",
+    ]);
+  });
+
+  it("leaves the current context in place when the snapshot names an older generation", async () => {
+    const requests: CapturedRequest[] = [];
+    let nextId = 0;
+    const client = createTimedClient(createControlFetch(requests), new FakeTimerScheduler(), {
+      acquisitionIdFactory: () => `acq_${++nextId}`,
+    });
+    const first = await client.context("sess_1");
+    expect(client.invalidate(first)).toBe(true);
+    const second = await client.context("sess_1");
+
+    expect(client.invalidate(first)).toBe(false);
+    expect(client.invalidate({ ...second, controlEpoch: first.controlEpoch })).toBe(false);
+    expect(client.invalidate({ ...second, acquisitionId: first.acquisitionId })).toBe(false);
+    await expect(client.context("sess_1")).resolves.toBe(second);
+    expect(requests).toHaveLength(2);
+  });
+
+  it("bounds each control request with a default ten-second deadline", async () => {
+    const timers = new FakeTimerScheduler();
+    const client = createTimedClient(createControlFetch([]), timers);
+    let resolved = false;
+    const acquiring = client.context("sess_1").then((context) => {
+      resolved = true;
+      return context;
+    });
+
+    expect(timers.delays).toEqual([10_000]);
+    await acquiring;
+    expect(resolved).toBe(true);
+    expect(timers.delays).not.toContain(10_000);
+  });
+
+  it.each([
+    [0, 100],
+    [250, 250],
+    [10_000_000, 60_000],
+  ] as const)("clamps requestTimeoutMs %s to %s", async (requested, applied) => {
+    const timers = new FakeTimerScheduler();
+    const client = createTimedClient(async () => new Promise<Response>(() => undefined), timers, {
+      requestTimeoutMs: requested,
+    });
+
+    void client.context("sess_1").catch(() => undefined);
+
+    expect(timers.delays).toEqual([applied]);
+  });
+
+  it("rejects an acquisition whose fetch never settles at the deadline", async () => {
+    const timers = new FakeTimerScheduler();
+    const signals: AbortSignal[] = [];
+    const client = createTimedClient(
+      async (_url, init) => {
+        if (init.signal) {
+          signals.push(init.signal);
+        }
+        return new Promise<Response>(() => undefined);
+      },
+      timers,
+      { requestTimeoutMs: 2_000 },
+    );
+    const acquiring = client.context("sess_1").catch((error: unknown) => error);
+
+    await vi.waitFor(() => expect(signals).toHaveLength(1));
+    expect(signals[0]?.aborted).toBe(false);
+    timers.fireDelay(2_000);
+
+    const failure = await acquiring;
+    expect(failure).toBeInstanceOf(RestParticipantControlError);
+    expect(failure).toMatchObject({
+      code: "TRANSPORT",
+      details: { operation: "acquire", status: null },
+    });
+    expect(signals[0]?.aborted).toBe(true);
+    expect(client.debugInfo()).toMatchObject({ acquiringSessionCount: 0, activeContextCount: 0 });
+  });
+
+  it("retries a timed-out acquisition with the same Acquisition ID and ignores its late response", async () => {
+    const timers = new FakeTimerScheduler();
+    const requests: CapturedRequest[] = [];
+    let answerFirst: ((response: Response) => void) | null = null;
+    const client = createTimedClient(
+      async (url, init) => {
+        requests.push(capture(url, init));
+        if (requests.length === 1) {
+          return new Promise<Response>((resolve) => {
+            answerFirst = resolve;
+          });
+        }
+        return acquisitionResponse("acq_1", 2);
+      },
+      timers,
+      { acquisitionTransportRetries: 1, requestTimeoutMs: 2_000 },
+    );
+    const acquiring = client.context("sess_1");
+
+    await vi.waitFor(() => expect(answerFirst).not.toBeNull());
+    timers.fireDelay(2_000);
+    const installed = await acquiring;
+    expect(installed).toMatchObject({ acquisitionId: "acq_1", controlEpoch: 2 });
+    expect(requests.map((request) => request.body.acquisitionId)).toEqual(["acq_1", "acq_1"]);
+
+    answerFirst?.(acquisitionResponse("acq_1", 1));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    await expect(client.context("sess_1")).resolves.toBe(installed);
+    expect(requests).toHaveLength(2);
+    expect(client.debugInfo()).toMatchObject({
+      activeContextCount: 1,
+      acquiringSessionCount: 0,
+      renewalTimerCount: 1,
+    });
+  });
+
+  it("rejects an acquisition whose response body never ends at the deadline", async () => {
+    const timers = new FakeTimerScheduler();
+    let fetched = 0;
+    const client = createTimedClient(
+      async () => {
+        fetched += 1;
+        return new Response(new ReadableStream({ start() {} }), { status: 201 });
+      },
+      timers,
+      { requestTimeoutMs: 2_000 },
+    );
+    const acquiring = client.context("sess_1").catch((error: unknown) => error);
+
+    await vi.waitFor(() => expect(fetched).toBe(1));
+    timers.fireDelay(2_000);
+
+    await expect(acquiring).resolves.toMatchObject({
+      code: "TRANSPORT",
+      details: { operation: "acquire", status: 201 },
+    });
+  });
+
+  it("aborts a stalled acquisition at shutdown before its deadline", async () => {
+    const timers = new FakeTimerScheduler();
+    const client = createTimedClient(async () => new Promise<Response>(() => undefined), timers, {
+      shutdownPendingWaitMs: 1,
+    });
+    const acquiring = client.context("sess_1").catch((error: unknown) => error);
+
+    await client.stop();
+
+    await expect(acquiring).resolves.toMatchObject({ code: "TRANSPORT" });
+    expect(timers.delays).toEqual([]);
+  });
+
+  it.each([
+    ["a fetch that never settles", () => new Promise<Response>(() => undefined)],
+    [
+      "a response body that never ends",
+      async () => new Response(new ReadableStream({ start() {} }), { status: 200 }),
+    ],
+  ] as const)("keeps the context and retries a renewal that times out on %s", async (_label, stall) => {
+    const timers = new FakeTimerScheduler();
+    const failures: unknown[] = [];
+    const heartbeats: string[] = [];
+    const control = createControlFetch([]);
+    const client = createTimedClient(
+      async (url, init) => {
+        if (url.pathname.endsWith("/heartbeat")) {
+          heartbeats.push(url.pathname);
+          return stall();
+        }
+        return control(url, init);
+      },
+      timers,
+      {
+        onRenewalFailure: (failure) => failures.push(failure),
+        requestTimeoutMs: 2_000,
+      },
+    );
+    const acquired = await client.context("sess_1");
+
+    timers.fireDelay(30_000);
+    await vi.waitFor(() => expect(heartbeats).toHaveLength(1));
+    timers.fireDelay(2_000);
+
+    await vi.waitFor(() => expect(failures).toHaveLength(1));
+    expect(failures[0]).toEqual({ code: "TRANSPORT", controlRetained: true, sessionId: "sess_1" });
+    expect(client.debugInfo()).toMatchObject({
+      activeContextCount: 1,
+      lastFailureCode: "TRANSPORT",
+      renewalTimerCount: 1,
+    });
+    expect(timers.delays).toEqual([1_000]);
+    await expect(client.context("sess_1")).resolves.toBe(acquired);
+  });
+
+  it.each([
+    ["a fetch that never settles", () => new Promise<Response>(() => undefined)],
+    [
+      "a response body that never ends",
+      async () => new Response(new ReadableStream({ start() {} }), { status: 200 }),
+    ],
+  ] as const)("reports an uncertain release that times out on %s", async (_label, stall) => {
+    const timers = new FakeTimerScheduler();
+    const lost: unknown[] = [];
+    const control = createControlFetch([]);
+    let releases = 0;
+    const client = createTimedClient(
+      async (url, init) => {
+        if (url.pathname.endsWith("/control/release")) {
+          releases += 1;
+          return stall();
+        }
+        return control(url, init);
+      },
+      timers,
+      { onControlLost: (loss) => lost.push(loss), requestTimeoutMs: 2_000 },
+    );
+    await client.context("sess_1");
+
+    const releasing = client.release("sess_1").catch((error: unknown) => error);
+    await vi.waitFor(() => expect(releases).toBe(1));
+    timers.fireDelay(2_000);
+
+    await expect(releasing).resolves.toMatchObject({
+      code: "TRANSPORT",
+      details: { operation: "release" },
+    });
+    expect(client.debugInfo()).toMatchObject({
+      activeContextCount: 0,
+      uncertainReleaseCount: 1,
+    });
+    expect(lost).toEqual([]);
+  });
+
+  it("reports a renewal transport failure that keeps the context", async () => {
+    const timers = new FakeTimerScheduler();
+    const failures: unknown[] = [];
+    const lost: unknown[] = [];
+    const control = createControlFetch([]);
+    const client = createTimedClient(
+      async (url, init) => {
+        if (url.pathname.endsWith("/heartbeat")) {
+          throw new Error("connection reset");
+        }
+        return control(url, init);
+      },
+      timers,
+      {
+        onControlLost: (loss) => lost.push(loss),
+        onRenewalFailure: (failure) => failures.push(failure),
+      },
+    );
+    await client.context("sess_1");
+
+    timers.fireNext();
+    await vi.waitFor(() => expect(failures).toHaveLength(1));
+    timers.fireNext();
+    await vi.waitFor(() => expect(failures).toHaveLength(2));
+
+    expect(failures).toEqual([
+      { code: "TRANSPORT", controlRetained: true, sessionId: "sess_1" },
+      { code: "TRANSPORT", controlRetained: true, sessionId: "sess_1" },
+    ]);
+    expect(lost).toEqual([]);
+    expect(client.debugInfo().activeContextCount).toBe(1);
+  });
+
+  it.each([
+    [409, { code: "CONTROL_EPOCH_STALE" }, "CONTROL_EPOCH_STALE"],
+    [409, {}, "CONTROL_CONFLICT"],
+    [428, { code: "CONTROL_EPOCH_REQUIRED" }, "CONTROL_EPOCH_REQUIRED"],
+  ] as const)("reports a renewal rejected with HTTP %s as lost control (%s)", async (status, body, code) => {
+    const timers = new FakeTimerScheduler();
+    const failures: unknown[] = [];
+    const lost: unknown[] = [];
+    const control = createControlFetch([]);
+    const client = createTimedClient(
+      async (url, init) => {
+        if (url.pathname.endsWith("/heartbeat")) {
+          return new Response(JSON.stringify(body), { status });
+        }
+        return control(url, init);
+      },
+      timers,
+      {
+        onControlLost: (loss) => lost.push(loss),
+        onRenewalFailure: (failure) => failures.push(failure),
+      },
+    );
+    await client.context("sess_1");
+
+    timers.fireNext();
+    await vi.waitFor(() => expect(failures).toHaveLength(1));
+
+    expect(failures).toEqual([{ code, controlRetained: false, sessionId: "sess_1" }]);
+    expect(lost).toEqual([{ code, sessionId: "sess_1" }]);
+    expect(client.debugInfo()).toMatchObject({ activeContextCount: 0, renewalTimerCount: 0 });
+  });
+
+  it("reports a renewal failure after the lease ran out as an expiry", async () => {
+    const timers = new FakeTimerScheduler();
+    const failures: unknown[] = [];
+    const lost: unknown[] = [];
+    let now = Date.parse("2026-07-16T12:00:00.000Z");
+    const control = createControlFetch([]);
+    const client = createTimedClient(
+      async (url, init) => {
+        if (url.pathname.endsWith("/heartbeat")) {
+          now = Date.parse("2026-07-16T12:01:00.000Z");
+          throw new Error("connection reset");
+        }
+        return control(url, init);
+      },
+      timers,
+      {
+        now: () => now,
+        onControlLost: (loss) => lost.push(loss),
+        onRenewalFailure: (failure) => failures.push(failure),
+      },
+    );
+    await client.context("sess_1");
+
+    timers.fireNext();
+    await vi.waitFor(() => expect(failures).toHaveLength(1));
+
+    expect(failures).toEqual([{ code: "TRANSPORT", controlRetained: false, sessionId: "sess_1" }]);
+    expect(lost).toEqual([{ code: "LEASE_EXPIRED", sessionId: "sess_1" }]);
+    expect(client.debugInfo().activeContextCount).toBe(0);
+  });
+
+  it("reports an expired context found by context() and an explicit invalidation", async () => {
+    const lost: unknown[] = [];
+    let now = Date.parse("2026-07-16T12:00:00.000Z");
+    let nextId = 0;
+    const client = createTimedClient(createControlFetch([]), new FakeTimerScheduler(), {
+      acquisitionIdFactory: () => `acq_${++nextId}`,
+      now: () => now,
+      onControlLost: (loss) => lost.push(loss),
+    });
+    await client.context("sess_1");
+    now = Date.parse("2026-07-16T12:01:00.000Z");
+    const replacement = await client.context("sess_1");
+    expect(lost).toEqual([{ code: "LEASE_EXPIRED", sessionId: "sess_1" }]);
+
+    expect(client.invalidate(replacement)).toBe(true);
+    expect(client.invalidate(replacement)).toBe(false);
+    expect(lost).toEqual([
+      { code: "LEASE_EXPIRED", sessionId: "sess_1" },
+      { code: "INVALIDATED", sessionId: "sess_1" },
+    ]);
+  });
+
+  it("acquires nothing after an expiry callback stops the client", async () => {
+    const requests: CapturedRequest[] = [];
+    let now = Date.parse("2026-07-16T12:00:00.000Z");
+    let nextId = 0;
+    let stopping: Promise<void> | null = null;
+    const client: RestParticipantControlClient = createTimedClient(
+      createControlFetch(requests),
+      new FakeTimerScheduler(),
+      {
+        acquisitionIdFactory: () => `acq_${++nextId}`,
+        now: () => now,
+        onControlLost: () => {
+          stopping = client.stop();
+        },
+      },
+    );
+    await client.context("sess_1");
+    now = Date.parse("2026-07-16T12:01:00.000Z");
+
+    await expect(client.context("sess_1")).rejects.toMatchObject({ code: "STOPPED" });
+    expect(stopping).not.toBeNull();
+    await stopping;
+
+    expect(requests.map((request) => request.path)).toEqual(["/sessions/sess_1/participants"]);
+    expect(client.debugInfo()).toMatchObject({
+      activeContextCount: 0,
+      acquiringSessionCount: 0,
+      renewalTimerCount: 0,
+      stopped: true,
+    });
+  });
+
+  it("does not report lost control for release or stop", async () => {
+    const lost: unknown[] = [];
+    const failures: unknown[] = [];
+    const client = createTimedClient(createControlFetch([]), new FakeTimerScheduler(), {
+      onControlLost: (loss) => lost.push(loss),
+      onRenewalFailure: (failure) => failures.push(failure),
+    });
+    await client.context("sess_1");
+    await client.release("sess_1");
+    await client.context("sess_2");
+    await client.stop();
+
+    expect(lost).toEqual([]);
+    expect(failures).toEqual([]);
+  });
+
+  it("survives throwing callbacks and traces their failures", async () => {
+    const timers = new FakeTimerScheduler();
+    const control = createControlFetch([]);
+    const logs: StructuredLogEntry[] = [];
+    let renewals = 0;
+    const client = createTimedClient(
+      async (url, init) => {
+        if (url.pathname.endsWith("/heartbeat")) {
+          renewals += 1;
+          if (renewals === 1) {
+            throw new Error("connection reset");
+          }
+          return new Response(JSON.stringify({ code: "CONTROL_EPOCH_STALE" }), { status: 409 });
+        }
+        return control(url, init);
+      },
+      timers,
+      {
+        observability: {
+          boundaryLogsEnabled: true,
+          logger: { log: (entry) => logs.push(entry) },
+          moduleName: "RestParticipantControlClient",
+        },
+        onControlLost: () => {
+          throw new Error("lost callback failed");
+        },
+        onRenewalFailure: () => {
+          throw new Error("renewal callback failed");
+        },
+      },
+    );
+    const callbackErrors = () =>
+      logs
+        .filter((entry) => entry.message === "boundary.error" && entry.operation.startsWith("on"))
+        .map((entry) => [entry.operation, (entry.data.error as { message: string }).message]);
+    await client.context("sess_1");
+
+    timers.fireNext();
+    await vi.waitFor(() => expect(callbackErrors()).toHaveLength(1));
+    expect(callbackErrors()).toEqual([["onRenewalFailure", "renewal callback failed"]]);
+    expect(client.debugInfo()).toMatchObject({ activeContextCount: 1, renewalTimerCount: 1 });
+
+    timers.fireNext();
+    await vi.waitFor(() => expect(callbackErrors()).toHaveLength(3));
+    expect(callbackErrors()).toEqual([
+      ["onRenewalFailure", "renewal callback failed"],
+      ["onControlLost", "lost callback failed"],
+      ["onRenewalFailure", "renewal callback failed"],
+    ]);
+    expect(client.debugInfo()).toMatchObject({ activeContextCount: 0, renewalTimerCount: 0 });
+
+    const again = await client.context("sess_1");
+    expect(client.invalidate(again)).toBe(true);
+    expect(callbackErrors()).toHaveLength(4);
+    await expect(client.context("sess_1")).resolves.toMatchObject({ sessionId: "sess_1" });
+  });
+
+  it("passes callbacks no token, header or response body", async () => {
+    const timers = new FakeTimerScheduler();
+    const received: unknown[] = [];
+    const control = createControlFetch([]);
+    const client = new RestParticipantControlClient(
+      {
+        authToken: "secret-token",
+        instanceId: "inst_1",
+        participantId: "part_1",
+        runtimeKind: "generic_agent",
+        serviceUrl: "http://tether.test",
+      },
+      {
+        acquisitionIdFactory: () => "acq_1",
+        fetch: async (url, init) => {
+          if (url.pathname.endsWith("/heartbeat")) {
+            return new Response(
+              JSON.stringify({ code: "CONTROL_EPOCH_STALE", detail: "response-body-detail" }),
+              { status: 409 },
+            );
+          }
+          return control(url, init);
+        },
+        now: () => Date.parse("2026-07-16T12:00:00.000Z"),
+        onControlLost: (loss) => received.push(loss),
+        onRenewalFailure: (failure) => received.push(failure),
+        timers,
+      },
+    );
+    await client.context("sess_1");
+
+    timers.fireNext();
+    await vi.waitFor(() => expect(received).toHaveLength(2));
+
+    const serialized = JSON.stringify(received);
+    expect(serialized).not.toContain("secret-token");
+    expect(serialized).not.toContain("Bearer");
+    expect(serialized).not.toContain("response-body-detail");
+    for (const value of received) {
+      expect(Object.keys(value as object).sort()).toEqual(
+        Object.keys(value as object).includes("controlRetained")
+          ? ["code", "controlRetained", "sessionId"]
+          : ["code", "sessionId"],
+      );
+    }
+  });
+
   it("keeps an uncertain release bounded and never replays it", async () => {
     const requests: CapturedRequest[] = [];
     const fetch: RestParticipantControlFetch = async (url, init) => {
@@ -537,6 +1063,29 @@ function createClient(fetch: RestParticipantControlFetch): RestParticipantContro
   );
 }
 
+function createTimedClient(
+  fetch: RestParticipantControlFetch,
+  timers: RestParticipantControlTimerScheduler,
+  options: Omit<RestParticipantControlClientOptions, "fetch" | "timers"> = {},
+): RestParticipantControlClient {
+  return new RestParticipantControlClient(
+    {
+      instanceId: "inst_1",
+      participantId: "part_1",
+      runtimeKind: "generic_agent",
+      serviceUrl: "http://tether.test",
+    },
+    {
+      acquisitionIdFactory: () => "acq_1",
+      acquisitionTransportRetries: 0,
+      now: () => Date.parse("2026-07-16T12:00:00.000Z"),
+      ...options,
+      fetch,
+      timers,
+    },
+  );
+}
+
 function createControlFetch(requests: CapturedRequest[]): RestParticipantControlFetch {
   return async (url, init) => {
     const request = capture(url, init);
@@ -568,26 +1117,52 @@ function createControlFetch(requests: CapturedRequest[]): RestParticipantControl
 }
 
 class FakeTimerScheduler implements RestParticipantControlTimerScheduler {
-  private readonly callbacks: Array<() => void> = [];
+  private readonly entries: Array<{
+    readonly callback: () => void;
+    readonly delayMs: number;
+    readonly handle: RestParticipantControlTimerHandle;
+  }> = [];
   unrefCount = 0;
 
-  clearTimeout(): void {}
-
-  fireNext(): void {
-    const callback = this.callbacks.shift();
-    if (!callback) {
-      throw new Error("Expected a scheduled renewal");
-    }
-    callback();
+  /** Pending timer delays in scheduling order. */
+  get delays(): number[] {
+    return this.entries.map((entry) => entry.delayMs);
   }
 
-  setTimeout(callback: () => void): RestParticipantControlTimerHandle {
-    this.callbacks.push(callback);
-    return {
+  clearTimeout(handle: RestParticipantControlTimerHandle): void {
+    const index = this.entries.findIndex((entry) => entry.handle === handle);
+    if (index >= 0) {
+      this.entries.splice(index, 1);
+    }
+  }
+
+  /** Fires the earliest scheduled timer that is still pending. */
+  fireNext(): void {
+    const entry = this.entries.shift();
+    if (!entry) {
+      throw new Error("Expected a scheduled timer");
+    }
+    entry.callback();
+  }
+
+  /** Fires the earliest pending timer scheduled with exactly this delay. */
+  fireDelay(delayMs: number): void {
+    const index = this.entries.findIndex((entry) => entry.delayMs === delayMs);
+    const entry = index >= 0 ? this.entries.splice(index, 1)[0] : undefined;
+    if (!entry) {
+      throw new Error(`Expected a scheduled timer of ${delayMs} ms`);
+    }
+    entry.callback();
+  }
+
+  setTimeout(callback: () => void, delayMs: number): RestParticipantControlTimerHandle {
+    const handle: RestParticipantControlTimerHandle = {
       unref: () => {
         this.unrefCount += 1;
       },
     };
+    this.entries.push({ callback, delayMs, handle });
+    return handle;
   }
 }
 

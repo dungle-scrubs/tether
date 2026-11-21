@@ -69,6 +69,46 @@ dashboards, and approval observers should use this API when they only need
 `onEvent`, `onError`, `waitForReplayComplete`, reconnect behavior, and stream
 diagnostics.
 
+## REST Control and Task Clients
+
+Runtimes that drive their own work loop over HTTP, without a participant
+WebSocket, use `RestParticipantControlClient` for the control lease and
+`RestParticipantTaskClient` for task routes. Import both from
+`@dungle-scrubs/tether-client/rest` to stay free of the WebSocket runtime.
+
+`RestParticipantControlClient.context(sessionId)` acquires or returns the
+session's single control context and renews it in the background from server
+guidance. `invalidate(context)` clears the current context when the snapshot
+names its generation (same acquisition id and control epoch), even when the
+snapshot predates a renewal; a snapshot of an older generation changes nothing
+and returns `false`.
+
+| Option | Default | Meaning |
+| --- | ---: | --- |
+| `requestTimeoutMs` | 10,000 ms | Deadline for each acquire, renew and release request, including the response body. Clamped to 100..60,000 ms. |
+| `onRenewalFailure` | none | Called once per failed background renewal with `{ sessionId, code, controlRetained }`. |
+| `onControlLost` | none | Called once when the client clears a context other than by `release()` or `stop()`, with `{ sessionId, code }`. |
+
+A request that reaches its deadline fails as `TRANSPORT`, like a network
+failure: acquisition retries it within `acquisitionTransportRetries`, renewal
+keeps the context and retries while the lease lasts, and release reports an
+uncertain release. The deadline composes with shutdown, which still aborts a
+pending acquisition.
+
+`controlRetained` is `true` when the client keeps the context and will retry
+the renewal, and `false` when it cleared it. `onControlLost` receives the
+renewal failure code for a rejected renewal (`CONTROL_CONFLICT`,
+`CONTROL_EPOCH_STALE` or `CONTROL_EPOCH_REQUIRED`), `LEASE_EXPIRED` when the
+lease ran out, and `INVALIDATED` after `invalidate()`. Callbacks receive no
+token, header or response body. A callback that throws is traced through the
+client's observability and does not affect the lease lifecycle.
+
+`RestParticipantTaskClient.createTask(sessionId, { kind, objective, input,
+schedule })` sends `schedule` only when given. It is the protocol's
+`scheduledTaskIdentitySchema` (`scheduleAlgorithmVersion`, `scheduleIntervalMs`,
+`scheduleWindowStart`, `scopeKey`): the server derives the task id from it and
+returns the existing run for a window it has already created.
+
 ## Replay-Safe Startup
 
 Replay-consuming subscriptions must exist before the participant socket opens.

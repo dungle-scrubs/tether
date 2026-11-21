@@ -43,7 +43,7 @@ export interface RestParticipantControlTimerHandle {
   readonly unref?: () => void;
 }
 
-/** Injected timer seam used for deterministic renewal tests. */
+/** Injected timer seam for renewal timers and request deadlines, used by deterministic tests. */
 export interface RestParticipantControlTimerScheduler {
   readonly clearTimeout: (handle: RestParticipantControlTimerHandle) => void;
   readonly setTimeout: (callback: () => void, delayMs: number) => RestParticipantControlTimerHandle;
@@ -60,6 +60,30 @@ export interface RestParticipantControlClientConfig {
   readonly serviceUrl: string;
 }
 
+/** One failed background renewal attempt, carrying no token, header or response body. */
+export interface RestParticipantControlRenewalFailure {
+  readonly code: RestParticipantControlErrorCode;
+  /** True when the client keeps the context and retries; false when it cleared it. */
+  readonly controlRetained: boolean;
+  readonly sessionId: string;
+}
+
+/**
+ * Why the client cleared a session's context on its own or through
+ * `invalidate`: a renewal failure code, `LEASE_EXPIRED` when the lease ran
+ * out, or `INVALIDATED` when a caller invalidated the current generation.
+ */
+export type RestParticipantControlLossCode =
+  | RestParticipantControlErrorCode
+  | "INVALIDATED"
+  | "LEASE_EXPIRED";
+
+/** A session context the client cleared for a reason other than `release()` or `stop()`. */
+export interface RestParticipantControlLoss {
+  readonly code: RestParticipantControlLossCode;
+  readonly sessionId: string;
+}
+
 /** Injectable runtime dependencies and bounded retry configuration. */
 export interface RestParticipantControlClientOptions {
   readonly acquisitionIdFactory?: () => string;
@@ -67,6 +91,16 @@ export interface RestParticipantControlClientOptions {
   readonly fetch?: RestParticipantControlFetch;
   readonly now?: () => number;
   readonly observability?: ModuleObservabilityOptions;
+  /** Called once when a context is cleared other than by `release()` or `stop()`. */
+  readonly onControlLost?: (loss: RestParticipantControlLoss) => void;
+  /** Called once per failed background renewal attempt. */
+  readonly onRenewalFailure?: (failure: RestParticipantControlRenewalFailure) => void;
+  /**
+   * Deadline for each acquire, renew and release request, including reading
+   * the response body. Defaults to 10,000 ms, clamped to 100..60,000 ms. A
+   * timeout fails as `TRANSPORT`.
+   */
+  readonly requestTimeoutMs?: number;
   readonly shutdownPendingWaitMs?: number;
   readonly timers?: RestParticipantControlTimerScheduler;
 }
@@ -148,7 +182,10 @@ export class RestParticipantControlClient {
   #lastFailureCode: RestParticipantControlErrorCode | null = null;
   readonly #now: () => number;
   readonly #observability: ModuleObservability;
+  readonly #onControlLost: ((loss: RestParticipantControlLoss) => void) | undefined;
+  readonly #onRenewalFailure: ((failure: RestParticipantControlRenewalFailure) => void) | undefined;
   readonly #participantId: string;
+  readonly #requestTimeoutMs: number;
   readonly #runtimeKind: string;
   readonly #serviceUrl: string;
   readonly #shutdownPendingWaitMs: number;
@@ -176,7 +213,10 @@ export class RestParticipantControlClient {
     this.#observability = new ModuleObservability(
       options.observability ?? readModuleObservabilityOptions("RestParticipantControlClient"),
     );
+    this.#onControlLost = options.onControlLost;
+    this.#onRenewalFailure = options.onRenewalFailure;
     this.#participantId = config.participantId;
+    this.#requestTimeoutMs = Math.max(100, Math.min(60_000, options.requestTimeoutMs ?? 10_000));
     this.#runtimeKind = config.runtimeKind;
     this.#serviceUrl = config.serviceUrl.replace(/\/$/u, "");
     this.#shutdownPendingWaitMs = Math.max(
@@ -197,7 +237,11 @@ export class RestParticipantControlClient {
         }
         const state = this.#state(sessionId);
         if (state.context && Date.parse(state.context.leaseExpiresAt) <= this.#now()) {
-          this.#invalidateStateContext(state, state.context);
+          this.#loseStateContext(state, state.context, "LEASE_EXPIRED");
+          // The loss callback may have called stop(); acquire nothing after shutdown began.
+          if (this.#stopped) {
+            throw this.#error("STOPPED", "acquire");
+          }
         }
         if (state.context) {
           return state.context;
@@ -230,23 +274,16 @@ export class RestParticipantControlClient {
     );
   }
 
-  /** Invalidates only the exact matching installed context. */
+  /**
+   * Clears the session's current context when the snapshot names its control
+   * generation (same acquisition id and control epoch), even if the snapshot
+   * predates a renewal. A snapshot of an older generation changes nothing.
+   */
   invalidate(context: RestParticipantControlContext): boolean {
     return this.#observability.traceBoundarySync(
       "invalidate",
       { operation: "invalidate" },
-      () => {
-        const state = this.#states.get(context.sessionId);
-        if (
-          !state?.context ||
-          state.context.acquisitionId !== context.acquisitionId ||
-          state.context.controlEpoch !== context.controlEpoch
-        ) {
-          return false;
-        }
-        this.#invalidateStateContext(state, context);
-        return true;
-      },
+      () => this.#invalidateGeneration(context, "INVALIDATED"),
       (invalidated) => ({ outcome: invalidated ? "invalidated" : "unchanged" }),
     );
   }
@@ -456,45 +493,78 @@ export class RestParticipantControlClient {
             error.code === "CONTROL_CONFLICT" ||
             error.code === "CONTROL_EPOCH_REQUIRED")
         ) {
-          this.invalidate(context);
+          this.#invalidateGeneration(context, error.code);
         } else if (state.context === context) {
           this.#scheduleRenewalRecovery(state, context);
+        }
+        if (this.#onRenewalFailure) {
+          const failure: RestParticipantControlRenewalFailure = {
+            // #request maps every failure to a typed error; TRANSPORT covers the unreachable rest.
+            code: error instanceof RestParticipantControlError ? error.code : "TRANSPORT",
+            controlRetained: state.context === context,
+            sessionId: context.sessionId,
+          };
+          this.#notify("onRenewalFailure", () => this.#onRenewalFailure?.(failure));
         }
         throw error;
       }
     });
   }
 
+  /**
+   * Sends one control request under its own deadline, which covers the fetch
+   * and the response body. The deadline composes with the caller's abort
+   * signal; either one fails the request as TRANSPORT even when the fetch
+   * implementation ignores the signal.
+   */
   async #request(
     operation: "acquire" | "release" | "renew",
     path: string,
     body: Record<string, unknown>,
     signal?: AbortSignal,
   ): Promise<{ readonly body: unknown; readonly status: number }> {
-    let response: Response;
+    const deadline = new AbortController();
+    const requestSignal = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
+    const timer = this.#timers.setTimeout(() => {
+      deadline.abort(new DOMException("Control request deadline exceeded", "TimeoutError"));
+    }, this.#requestTimeoutMs);
+    timer.unref?.();
     try {
-      response = await this.#fetch(new URL(path, `${this.#serviceUrl}/`), {
-        body: JSON.stringify(body),
-        headers: {
-          ...(this.#authToken ? { authorization: `Bearer ${this.#authToken}` } : {}),
-          "content-type": "application/json",
-        },
-        method: "POST",
-        ...(signal ? { signal } : {}),
-      });
-    } catch {
-      throw this.#error("TRANSPORT", operation);
+      let response: Response;
+      try {
+        requestSignal.throwIfAborted();
+        response = await untilAborted(
+          this.#fetch(new URL(path, `${this.#serviceUrl}/`), {
+            body: JSON.stringify(body),
+            headers: {
+              ...(this.#authToken ? { authorization: `Bearer ${this.#authToken}` } : {}),
+              "content-type": "application/json",
+            },
+            method: "POST",
+            signal: requestSignal,
+          }),
+          requestSignal,
+        );
+      } catch {
+        throw this.#error("TRANSPORT", operation);
+      }
+      let responseBody: unknown;
+      try {
+        responseBody = await untilAborted(readJson(response), requestSignal);
+      } catch {
+        throw this.#error("TRANSPORT", operation, response.status);
+      }
+      if (!response.ok) {
+        throw this.#error(
+          mapServerError(response.status, responseBody),
+          operation,
+          response.status,
+        );
+      }
+      return { body: responseBody, status: response.status };
+    } finally {
+      this.#timers.clearTimeout(timer);
     }
-    let responseBody: unknown;
-    try {
-      responseBody = await readJson(response);
-    } catch {
-      throw this.#error("TRANSPORT", operation, response.status);
-    }
-    if (!response.ok) {
-      throw this.#error(mapServerError(response.status, responseBody), operation, response.status);
-    }
-    return { body: responseBody, status: response.status };
   }
 
   #scheduleRenewal(state: SessionState, context: RestParticipantControlContext): void {
@@ -519,19 +589,54 @@ export class RestParticipantControlClient {
     state.timer = null;
   }
 
-  #invalidateStateContext(state: SessionState, context: RestParticipantControlContext): void {
+  /** Clears the current context when the snapshot names its generation; reports the loss. */
+  #invalidateGeneration(
+    context: RestParticipantControlContext,
+    code: RestParticipantControlLossCode,
+  ): boolean {
+    const state = this.#states.get(context.sessionId);
+    if (
+      !state?.context ||
+      state.context.acquisitionId !== context.acquisitionId ||
+      state.context.controlEpoch !== context.controlEpoch
+    ) {
+      return false;
+    }
+    this.#loseStateContext(state, state.context, code);
+    return true;
+  }
+
+  /** Clears one exact installed context and reports the loss to the caller's callback. */
+  #loseStateContext(
+    state: SessionState,
+    context: RestParticipantControlContext,
+    code: RestParticipantControlLossCode,
+  ): void {
     if (state.context !== context) {
       return;
     }
     this.#clearTimer(state);
     state.acquisitionId = null;
     state.context = null;
+    if (this.#onControlLost) {
+      const loss: RestParticipantControlLoss = { code, sessionId: context.sessionId };
+      this.#notify("onControlLost", () => this.#onControlLost?.(loss));
+    }
+  }
+
+  /** Runs a caller callback; a throw is traced as a boundary failure and never propagates. */
+  #notify(operation: "onControlLost" | "onRenewalFailure", callback: () => void): void {
+    try {
+      this.#observability.traceBoundarySync(operation, { operation }, callback);
+    } catch {
+      // Traced above; a consumer callback must not break the lifecycle.
+    }
   }
 
   #scheduleRenewalRecovery(state: SessionState, context: RestParticipantControlContext): void {
     const remainingMs = Date.parse(context.leaseExpiresAt) - this.#now();
     if (remainingMs <= 1) {
-      this.#invalidateStateContext(state, context);
+      this.#loseStateContext(state, context, "LEASE_EXPIRED");
       return;
     }
     this.#clearTimer(state);
@@ -593,6 +698,30 @@ async function readJson(response: Response): Promise<unknown> {
   } catch {
     return null;
   }
+}
+
+/** Settles with the pending work, or rejects as soon as the signal aborts. */
+function untilAborted<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const aborted = () => {
+      reject(new Error("Control request aborted"));
+    };
+    if (signal.aborted) {
+      aborted();
+    } else {
+      signal.addEventListener("abort", aborted, { once: true });
+    }
+    pending.then(
+      (value) => {
+        signal.removeEventListener("abort", aborted);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", aborted);
+        reject(error);
+      },
+    );
+  });
 }
 
 /** Maps public HTTP status and stable error code to a bounded client failure. */

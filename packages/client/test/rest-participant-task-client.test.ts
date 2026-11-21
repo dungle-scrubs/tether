@@ -1,4 +1,5 @@
 import { ok } from "node:assert/strict";
+import { createTaskSchema } from "@dungle-scrubs/tether-protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -370,6 +371,36 @@ describe("RestParticipantTaskClient", () => {
       kind: "media_status",
       objective: "Report status",
     });
+  });
+
+  it("sends a schedule identity on create exactly as given, and no schedule key without one", async () => {
+    const scheduled = fetchJson(201, { status: "created", task: taskRecord });
+    const schedule = {
+      scheduleAlgorithmVersion: 1,
+      scheduleIntervalMs: 3_600_000,
+      scheduleWindowStart: 1_790_000_000_000,
+      scopeKey: "example-scope",
+    };
+
+    await scheduled.client.createTask("sess_1", {
+      kind: "example.digest",
+      objective: "Summarize the window",
+      schedule,
+    });
+
+    expect(scheduled.requests[0]?.body).toEqual({
+      kind: "example.digest",
+      objective: "Summarize the window",
+      schedule,
+    });
+    expect(createTaskSchema.safeParse(scheduled.requests[0]?.body).success).toBe(true);
+
+    const unscheduled = fetchJson(201, { status: "created", task: taskRecord });
+    await unscheduled.client.createTask("sess_1", {
+      kind: "example.digest",
+      objective: "Summarize the window",
+    });
+    expect(unscheduled.requests[0]?.body).not.toHaveProperty("schedule");
   });
 
   it("creates a task from a bare record when the response is not wrapped", async () => {
