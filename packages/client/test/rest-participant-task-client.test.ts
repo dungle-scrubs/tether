@@ -845,6 +845,116 @@ describe("RestParticipantTaskClient conflict reasons", () => {
   });
 });
 
+/** A 409 whose body stays open until the test closes it, recording whether it was cancelled. */
+function openConflictBody(): {
+  readonly close: (text: string) => void;
+  readonly response: Response;
+  readonly state: { cancelled: boolean };
+} {
+  const state = { cancelled: false };
+  let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const stream = new ReadableStream<Uint8Array>(
+    {
+      start: (c) => {
+        controller = c;
+      },
+      cancel: () => {
+        state.cancelled = true;
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  return {
+    close: (text) => {
+      controller?.enqueue(new TextEncoder().encode(text));
+      controller?.close();
+    },
+    response: new Response(stream, { status: 409 }),
+    state,
+  };
+}
+
+/** Marks when a pending call settles, without leaving its rejection unobserved. */
+function track(pending: Promise<unknown>): { readonly settled: () => boolean } {
+  let settled = false;
+  pending.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  return { settled: () => settled };
+}
+
+describe("RestParticipantTaskClient conflict body deadline", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it("settles a 409 whose body never closes as a conflict without a reason", async () => {
+    vi.useFakeTimers();
+    const body = openConflictBody();
+    const client = new RestParticipantTaskClient(
+      { authToken: null, participantId: "part_1", serviceUrl: "https://fixture.invalid" },
+      { fetch: async () => body.response },
+    );
+    const pending = client.claimTask("sess_1", "task_1");
+    const progress = track(pending);
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(progress.settled()).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(progress.settled()).toBe(true);
+    const error = await rejection(pending);
+    expect(error.code).toBe("CLAIM_CONFLICT");
+    expect(error.conflictReason).toBeNull();
+    expect(error.details).toEqual({ operation: "claim", status: 409 });
+    expect(body.state.cancelled).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("keeps the reason of a body that closes just before the deadline and leaves no timer", async () => {
+    vi.useFakeTimers();
+    const body = openConflictBody();
+    const client = new RestParticipantTaskClient(
+      { authToken: null, participantId: "part_1", serviceUrl: "https://fixture.invalid" },
+      { fetch: async () => body.response },
+    );
+    const pending = client.completeTask("sess_1", "task_1", { claimId: "claim_1", result: {} });
+    const progress = track(pending);
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(progress.settled()).toBe(false);
+    body.close(JSON.stringify({ code: "CONTROL_CONFLICT" }));
+    const error = await rejection(pending);
+    expect(error.code).toBe("CLAIM_CONFLICT");
+    expect(error.conflictReason).toBe("CONTROL_CONFLICT");
+    expect(body.state.cancelled).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("gives a conflict without a reason when the caller aborts before the deadline", async () => {
+    vi.useFakeTimers();
+    const body = openConflictBody();
+    const owner = new AbortController();
+    const client = boundedTaskClient(body.response, {
+      signal: owner.signal,
+      timeoutMs: 60_000,
+    });
+    const pending = client.releaseTask("sess_1", "task_1", { claimId: "claim_1" });
+    const progress = track(pending);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(progress.settled()).toBe(false);
+    owner.abort();
+    const error = await rejection(pending);
+    expect(error.code).toBe("CLAIM_CONFLICT");
+    expect(error.conflictReason).toBeNull();
+    expect(body.state.cancelled).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
 describe("RestParticipantTaskClient.cancelTask", () => {
   const cancelledRecord = { ...taskRecord, cancelledAt: "2026-10-01T00:05:00.000Z" };
 

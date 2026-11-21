@@ -129,6 +129,14 @@ const conflictBodySchema = z.union([
 const conflictBodyMaxBytes = 4_096;
 
 /**
+ * Longest wait for a 409 body before rejecting without its reason. The byte cap
+ * bounds size, not time: a body left open below it would otherwise hold the
+ * conflict back from a caller that passed no signal. A fixed constant because
+ * no other option of the task client carries a deadline.
+ */
+const conflictBodyDeadlineMs = 2_000;
+
+/**
  * Why the server refused a task call with HTTP 409, when its body says so. A
  * claim race or a terminal task carries no code, so its reason is `null`.
  */
@@ -250,6 +258,11 @@ export function isRestParticipantResourceLimit(
  * lease (another channel holds it, or the control epoch is stale): acquire
  * control again before retrying. False for a claim race, a terminal task, a
  * task-identity conflict, a conflict without a reason, and anything else.
+ *
+ * False does not prove the task's state refused the call: a conflict body that
+ * is unreadable, oversized, slower than the read deadline or cut off by the
+ * caller's abort also yields a null reason. Treat null as unknown when
+ * certainty matters.
  */
 export function isControlConflict(error: unknown): error is RestParticipantTaskError & {
   readonly code: "CLAIM_CONFLICT";
@@ -444,18 +457,29 @@ async function readJsonBody(
   }
 }
 
-/** Reads the one known code from a bounded 409 body; never throws. */
+/**
+ * Reads the one known code from a 409 body bounded in bytes and in time; never
+ * throws. The caller's signal, its deadline or this read's own deadline,
+ * whichever ends first, cancels the body and yields a null reason.
+ */
 async function readConflictReason(
   response: Response,
   operation: TaskOperation,
   signal: AbortSignal | undefined,
 ): Promise<RestParticipantTaskConflictReason | null> {
-  const body = await readJsonBody(
-    response,
-    operation,
-    { maxBytes: conflictBodyMaxBytes },
-    signal,
-  ).catch(() => null);
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(), conflictBodyDeadlineMs);
+  let body: unknown;
+  try {
+    body = await readJsonBody(
+      response,
+      operation,
+      { maxBytes: conflictBodyMaxBytes },
+      signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal,
+    ).catch(() => null);
+  } finally {
+    clearTimeout(timer);
+  }
   const parsed = conflictBodySchema.safeParse(body);
   if (!parsed.success) {
     return null;
